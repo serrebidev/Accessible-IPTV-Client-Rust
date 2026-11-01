@@ -39,7 +39,11 @@ public class FoundationAccessible {
 }
 '@
 
-$appPath = Join-Path $PSScriptRoot '..\target\debug\iptv-app.exe'
+$appPath = if ($env:CARGO_TARGET_DIR) {
+    Join-Path $env:CARGO_TARGET_DIR 'debug\iptv-app.exe'
+} else {
+    Join-Path $PSScriptRoot '..\target\debug\iptv-app.exe'
+}
 $startInfo = [System.Diagnostics.ProcessStartInfo]::new((Resolve-Path -LiteralPath $appPath).Path)
 $startInfo.UseShellExecute = $false
 # Hide only the console; WindowStyle Hidden also hides wx's first GUI window.
@@ -75,13 +79,32 @@ try {
     if ($accessible.Description -ne 'No playlist loaded. Channel list is empty.') {
         throw "Unexpected MSAA empty-state description: $($accessible.Description)"
     }
+    foreach ($name in @('Open playlist', 'Cancel loading', 'Search channels')) {
+        $control = $window.FindFirst(
+            [System.Windows.Automation.TreeScope]::Descendants,
+            [System.Windows.Automation.PropertyCondition]::new(
+                [System.Windows.Automation.AutomationElement]::NameProperty, $name))
+        if ($null -eq $control -or -not $control.Current.IsKeyboardFocusable) {
+            throw "Missing or non-focusable control: $name"
+        }
+    }
     $status = $window.FindFirst(
         [System.Windows.Automation.TreeScope]::Descendants,
-        [System.Windows.Automation.PropertyCondition]::new(
-            [System.Windows.Automation.AutomationElement]::NameProperty,
-            'No playlist loaded. Channel list is empty.'))
-    if ($null -eq $status) { throw 'Empty-state text is missing from the accessibility tree.' }
-    Write-Output "PASS: MSAA Channels, native list role, keyboard focusable, zero items, empty-state text/description. HasKeyboardFocus=$([bool]($accessible.State -band 4))"
+        [System.Windows.Automation.AndCondition]::new(
+            [System.Windows.Automation.PropertyCondition]::new(
+                [System.Windows.Automation.AutomationElement]::NameProperty, 'Playlist status'),
+            [System.Windows.Automation.PropertyCondition]::new(
+                [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+                [System.Windows.Automation.ControlType]::Edit)))
+    if ($null -eq $status -or -not $status.Current.IsKeyboardFocusable) {
+        throw 'Focusable Playlist status field is missing from the accessibility tree.'
+    }
+    $value = $status.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern)
+    if (-not $value.Current.IsReadOnly -or $value.Current.Value -ne 'No playlist loaded. Channel list is empty.') {
+        throw 'Playlist status is not read-only or has incorrect initial empty guidance.'
+    }
+    Write-Output "PASS: MSAA Channels, native list role, zero items; named focusable actions/search; focusable read-only empty status. HasKeyboardFocus=$([bool]($accessible.State -band 4)). Announcements and traversal require separate validation."
+
 } finally {
     if (-not $app.HasExited) {
         if (-not $app.CloseMainWindow() -or -not $app.WaitForExit(10000)) {
