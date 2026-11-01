@@ -1,5 +1,8 @@
-use iptv_core::BrowseModel;
-use std::{cell::RefCell, rc::Rc, sync::mpsc};
+use iptv_core::{
+    browser::{BrowseEvent, BrowserWorker},
+    search::SearchResults,
+};
+use std::{cell::RefCell, rc::Rc};
 use wxdragon::event::EventType;
 use wxdragon::prelude::*;
 use wxdragon::timer::Timer;
@@ -18,6 +21,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .with_label("&Open playlist…")
             .build();
         open.set_accessibility_label("Open playlist");
+        let cancel = Button::builder(&panel)
+            .with_label("&Cancel loading")
+            .build();
+        cancel.set_accessibility_label("Cancel loading");
+        let search_label = StaticText::builder(&panel)
+            .with_label("&Search channels")
+            .build();
+        let search = TextCtrl::builder(&panel)
+            .with_style(TextCtrlStyle::ProcessEnter)
+            .build();
+        search.set_accessibility_label("Search channels");
+        search.set_accessibility_description("Type to filter channel names. Tab or Enter moves to Channels; Shift+Tab returns to Cancel loading.");
         // Keep the label immediately before the list for native MSW accessible naming.
         let label = StaticText::builder(&panel).with_label("Channels").build();
         let list = ListCtrl::builder(&panel)
@@ -40,22 +55,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             event.skip(true);
         });
 
-        let model = Rc::new(RefCell::new(BrowseModel::empty()));
+        let model = Rc::new(RefCell::new(SearchResults::default()));
         let rows = Rc::clone(&model);
         assert!(list.set_virtual_text_callback(move |index, column| {
             channel_text(&rows.borrow(), index, column)
         }));
         list.set_item_count(0);
 
-        let status = StaticText::builder(&panel)
-            .with_label("No playlist loaded. Channel list is empty.")
+        let status_label = StaticText::builder(&panel)
+            .with_label("Playlist status")
             .build();
-        bind_local_open(frame, open, list, status, model);
+        let details = TextCtrl::builder(&panel)
+            .with_style(TextCtrlStyle::ReadOnly | TextCtrlStyle::MultiLine)
+            .with_value("No playlist loaded. Channel list is empty.")
+            .build();
+        details.set_accessibility_label("Playlist status");
+        details.set_accessibility_description("Read loading and search results here. Open playlist chooses a file or retries a failed load.");
+        let status = Status {
+            label: status_label,
+            details,
+        };
+        bind_browser(frame, open, cancel, search, list, status, model);
         let layout = BoxSizer::builder(Orientation::Vertical).build();
         layout.add(&open, 0, SizerFlag::All, 8);
+        layout.add(&cancel, 0, SizerFlag::All, 8);
+        layout.add(&search_label, 0, SizerFlag::All, 8);
+        layout.add(&search, 0, SizerFlag::Expand | SizerFlag::All, 8);
         layout.add(&label, 0, SizerFlag::All, 8);
         layout.add(&list, 1, SizerFlag::Expand | SizerFlag::All, 8);
-        layout.add(&status, 0, SizerFlag::All, 8);
+        layout.add(&status_label, 0, SizerFlag::All, 8);
+        layout.add(&details, 0, SizerFlag::Expand | SizerFlag::All, 8);
         panel.set_sizer(layout, true);
 
         let frame_layout = BoxSizer::builder(Orientation::Vertical).build();
@@ -68,66 +97,66 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     })
 }
 
-fn bind_local_open(
+#[derive(Clone, Copy)]
+struct Status {
+    label: StaticText,
+    details: TextCtrl,
+}
+
+impl Status {
+    fn set_label(self, message: &str) {
+        self.details.change_value(message);
+        live_region::announce_with_priority(self.label, message, live_region::Priority::Medium);
+    }
+}
+
+fn bind_browser(
     frame: Frame,
     open: Button,
+    cancel: Button,
+    search: TextCtrl,
     list: ListCtrl,
-    status: StaticText,
-    model: Rc<RefCell<BrowseModel>>,
+    status: Status,
+    model: Rc<RefCell<SearchResults>>,
 ) {
-    // Only the worker owns file I/O and parsing. The timer drains its result
-    // on the UI thread; closing the window never waits for a large file.
-    let pending = Rc::new(RefCell::new(
-        None::<mpsc::Receiver<std::io::Result<BrowseModel>>>,
-    ));
+    let browser = Rc::new(RefCell::new(BrowserWorker::default()));
     let timer = Rc::new(Timer::new(&frame));
     let completed_timer = Rc::downgrade(&timer);
-    let result = Rc::clone(&pending);
+    let completed_browser = Rc::clone(&browser);
     timer.on_tick(move |_| {
-        let received = result.borrow().as_ref().map(mpsc::Receiver::try_recv);
-        let loaded = match received {
-            Some(Ok(loaded)) => loaded,
-            Some(Err(mpsc::TryRecvError::Disconnected)) => {
-                Err(std::io::Error::other("Playlist worker stopped"))
+        let event = completed_browser.borrow_mut().poll(&search.get_value());
+        match event {
+            Some(BrowseEvent::Results(results)) => publish_results(list, status, &model, results),
+            Some(BrowseEvent::Recovery(error)) => {
+                status.set_label(error.message());
+                list.set_accessibility_description(error.message());
             }
-            _ => return,
-        };
-        *result.borrow_mut() = None;
-        if let Some(timer) = completed_timer.upgrade() {
-            timer.stop();
+            None => {}
         }
-        let message = match loaded {
-            Ok(loaded) => {
-                let count = i64::try_from(loaded.channels().len()).unwrap_or(i64::MAX);
-                // Clear native selection before replacing row identities.
-                list.set_item_count(0);
-                let previous = model.replace(loaded);
-                // Retiring a huge playlist must not free all its rows on the UI thread.
-                std::thread::spawn(move || drop(previous));
-                list.set_item_count(count);
-                if count > 0 {
-                    list.set_item_state(
-                        0,
-                        ListItemState::Selected | ListItemState::Focused,
-                        ListItemState::Selected | ListItemState::Focused,
-                    );
-                    list.refresh_items(0, count - 1);
-                }
-                format!("{count} channels loaded.")
+        if !completed_browser.borrow().is_busy() {
+            if let Some(timer) = completed_timer.upgrade() {
+                timer.stop();
             }
-            Err(_) => "Could not open playlist. Choose another local UTF-8 playlist.".to_owned(),
-        };
-        status.set_label(&message);
-        list.set_accessibility_description(&message);
-        // Completion never moves keyboard focus away from the user's control.
+        }
     });
-    let request = Rc::clone(&pending);
+    let search_browser = Rc::clone(&browser);
+    let poll_search = Rc::clone(&timer);
+    search.on_text_changed(move |_| {
+        let cancelled = search_browser.borrow_mut().search(search.get_value());
+        if cancelled {
+            status.set_label("Load cancelled. Searching previous channels...");
+        } else {
+            status.details.change_value("Searching channels...");
+        }
+        assert!(poll_search.start(50, false));
+    });
+    // Only an explicit user action moves keyboard focus. A late completion can
+    // update item state but never interrupt a new editing session in Search.
+    search.on_text_enter(move |_| list.set_focus());
+
+    let request = Rc::clone(&browser);
     let poll = Rc::clone(&timer);
     open.on_click(move |_| {
-        // Serialize loads until cancellation/replacement is added in ticket 04.
-        if request.borrow().is_some() {
-            return;
-        }
         let dialog = FileDialog::builder(&frame)
             .with_message("Open local playlist")
             .with_wildcard("M3U playlists (*.m3u;*.m3u8)|*.m3u;*.m3u8|All files (*.*)|*.*")
@@ -139,27 +168,94 @@ fn bind_local_open(
         let Some(path) = dialog.get_path() else {
             return;
         };
-        let (sender, receiver) = mpsc::channel();
-        *request.borrow_mut() = Some(receiver);
-        status.set_label("Loading playlist…");
+        request.borrow_mut().load(std::path::PathBuf::from(path));
+        status
+            .set_label("Loading playlist. Cancel loading or open another playlist to replace it.");
         assert!(poll.start(50, false));
-        std::thread::spawn(move || {
-            let _ = sender.send(BrowseModel::open_local(std::path::Path::new(&path)));
-        });
+    });
+    let cancel_browser = Rc::clone(&browser);
+    cancel.on_click(move |_| {
+        if cancel_browser.borrow_mut().cancel_load() {
+            status.set_label(
+                "Load cancelled. Previous channels kept. Open playlist to choose a file or retry.",
+            );
+        }
     });
     frame.on_close(move |event| {
+        browser.borrow_mut().cancel();
         timer.stop();
         event.skip(true);
     });
 }
 
-fn channel_text(model: &BrowseModel, index: i64, column: i32) -> String {
+fn publish_results(
+    list: ListCtrl,
+    status: Status,
+    model: &RefCell<SearchResults>,
+    results: SearchResults,
+) {
+    let selected = usize::try_from(list.get_first_selected_item()).ok();
+    let focused =
+        usize::try_from(list.get_next_item(-1, ListNextItemFlag::All, ListItemState::Focused)).ok();
+    let (restored_selected, restored_focused, keep_selected, keep_focused) = {
+        let previous = model.borrow();
+        (
+            results.restore_row(&previous, selected),
+            results.restore_row(&previous, focused),
+            selected.is_some_and(|row| results.retains_row(&previous, row)),
+            focused.is_some_and(|row| results.retains_row(&previous, row)),
+        )
+    };
+    let count = i64::try_from(results.len()).unwrap_or(i64::MAX);
+    // MSAA can synchronously query rows during SetItemCount. On shrink the old
+    // model must remain available; on grow the new model must already exist.
+    for (row, keep, state) in [
+        (selected, keep_selected, ListItemState::Selected),
+        (focused, keep_focused, ListItemState::Focused),
+    ] {
+        if !keep {
+            if let Some(row) = row.and_then(|row| i64::try_from(row).ok()) {
+                list.set_item_state(row, ListItemState::None, state);
+            }
+        }
+    }
+    let old_count = i64::from(list.get_item_count());
+    if count < old_count {
+        list.set_item_count(count);
+    }
+    let message = results.status();
+    let previous = model.replace(results);
+    if count > old_count {
+        list.set_item_count(count);
+    }
+    if let Some(row) = restored_selected
+        .filter(|_| !keep_selected)
+        .and_then(|row| i64::try_from(row).ok())
+    {
+        list.set_item_state(row, ListItemState::Selected, ListItemState::Selected);
+        list.ensure_visible(row);
+    }
+    if let Some(row) = restored_focused
+        .filter(|_| !keep_focused)
+        .and_then(|row| i64::try_from(row).ok())
+    {
+        list.set_item_state(row, ListItemState::Focused, ListItemState::Focused);
+    }
+    if count > 0 {
+        list.refresh_items(0, count - 1);
+    }
+    status.set_label(&message);
+    list.set_accessibility_description(&message);
+    std::thread::spawn(move || drop(previous));
+}
+
+fn channel_text(model: &SearchResults, index: i64, column: i32) -> String {
     if column != 0 {
         return String::new();
     }
     usize::try_from(index)
         .ok()
-        .and_then(|index| model.channels().get(index))
+        .and_then(|index| model.channel(index))
         .map_or_else(String::new, |channel| {
             if channel.name.is_empty() {
                 // Stream URLs can contain credentials; never use them as row labels.
@@ -173,10 +269,12 @@ fn channel_text(model: &BrowseModel, index: i64, column: i32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use iptv_core::{search::SearchWorker, BrowseModel};
+    use std::sync::Arc;
 
     #[test]
     fn empty_list_has_no_placeholder_or_stale_accessible_rows() {
-        let model = BrowseModel::empty();
+        let model = SearchResults::default();
         for index in [-1, 0, 1, i64::MAX] {
             assert_eq!(channel_text(&model, index, 0), "");
             assert_eq!(channel_text(&model, index, 1), "");
@@ -187,7 +285,19 @@ mod tests {
     fn populated_rows_expose_names_in_source_order_without_stream_credentials() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../iptv-core/tests/fixtures/local.m3u");
-        let model = BrowseModel::open_local(&path).unwrap();
+        let worker = SearchWorker::default();
+        worker.submit(
+            Arc::new(BrowseModel::open_local(&path).unwrap()),
+            String::new(),
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let model = loop {
+            if let Some(result) = worker.try_latest() {
+                break result;
+            }
+            assert!(std::time::Instant::now() < deadline, "search timed out");
+            std::thread::yield_now();
+        };
         assert_eq!(channel_text(&model, 0, 0), "ABC East HD");
         assert_eq!(channel_text(&model, 1, 0), "映画, HD");
         assert_eq!(channel_text(&model, 2, 0), "Bob's Burgers, Season 1");

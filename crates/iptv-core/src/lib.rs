@@ -1,5 +1,9 @@
 //! wx-free domain types and playlist behavior for the Rust port.
 
+pub mod browser;
+pub mod loading;
+pub mod search;
+
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -19,25 +23,30 @@ pub struct Channel {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct BrowseModel {
     channels: Vec<Channel>,
+    malformed: usize,
 }
 
 impl BrowseModel {
     /// Read a local UTF-8 playlist. Call from a worker, never the UI thread.
     ///
     /// # Errors
-    /// Returns the file read or UTF-8 decoding error without replacing existing state.
+    /// Returns a file read error without replacing existing state. Invalid UTF-8 bytes
+    /// are ignored, matching the Python local-file loader.
     pub fn open_local(path: &Path) -> std::io::Result<Self> {
-        let text = std::fs::read_to_string(path)?;
-        Ok(Self {
-            channels: parse_m3u(&text),
-        })
+        loading::read_local(path, || true)?.ok_or_else(|| std::io::Error::other("Load cancelled"))
     }
 
     #[must_use]
     pub const fn empty() -> Self {
         Self {
             channels: Vec::new(),
+            malformed: 0,
         }
+    }
+
+    #[must_use]
+    pub const fn malformed_entries(&self) -> usize {
+        self.malformed
     }
 
     #[must_use]
@@ -51,10 +60,28 @@ impl BrowseModel {
 /// reparsing the original source.
 #[must_use]
 pub fn parse_m3u(text: &str) -> Vec<Channel> {
+    parse_cancellable(text, || true)
+        .unwrap_or_default()
+        .channels
+}
+
+fn parse_cancellable(text: &str, current: impl Fn() -> bool) -> Option<BrowseModel> {
     let mut pending = PendingChannel::default();
     let mut channels = Vec::new();
-
-    for raw_line in text.trim_start_matches('\u{feff}').lines() {
+    let mut malformed = 0;
+    let mut has_pending = false;
+    let mut pending_malformed = false;
+    // Python splitlines accepts CR-only and Unicode line boundaries too.
+    for (index, raw_line) in text
+        .trim_start_matches('\u{feff}')
+        .split([
+            '\n', '\r', '\x0b', '\x0c', '\x1c', '\x1d', '\x1e', '\u{85}', '\u{2028}', '\u{2029}',
+        ])
+        .enumerate()
+    {
+        if index % 256 == 0 && !current() {
+            return None;
+        }
         let line = raw_line.trim();
         if line.is_empty() {
             continue;
@@ -63,47 +90,49 @@ pub fn parse_m3u(text: &str) -> Vec<Channel> {
             .get(..7)
             .is_some_and(|prefix| prefix.eq_ignore_ascii_case("#EXTINF"))
         {
+            if has_pending && !pending_malformed {
+                malformed += 1;
+            }
+            pending_malformed = malformed_extinf(line);
+            if pending_malformed {
+                malformed += 1;
+            }
             pending = PendingChannel::from_extinf(line);
+            has_pending = true;
         } else if !line.starts_with('#') {
             channels.push(pending.finish(line));
             pending = PendingChannel::default();
+            has_pending = false;
         }
     }
 
-    channels
+    current().then_some(BrowseModel {
+        channels,
+        malformed: malformed + usize::from(has_pending && !pending_malformed),
+    })
 }
 
 /// Search channels using the Python reference's exact-name, word-start, then
-/// general-match ranking. Rust's stable sort preserves source order for ties.
+/// general-match ranking. Source indexes preserve playlist order for ties.
 #[must_use]
 pub fn search_channels<'a>(channels: &'a [Channel], query: &str) -> Vec<&'a Channel> {
-    let query = query.trim().to_lowercase();
-    if query.is_empty() {
-        return channels.iter().collect();
-    }
-
-    let mut matches: Vec<(usize, &Channel)> = channels
-        .iter()
-        .enumerate()
-        .filter(|(_, channel)| channel.name.to_lowercase().contains(&query))
-        .collect();
-    matches.sort_by(|(left_index, left), (right_index, right)| {
-        search_rank(&left.name, &query)
-            .cmp(&search_rank(&right.name, &query))
-            .then(left_index.cmp(right_index))
-    });
-    matches.into_iter().map(|(_, channel)| channel).collect()
+    search::matching_rows(channels, query, || true)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|index| &channels[index])
+        .collect()
 }
 
 fn search_rank(name: &str, query: &str) -> (u8, usize) {
-    let name = name.trim().to_lowercase();
+    let name = name.trim();
     if name == query {
         return (0, 0);
     }
-    let word_start = name
-        .find(query)
-        .is_some_and(|index| index == 0 || !name.as_bytes()[index - 1].is_ascii_alphanumeric());
-    (if word_start { 1 } else { 2 }, name.len())
+    let word_start = name.char_indices().any(|(index, _)| {
+        (index == 0 || !name.as_bytes()[index - 1].is_ascii_alphanumeric())
+            && name[index..].starts_with(query)
+    });
+    (if word_start { 1 } else { 2 }, name.chars().count())
 }
 
 #[derive(Default)]
@@ -143,6 +172,24 @@ impl PendingChannel {
     }
 }
 
+fn malformed_extinf(line: &str) -> bool {
+    let Some(comma) = name_separator(line) else {
+        return true;
+    };
+    let mut quote = None;
+    for character in line[..comma].chars() {
+        if quote == Some(character) {
+            quote = None;
+        } else if quote.is_none() && matches!(character, '\'' | '"') {
+            quote = Some(character);
+        }
+    }
+    !line
+        .get(..8)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("#EXTINF:"))
+        || quote.is_some()
+}
+
 fn name_separator(line: &str) -> Option<usize> {
     let mut quote = None;
     for (index, character) in line.char_indices() {
@@ -164,51 +211,46 @@ fn parse_attributes(input: &str) -> BTreeMap<String, String> {
     let mut attributes = BTreeMap::new();
     let mut cursor = 0;
     let bytes = input.as_bytes();
-
     while cursor < bytes.len() {
-        while cursor < bytes.len() && (bytes[cursor].is_ascii_whitespace() || bytes[cursor] == b',')
-        {
-            cursor += 1;
-        }
-        let key_start = cursor;
-        while cursor < bytes.len() && bytes[cursor] != b'=' && !bytes[cursor].is_ascii_whitespace()
-        {
-            cursor += 1;
-        }
-        if key_start == cursor {
+        if !attribute_key(bytes[cursor]) {
             cursor += 1;
             continue;
         }
-        let key = input[key_start..cursor].to_lowercase();
+        let start = cursor;
+        while cursor < bytes.len() && attribute_key(bytes[cursor]) {
+            cursor += 1;
+        }
+        let key = input[start..cursor].to_ascii_lowercase();
         while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
             cursor += 1;
         }
-        if cursor >= bytes.len() || bytes[cursor] != b'=' {
+        if bytes.get(cursor) != Some(&b'=') {
             continue;
         }
         cursor += 1;
         while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
             cursor += 1;
         }
-        let value = if cursor < bytes.len() && matches!(bytes[cursor], b'"' | b'\'') {
-            let quote = bytes[cursor];
-            cursor += 1;
-            let value_start = cursor;
-            while cursor < bytes.len() && bytes[cursor] != quote {
-                cursor += 1;
-            }
-            let value = input[value_start..cursor].to_owned();
-            cursor = cursor.saturating_add(1);
-            value
+        let start = cursor;
+        let quoted = bytes
+            .get(cursor)
+            .copied()
+            .filter(|b| matches!(b, b'"' | b'\''))
+            .and_then(|quote| bytes[cursor + 1..].iter().position(|&b| b == quote));
+        let value = if let Some(end) = quoted {
+            cursor += end + 2;
+            &input[start + 1..cursor - 1]
         } else {
-            let value_start = cursor;
             while cursor < bytes.len()
                 && !bytes[cursor].is_ascii_whitespace()
-                && bytes[cursor] != b','
+                && !matches!(bytes[cursor], b'"' | b',')
             {
                 cursor += 1;
             }
-            input[value_start..cursor].to_owned()
+            if cursor == start {
+                continue;
+            }
+            &input[start..cursor]
         };
         attributes
             .entry(key)
@@ -216,6 +258,10 @@ fn parse_attributes(input: &str) -> BTreeMap<String, String> {
     }
 
     attributes
+}
+
+fn attribute_key(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')
 }
 
 #[cfg(test)]
@@ -250,6 +296,17 @@ mod tests {
         assert_eq!(results[0].name, "Challenge");
         assert_eq!(results[1].name, "The Challenge");
         assert_eq!(results[2].name, "PEACOCK Challenge event");
+    }
+
+    #[test]
+    fn diagnostics_accept_mixed_case_directives_and_quotes_in_display_names() {
+        let model = super::parse_cancellable(
+            "#ExTiNf:-1 group-title='News',Bob's \"News\"\nurl\n",
+            || true,
+        )
+        .unwrap();
+        assert_eq!(model.malformed_entries(), 0);
+        assert_eq!(model.channels()[0].name, "Bob's \"News\"");
     }
 
     #[test]
