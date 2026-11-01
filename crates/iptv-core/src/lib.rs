@@ -49,9 +49,7 @@ pub fn parse_m3u(text: &str) -> Vec<Channel> {
         }
         if line.starts_with("#EXTINF") {
             pending = PendingChannel::from_extinf(line);
-        } else if line.starts_with('#') {
-            continue;
-        } else {
+        } else if !line.starts_with('#') {
             channels.push(pending.finish(line));
             pending = PendingChannel::default();
         }
