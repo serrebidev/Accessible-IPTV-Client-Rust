@@ -1,0 +1,9 @@
+﻿#EXTM3U
+#EXTINF:-1 tvg-id="abc.us" tvg-name="ABC East" tvg-logo="http://logo.com/abc.png" group-title="USA News",ABC East HD
+http://stream.example.com/abc
+#extinf:-1 tvg-id='movies' http-user-agent="Browser (KHTML, like Gecko)" group-title=' Movies ' custom=kept,映画, HD
+https://example.invalid/movies
+#EXTINF:-1 group-title="Kids",Bob's Burgers, Season 1
+https://example.invalid/kids
+
+https://example.invalid/plain
