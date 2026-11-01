@@ -1,0 +1,2 @@
+# Parity fixtures exercise exact BOM, encoding and line-ending bytes.
+crates/iptv-core/tests/fixtures/*.m3u -text whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol

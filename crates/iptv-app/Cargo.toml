@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 iptv-core.workspace = true
 wxdragon.workspace = true
+live-region.workspace = true
 
 [lints.rust]
 unsafe_code = "forbid"

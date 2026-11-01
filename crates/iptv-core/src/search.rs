@@ -107,7 +107,7 @@ impl SearchResults {
 
     #[must_use]
     pub fn status(&self) -> String {
-        if self.playlist.channels().is_empty() {
+        let message = if self.playlist.channels().is_empty() {
             "Channel list is empty. Open another playlist.".to_owned()
         } else if self.query.trim().is_empty() {
             format!(
@@ -118,6 +118,11 @@ impl SearchResults {
             "No matching channels. Change or clear Search channels.".to_owned()
         } else {
             format!("{} matching channels.", self.len())
+        };
+        if self.playlist.malformed_entries() > 0 {
+            format!("Playlist contains malformed entries; usable channels kept. {message}")
+        } else {
+            message
         }
     }
 }
@@ -191,6 +196,11 @@ impl SearchWorker {
         });
     }
 
+    /// Invalidate active and already queued completions without waiting.
+    pub fn cancel(&self) {
+        self.generation.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Take only a current result, including when an old completion was already
     /// queued before the next keystroke. Retire stale playlists off the caller.
     #[must_use]
@@ -229,6 +239,7 @@ mod tests {
         }
         Arc::new(BrowseModel {
             channels: parse_m3u(&text),
+            malformed: 0,
         })
     }
 

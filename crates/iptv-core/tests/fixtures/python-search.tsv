@@ -1,0 +1,25 @@
+# Python 9aa89e053225ef2c83c4f3659775a00723012ff7; source, query, ordered source indexes
+local.m3u		0,1,2,3	.
+local.m3u	c	0	.
+local.m3u	 CAT 		.
+local.m3u	news		.
+local.m3u	missing		.
+local.m3u	映画	1	.
+recovery.m3u		0,1,2,3,4,5	.
+recovery.m3u	c	0,4,3,1,2	.
+recovery.m3u	 CAT 	0,4,3,1	.
+recovery.m3u	news		.
+recovery.m3u	missing		.
+recovery.m3u	映画		.
+empty.m3u			.
+empty.m3u	c		.
+empty.m3u	 CAT 		.
+empty.m3u	news		.
+empty.m3u	missing		.
+empty.m3u	映画		.
+invalid-utf8.m3u		0	.
+invalid-utf8.m3u	c		.
+invalid-utf8.m3u	 CAT 		.
+invalid-utf8.m3u	news	0	.
+invalid-utf8.m3u	missing		.
+invalid-utf8.m3u	映画		.

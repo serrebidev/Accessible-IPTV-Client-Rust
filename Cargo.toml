@@ -13,3 +13,4 @@ license = "MIT OR Apache-2.0"
 [workspace.dependencies]
 iptv-core = { path = "crates/iptv-core" }
 wxdragon = "=0.9.24"
+live-region = "=0.3.3"

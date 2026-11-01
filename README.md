@@ -34,10 +34,15 @@ moves to **Channels**; Shift+Tab returns from Channels to search. Browse with
 the arrow keys, Home and End. Results preserve the selected channel while it
 remains present; otherwise the first result is selected. Search completion
 never moves keyboard focus. No matches produce zero rows and recovery text.
-Reading and parsing run on a worker; opening another file is gated until the
-current load completes. Cancel leaves the current playlist intact. Failed
-loads retain the previous channels and show a status message. Dynamic spoken
-status and richer recovery/cancellation belong to ticket 04.
+Reading and parsing run on a cancellable worker. Open another file to replace a
+pending load, or use **Cancel loading** (Alt+C). Typing a new search cancels a
+pending load and searches the previous playlist. Cancelling the file chooser
+keeps the current operation intact. Failed loads keep the previous channels;
+use **Open playlist** to retry or choose another file. Empty playlists have zero
+rows and recovery guidance. Tab from Channels to the read-only **Playlist status**
+field to review the current state. Loads, results, empty and recovery states use
+live-region announcements without moving keyboard focus. Owner-heard NVDA
+validation remains pending.
 After `cargo build -p iptv-app`, run `powershell -NoProfile -File tools/smoke-foundation.ps1`
 on an interactive Windows desktop to inspect the native accessibility tree.
 This briefly opens the prototype and closes it normally; it does not send keys
@@ -49,3 +54,5 @@ Build and unit-test success does not close the owner-heard NVDA gate.
 See [local browse evidence and remaining checks](docs/validation/0003-local-playlist-browse.md).
 
 See [incremental search evidence and remaining checks](docs/validation/0004-incremental-channel-search.md).
+
+See [playlist recovery and pinned Python parity evidence](docs/validation/0005-playlist-recovery.md).

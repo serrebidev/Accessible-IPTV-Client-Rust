@@ -1,0 +1,12 @@
+# Python 9aa89e053225ef2c83c4f3659775a00723012ff7; source, name, group, url, tvg-id, tvg-name
+local.m3u	ABC East HD	USA News	http://stream.example.com/abc	abc.us	ABC East	.
+local.m3u	映画, HD	Movies	https://example.invalid/movies	movies		.
+local.m3u	Bob's Burgers, Season 1	Kids	https://example.invalid/kids			.
+local.m3u			https://example.invalid/plain			.
+recovery.m3u	Cat	News	https://example.invalid/first	first		.
+recovery.m3u	xcat cat		https://example.invalid/two	two		.
+recovery.m3u	Recovered		https://example.invalid/recovered			.
+recovery.m3u	猫cat		https://example.invalid/unicode		TV	.
+recovery.m3u	Cat		https://example.invalid/duplicate			.
+recovery.m3u			https://example.invalid/plain			.
+invalid-utf8.m3u	Bad News		https://example.invalid/bytes			.
