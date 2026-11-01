@@ -27,7 +27,13 @@ The first build downloads/builds wxWidgets through `wxdragon-sys` and can take
 several minutes. The core can be checked separately with `cargo test -p iptv-core`
 without a GUI toolchain. Run the prototype with `cargo run -p iptv-app`.
 Use Alt+O or Tab to **Open playlist**, choose a local `.m3u`/`.m3u8` file,
-then Tab to **Channels** and browse with the arrow keys, Home and End.
+then Tab to **Search channels** to filter names as you type. Search ignores
+case and ranks exact names, word starts, then other matches; ties retain
+playlist order. Clear the field to restore the full playlist. Tab or Enter
+moves to **Channels**; Shift+Tab returns from Channels to search. Browse with
+the arrow keys, Home and End. Results preserve the selected channel while it
+remains present; otherwise the first result is selected. Search completion
+never moves keyboard focus. No matches produce zero rows and recovery text.
 Reading and parsing run on a worker; opening another file is gated until the
 current load completes. Cancel leaves the current playlist intact. Failed
 loads retain the previous channels and show a status message. Dynamic spoken
@@ -41,3 +47,5 @@ See [the toolkit decision](docs/adr/0003-wxdragon-first-toolkit.md) and
 [the prototype acceptance checklist](docs/validation/0002-toolkit-foundation.md).
 Build and unit-test success does not close the owner-heard NVDA gate.
 See [local browse evidence and remaining checks](docs/validation/0003-local-playlist-browse.md).
+
+See [incremental search evidence and remaining checks](docs/validation/0004-incremental-channel-search.md).

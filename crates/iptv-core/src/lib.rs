@@ -1,5 +1,7 @@
 //! wx-free domain types and playlist behavior for the Rust port.
 
+pub mod search;
+
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -74,36 +76,26 @@ pub fn parse_m3u(text: &str) -> Vec<Channel> {
 }
 
 /// Search channels using the Python reference's exact-name, word-start, then
-/// general-match ranking. Rust's stable sort preserves source order for ties.
+/// general-match ranking. Source indexes preserve playlist order for ties.
 #[must_use]
 pub fn search_channels<'a>(channels: &'a [Channel], query: &str) -> Vec<&'a Channel> {
-    let query = query.trim().to_lowercase();
-    if query.is_empty() {
-        return channels.iter().collect();
-    }
-
-    let mut matches: Vec<(usize, &Channel)> = channels
-        .iter()
-        .enumerate()
-        .filter(|(_, channel)| channel.name.to_lowercase().contains(&query))
-        .collect();
-    matches.sort_by(|(left_index, left), (right_index, right)| {
-        search_rank(&left.name, &query)
-            .cmp(&search_rank(&right.name, &query))
-            .then(left_index.cmp(right_index))
-    });
-    matches.into_iter().map(|(_, channel)| channel).collect()
+    search::matching_rows(channels, query, || true)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|index| &channels[index])
+        .collect()
 }
 
 fn search_rank(name: &str, query: &str) -> (u8, usize) {
-    let name = name.trim().to_lowercase();
+    let name = name.trim();
     if name == query {
         return (0, 0);
     }
-    let word_start = name
-        .find(query)
-        .is_some_and(|index| index == 0 || !name.as_bytes()[index - 1].is_ascii_alphanumeric());
-    (if word_start { 1 } else { 2 }, name.len())
+    let word_start = name.char_indices().any(|(index, _)| {
+        (index == 0 || !name.as_bytes()[index - 1].is_ascii_alphanumeric())
+            && name[index..].starts_with(query)
+    });
+    (if word_start { 1 } else { 2 }, name.chars().count())
 }
 
 #[derive(Default)]
