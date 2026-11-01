@@ -28,6 +28,23 @@ Copy his habits:
 - `tracing` for logs. No println debugging left behind.
 - Tests in the crates, next to the code they guard.
 
+## More models
+
+Two more accounts to study. Different lessons:
+
+- masonasons — https://github.com/masonasons
+  No Rust there. Do not go looking for Rust code, there is none. Steal the patterns instead:
+  - FastSMRW: portable core, thin native front end. Same border we draw between core crate and app crate. He proves it survives a full rewrite.
+  - SingingVoiceStudio: wxWidgets, screen-reader first. Our toolkit's family — study how he names controls and orders focus.
+  - FastPlay: accessible audio player, tempo/pitch, effects. Our player must feel that direct from the keyboard.
+  Lesson: architecture and player craft, not language.
+
+- CVS Health accessibility techniques — https://github.com/cvs-health/ios-swiftui-accessibility-techniques
+  SwiftUI, iOS, not our platform. Steal the discipline, not the code:
+  - Every pattern written twice: good example, bad example, side by side, testable with a screen reader. Copy that habit in our tests and docs.
+  - Their checklist mindset: labels, grouping, focus order, announcements, large text, contrast, reduced motion — audited, written down, checked again. We keep the same kind of checklist for NVDA/JAWS/VoiceOver on desktop.
+  Lesson: accessibility is a catalogue of named patterns with pass/fail checks, not a vibe.
+
 ## GUI law
 
 - wxDragon only. No Electron. No web UI. No second toolkit "just for this one window".
@@ -52,6 +69,8 @@ This app exists for blind users. Brandon is blind. He tests with NVDA himself.
 - Lists must not re-announce rows that did not change. Use quiet-list patterns.
 - Speak state changes through live region, not dialogs, not focus tricks.
 - No ASCII art. No box drawing. No clever visual-only layout.
+- Respect system settings: large text, high contrast/dark mode, reduced motion. Never hard-code around them.
+- Related controls grouped and labelled as a group, not a pile of loose widgets. Focus order matches the logical order a listener expects.
 - If a sighted user can do it and a screen reader user cannot, it is a bug. Top priority bug.
 
 ## Parity list — port all of it
