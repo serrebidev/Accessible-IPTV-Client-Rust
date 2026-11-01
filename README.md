@@ -56,3 +56,5 @@ See [local browse evidence and remaining checks](docs/validation/0003-local-play
 See [incremental search evidence and remaining checks](docs/validation/0004-incremental-channel-search.md).
 
 See [playlist recovery and pinned Python parity evidence](docs/validation/0005-playlist-recovery.md).
+
+See [the pending owner-heard NVDA acceptance record and session steps](docs/validation/0006-owner-heard-accessibility.md).
