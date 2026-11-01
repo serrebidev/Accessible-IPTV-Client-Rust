@@ -1,6 +1,7 @@
 //! wx-free domain types and playlist behavior for the Rust port.
 
 use std::collections::BTreeMap;
+use std::path::Path;
 
 /// A channel as it appears in a playlist.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -14,13 +15,24 @@ pub struct Channel {
     pub unknown_attributes: BTreeMap<String, String>,
 }
 
-/// The initial empty browse state exposed to the desktop adapter.
+/// Widget-independent local playlist browse state.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct BrowseModel {
     channels: Vec<Channel>,
 }
 
 impl BrowseModel {
+    /// Read a local UTF-8 playlist. Call from a worker, never the UI thread.
+    ///
+    /// # Errors
+    /// Returns the file read or UTF-8 decoding error without replacing existing state.
+    pub fn open_local(path: &Path) -> std::io::Result<Self> {
+        let text = std::fs::read_to_string(path)?;
+        Ok(Self {
+            channels: parse_m3u(&text),
+        })
+    }
+
     #[must_use]
     pub const fn empty() -> Self {
         Self {
@@ -47,7 +59,10 @@ pub fn parse_m3u(text: &str) -> Vec<Channel> {
         if line.is_empty() {
             continue;
         }
-        if line.starts_with("#EXTINF") {
+        if line
+            .get(..7)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("#EXTINF"))
+        {
             pending = PendingChannel::from_extinf(line);
         } else if !line.starts_with('#') {
             channels.push(pending.finish(line));
@@ -100,7 +115,7 @@ struct PendingChannel {
 impl PendingChannel {
     fn from_extinf(line: &str) -> Self {
         let mut pending = Self::default();
-        let comma = line.find(',');
+        let comma = name_separator(line);
         let metadata = comma.map_or(line, |index| &line[..index]);
         pending.name = comma.map_or_else(String::new, |index| line[index + 1..].trim().to_owned());
         let attributes = metadata
@@ -126,6 +141,23 @@ impl PendingChannel {
             unknown_attributes,
         }
     }
+}
+
+fn name_separator(line: &str) -> Option<usize> {
+    let mut quote = None;
+    for (index, character) in line.char_indices() {
+        if quote == Some(character) {
+            quote = None;
+        } else if quote.is_none() {
+            match character {
+                '\'' | '"' => quote = Some(character),
+                ',' => return Some(index),
+                _ => {}
+            }
+        }
+    }
+    // Match Python's recovery for an unterminated quoted attribute.
+    line.find(',')
 }
 
 fn parse_attributes(input: &str) -> BTreeMap<String, String> {
@@ -158,10 +190,11 @@ fn parse_attributes(input: &str) -> BTreeMap<String, String> {
         while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
             cursor += 1;
         }
-        let value = if cursor < bytes.len() && bytes[cursor] == b'"' {
+        let value = if cursor < bytes.len() && matches!(bytes[cursor], b'"' | b'\'') {
+            let quote = bytes[cursor];
             cursor += 1;
             let value_start = cursor;
-            while cursor < bytes.len() && bytes[cursor] != b'"' {
+            while cursor < bytes.len() && bytes[cursor] != quote {
                 cursor += 1;
             }
             let value = input[value_start..cursor].to_owned();
@@ -169,12 +202,17 @@ fn parse_attributes(input: &str) -> BTreeMap<String, String> {
             value
         } else {
             let value_start = cursor;
-            while cursor < bytes.len() && !bytes[cursor].is_ascii_whitespace() {
+            while cursor < bytes.len()
+                && !bytes[cursor].is_ascii_whitespace()
+                && bytes[cursor] != b','
+            {
                 cursor += 1;
             }
             input[value_start..cursor].to_owned()
         };
-        attributes.entry(key).or_insert(value);
+        attributes
+            .entry(key)
+            .or_insert_with(|| value.trim().to_owned());
     }
 
     attributes
