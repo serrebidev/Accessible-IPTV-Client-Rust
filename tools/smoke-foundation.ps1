@@ -15,6 +15,11 @@ public class FoundationAccessible {
     public int Children;
     public int Rows;
     public bool HasHeader;
+    public string Value;
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetWindow(IntPtr window, uint command);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern int GetClassName(IntPtr window, System.Text.StringBuilder name, int length);
     [DllImport("user32.dll")]
     private static extern IntPtr SendMessage(IntPtr window, uint message, IntPtr wParam, IntPtr lParam);
     [DllImport("oleacc.dll")]
@@ -28,6 +33,7 @@ public class FoundationAccessible {
             return new FoundationAccessible {
                 Name = accessible.get_accName(0),
                 Description = accessible.get_accDescription(0),
+                Value = accessible.get_accValue(0),
                 Role = Convert.ToInt32(accessible.get_accRole(0)),
                 State = Convert.ToInt32(accessible.get_accState(0)),
                 Children = accessible.accChildCount,
@@ -35,6 +41,23 @@ public class FoundationAccessible {
                 HasHeader = SendMessage(window, 0x101F, IntPtr.Zero, IntPtr.Zero) != IntPtr.Zero // LVM_GETHEADER
             };
         } finally { Marshal.ReleaseComObject(accessible); }
+    }
+
+    public static IntPtr FindDescendant(IntPtr root, string className, string name) {
+        var child = GetWindow(root, 5); // GW_CHILD
+        while (child != IntPtr.Zero) {
+            var classBuffer = new System.Text.StringBuilder(128);
+            GetClassName(child, classBuffer, classBuffer.Capacity);
+            if (classBuffer.ToString() == className) {
+                try {
+                    if (Read(child).Name == name) return child;
+                } catch { }
+            }
+            var nested = FindDescendant(child, className, name);
+            if (nested != IntPtr.Zero) return nested;
+            child = GetWindow(child, 2); // GW_HWNDNEXT
+        }
+        return IntPtr.Zero;
     }
 }
 '@
@@ -59,13 +82,10 @@ try {
     if ($app.MainWindowHandle -eq [IntPtr]::Zero) {
         throw 'Prototype has no native window.'
     }
-    $window = [System.Windows.Automation.AutomationElement]::FromHandle($app.MainWindowHandle)
-    $list = $window.FindFirst(
-        [System.Windows.Automation.TreeScope]::Descendants,
-        [System.Windows.Automation.PropertyCondition]::new(
-            [System.Windows.Automation.AutomationElement]::ClassNameProperty, 'SysListView32'))
-    if ($null -eq $list) { throw 'Native virtual list not found.' }
-    $accessible = [FoundationAccessible]::Read([IntPtr]$list.Current.NativeWindowHandle)
+    $windowHandle = $app.MainWindowHandle
+    $listHandle = [FoundationAccessible]::FindDescendant($windowHandle, 'SysListView32', 'Channels')
+    if ($listHandle -eq [IntPtr]::Zero) { throw 'Native virtual list not found.' }
+    $accessible = [FoundationAccessible]::Read($listHandle)
     if ($accessible.Name -ne 'Channels') { throw "Unexpected MSAA list name: $($accessible.Name)" }
     if ($accessible.Role -ne 0x21) { # ROLE_SYSTEM_LIST
         throw "Unexpected MSAA list role: $($accessible.Role)"
@@ -79,28 +99,30 @@ try {
     if ($accessible.Description -ne 'No playlist loaded. Channel list is empty.') {
         throw "Unexpected MSAA empty-state description: $($accessible.Description)"
     }
-    foreach ($name in @('Open playlist', 'Cancel loading', 'Search channels')) {
-        $control = $window.FindFirst(
-            [System.Windows.Automation.TreeScope]::Descendants,
-            [System.Windows.Automation.PropertyCondition]::new(
-                [System.Windows.Automation.AutomationElement]::NameProperty, $name))
-        if ($null -eq $control -or -not $control.Current.IsKeyboardFocusable) {
-            throw "Missing or non-focusable control: $name"
+    foreach ($controlSpec in @(
+        @{ Class = 'Button'; Name = 'Open playlist' },
+        @{ Class = 'Button'; Name = 'Cancel loading' },
+        @{ Class = 'Edit'; Name = 'Search channels' }
+    )) {
+        $controlHandle = [FoundationAccessible]::FindDescendant(
+            $windowHandle, $controlSpec.Class, $controlSpec.Name)
+        if ($controlHandle -eq [IntPtr]::Zero) {
+            throw "Missing native control: $($controlSpec.Name)"
+        }
+        $control = [FoundationAccessible]::Read($controlHandle)
+        if (-not ($control.State -band 0x100000)) {
+            throw "Missing or non-focusable control: $($controlSpec.Name)"
         }
     }
-    $status = $window.FindFirst(
-        [System.Windows.Automation.TreeScope]::Descendants,
-        [System.Windows.Automation.AndCondition]::new(
-            [System.Windows.Automation.PropertyCondition]::new(
-                [System.Windows.Automation.AutomationElement]::NameProperty, 'Playlist status'),
-            [System.Windows.Automation.PropertyCondition]::new(
-                [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
-                [System.Windows.Automation.ControlType]::Edit)))
-    if ($null -eq $status -or -not $status.Current.IsKeyboardFocusable) {
+    $statusHandle = [FoundationAccessible]::FindDescendant(
+        $windowHandle, 'Edit', 'Playlist status')
+    if ($statusHandle -eq [IntPtr]::Zero) {
         throw 'Focusable Playlist status field is missing from the accessibility tree.'
     }
-    $value = $status.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern)
-    if (-not $value.Current.IsReadOnly -or $value.Current.Value -ne 'No playlist loaded. Channel list is empty.') {
+    $status = [FoundationAccessible]::Read($statusHandle)
+    if (-not ($status.State -band 0x100000) -or
+        -not ($status.State -band 0x40) -or
+        $status.Value -ne 'No playlist loaded. Channel list is empty.') {
         throw 'Playlist status is not read-only or has incorrect initial empty guidance.'
     }
     Write-Output "PASS: MSAA Channels, native list role, zero items; named focusable actions/search; focusable read-only empty status. HasKeyboardFocus=$([bool]($accessible.State -band 4)). Announcements and traversal require separate validation."
