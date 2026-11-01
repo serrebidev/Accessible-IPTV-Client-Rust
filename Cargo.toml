@@ -1,0 +1,15 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/iptv-core",
+    "crates/iptv-app",
+]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.97.1"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+iptv-core = { path = "crates/iptv-core" }
+wxdragon = "=0.9.24"

@@ -125,3 +125,17 @@ Ported from the Python player. Do not reinvent:
 - Farhan Khan (thebetterfarhan) — trusted co-developer. Wrote the Python responsiveness spec. His budgets and designs carry over.
 
 When unsure: read the Python code. It already answered.
+
+## Agent skills
+
+### Issue tracker
+
+Issues and specs for this repository live in GitHub Issues. Use the `gh` CLI. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Use the canonical labels `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, and `wontfix`. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+This is a single-context repository. Read `GLOSSARY.md` and relevant records under `docs/adr/` when they exist. See `docs/agents/domain.md`.
