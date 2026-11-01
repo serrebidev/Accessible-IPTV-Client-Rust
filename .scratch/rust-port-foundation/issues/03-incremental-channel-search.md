@@ -6,6 +6,8 @@
 
 **Status:** ready-for-agent
 
+**Python reference:** Match the Python client’s `search_rank` behavior, asynchronous search generation, `_VirtualChannelList` selection/focus handling, and the rule that editing search must not be interrupted by stale results.
+
 - [ ] Search updates incrementally as the user types.
 - [ ] Matching is case-insensitive and uses deterministic ordering.
 - [ ] No-result and cleared-search states are understandable and accessible.

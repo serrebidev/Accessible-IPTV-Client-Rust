@@ -6,6 +6,8 @@
 
 **Status:** ready-for-agent
 
+**Python reference:** Use the wxPython client’s accessible virtual-list behavior and explicit control naming as the acceptance model for the prototype. The Rust prototype must prove the same keyboard and screen-reader boundary before the toolkit decision is finalized.
+
 - [ ] A stable Rust toolchain and explicit MSRV are recorded and used consistently by local checks.
 - [ ] Workspace boundaries keep domain logic independent from desktop widgets.
 - [ ] The toolkit comparison covers Windows fit, keyboard operation, accessible names, focus, announcements, packaging, and maintainability.

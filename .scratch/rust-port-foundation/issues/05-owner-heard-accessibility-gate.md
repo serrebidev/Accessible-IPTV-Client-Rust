@@ -6,6 +6,8 @@
 
 **Status:** ready-for-agent
 
+**Python reference:** Reuse the Python client’s NVDA smoke expectations for accessible names, virtual-list rows, search focus, and recovery announcements as the manual comparison checklist, while keeping the Rust result independent and separately recorded.
+
 - [ ] The owner can open a local playlist using keyboard-only interaction.
 - [ ] NVDA announces the playlist control, channel list, channel rows, search control, result changes, and recovery states clearly.
 - [ ] Focus order and focus restoration remain usable through load, search, clear, no-result, and recovery flows.

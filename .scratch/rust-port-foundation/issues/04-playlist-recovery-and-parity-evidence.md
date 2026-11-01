@@ -6,6 +6,8 @@
 
 **Status:** ready-for-agent
 
+**Python reference:** Derive fixtures and failure expectations from the Python M3U parsing tests, loading paths, stale-search guards, and accessible empty/error states. Record the exact Python revision used for every parity fixture.
+
 - [ ] Empty playlists produce an announced, focusable empty state.
 - [ ] Missing and unreadable sources produce an announced recovery state with retry or choose-file action.
 - [ ] Malformed entries do not crash the application or hide otherwise valid entries.
