@@ -1,5 +1,6 @@
 use iptv_core::guide::Guide;
 use iptv_core::i18n::I18n;
+use iptv_core::updater::{UpdateEvent, UpdateWorker};
 use iptv_core::{
     browser::{BrowseEvent, BrowserWorker},
     cast::{CastDevice, CastEvent, CastWorker},
@@ -203,6 +204,9 @@ struct Wiring {
     cast_pending: Rc<std::cell::Cell<bool>>,
     cast_ui: Rc<RefCell<Option<CastUi>>>,
     guide_ui: Rc<RefCell<Option<GuideUi>>>,
+    update_worker: Rc<UpdateWorker>,
+    update_pending: Rc<std::cell::Cell<bool>>,
+    tray: Rc<TaskBarIcon>,
     i18n: Rc<I18n>,
     vod_worker: Rc<VodWorker>,
     vod_pending: Rc<std::cell::Cell<bool>>,
@@ -402,6 +406,9 @@ fn bind_browser(frame: Frame, controls: Controls, model: Rc<RefCell<SearchResult
         cast_pending: Rc::new(std::cell::Cell::new(false)),
         cast_ui: Rc::new(RefCell::new(None)),
         guide_ui: Rc::new(RefCell::new(None)),
+        update_worker: Rc::new(UpdateWorker::new()),
+        update_pending: Rc::new(std::cell::Cell::new(false)),
+        tray: Rc::new(build_tray_icon()),
         i18n,
         vod_worker: Rc::new(VodWorker::new()),
         vod_pending: Rc::new(std::cell::Cell::new(false)),
@@ -436,6 +443,7 @@ fn bind_browser(frame: Frame, controls: Controls, model: Rc<RefCell<SearchResult
     bind_vod(&wiring, controls);
     bind_cast(&wiring, controls);
     bind_guide(&wiring, controls);
+    build_menu(frame, &wiring, controls);
     bind_actions(frame, &wiring, controls);
     let browser = Rc::clone(&wiring.browser);
     let timer = Rc::clone(&wiring.timer);
@@ -471,6 +479,7 @@ fn bind_completion(wiring: &Wiring, controls: Controls) {
         poll_recordings(&completed, status);
         poll_vod(&completed, status);
         poll_cast(&completed, status);
+        poll_updates(&completed, status);
         if !completed.browser.borrow().is_busy()
             && !completed.epg_pending.get()
             && !completed.provider_pending.get()
@@ -483,6 +492,7 @@ fn bind_completion(wiring: &Wiring, controls: Controls) {
             && completed.dvr.borrow().pending_count() == 0
             && !completed.vod_pending.get()
             && !completed.cast_pending.get()
+            && !completed.update_pending.get()
         {
             if let Some(timer) = completed_timer.upgrade() {
                 timer.stop();
@@ -1448,20 +1458,157 @@ struct GuideUi {
 fn bind_guide(wiring: &Wiring, controls: Controls) {
     let button = controls.guide_button;
     let status = controls.status;
-    let ui_slot = Rc::clone(&wiring.guide_ui);
-    let i18n = Rc::clone(&wiring.i18n);
+    let wiring = clone_wiring(wiring);
     button.on_click(move |_| {
-        let ui = ensure_guide_ui(&ui_slot);
-        let language = i18n.resolved_language();
-        let (guide, section) = iptv_core::guide::open_topic(Some(&language), None, None);
-        show_guide(&ui, guide);
-        if let Some(section) = section {
-            move_caret(&ui, &section);
-        }
-        ui.frame.show(true);
-        ui.frame.raise();
-        status.set_label("User Guide opened.");
+        open_guide_window(&wiring, status);
     });
+}
+
+/// Shallow-clone the wiring handles for menu handlers (every field
+/// is an Rc handle).
+fn clone_wiring(wiring: &Wiring) -> Wiring {
+    Wiring {
+        persist: Persist {
+            config: Rc::clone(&wiring.persist.config),
+            path: wiring.persist.path.clone(),
+        },
+        browser: Rc::clone(&wiring.browser),
+        categories: Rc::clone(&wiring.categories),
+        timer: Rc::clone(&wiring.timer),
+        model: Rc::clone(&wiring.model),
+        player: Rc::clone(&wiring.player),
+        epg: Rc::clone(&wiring.epg),
+        epg_worker: Rc::clone(&wiring.epg_worker),
+        epg_pending: Rc::clone(&wiring.epg_pending),
+        reminders: Rc::clone(&wiring.reminders),
+        provider_worker: Rc::clone(&wiring.provider_worker),
+        provider_pending: Rc::clone(&wiring.provider_pending),
+        pending_resolve: Rc::clone(&wiring.pending_resolve),
+        recordings: Rc::clone(&wiring.recordings),
+        cast_worker: Rc::clone(&wiring.cast_worker),
+        cast_pending: Rc::clone(&wiring.cast_pending),
+        cast_ui: Rc::clone(&wiring.cast_ui),
+        guide_ui: Rc::clone(&wiring.guide_ui),
+        update_worker: Rc::clone(&wiring.update_worker),
+        update_pending: Rc::clone(&wiring.update_pending),
+        tray: Rc::clone(&wiring.tray),
+        i18n: Rc::clone(&wiring.i18n),
+        vod_worker: Rc::clone(&wiring.vod_worker),
+        vod_pending: Rc::clone(&wiring.vod_pending),
+        vod_ui: Rc::clone(&wiring.vod_ui),
+        dvr: Rc::clone(&wiring.dvr),
+        recorded: Rc::clone(&wiring.recorded),
+        shutdown_attempted: Rc::clone(&wiring.shutdown_attempted),
+        last_dvr_tick: Rc::clone(&wiring.last_dvr_tick),
+    }
+}
+
+/// Open the User Guide window at the start of the manual.
+fn open_guide_window(wiring: &Wiring, status: Status) {
+    let ui = ensure_guide_ui(&wiring.guide_ui);
+    let language = wiring.i18n.resolved_language();
+    let (guide, section) = iptv_core::guide::open_topic(Some(&language), None, None);
+    show_guide(&ui, guide);
+    if let Some(section) = section {
+        move_caret(&ui, &section);
+    }
+    ui.frame.show(true);
+    ui.frame.raise();
+    status.set_label("User Guide opened.");
+}
+
+/// The tray icon (kept alive on the wiring): tooltip plus a
+/// Show/Exit popup menu.
+fn build_tray_icon() -> TaskBarIcon {
+    let icon = TaskBarIcon::builder()
+        .with_tooltip("Accessible IPTV Client")
+        .build();
+    if let Some(bitmap) = Bitmap::new(16, 16) {
+        icon.set_icon(&bitmap, "Accessible IPTV Client");
+    }
+    let mut popup = Menu::builder()
+        .append_item(5004, "&Show Accessible IPTV Client", "")
+        .append_item(4004, "E&xit", "")
+        .build();
+    icon.set_popup_menu(&mut popup);
+    icon
+}
+
+/// The main window's menu bar. Labels carry the effective shortcuts
+/// from the shortcuts engine, so a config override changes the menu
+/// the same way it changes the binding.
+fn build_menu(frame: Frame, wiring: &Wiring, controls: Controls) {
+    let status = controls.status;
+    let config_value = serde_json::Value::Object(wiring.persist.config.borrow().raw().clone());
+    let main_keys = iptv_core::shortcuts::effective(&config_value, "main");
+    let exit_key = main_keys.get("exit").cloned().unwrap_or_default();
+    let file_menu = Menu::builder()
+        .append_item(4004, &format!("E&xit\t{exit_key}"), "Close the application")
+        .build();
+    let help_menu = Menu::builder()
+        .append_item(5002, "User &Guide", "Open the User Guide")
+        .append_item(
+            5003,
+            "Check for &Updates",
+            "Check GitHub for a newer release",
+        )
+        .build();
+    let menu_bar = MenuBar::builder()
+        .append(file_menu, "&File")
+        .append(help_menu, "&Help")
+        .build();
+    frame.set_menu_bar(menu_bar);
+    let wiring = clone_wiring(wiring);
+    frame.on_menu(move |event| match event.get_id() {
+        4004 => {
+            frame.close(false);
+        }
+        5002 => {
+            open_guide_window(&wiring, status);
+        }
+        5003 => {
+            wiring.update_worker.check(
+                "serrebidev",
+                "Accessible-IPTV-Client-Rust",
+                "update-manifest.json",
+                env!("CARGO_PKG_VERSION"),
+            );
+            wiring.update_pending.set(true);
+            assert!(wiring.timer.start(50, false));
+            status.set_label("Checking for updates...");
+        }
+        5004 => {
+            frame.show(true);
+            frame.raise();
+        }
+        _ => {}
+    });
+}
+
+/// Collect update-check outcomes onto the status line.
+fn poll_updates(wiring: &Wiring, status: Status) {
+    while let Some(event) = wiring.update_worker.try_recv() {
+        wiring.update_pending.set(false);
+        match event {
+            UpdateEvent::Checked { manifest, newer } => {
+                if newer {
+                    status.set_label(&format!(
+                        "Version {} is available. You have {}.",
+                        manifest.version,
+                        env!("CARGO_PKG_VERSION")
+                    ));
+                } else {
+                    status.set_label(&format!(
+                        "Accessible IPTV Client is up to date ({}).",
+                        env!("CARGO_PKG_VERSION")
+                    ));
+                }
+            }
+            UpdateEvent::Failed(error) => {
+                status.set_label(&format!("Update check failed: {error}"));
+            }
+        }
+    }
 }
 
 /// Build the guide window once and keep it (closing hides it).
