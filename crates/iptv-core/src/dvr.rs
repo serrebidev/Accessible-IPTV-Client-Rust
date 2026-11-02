@@ -319,6 +319,21 @@ impl DvrSchedule {
         id
     }
 
+    /// Delete a job outright (finished jobs only, like Python's
+    /// Scheduled Recordings dialog Delete).
+    pub fn remove_job(&mut self, job_id: &str) -> bool {
+        let Some(job) = self.jobs.iter().find(|j| j.id == job_id) else {
+            return false;
+        };
+        if !DONE_STATUSES.contains(&job.status.as_str()) {
+            return false;
+        }
+        self.jobs.retain(|j| j.id != job_id);
+        self.stopping_since.remove(job_id);
+        self.save();
+        true
+    }
+
     pub fn cancel_job(&mut self, job_id: &str) -> bool {
         let Some(job) = self.jobs.iter_mut().find(|j| j.id == job_id) else {
             return false;

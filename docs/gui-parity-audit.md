@@ -114,3 +114,49 @@ and defines the alignment program (issues G1–G7).
 
 Slices land in order; each is its own issue, PR, gates, and
 validation note, per the repo flow.
+
+## Verification update — 2026-11-01 (v0.2.0)
+
+Sections 3 and 4 above are closed. Every inventoried surface
+shipped and is verified in the validation notes:
+
+- Menus: File, Player, View, Options, Recordings and Help now
+  match the Python menu bar item for item, including the
+  Recordings menu (Start/Stop/Stop All, Programme Reminders,
+  Check Recording Storage, Minimum Free Space with Python's
+  `recording_min_free_mib` reserve semantics, Scheduled
+  Recordings, Recording Format radios, Schedule Padding with
+  Python's config keys and 0..=180 range, Open Recordings
+  Folder, Set Download Folder, Shut Down the Computer When
+  Recordings Finish). Check for Updates sits in Help, and the
+  Automatic Announcements labels are Python's (None, Errors
+  only, Important events, Detailed status). Evidence:
+  validations 0021, 0026, 0034.
+- Player window: seek and volume sliders, time and subtitle
+  readouts, audio track choice, Record/Cast/Full Screen, and
+  the full PLAYER shortcut dispatch. Evidence: 0027.
+- Playback engines: libVLC drives the built-in player when
+  installed, with track enumeration and preferred-track
+  selection; MediaCtrl is the fallback. Evidence: 0028.
+- EPG: the SQLite store mirrors every loaded guide. Evidence:
+  0029.
+- Subtitle Speech submenu: Speak subtitles, Read current,
+  Read previous, Review recent subtitles and Subtitle
+  capabilities all work over the screen-reader announcement
+  path. The application-voice (TTS) backend and its device
+  settings remain unported by design; subtitle speech rides
+  the screen reader. Evidence: 0034.
+- The shutdown countdown is 60 seconds with Cancel focused,
+  matching Python (an earlier Rust build used 30; fixed in
+  0034).
+
+Two audit-process notes. First, several dialog classes in the
+Python tree (a standalone Search dialog, Preferences dialog,
+Create Playlist, Channel Groups, Volume Normalization) are
+not reachable from the Python UI — no code instantiates them —
+so they are not parity targets; the reachable Python UI is the
+menu bar, the main window, the player window and the dialogs
+those open, and all of them are covered. Second, on Linux the
+Python app presents its menu through a Menu button because
+menu bars are unreliable there; the Rust app uses a standard
+menu bar on every platform, which exposes the same commands.

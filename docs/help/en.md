@@ -287,6 +287,8 @@ The program can record any channel to a file while you watch something else, or 
 - Recordings > Stop Recording stops the highlighted channel's recording, and Stop All Recordings stops them all.
 - Recordings > Open Recordings Folder opens the folder the files are saved in.
 - Recordings > Set Download Folder chooses that folder. Catch-up downloads go there too.
+- Recordings > Check Recording Storage shows the recordings folder, how much free space it has, and the reserve below.
+- Recordings > Minimum Free Space sets how much space, in MiB, must stay free before a recording may start (default 256). A recording that would break the reserve does not start, and you are told how much space is free.
 - Every recording writes a log file into the logs folder inside the recordings folder. If a recording ends with a warning or error, its message includes a summary of any warning, error and fatal-error lines found in the log. Open the log for the details. The log ends with a summary: how long the recording was meant to be, how long it turned out, and every warning and error grouped by kind, with the times they happened.
 
 Recording what you are watching in the built-in player uses the same connection to the provider, so it works even with accounts that allow only one stream at a time.
@@ -358,7 +360,7 @@ The Options menu holds the program's settings. Each one is saved as soon as you 
 - Show Stream URL: adds the Stream URL field after the episode description in the main window.
 - Auto-check for Updates: see Updates.
 - Automatic Announcements: choose None, Errors only, Important events or Detailed status for automatic player and channel feedback.
-- Keyboard Shortcuts: change a command's key combination. Conflicting shortcuts are rejected; restart the program after saving.
+- Keyboard Shortcuts: the editor lists every command for the main window and the player window with its current key combination, and you can search the list. Choose Edit on a command and type the new combination (for example Ctrl+Shift+F); a combination another command already uses is rejected with a message. Reset All restores every default. Changes save at once and apply to menus and keys right away.
 - Export Settings and Import Settings: save or restore an encrypted backup of playlists, guide sources, favorites and preferences. Keep the backup password; you need it to restore provider credentials.
 
 ### Language {#language}
