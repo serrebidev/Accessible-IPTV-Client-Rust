@@ -251,7 +251,7 @@ struct Wiring {
     reminders: Rc<RefCell<Vec<Reminder>>>,
     provider_worker: Rc<ProviderWorker>,
     provider_pending: Rc<std::cell::Cell<bool>>,
-    pending_resolve: Rc<RefCell<Option<Channel>>>,
+    pending_resolve: Rc<RefCell<Option<(u64, Channel)>>>,
     recordings: Rc<RefCell<RecordingEngine>>,
     cast_worker: Rc<CastWorker>,
     cast_pending: Rc<std::cell::Cell<bool>>,
@@ -752,15 +752,24 @@ fn poll_providers(wiring: &Wiring, controls: Controls) {
                     status.set_label(&failure);
                 }
             }
-            ProviderEvent::Resolved(result) => {
-                let pending = wiring.pending_resolve.borrow_mut().take();
+            ProviderEvent::Resolved { request_id, result } => {
+                let pending = wiring
+                    .pending_resolve
+                    .borrow()
+                    .as_ref()
+                    .filter(|(pending_id, _)| *pending_id == request_id)
+                    .cloned();
+                if pending.is_some() {
+                    let _ = wiring.pending_resolve.borrow_mut().take();
+                }
                 match (pending, result) {
-                    (Some(mut channel), Ok(url)) => {
+                    (Some((_, mut channel)), Ok(url)) => {
                         channel.url = url;
                         play_channel(&wiring.player, &wiring.persist, &channel, status);
                     }
-                    (_, Err(error)) => status.set_label(&error),
+                    (Some((_id, _)), Err(error)) => status.set_label(&error),
                     (None, Ok(_)) => {}
+                    (None, Err(_)) => {}
                 }
             }
             ProviderEvent::Account(result) => match result {
@@ -2612,8 +2621,8 @@ fn bind_playback(
                 status.set_label("This Stalker channel has no provider account configured.");
                 return;
             };
-            *pending_resolve.borrow_mut() = Some(channel.clone());
-            provider_worker.resolve(key, channel.unknown_attributes.clone());
+            let request_id = provider_worker.resolve(key, channel.unknown_attributes.clone());
+            *pending_resolve.borrow_mut() = Some((request_id, channel.clone()));
             status.set_label("Resolving stream link...");
             assert!(timer.start(50, false));
             return;

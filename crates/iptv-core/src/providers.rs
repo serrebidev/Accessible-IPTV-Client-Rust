@@ -8,6 +8,7 @@
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde_json::Value;
 
@@ -26,6 +27,9 @@ const PORTAL_FILENAMES: &[&str] = &[
 ];
 
 type ProviderResult<T> = Result<T, String>;
+
+/// Opaque identity for one asynchronous provider request.
+pub type ProviderRequestId = u64;
 
 // ---------------------------------------------------------------------------
 // URL helpers
@@ -875,10 +879,12 @@ impl ProviderAccount {
 enum ProviderJob {
     Load(Vec<ProviderAccount>),
     Resolve {
+        request_id: ProviderRequestId,
         provider_id: String,
         data: BTreeMap<String, String>,
     },
     ResolveCatchup {
+        request_id: ProviderRequestId,
         provider_id: String,
         data: BTreeMap<String, String>,
         start_text: String,
@@ -896,7 +902,10 @@ pub enum ProviderEvent {
         epg_urls: Vec<String>,
         failures: Vec<String>,
     },
-    Resolved(ProviderResult<String>),
+    Resolved {
+        request_id: ProviderRequestId,
+        result: ProviderResult<String>,
+    },
     Account(ProviderResult<String>),
 }
 
@@ -910,6 +919,7 @@ enum Client {
 pub struct ProviderWorker {
     jobs: std::sync::mpsc::Sender<ProviderJob>,
     events: std::sync::Mutex<std::sync::mpsc::Receiver<ProviderEvent>>,
+    next_request_id: AtomicU64,
 }
 
 impl Default for ProviderWorker {
@@ -986,16 +996,21 @@ impl ProviderWorker {
             while let Ok(job) = job_receiver.recv() {
                 let event = match job {
                     ProviderJob::Load(accounts) => handle_load(accounts, &mut clients),
-                    ProviderJob::Resolve { provider_id, data } => {
+                    ProviderJob::Resolve {
+                        request_id,
+                        provider_id,
+                        data,
+                    } => {
                         let result = match clients.get(&provider_id) {
                             Some((_, Client::Stalker(client))) => {
                                 client.resolve_stream(&data, now_epoch())
                             }
                             _ => Err("No Stalker portal for this channel".to_string()),
                         };
-                        ProviderEvent::Resolved(result)
+                        ProviderEvent::Resolved { request_id, result }
                     }
                     ProviderJob::ResolveCatchup {
+                        request_id,
                         provider_id,
                         data,
                         start_text,
@@ -1010,7 +1025,7 @@ impl ProviderWorker {
                             ),
                             _ => Err("No Stalker portal for this channel".to_string()),
                         };
-                        ProviderEvent::Resolved(result)
+                        ProviderEvent::Resolved { request_id, result }
                     }
                     ProviderJob::Account { provider_id } => {
                         let result = match clients.get(&provider_id) {
@@ -1034,6 +1049,7 @@ impl ProviderWorker {
         Self {
             jobs: job_sender,
             events: std::sync::Mutex::new(event_receiver),
+            next_request_id: AtomicU64::new(1),
         }
     }
 
@@ -1047,17 +1063,30 @@ impl ProviderWorker {
         data: BTreeMap<String, String>,
         start_text: String,
         duration_minutes: i64,
-    ) {
+    ) -> ProviderRequestId {
+        let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
         let _ = self.jobs.send(ProviderJob::ResolveCatchup {
+            request_id,
             provider_id,
             data,
             start_text,
             duration_minutes,
         });
+        request_id
     }
 
-    pub fn resolve(&self, provider_id: String, data: BTreeMap<String, String>) {
-        let _ = self.jobs.send(ProviderJob::Resolve { provider_id, data });
+    pub fn resolve(
+        &self,
+        provider_id: String,
+        data: BTreeMap<String, String>,
+    ) -> ProviderRequestId {
+        let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
+        let _ = self.jobs.send(ProviderJob::Resolve {
+            request_id,
+            provider_id,
+            data,
+        });
+        request_id
     }
 
     pub fn account(&self, provider_id: String) {
@@ -1576,5 +1605,16 @@ mod tests {
         .expect("xtream");
         assert_eq!(xtream.provider_id().as_deref(), Some("prov1"));
         assert!(ProviderAccount::from_config(&serde_json::json!({"type": "m3u"})).is_none());
+    }
+
+    #[test]
+    fn asynchronous_resolution_requests_have_distinct_ids() {
+        let worker = ProviderWorker::new();
+        let first = worker.resolve("missing-a".to_string(), BTreeMap::new());
+        let second = worker.resolve("missing-b".to_string(), BTreeMap::new());
+
+        assert_ne!(first, second);
+        assert!(first > 0);
+        assert!(second > first);
     }
 }
