@@ -94,46 +94,99 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let status = Status {
             label: status_label,
             details,
+            bar: Some(frame),
         };
-        bind_browser(
+        let (episode_description, stream_url) = info_panels(panel);
+        let controls_all = Controls {
+            open,
+            cancel,
+            record,
+            vod,
+            cast,
+            guide_button,
+            category,
+            toggle_favorite,
+            search,
+            list,
+            episode_description,
+            stream_url,
+            status,
+        };
+        let controls_for_layout = controls_all;
+        bind_browser(frame, controls_all, model);
+        layout_main(
             frame,
-            Controls {
-                open,
-                cancel,
-                record,
-                vod,
-                cast,
-                guide_button,
-                category,
-                toggle_favorite,
-                search,
-                list,
-                status,
-            },
-            model,
+            panel,
+            controls_for_layout,
+            category_label,
+            search_label,
+            label,
         );
-        let layout = BoxSizer::builder(Orientation::Vertical).build();
-        layout.add(&open, 0, SizerFlag::All, 8);
-        layout.add(&cancel, 0, SizerFlag::All, 8);
-        layout.add(&category_label, 0, SizerFlag::All, 8);
-        layout.add(&category, 0, SizerFlag::Expand | SizerFlag::All, 8);
-        layout.add(&toggle_favorite, 0, SizerFlag::All, 8);
-        layout.add(&search_label, 0, SizerFlag::All, 8);
-        layout.add(&search, 0, SizerFlag::Expand | SizerFlag::All, 8);
-        layout.add(&label, 0, SizerFlag::All, 8);
-        layout.add(&list, 1, SizerFlag::Expand | SizerFlag::All, 8);
-        layout.add(&status_label, 0, SizerFlag::All, 8);
-        layout.add(&details, 0, SizerFlag::Expand | SizerFlag::All, 8);
-        panel.set_sizer(layout, true);
-
-        let frame_layout = BoxSizer::builder(Orientation::Vertical).build();
-        frame_layout.add(&panel, 1, SizerFlag::Expand, 0);
-        frame.set_sizer(frame_layout, true);
-
-        frame.show(true);
-        frame.centre();
-        list.set_focus();
     })
+}
+
+/// The main window layout: controls in browse/tab order, the frame
+/// status bar, then show and focus the channel list.
+fn layout_main(
+    frame: Frame,
+    panel: Panel,
+    controls: Controls,
+    category_label: StaticText,
+    search_label: StaticText,
+    channels_label: StaticText,
+) {
+    let layout = BoxSizer::builder(Orientation::Vertical).build();
+    layout.add(&controls.open, 0, SizerFlag::All, 8);
+    layout.add(&controls.cancel, 0, SizerFlag::All, 8);
+    layout.add(&category_label, 0, SizerFlag::All, 8);
+    layout.add(&controls.category, 0, SizerFlag::Expand | SizerFlag::All, 8);
+    layout.add(&controls.toggle_favorite, 0, SizerFlag::All, 8);
+    layout.add(&search_label, 0, SizerFlag::All, 8);
+    layout.add(&controls.search, 0, SizerFlag::Expand | SizerFlag::All, 8);
+    layout.add(&channels_label, 0, SizerFlag::All, 8);
+    layout.add(&controls.list, 1, SizerFlag::Expand | SizerFlag::All, 8);
+    layout.add(
+        &controls.episode_description,
+        0,
+        SizerFlag::Expand | SizerFlag::All,
+        8,
+    );
+    layout.add(
+        &controls.stream_url,
+        0,
+        SizerFlag::Expand | SizerFlag::All,
+        8,
+    );
+    layout.add(&controls.status.label, 0, SizerFlag::All, 8);
+    layout.add(
+        &controls.status.details,
+        0,
+        SizerFlag::Expand | SizerFlag::All,
+        8,
+    );
+    panel.set_sizer(layout, true);
+    let frame_layout = BoxSizer::builder(Orientation::Vertical).build();
+    frame_layout.add(&panel, 1, SizerFlag::Expand, 0);
+    frame.set_sizer(frame_layout, true);
+    frame.create_status_bar(1, 0, 0, "Status");
+    frame.set_status_text("Ready.", 0);
+    frame.show(true);
+    frame.centre();
+    controls.list.set_focus();
+}
+
+/// The Episode description and Stream URL panels that follow the
+/// channel list in tab order, as in the Python main window.
+fn info_panels(panel: Panel) -> (TextCtrl, TextCtrl) {
+    let episode_description = TextCtrl::builder(&panel)
+        .with_style(TextCtrlStyle::ReadOnly | TextCtrlStyle::MultiLine)
+        .build();
+    episode_description.set_accessibility_label("Episode description");
+    let stream_url = TextCtrl::builder(&panel)
+        .with_style(TextCtrlStyle::ReadOnly | TextCtrlStyle::MultiLine)
+        .build();
+    stream_url.set_accessibility_label("Stream URL");
+    (episode_description, stream_url)
 }
 
 /// The Category list and the Toggle favorite action, in browse order.
@@ -156,16 +209,23 @@ fn category_controls(panel: Panel) -> (StaticText, ListBox, Button) {
 struct Status {
     label: StaticText,
     details: TextCtrl,
+    bar: Option<Frame>,
 }
 
 impl Status {
     fn set_label(self, message: &str) {
         self.details.change_value(message);
+        if let Some(frame) = self.bar {
+            frame.set_status_text(message, 0);
+        }
         live_region::announce_with_priority(self.label, message, live_region::Priority::Medium);
     }
 
     fn set_silent(self, message: &str) {
         self.details.change_value(message);
+        if let Some(frame) = self.bar {
+            frame.set_status_text(message, 0);
+        }
     }
 }
 
@@ -181,6 +241,8 @@ struct Controls {
     toggle_favorite: Button,
     search: TextCtrl,
     list: ListCtrl,
+    episode_description: TextCtrl,
+    stream_url: TextCtrl,
     status: Status,
 }
 
@@ -376,6 +438,9 @@ fn record_button(panel: Panel) -> Button {
 fn bind_browser(frame: Frame, controls: Controls, model: Rc<RefCell<SearchResults>>) {
     let candidates = config::config_candidates();
     let loaded = config::load(&candidates, &candidates[0]);
+    if !loaded.config.bool_or("show_channel_url", true) {
+        controls.stream_url.hide();
+    }
     let dvr_path = iptv_core::dvr::schedule_path(&loaded.path);
     let i18n = {
         let mut i18n = I18n::default();
@@ -513,6 +578,8 @@ fn bind_actions(frame: Frame, wiring: &Wiring, controls: Controls) {
         toggle_favorite,
         search,
         list,
+        episode_description,
+        stream_url,
         status,
     } = controls;
     let browser = Rc::clone(&wiring.browser);
@@ -559,7 +626,7 @@ fn bind_actions(frame: Frame, wiring: &Wiring, controls: Controls) {
         event.skip(true);
     });
     bind_toggle(wiring, toggle_favorite, list, search, status);
-    bind_playback(wiring, list, status);
+    bind_playback(wiring, list, status, episode_description, stream_url);
     let request = Rc::clone(&browser);
     let poll = Rc::clone(&timer);
     open.on_click(move |_| {
@@ -1083,6 +1150,7 @@ fn build_vod_window() -> (Frame, ListBox, ListBox, Button, Button, Status) {
     let status = Status {
         label: status_label,
         details,
+        bar: None,
     };
     (frame, groups, items, play, back, status)
 }
@@ -1335,6 +1403,7 @@ fn ensure_cast_ui(
     let status = Status {
         label: status_label,
         details,
+        bar: None,
     };
     let view = Rc::new(RefCell::new(CastView::default()));
     let ui = CastUi {
@@ -1646,6 +1715,7 @@ fn ensure_guide_ui(slot: &Rc<RefCell<Option<GuideUi>>>) -> GuideUi {
     let status = Status {
         label: status_label,
         details,
+        bar: None,
     };
     let guide = Rc::new(RefCell::new(iptv_core::guide::load_guide(None, None)));
     let ui = GuideUi {
@@ -1735,7 +1805,13 @@ fn move_caret(ui: &GuideUi, section: &iptv_core::guide::Section) {
         .set_insertion_point(i64::try_from(section.start).unwrap_or(0));
 }
 
-fn bind_playback(wiring: &Wiring, list: ListCtrl, status: Status) {
+fn bind_playback(
+    wiring: &Wiring,
+    list: ListCtrl,
+    status: Status,
+    episode_description: TextCtrl,
+    stream_url: TextCtrl,
+) {
     let browser = Rc::clone(&wiring.browser);
     let model = Rc::clone(&wiring.model);
     let player = Rc::clone(&wiring.player);
@@ -1779,12 +1855,18 @@ fn bind_playback(wiring: &Wiring, list: ListCtrl, status: Status) {
         }
         play_channel(&player, &persist, &channel, status);
     });
-    bind_epg_highlight(wiring, list, status);
+    bind_epg_highlight(wiring, list, status, episode_description, stream_url);
 }
 
 /// Moving through Channels announces the highlighted channel's now/next
 /// programme from the loaded guide, when it has one.
-fn bind_epg_highlight(wiring: &Wiring, list: ListCtrl, status: Status) {
+fn bind_epg_highlight(
+    wiring: &Wiring,
+    list: ListCtrl,
+    status: Status,
+    episode_description: TextCtrl,
+    stream_url: TextCtrl,
+) {
     let browser = Rc::clone(&wiring.browser);
     let model = Rc::clone(&wiring.model);
     let epg = Rc::clone(&wiring.epg);
@@ -1798,8 +1880,10 @@ fn bind_epg_highlight(wiring: &Wiring, list: ListCtrl, status: Status) {
         let Some(channel) = browser.borrow().channel(index) else {
             return;
         };
+        stream_url.set_value(&channel.url);
         let guard = epg.borrow();
         let Some((guide, indexes)) = guard.as_ref() else {
+            episode_description.set_value("");
             return;
         };
         let known: std::collections::HashSet<String> =
@@ -1812,6 +1896,12 @@ fn bind_epg_highlight(wiring: &Wiring, list: ListCtrl, status: Status) {
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(0));
         let (current, next) = guide.now_next(&guide_id, now);
+        let description_text = match &current {
+            Some(p) if !p.description.is_empty() => p.description.clone(),
+            Some(p) => p.title.clone(),
+            None => String::new(),
+        };
+        episode_description.set_value(&description_text);
         let mut parts: Vec<String> = Vec::new();
         if let Some(p) = current {
             parts.push(format!("Now: {} until {}.", p.title, local_hhmm(p.stop)));
