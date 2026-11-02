@@ -1,5 +1,6 @@
 use iptv_core::{
     browser::{BrowseEvent, BrowserWorker},
+    cast::{CastDevice, CastEvent, CastWorker},
     categories::Category,
     config::{self, Config},
     dvr::{channel_from_snapshot, DvrAction, DvrSchedule},
@@ -35,16 +36,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         frame.set_accessibility_label("Accessible IPTV Client");
 
         let panel = Panel::builder(&frame).build();
-        let open = Button::builder(&panel)
-            .with_label("&Open playlist…")
-            .build();
-        open.set_accessibility_label("Open playlist");
-        let cancel = Button::builder(&panel)
-            .with_label("&Cancel loading")
-            .build();
-        cancel.set_accessibility_label("Cancel loading");
+        let (open, cancel) = open_cancel_buttons(panel);
         let record = record_button(panel);
         let vod = vod_button(panel);
+        let cast = cast_button(panel);
         let (category_label, category, toggle_favorite) = category_controls(panel);
         let search_label = StaticText::builder(&panel)
             .with_label("&Search channels")
@@ -103,6 +98,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 cancel,
                 record,
                 vod,
+                cast,
                 category,
                 toggle_favorite,
                 search,
@@ -174,6 +170,7 @@ struct Controls {
     cancel: Button,
     record: Button,
     vod: Button,
+    cast: Button,
     category: ListBox,
     toggle_favorite: Button,
     search: TextCtrl,
@@ -197,6 +194,9 @@ struct Wiring {
     provider_pending: Rc<std::cell::Cell<bool>>,
     pending_resolve: Rc<RefCell<Option<Channel>>>,
     recordings: Rc<RefCell<RecordingEngine>>,
+    cast_worker: Rc<CastWorker>,
+    cast_pending: Rc<std::cell::Cell<bool>>,
+    cast_ui: Rc<RefCell<Option<CastUi>>>,
     vod_worker: Rc<VodWorker>,
     vod_pending: Rc<std::cell::Cell<bool>>,
     vod_ui: Rc<RefCell<Option<VodUi>>>,
@@ -311,6 +311,16 @@ impl Persist {
     }
 }
 
+/// The Cast window button for the main window.
+fn cast_button(panel: Panel) -> Button {
+    let cast = Button::builder(&panel).with_label("Cas&t").build();
+    cast.set_accessibility_label("Cast");
+    cast.set_accessibility_description(
+        "Open the cast window to send the selected channel to a TV or speaker on your network.",
+    );
+    cast
+}
+
 /// The VOD window button for the main window.
 fn vod_button(panel: Panel) -> Button {
     let vod = Button::builder(&panel).with_label("&VOD").build();
@@ -319,6 +329,19 @@ fn vod_button(panel: Panel) -> Button {
         "Open the video-on-demand browser for movies and series from your providers and playlists.",
     );
     vod
+}
+
+/// The Open playlist / Cancel loading buttons for the main window.
+fn open_cancel_buttons(panel: Panel) -> (Button, Button) {
+    let open = Button::builder(&panel)
+        .with_label("&Open playlist…")
+        .build();
+    open.set_accessibility_label("Open playlist");
+    let cancel = Button::builder(&panel)
+        .with_label("&Cancel loading")
+        .build();
+    cancel.set_accessibility_label("Cancel loading");
+    (open, cancel)
 }
 
 /// The Record toggle button for the main window.
@@ -355,6 +378,9 @@ fn bind_browser(frame: Frame, controls: Controls, model: Rc<RefCell<SearchResult
         provider_pending: Rc::new(std::cell::Cell::new(false)),
         pending_resolve: Rc::new(RefCell::new(None)),
         recordings: Rc::new(RefCell::new(RecordingEngine::new())),
+        cast_worker: Rc::new(CastWorker::new()),
+        cast_pending: Rc::new(std::cell::Cell::new(false)),
+        cast_ui: Rc::new(RefCell::new(None)),
         vod_worker: Rc::new(VodWorker::new()),
         vod_pending: Rc::new(std::cell::Cell::new(false)),
         vod_ui: Rc::new(RefCell::new(None)),
@@ -386,6 +412,7 @@ fn bind_browser(frame: Frame, controls: Controls, model: Rc<RefCell<SearchResult
     bind_completion(&wiring, controls);
     bind_recording(&wiring, controls);
     bind_vod(&wiring, controls);
+    bind_cast(&wiring, controls);
     bind_actions(frame, &wiring, controls);
     let browser = Rc::clone(&wiring.browser);
     let timer = Rc::clone(&wiring.timer);
@@ -420,6 +447,7 @@ fn bind_completion(wiring: &Wiring, controls: Controls) {
         poll_providers(&completed, controls);
         poll_recordings(&completed, status);
         poll_vod(&completed, status);
+        poll_cast(&completed, status);
         if !completed.browser.borrow().is_busy()
             && !completed.epg_pending.get()
             && !completed.provider_pending.get()
@@ -431,6 +459,7 @@ fn bind_completion(wiring: &Wiring, controls: Controls) {
             && completed.recordings.borrow().active_count() == 0
             && completed.dvr.borrow().pending_count() == 0
             && !completed.vod_pending.get()
+            && !completed.cast_pending.get()
         {
             if let Some(timer) = completed_timer.upgrade() {
                 timer.stop();
@@ -445,6 +474,7 @@ fn bind_actions(frame: Frame, wiring: &Wiring, controls: Controls) {
         cancel,
         record: _,
         vod: _,
+        cast: _,
         category,
         toggle_favorite,
         search,
@@ -1178,6 +1208,202 @@ fn poll_vod(wiring: &Wiring, status: Status) {
             VodEvent::Episodes(Err(error)) => {
                 ui.status
                     .set_label(&format!("Could not load episodes: {error}"));
+            }
+        }
+    }
+}
+
+/// The cast window's handles and state.
+#[derive(Clone)]
+struct CastUi {
+    frame: Frame,
+    devices: ListBox,
+    status: Status,
+    view: Rc<RefCell<CastView>>,
+}
+
+#[derive(Default)]
+struct CastView {
+    devices: Vec<CastDevice>,
+    channel: Option<Channel>,
+}
+
+/// Open (creating on first use) the cast window and start discovery
+/// for the currently selected channel.
+fn bind_cast(wiring: &Wiring, controls: Controls) {
+    let cast = controls.cast;
+    let status = controls.status;
+    let list = controls.list;
+    let worker = Rc::clone(&wiring.cast_worker);
+    let pending = Rc::clone(&wiring.cast_pending);
+    let ui_slot = Rc::clone(&wiring.cast_ui);
+    let browser = Rc::clone(&wiring.browser);
+    let model = Rc::clone(&wiring.model);
+    let timer = Rc::clone(&wiring.timer);
+    cast.on_click(move |_| {
+        let ui = ensure_cast_ui(&ui_slot, &worker, &pending, &timer);
+        ui.frame.show(true);
+        ui.frame.raise();
+        let channel = selected_channel(&browser, &model, list);
+        ui.view.borrow_mut().channel.clone_from(&channel);
+        match &channel {
+            Some(channel) => {
+                ui.status
+                    .set_label(&format!("Looking for cast devices for {}...", channel.name));
+            }
+            None => {
+                ui.status
+                    .set_label("Choose a channel in the main window, then discover.");
+            }
+        }
+        worker.discover();
+        pending.set(true);
+        assert!(timer.start(50, false));
+        status.set_label("Looking for cast devices...");
+    });
+}
+
+/// Build the cast window once and keep it (closing hides it).
+fn ensure_cast_ui(
+    slot: &Rc<RefCell<Option<CastUi>>>,
+    worker: &Rc<CastWorker>,
+    pending: &Rc<std::cell::Cell<bool>>,
+    timer: &Rc<Timer<Frame>>,
+) -> CastUi {
+    if let Some(ui) = slot.borrow().as_ref() {
+        return ui.clone();
+    }
+    let frame = Frame::builder()
+        .with_title("Cast")
+        .with_size(Size::new(560, 420))
+        .build();
+    frame.set_accessibility_label("Cast");
+    let panel = Panel::builder(&frame).build();
+    let devices = ListBox::builder(&panel).build();
+    devices.set_accessibility_label("Cast devices");
+    devices.set_accessibility_description(
+        "Choose a device. Play sends the selected channel to it; Stop ends the cast.",
+    );
+    let play = Button::builder(&panel).with_label("&Play").build();
+    play.set_accessibility_label("Play on device");
+    let stop = Button::builder(&panel).with_label("&Stop").build();
+    stop.set_accessibility_label("Stop casting");
+    let refresh = Button::builder(&panel).with_label("&Refresh").build();
+    refresh.set_accessibility_label("Refresh devices");
+    let status_label = StaticText::builder(&panel)
+        .with_label("Cast status")
+        .build();
+    let details = TextCtrl::builder(&panel)
+        .with_style(TextCtrlStyle::ReadOnly | TextCtrlStyle::MultiLine)
+        .with_value("No devices yet. Refresh to search your network.")
+        .build();
+    details.set_accessibility_label("Cast status");
+    let status = Status {
+        label: status_label,
+        details,
+    };
+    let view = Rc::new(RefCell::new(CastView::default()));
+    let ui = CastUi {
+        frame,
+        devices,
+        status,
+        view,
+    };
+    {
+        let view = Rc::clone(&ui.view);
+        let devices_box = devices;
+        let worker = Rc::clone(worker);
+        let pending = Rc::clone(pending);
+        let timer = Rc::clone(timer);
+        play.on_click(move |_| {
+            let Some(selection) = devices_box.get_selection() else {
+                return;
+            };
+            let view = view.borrow();
+            let (Some(device), Some(channel)) =
+                (view.devices.get(selection as usize), view.channel.as_ref())
+            else {
+                return;
+            };
+            let (clean_url, _) = iptv_core::playback::split_stream_modifiers(&channel.url);
+            worker.play(device.clone(), clean_url, channel.name.clone());
+            pending.set(true);
+            assert!(timer.start(50, false));
+            status.set_label(&format!("Casting {} to {}...", channel.name, device.name));
+        });
+    }
+    {
+        let view = Rc::clone(&ui.view);
+        let devices_box = devices;
+        let worker = Rc::clone(worker);
+        stop.on_click(move |_| {
+            let Some(selection) = devices_box.get_selection() else {
+                return;
+            };
+            if let Some(device) = view.borrow().devices.get(selection as usize).cloned() {
+                worker.stop(device);
+                status.set_label("Stopping the cast...");
+            }
+        });
+    }
+    {
+        let worker = Rc::clone(worker);
+        let pending = Rc::clone(pending);
+        let timer = Rc::clone(timer);
+        refresh.on_click(move |_| {
+            worker.discover();
+            pending.set(true);
+            assert!(timer.start(50, false));
+            status.set_label("Looking for cast devices...");
+        });
+    }
+    {
+        let frame_hide = frame;
+        frame.on_close(move |event| {
+            frame_hide.hide();
+            event.skip(false);
+        });
+    }
+    *slot.borrow_mut() = Some(ui.clone());
+    ui
+}
+
+/// Collect cast worker events into the window.
+fn poll_cast(wiring: &Wiring, status: Status) {
+    while let Some(event) = wiring.cast_worker.try_recv() {
+        wiring.cast_pending.set(false);
+        let Some(ui) = wiring.cast_ui.borrow().clone() else {
+            continue;
+        };
+        match event {
+            CastEvent::Devices(devices) => {
+                let count = devices.len();
+                let names: Vec<String> = devices.iter().map(|d| d.name.clone()).collect();
+                ui.view.borrow_mut().devices = devices;
+                let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+                ui.devices.set_items(&refs);
+                if !refs.is_empty() {
+                    ui.devices.set_selection(0, true);
+                }
+                if count == 0 {
+                    ui.status
+                        .set_label("No cast devices found. Check the TV is on and on this network, then Refresh.");
+                } else {
+                    ui.status.set_label(&format!(
+                        "Found {count} cast device(s). Choose one and press Play."
+                    ));
+                }
+                status.set_label("Cast device search finished.");
+            }
+            CastEvent::Played(Ok(name)) => {
+                ui.status.set_label(&format!("Casting to {name}."));
+                status.set_label(&format!("Casting to {name}."));
+            }
+            CastEvent::Played(Err(error)) => {
+                ui.status.set_label(&format!("Casting failed: {error}"));
+            }
+            CastEvent::Stopped(name) => {
+                ui.status.set_label(&format!("Stopped casting to {name}."));
             }
         }
     }

@@ -2,6 +2,7 @@
 
 pub mod audiotracks;
 pub mod browser;
+pub mod cast;
 pub mod catchup;
 pub mod categories;
 pub mod config;
