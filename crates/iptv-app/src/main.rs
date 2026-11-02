@@ -5854,8 +5854,101 @@ fn list_dialog(title: &str, list_label: &str) -> (Frame, Panel, ListBox, Status)
     (frame, panel, list, status)
 }
 
-/// File > What's on Now: every channel's current programme; Play
-/// starts the chosen channel.
+/// The What's on Now dialog's controls and layout: filter
+/// field, count label, the programme list, the dialog status
+/// field, and the Play / Schedule Recording / Close row.
+fn whats_on_layout(
+    panel: Panel,
+    list: ListBox,
+    dstatus: Status,
+) -> (TextCtrl, StaticText, Button, Button, Button) {
+    let filter_label = StaticText::builder(&panel)
+        .with_label("Filter (Tab):")
+        .build();
+    let filter = TextCtrl::builder(&panel)
+        .with_style(TextCtrlStyle::ProcessEnter)
+        .build();
+    filter.set_accessibility_label("Filter programs");
+    filter.set_accessibility_description(
+        "Type to filter programmes by title or channel name. Enter moves to the programme list.",
+    );
+    let count_label = StaticText::builder(&panel).with_label("0 programs").build();
+    let play = Button::builder(&panel).with_label("&Play").build();
+    let schedule = Button::builder(&panel)
+        .with_label("&Schedule Recording")
+        .build();
+    let close = Button::builder(&panel).with_label("&Close").build();
+    let layout = BoxSizer::builder(Orientation::Vertical).build();
+    layout.add(&filter_label, 0, SizerFlag::All, 8);
+    layout.add(&filter, 0, SizerFlag::Expand | SizerFlag::All, 8);
+    layout.add(&count_label, 0, SizerFlag::All, 8);
+    layout.add(&list, 1, SizerFlag::Expand | SizerFlag::All, 8);
+    layout.add(&dstatus.details, 0, SizerFlag::Expand | SizerFlag::All, 8);
+    let buttons = BoxSizer::builder(Orientation::Horizontal).build();
+    buttons.add(&play, 0, SizerFlag::All, 4);
+    buttons.add(&schedule, 0, SizerFlag::All, 4);
+    buttons.add(&close, 0, SizerFlag::All, 4);
+    layout.add_sizer(&buttons, 0, SizerFlag::Expand, 0);
+    panel.set_sizer(layout, true);
+    (filter, count_label, play, schedule, close)
+}
+
+/// The What's on Now buttons: Play and Schedule Recording act
+/// on the filtered row; Close hides the dialog.
+#[allow(clippy::too_many_arguments)]
+fn wire_whats_on_buttons(
+    wiring: &Wiring,
+    frame: Frame,
+    list: ListBox,
+    dstatus: Status,
+    status: Status,
+    play: Button,
+    schedule: Button,
+    close: Button,
+    rows: &Rc<RefCell<Vec<(Channel, Programme)>>>,
+    filtered: &Rc<RefCell<Vec<usize>>>,
+) {
+    let wiring_p = clone_wiring(wiring);
+    let rows_p = Rc::clone(rows);
+    let filtered_p = Rc::clone(filtered);
+    play.on_click(move |_| {
+        let Some(index) = list.get_selection() else {
+            dstatus.set_label("Choose a programme to play first.");
+            return;
+        };
+        let row_index = filtered_p
+            .borrow()
+            .get(usize::try_from(index).unwrap_or(usize::MAX))
+            .copied();
+        if let Some((channel, _)) = row_index.and_then(|i| rows_p.borrow().get(i).cloned()) {
+            play_channel(&wiring_p.player, &wiring_p.persist, &channel, status);
+            frame.hide();
+        }
+    });
+    let wiring_s = clone_wiring(wiring);
+    let rows_s = Rc::clone(rows);
+    let filtered_s = Rc::clone(filtered);
+    schedule.on_click(move |_| {
+        let Some(index) = list.get_selection() else {
+            dstatus.set_label("Choose a programme to schedule first.");
+            return;
+        };
+        let row_index = filtered_s
+            .borrow()
+            .get(usize::try_from(index).unwrap_or(usize::MAX))
+            .copied();
+        if let Some((channel, programme)) = row_index.and_then(|i| rows_s.borrow().get(i).cloned())
+        {
+            add_dvr_job(&wiring_s, &channel, &programme, status);
+        }
+    });
+    close.on_click(move |_| frame.hide());
+}
+
+/// File > What's on Now: every channel's current programme,
+/// with Python's filter field (substring over programme title
+/// or channel name), the "{count} programs" label, and Play /
+/// Schedule Recording / Close.
 fn open_whats_on_now(wiring: &Wiring, status: Status) {
     let mut rows: Vec<(Channel, Programme)> = Vec::new();
     for channel in wiring.browser.borrow().all_channels() {
@@ -5867,39 +5960,73 @@ fn open_whats_on_now(wiring: &Wiring, status: Status) {
         status.set_label("No guide information is loaded yet.");
         return;
     }
-    let (frame, panel, list, dstatus) = list_dialog("What's on Now", "Programmes on now");
-    let labels: Vec<String> = rows
-        .iter()
-        .map(|(channel, p)| {
-            format!(
-                "{} — {} ({}-{})",
-                channel.name,
-                p.title,
-                local_hhmm(p.start),
-                local_hhmm(p.stop)
-            )
-        })
-        .collect();
-    list.set_items(&labels.iter().map(String::as_str).collect::<Vec<_>>());
-    list.set_selection(0, true);
-    dstatus.set_label(&format!("{} programmes on now.", rows.len()));
-    let play = Button::builder(&panel).with_label("&Play").build();
-    let close = Button::builder(&panel).with_label("&Close").build();
+    let (frame, panel, list, dstatus) = list_dialog("What's on Now", "Currently airing programs");
+    let (filter, count_label, play, schedule, close) = whats_on_layout(panel, list, dstatus);
+
     let rows = Rc::new(RefCell::new(rows));
-    let wiring_p = clone_wiring(wiring);
-    play.on_click(move |_| {
-        let Some(index) = list.get_selection() else {
-            return;
-        };
-        if let Some((channel, _)) = rows
-            .borrow()
-            .get(usize::try_from(index).unwrap_or(usize::MAX))
-        {
-            play_channel(&wiring_p.player, &wiring_p.persist, channel, status);
-            frame.hide();
+    let filtered = Rc::new(RefCell::new(
+        (0..rows.borrow().len()).collect::<Vec<usize>>(),
+    ));
+    let render = {
+        let rows = Rc::clone(&rows);
+        let filtered = Rc::clone(&filtered);
+        move |list: ListBox, count_label: StaticText| {
+            let rows = rows.borrow();
+            let filtered = filtered.borrow();
+            let labels: Vec<String> = filtered
+                .iter()
+                .filter_map(|index| rows.get(*index))
+                .map(|(channel, p)| {
+                    format!(
+                        "{} — {} ({}-{})",
+                        channel.name,
+                        p.title,
+                        local_hhmm(p.start),
+                        local_hhmm(p.stop)
+                    )
+                })
+                .collect();
+            list.set_items(&labels.iter().map(String::as_str).collect::<Vec<_>>());
+            if !labels.is_empty() {
+                list.set_selection(0, true);
+            }
+            count_label.set_label(&format!("{} programs", filtered.len()));
         }
+    };
+    render(list, count_label);
+    dstatus.set_silent("Select a programme to play or schedule.");
+    let apply_filter = {
+        let rows = Rc::clone(&rows);
+        let filtered = Rc::clone(&filtered);
+        let render = render.clone();
+        move |list: ListBox, count_label: StaticText, query: &str| {
+            let query = query.trim().to_lowercase();
+            let mut next: Vec<usize> = Vec::new();
+            for (index, (channel, programme)) in rows.borrow().iter().enumerate() {
+                if query.is_empty()
+                    || programme.title.to_lowercase().contains(&query)
+                    || channel.name.to_lowercase().contains(&query)
+                {
+                    next.push(index);
+                }
+            }
+            if *filtered.borrow() != next {
+                *filtered.borrow_mut() = next;
+                render(list, count_label);
+            }
+        }
+    };
+    let filter_apply = apply_filter.clone();
+    filter.bind_internal(EventType::TEXT, move |_| {
+        filter_apply(list, count_label, &filter.get_value());
     });
-    close.on_click(move |_| frame.hide());
+    filter.bind_internal(EventType::TEXT_ENTER, move |_| {
+        apply_filter(list, count_label, &filter.get_value());
+        list.set_focus();
+    });
+    wire_whats_on_buttons(
+        wiring, frame, list, dstatus, status, play, schedule, close, &rows, &filtered,
+    );
     frame.show(true);
 }
 
