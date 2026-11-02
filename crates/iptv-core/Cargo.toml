@@ -1,5 +1,7 @@
 [dependencies]
 serde_json.workspace = true
+sha2.workspace = true
+ureq.workspace = true
 
 [package]
 name = "iptv-core"

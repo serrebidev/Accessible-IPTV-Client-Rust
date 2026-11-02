@@ -43,6 +43,15 @@ impl BrowserWorker {
         self.loading = true;
     }
 
+    /// Load several configured sources merged, with scope tags.
+    pub fn load_sources(&mut self, sources: Vec<crate::sources::PlaylistSource>) {
+        self.cancel_load();
+        self.searcher.cancel();
+        self.searching = false;
+        self.loader.submit_sources(sources);
+        self.loading = true;
+    }
+
     /// Returns whether a pending load was cancelled. Existing rows stay usable.
     pub fn cancel_load(&mut self) -> bool {
         self.loader.cancel();

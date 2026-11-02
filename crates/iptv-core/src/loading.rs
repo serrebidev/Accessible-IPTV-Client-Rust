@@ -36,6 +36,18 @@ pub(crate) fn read_local(
     path: &Path,
     current: impl Fn() -> bool,
 ) -> io::Result<Option<BrowseModel>> {
+    let Some(text) = read_local_text(path, &current)? else {
+        return Ok(None);
+    };
+    Ok(parse_cancellable(&text, current))
+}
+
+/// The text half of [`read_local`]: chunked reads plus the Python
+/// utf-8-sig/errors=ignore decoding, without replacement glyphs.
+pub(crate) fn read_local_text(
+    path: &Path,
+    current: &dyn Fn() -> bool,
+) -> io::Result<Option<String>> {
     let mut file = std::fs::File::open(path)?;
     let mut bytes = Vec::new();
     let mut chunk = vec![0; 64 * 1024];
@@ -73,20 +85,25 @@ pub(crate) fn read_local(
             }
         }
     }
-    Ok(parse_cancellable(&text, current))
+    Ok(Some(text))
+}
+
+enum LoadRequest {
+    Local(PathBuf),
+    Sources(Vec<crate::sources::PlaylistSource>),
 }
 
 /// One loader serializes work and discards obsolete requests and completions.
 /// Dropping or cancelling never waits on disk I/O or parsing.
 pub struct LoadWorker {
     generation: Arc<AtomicU64>,
-    requests: mpsc::Sender<(u64, PathBuf)>,
+    requests: mpsc::Sender<(u64, LoadRequest)>,
     results: mpsc::Receiver<LoadResult>,
 }
 
 impl Default for LoadWorker {
     fn default() -> Self {
-        let (requests, pending) = mpsc::channel::<(u64, PathBuf)>();
+        let (requests, pending) = mpsc::channel::<(u64, LoadRequest)>();
         let (completed, results) = mpsc::channel();
         let generation = Arc::new(AtomicU64::new(0));
         let active = Arc::clone(&generation);
@@ -96,14 +113,27 @@ impl Default for LoadWorker {
                     request = newer;
                 }
                 let current = || active.load(Ordering::Relaxed) == request.0;
-                let outcome = match read_local(&request.1, current) {
-                    Ok(Some(model)) => Ok(Arc::new(model)),
-                    Ok(None) => continue,
-                    Err(error) => Err(if error.kind() == io::ErrorKind::NotFound {
-                        LoadFailure::Missing
-                    } else {
-                        LoadFailure::Unreadable
-                    }),
+                let outcome = match &request.1 {
+                    LoadRequest::Local(path) => match read_local(path, current) {
+                        Ok(Some(model)) => Ok(Arc::new(model)),
+                        Ok(None) => continue,
+                        Err(error) => Err(if error.kind() == io::ErrorKind::NotFound {
+                            LoadFailure::Missing
+                        } else {
+                            LoadFailure::Unreadable
+                        }),
+                    },
+                    LoadRequest::Sources(sources) => {
+                        match crate::sources::load_merged(
+                            sources,
+                            &crate::sources::DefaultFetcher,
+                            current,
+                        ) {
+                            Ok(Some(merged)) => Ok(Arc::new(merged.model)),
+                            Ok(None) => continue,
+                            Err(failure) => Err(failure),
+                        }
+                    }
                 };
                 if current()
                     && completed
@@ -128,7 +158,14 @@ impl Default for LoadWorker {
 impl LoadWorker {
     pub fn submit(&self, path: PathBuf) {
         let generation = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
-        let _ = self.requests.send((generation, path));
+        let _ = self.requests.send((generation, LoadRequest::Local(path)));
+    }
+
+    pub fn submit_sources(&self, sources: Vec<crate::sources::PlaylistSource>) {
+        let generation = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
+        let _ = self
+            .requests
+            .send((generation, LoadRequest::Sources(sources)));
     }
 
     pub fn cancel(&self) {
