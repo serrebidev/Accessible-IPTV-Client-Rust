@@ -1,19 +1,28 @@
 //! wx-free domain types and playlist behavior for the Rust port.
 
+pub mod audiotracks;
 pub mod browser;
+pub mod cast;
 pub mod catchup;
 pub mod categories;
 pub mod config;
 pub mod downloads;
+pub mod dvr;
 pub mod epg;
 pub mod favorites;
+pub mod guide;
+pub mod i18n;
 pub mod loading;
 pub mod playback;
 pub mod providers;
 pub mod recording;
 pub mod reminders;
 pub mod search;
+pub mod shortcuts;
 pub mod sources;
+pub mod subtitles;
+pub mod updater;
+pub mod vod;
 
 use std::collections::BTreeMap;
 use std::path::Path;

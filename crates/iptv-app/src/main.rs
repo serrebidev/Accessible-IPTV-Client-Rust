@@ -1,7 +1,12 @@
+use iptv_core::guide::Guide;
+use iptv_core::i18n::I18n;
+use iptv_core::updater::{UpdateEvent, UpdateWorker};
 use iptv_core::{
     browser::{BrowseEvent, BrowserWorker},
+    cast::{CastDevice, CastEvent, CastWorker},
     categories::Category,
     config::{self, Config},
+    dvr::{channel_from_snapshot, DvrAction, DvrSchedule},
     epg::{local_hhmm, match_guide_channel, EpgGuide, EpgWorker, GuideIndexes},
     favorites::{channel_key, FavoriteSet, Toggle},
     playback::{
@@ -10,9 +15,12 @@ use iptv_core::{
         PlayerChoice, SessionState,
     },
     providers::{ProviderAccount, ProviderEvent, ProviderWorker},
+    recording::{self, RecordingEngine},
     reminders::{normalize_reminders, Reminder, ReminderStatus},
     search::SearchResults,
     sources::PlaylistSource,
+    subtitles::{active as active_cue, load_cues, Cue},
+    vod::{VodCatalog, VodEvent, VodItem, VodKind, VodWorker},
     Channel,
 };
 use std::{cell::RefCell, collections::BTreeMap, path::PathBuf, process::Command, rc::Rc};
@@ -31,14 +39,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         frame.set_accessibility_label("Accessible IPTV Client");
 
         let panel = Panel::builder(&frame).build();
-        let open = Button::builder(&panel)
-            .with_label("&Open playlist…")
-            .build();
-        open.set_accessibility_label("Open playlist");
-        let cancel = Button::builder(&panel)
-            .with_label("&Cancel loading")
-            .build();
-        cancel.set_accessibility_label("Cancel loading");
+        let (open, cancel) = open_cancel_buttons(panel);
+        let record = record_button(panel);
+        let vod = vod_button(panel);
+        let cast = cast_button(panel);
+        let guide_button = guide_ui_button(panel);
         let (category_label, category, toggle_favorite) = category_controls(panel);
         let search_label = StaticText::builder(&panel)
             .with_label("&Search channels")
@@ -89,42 +94,99 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let status = Status {
             label: status_label,
             details,
+            bar: Some(frame),
         };
-        bind_browser(
+        let (episode_description, stream_url) = info_panels(panel);
+        let controls_all = Controls {
+            open,
+            cancel,
+            record,
+            vod,
+            cast,
+            guide_button,
+            category,
+            toggle_favorite,
+            search,
+            list,
+            episode_description,
+            stream_url,
+            status,
+        };
+        let controls_for_layout = controls_all;
+        bind_browser(frame, controls_all, model);
+        layout_main(
             frame,
-            Controls {
-                open,
-                cancel,
-                category,
-                toggle_favorite,
-                search,
-                list,
-                status,
-            },
-            model,
+            panel,
+            controls_for_layout,
+            category_label,
+            search_label,
+            label,
         );
-        let layout = BoxSizer::builder(Orientation::Vertical).build();
-        layout.add(&open, 0, SizerFlag::All, 8);
-        layout.add(&cancel, 0, SizerFlag::All, 8);
-        layout.add(&category_label, 0, SizerFlag::All, 8);
-        layout.add(&category, 0, SizerFlag::Expand | SizerFlag::All, 8);
-        layout.add(&toggle_favorite, 0, SizerFlag::All, 8);
-        layout.add(&search_label, 0, SizerFlag::All, 8);
-        layout.add(&search, 0, SizerFlag::Expand | SizerFlag::All, 8);
-        layout.add(&label, 0, SizerFlag::All, 8);
-        layout.add(&list, 1, SizerFlag::Expand | SizerFlag::All, 8);
-        layout.add(&status_label, 0, SizerFlag::All, 8);
-        layout.add(&details, 0, SizerFlag::Expand | SizerFlag::All, 8);
-        panel.set_sizer(layout, true);
-
-        let frame_layout = BoxSizer::builder(Orientation::Vertical).build();
-        frame_layout.add(&panel, 1, SizerFlag::Expand, 0);
-        frame.set_sizer(frame_layout, true);
-
-        frame.show(true);
-        frame.centre();
-        list.set_focus();
     })
+}
+
+/// The main window layout: controls in browse/tab order, the frame
+/// status bar, then show and focus the channel list.
+fn layout_main(
+    frame: Frame,
+    panel: Panel,
+    controls: Controls,
+    category_label: StaticText,
+    search_label: StaticText,
+    channels_label: StaticText,
+) {
+    let layout = BoxSizer::builder(Orientation::Vertical).build();
+    layout.add(&controls.open, 0, SizerFlag::All, 8);
+    layout.add(&controls.cancel, 0, SizerFlag::All, 8);
+    layout.add(&category_label, 0, SizerFlag::All, 8);
+    layout.add(&controls.category, 0, SizerFlag::Expand | SizerFlag::All, 8);
+    layout.add(&controls.toggle_favorite, 0, SizerFlag::All, 8);
+    layout.add(&search_label, 0, SizerFlag::All, 8);
+    layout.add(&controls.search, 0, SizerFlag::Expand | SizerFlag::All, 8);
+    layout.add(&channels_label, 0, SizerFlag::All, 8);
+    layout.add(&controls.list, 1, SizerFlag::Expand | SizerFlag::All, 8);
+    layout.add(
+        &controls.episode_description,
+        0,
+        SizerFlag::Expand | SizerFlag::All,
+        8,
+    );
+    layout.add(
+        &controls.stream_url,
+        0,
+        SizerFlag::Expand | SizerFlag::All,
+        8,
+    );
+    layout.add(&controls.status.label, 0, SizerFlag::All, 8);
+    layout.add(
+        &controls.status.details,
+        0,
+        SizerFlag::Expand | SizerFlag::All,
+        8,
+    );
+    panel.set_sizer(layout, true);
+    let frame_layout = BoxSizer::builder(Orientation::Vertical).build();
+    frame_layout.add(&panel, 1, SizerFlag::Expand, 0);
+    frame.set_sizer(frame_layout, true);
+    frame.create_status_bar(1, 0, 0, "Status");
+    frame.set_status_text("Ready.", 0);
+    frame.show(true);
+    frame.centre();
+    controls.list.set_focus();
+}
+
+/// The Episode description and Stream URL panels that follow the
+/// channel list in tab order, as in the Python main window.
+fn info_panels(panel: Panel) -> (TextCtrl, TextCtrl) {
+    let episode_description = TextCtrl::builder(&panel)
+        .with_style(TextCtrlStyle::ReadOnly | TextCtrlStyle::MultiLine)
+        .build();
+    episode_description.set_accessibility_label("Episode description");
+    let stream_url = TextCtrl::builder(&panel)
+        .with_style(TextCtrlStyle::ReadOnly | TextCtrlStyle::MultiLine)
+        .build();
+    stream_url.set_accessibility_label("Stream URL");
+    (episode_description, stream_url)
 }
 
 /// The Category list and the Toggle favorite action, in browse order.
@@ -147,16 +209,23 @@ fn category_controls(panel: Panel) -> (StaticText, ListBox, Button) {
 struct Status {
     label: StaticText,
     details: TextCtrl,
+    bar: Option<Frame>,
 }
 
 impl Status {
     fn set_label(self, message: &str) {
         self.details.change_value(message);
+        if let Some(frame) = self.bar {
+            frame.set_status_text(message, 0);
+        }
         live_region::announce_with_priority(self.label, message, live_region::Priority::Medium);
     }
 
     fn set_silent(self, message: &str) {
         self.details.change_value(message);
+        if let Some(frame) = self.bar {
+            frame.set_status_text(message, 0);
+        }
     }
 }
 
@@ -164,10 +233,16 @@ impl Status {
 struct Controls {
     open: Button,
     cancel: Button,
+    record: Button,
+    vod: Button,
+    cast: Button,
+    guide_button: Button,
     category: ListBox,
     toggle_favorite: Button,
     search: TextCtrl,
     list: ListCtrl,
+    episode_description: TextCtrl,
+    stream_url: TextCtrl,
     status: Status,
 }
 
@@ -186,6 +261,22 @@ struct Wiring {
     provider_worker: Rc<ProviderWorker>,
     provider_pending: Rc<std::cell::Cell<bool>>,
     pending_resolve: Rc<RefCell<Option<Channel>>>,
+    recordings: Rc<RefCell<RecordingEngine>>,
+    cast_worker: Rc<CastWorker>,
+    cast_pending: Rc<std::cell::Cell<bool>>,
+    cast_ui: Rc<RefCell<Option<CastUi>>>,
+    guide_ui: Rc<RefCell<Option<GuideUi>>>,
+    update_worker: Rc<UpdateWorker>,
+    update_pending: Rc<std::cell::Cell<bool>>,
+    tray: Rc<TaskBarIcon>,
+    i18n: Rc<I18n>,
+    vod_worker: Rc<VodWorker>,
+    vod_pending: Rc<std::cell::Cell<bool>>,
+    vod_ui: Rc<RefCell<Option<VodUi>>>,
+    dvr: Rc<RefCell<DvrSchedule>>,
+    recorded: Rc<std::cell::Cell<bool>>,
+    shutdown_attempted: Rc<std::cell::Cell<bool>>,
+    last_dvr_tick: Rc<std::cell::Cell<f64>>,
 }
 
 /// Built-in player window state, created lazily on first use.
@@ -195,6 +286,8 @@ struct PlayerState {
     window: Option<(Frame, MediaCtrl)>,
     current_channel: Option<Channel>,
     pending_resume_ms: Option<i64>,
+    subtitle_cues: Vec<Cue>,
+    last_spoken_cue: Option<usize>,
 }
 
 impl Default for PlayerState {
@@ -205,6 +298,8 @@ impl Default for PlayerState {
             window: None,
             current_channel: None,
             pending_resume_ms: None,
+            subtitle_cues: Vec::new(),
+            last_spoken_cue: None,
         }
     }
 }
@@ -289,9 +384,69 @@ impl Persist {
     }
 }
 
+/// The Cast window button for the main window.
+fn cast_button(panel: Panel) -> Button {
+    let cast = Button::builder(&panel).with_label("Cas&t").build();
+    cast.set_accessibility_label("Cast");
+    cast.set_accessibility_description(
+        "Open the cast window to send the selected channel to a TV or speaker on your network.",
+    );
+    cast
+}
+
+/// The VOD window button for the main window.
+fn vod_button(panel: Panel) -> Button {
+    let vod = Button::builder(&panel).with_label("&VOD").build();
+    vod.set_accessibility_label("Video on demand");
+    vod.set_accessibility_description(
+        "Open the video-on-demand browser for movies and series from your providers and playlists.",
+    );
+    vod
+}
+
+/// The Open playlist / Cancel loading buttons for the main window.
+fn open_cancel_buttons(panel: Panel) -> (Button, Button) {
+    let open = Button::builder(&panel)
+        .with_label("&Open playlist…")
+        .build();
+    open.set_accessibility_label("Open playlist");
+    let cancel = Button::builder(&panel)
+        .with_label("&Cancel loading")
+        .build();
+    cancel.set_accessibility_label("Cancel loading");
+    (open, cancel)
+}
+
+/// The User Guide button for the main window.
+fn guide_ui_button(panel: Panel) -> Button {
+    let button = Button::builder(&panel).with_label("User &Guide").build();
+    button.set_accessibility_label("User Guide");
+    button.set_accessibility_description("Open the offline User Guide.");
+    button
+}
+
+/// The Record toggle button for the main window.
+fn record_button(panel: Panel) -> Button {
+    let record = Button::builder(&panel).with_label("&Record").build();
+    record.set_accessibility_label("Record");
+    record.set_accessibility_description(
+        "Start or stop recording the selected channel to the recordings folder.",
+    );
+    record
+}
+
 fn bind_browser(frame: Frame, controls: Controls, model: Rc<RefCell<SearchResults>>) {
     let candidates = config::config_candidates();
     let loaded = config::load(&candidates, &candidates[0]);
+    if !loaded.config.bool_or("show_channel_url", true) {
+        controls.stream_url.hide();
+    }
+    let dvr_path = iptv_core::dvr::schedule_path(&loaded.path);
+    let i18n = {
+        let mut i18n = I18n::default();
+        i18n.init_from_config(&iptv_core::i18n::locale_dir(), loaded.config.raw());
+        Rc::new(i18n)
+    };
     let mut browser_worker = BrowserWorker::default();
     browser_worker.set_favorites(FavoriteSet::from_stored(loaded.config.favorites()));
     let wiring = Wiring {
@@ -311,8 +466,27 @@ fn bind_browser(frame: Frame, controls: Controls, model: Rc<RefCell<SearchResult
         provider_worker: Rc::new(ProviderWorker::new()),
         provider_pending: Rc::new(std::cell::Cell::new(false)),
         pending_resolve: Rc::new(RefCell::new(None)),
+        recordings: Rc::new(RefCell::new(RecordingEngine::new())),
+        cast_worker: Rc::new(CastWorker::new()),
+        cast_pending: Rc::new(std::cell::Cell::new(false)),
+        cast_ui: Rc::new(RefCell::new(None)),
+        guide_ui: Rc::new(RefCell::new(None)),
+        update_worker: Rc::new(UpdateWorker::new()),
+        update_pending: Rc::new(std::cell::Cell::new(false)),
+        tray: Rc::new(build_tray_icon()),
+        i18n,
+        vod_worker: Rc::new(VodWorker::new()),
+        vod_pending: Rc::new(std::cell::Cell::new(false)),
+        vod_ui: Rc::new(RefCell::new(None)),
+        dvr: Rc::new(RefCell::new(DvrSchedule::load(dvr_path, now_seconds()))),
+        recorded: Rc::new(std::cell::Cell::new(false)),
+        shutdown_attempted: Rc::new(std::cell::Cell::new(false)),
+        last_dvr_tick: Rc::new(std::cell::Cell::new(0.0)),
     };
     *wiring.reminders.borrow_mut() = wiring.persist.reminders();
+    if wiring.dvr.borrow().pending_count() > 0 {
+        assert!(wiring.timer.start(50, false));
+    }
     let epg_urls = wiring.persist.config.borrow().string_list("epg_urls");
     if !epg_urls.is_empty() {
         wiring.epg_worker.load(epg_urls);
@@ -330,6 +504,11 @@ fn bind_browser(frame: Frame, controls: Controls, model: Rc<RefCell<SearchResult
         assert!(wiring.timer.start(50, false));
     }
     bind_completion(&wiring, controls);
+    bind_recording(&wiring, controls);
+    bind_vod(&wiring, controls);
+    bind_cast(&wiring, controls);
+    bind_guide(&wiring, controls);
+    build_menu(frame, &wiring, controls);
     bind_actions(frame, &wiring, controls);
     let browser = Rc::clone(&wiring.browser);
     let timer = Rc::clone(&wiring.timer);
@@ -362,6 +541,10 @@ fn bind_completion(wiring: &Wiring, controls: Controls) {
         }
         poll_epg(&completed, status);
         poll_providers(&completed, controls);
+        poll_recordings(&completed, status);
+        poll_vod(&completed, status);
+        poll_cast(&completed, status);
+        poll_updates(&completed, status);
         if !completed.browser.borrow().is_busy()
             && !completed.epg_pending.get()
             && !completed.provider_pending.get()
@@ -370,6 +553,11 @@ fn bind_completion(wiring: &Wiring, controls: Controls) {
                 .borrow()
                 .iter()
                 .any(|r| r.status == ReminderStatus::Scheduled)
+            && completed.recordings.borrow().active_count() == 0
+            && completed.dvr.borrow().pending_count() == 0
+            && !completed.vod_pending.get()
+            && !completed.cast_pending.get()
+            && !completed.update_pending.get()
         {
             if let Some(timer) = completed_timer.upgrade() {
                 timer.stop();
@@ -382,10 +570,16 @@ fn bind_actions(frame: Frame, wiring: &Wiring, controls: Controls) {
     let Controls {
         open,
         cancel,
+        record: _,
+        vod: _,
+        cast: _,
+        guide_button: _,
         category,
         toggle_favorite,
         search,
         list,
+        episode_description,
+        stream_url,
         status,
     } = controls;
     let browser = Rc::clone(&wiring.browser);
@@ -432,7 +626,7 @@ fn bind_actions(frame: Frame, wiring: &Wiring, controls: Controls) {
         event.skip(true);
     });
     bind_toggle(wiring, toggle_favorite, list, search, status);
-    bind_playback(wiring, list, status);
+    bind_playback(wiring, list, status, episode_description, stream_url);
     let request = Rc::clone(&browser);
     let poll = Rc::clone(&timer);
     open.on_click(move |_| {
@@ -638,7 +832,986 @@ fn poll_epg(wiring: &Wiring, status: Status) {
 
 /// Enter (item activation) on Channels plays the selected channel through
 /// the configured player: the built-in window, or an external player.
-fn bind_playback(wiring: &Wiring, list: ListCtrl, status: Status) {
+fn bind_recording(wiring: &Wiring, controls: Controls) {
+    let record = controls.record;
+    let list = controls.list;
+    let status = controls.status;
+    let browser = Rc::clone(&wiring.browser);
+    let model = Rc::clone(&wiring.model);
+    let recordings = Rc::clone(&wiring.recordings);
+    let persist = wiring.persist.clone();
+    let timer = Rc::clone(&wiring.timer);
+    record.on_click(move |_| {
+        let Some(channel) = selected_channel(&browser, &model, list) else {
+            status.set_label("No channel selected. Choose a channel in Channels first.");
+            return;
+        };
+        toggle_recording(&recordings, &persist, &channel, status);
+        assert!(timer.start(50, false));
+    });
+}
+
+/// The channel behind the list's current selection, if any.
+fn selected_channel(
+    browser: &Rc<RefCell<BrowserWorker>>,
+    model: &Rc<RefCell<SearchResults>>,
+    list: ListCtrl,
+) -> Option<Channel> {
+    let selected = usize::try_from(list.get_first_selected_item()).ok();
+    let focused =
+        usize::try_from(list.get_next_item(-1, ListNextItemFlag::All, ListItemState::Focused)).ok();
+    let row = pick_row(selected, focused)?;
+    let index = model.borrow().playlist_index(row)?;
+    browser.borrow().channel(index)
+}
+
+/// Start or stop a manual recording of the channel.
+fn toggle_recording(
+    recordings: &Rc<RefCell<RecordingEngine>>,
+    persist: &Persist,
+    channel: &Channel,
+    status: Status,
+) {
+    let key = channel_key(channel);
+    if recordings.borrow().is_recording(&key) {
+        recordings.borrow_mut().stop(&key);
+        status.set_label(&format!("Stopping recording of {}.", channel.name));
+        return;
+    }
+    if channel.url.is_empty() {
+        status.set_label("This channel's stream link must be resolved before recording.");
+        return;
+    }
+    let format = persist
+        .config
+        .borrow()
+        .string_or("recording_format", "provider_mkv");
+    match start_recording(
+        recordings,
+        persist,
+        &key,
+        channel,
+        &format,
+        &channel.name.clone(),
+    ) {
+        Ok(path) => status.set_label(&format!(
+            "Recording {} to {}.",
+            channel.name,
+            path.display()
+        )),
+        Err(error) => status.set_label(&error),
+    }
+}
+
+/// Spawn ffmpeg for one recording; returns the output path.
+fn start_recording(
+    recordings: &Rc<RefCell<RecordingEngine>>,
+    persist: &Persist,
+    key: &str,
+    channel: &Channel,
+    format: &str,
+    display_name: &str,
+) -> Result<PathBuf, String> {
+    let dir = recordings_dir(persist);
+    let stamp = chrono::Local::now().format("%Y-%m-%d %H-%M-%S").to_string();
+    let in_use = recordings.borrow().in_use_paths();
+    let out = recording::unique_output_path(
+        &dir,
+        display_name,
+        recording::format_extension(format),
+        &stamp,
+        &in_use,
+    );
+    let headers = iptv_core::playback::StreamHeaders::for_channel(channel);
+    let (clean_url, _) = iptv_core::playback::split_stream_modifiers(&channel.url);
+    let cmd = recording::ffmpeg_command(
+        "ffmpeg",
+        &clean_url,
+        &out.to_string_lossy(),
+        format,
+        &headers,
+        &recording::FfmpegOptions {
+            show_stats: true,
+            ..recording::FfmpegOptions::default()
+        },
+    );
+    recordings.borrow_mut().start(key, &cmd, out.clone())?;
+    Ok(out)
+}
+
+/// The recordings folder: the configured path, else
+/// ~/Videos/Accessible IPTV Recordings like the reference default.
+fn recordings_dir(persist: &Persist) -> PathBuf {
+    let configured = persist.config.borrow().string_or("recordings_dir", "");
+    if !configured.trim().is_empty() {
+        return PathBuf::from(configured.trim());
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    PathBuf::from(home)
+        .join("Videos")
+        .join("Accessible IPTV Recordings")
+}
+
+/// Start one due DVR job's recording (or fail the job with the reason).
+fn start_dvr_job(wiring: &Wiring, status: Status, job_id: &str, now: f64) {
+    let Some(job) = wiring.dvr.borrow().get(job_id).cloned() else {
+        return;
+    };
+    let channel = channel_from_snapshot(&job.channel);
+    if channel.url.is_empty() {
+        wiring.dvr.borrow_mut().mark_finished(
+            job_id,
+            false,
+            "",
+            "Scheduled recordings from portal channels are not supported yet.",
+            now,
+        );
+        return;
+    }
+    let display = if job.title.is_empty() {
+        channel.name.clone()
+    } else {
+        job.title.clone()
+    };
+    match start_recording(
+        &wiring.recordings,
+        &wiring.persist,
+        &format!("dvr:{job_id}"),
+        &channel,
+        &job.format.clone(),
+        &display,
+    ) {
+        Ok(_) => status.set_label(&format!("Recording {display}.")),
+        Err(error) => {
+            wiring
+                .dvr
+                .borrow_mut()
+                .mark_finished(job_id, false, "", &error, now);
+        }
+    }
+}
+
+/// Per-tick recording housekeeping: collect finishes, run the DVR
+/// state machine (every 10 s, like the reference poll), and apply the
+/// shutdown-after-recordings gate.
+fn poll_recordings(wiring: &Wiring, status: Status) {
+    let now = now_seconds();
+    for finished in wiring.recordings.borrow_mut().poll_finished() {
+        wiring.recorded.set(true);
+        let name = finished
+            .out_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_string();
+        if let Some(job_id) = finished.key.strip_prefix("dvr:") {
+            wiring.dvr.borrow_mut().mark_finished(
+                job_id,
+                finished.success,
+                &finished.out_path.to_string_lossy(),
+                "",
+                now,
+            );
+        }
+        if finished.success {
+            status.set_label(&format!("Recording saved: {name}"));
+        } else {
+            status.set_label(&format!("Recording failed: {name}"));
+        }
+    }
+    if now - wiring.last_dvr_tick.get() >= 10.0 {
+        wiring.last_dvr_tick.set(now);
+        let actions = wiring.dvr.borrow_mut().tick(now);
+        for action in actions {
+            match action {
+                DvrAction::Stop(job_id) => {
+                    wiring
+                        .recordings
+                        .borrow_mut()
+                        .stop(&format!("dvr:{job_id}"));
+                }
+                DvrAction::Start(job_id) => start_dvr_job(wiring, status, &job_id, now),
+            }
+        }
+    }
+    let armed = wiring
+        .persist
+        .config
+        .borrow()
+        .bool_or("shutdown_after_recordings", false);
+    if !wiring.shutdown_attempted.get()
+        && recording::should_shutdown(
+            armed,
+            wiring.recorded.get(),
+            wiring.recordings.borrow().active_count(),
+            wiring.dvr.borrow().pending_count(),
+        )
+    {
+        wiring.shutdown_attempted.set(true);
+        let system = if cfg!(windows) {
+            "windows"
+        } else if cfg!(target_os = "macos") {
+            "darwin"
+        } else {
+            "linux"
+        };
+        let root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
+        match recording::shutdown_computer(system, &root) {
+            Ok(_) => status.set_label("All recordings finished. Shutting down."),
+            Err(error) => status.set_label(&format!("Shutdown failed: {error}")),
+        }
+    }
+}
+
+/// The VOD browser window's handles and view state.
+#[derive(Clone)]
+struct VodUi {
+    frame: Frame,
+    groups: ListBox,
+    items: ListBox,
+    status: Status,
+    view: Rc<RefCell<VodView>>,
+}
+
+#[derive(Default)]
+struct VodView {
+    catalog: VodCatalog,
+    accounts: Vec<ProviderAccount>,
+    showing: Vec<VodItem>,
+    stack: Vec<Vec<VodItem>>,
+}
+
+/// The provider accounts from the configured playlists (the accounts
+/// half of the startup split, recomputed when the VOD window opens).
+fn vod_accounts(persist: &Persist) -> Vec<ProviderAccount> {
+    let value = persist.config.borrow().value("playlists").cloned();
+    let mut accounts = Vec::new();
+    if let Some(serde_json::Value::Array(entries)) = value {
+        for entry in &entries {
+            if let Some(account) = ProviderAccount::from_config(entry) {
+                accounts.push(account);
+            }
+        }
+    }
+    accounts
+}
+
+/// Open (creating on first use) the VOD window and load the catalogue.
+fn bind_vod(wiring: &Wiring, controls: Controls) {
+    let vod = controls.vod;
+    let status = controls.status;
+    let worker = Rc::clone(&wiring.vod_worker);
+    let pending = Rc::clone(&wiring.vod_pending);
+    let ui_slot = Rc::clone(&wiring.vod_ui);
+    let player = Rc::clone(&wiring.player);
+    let persist = wiring.persist.clone();
+    let browser = Rc::clone(&wiring.browser);
+    let timer = Rc::clone(&wiring.timer);
+    vod.on_click(move |_| {
+        let ui = ensure_vod_ui(&ui_slot, &player, &persist, &worker, &pending, &timer);
+        ui.frame.show(true);
+        ui.frame.raise();
+        let accounts = vod_accounts(&persist);
+        ui.view.borrow_mut().accounts.clone_from(&accounts);
+        worker.build(accounts, browser.borrow().all_channels());
+        pending.set(true);
+        assert!(timer.start(50, false));
+        status.set_label("Loading video on demand catalogue...");
+    });
+}
+
+/// Build the VOD window's widgets: (frame, groups, items, play, back,
+/// status).
+fn build_vod_window() -> (Frame, ListBox, ListBox, Button, Button, Status) {
+    let frame = Frame::builder()
+        .with_title("Video on Demand")
+        .with_size(Size::new(720, 520))
+        .build();
+    frame.set_accessibility_label("Video on Demand");
+    let panel = Panel::builder(&frame).build();
+    let groups = ListBox::builder(&panel).build();
+    groups.set_accessibility_label("VOD groups");
+    groups.set_accessibility_description("Choose a movie or series group. Tab moves to Items.");
+    let items = ListBox::builder(&panel).build();
+    items.set_accessibility_label("VOD items");
+    items.set_accessibility_description(
+        "Choose a movie or series. Play / Open plays a movie or opens a series.",
+    );
+    let play = Button::builder(&panel).with_label("&Play / Open").build();
+    play.set_accessibility_label("Play or open selected item");
+    let back = Button::builder(&panel).with_label("&Back").build();
+    back.set_accessibility_label("Back");
+    let status_label = StaticText::builder(&panel).with_label("VOD status").build();
+    let details = TextCtrl::builder(&panel)
+        .with_style(TextCtrlStyle::ReadOnly | TextCtrlStyle::MultiLine)
+        .with_value("No catalogue loaded yet.")
+        .build();
+    details.set_accessibility_label("VOD status");
+    let status = Status {
+        label: status_label,
+        details,
+        bar: None,
+    };
+    (frame, groups, items, play, back, status)
+}
+
+/// Build the VOD window once and keep it (closing hides it).
+fn ensure_vod_ui(
+    slot: &Rc<RefCell<Option<VodUi>>>,
+    player: &Rc<RefCell<PlayerState>>,
+    persist: &Persist,
+    worker: &Rc<VodWorker>,
+    pending: &Rc<std::cell::Cell<bool>>,
+    timer: &Rc<Timer<Frame>>,
+) -> VodUi {
+    if let Some(ui) = slot.borrow().as_ref() {
+        return ui.clone();
+    }
+    let (frame, groups, items, play, back, status) = build_vod_window();
+    let view = Rc::new(RefCell::new(VodView::default()));
+    let ui = VodUi {
+        frame,
+        groups,
+        items,
+        status,
+        view,
+    };
+    // Group selection shows that group's items.
+    {
+        let view = Rc::clone(&ui.view);
+        let groups_box = groups;
+        let items_box = items;
+        groups.bind_internal(EventType::COMMAND_LISTBOX_SELECTED, move |_| {
+            let Some(selection) = groups_box.get_selection() else {
+                return;
+            };
+            let mut view = view.borrow_mut();
+            let Some(label) = view.catalog.order.get(selection as usize).cloned() else {
+                return;
+            };
+            view.showing = view.catalog.groups.get(&label).cloned().unwrap_or_default();
+            view.stack.clear();
+            show_items(items_box, &view.showing);
+        });
+    }
+    // Play / Open: movies play; series drill in (episodes inline for
+    // M3U folders, fetched for Xtream series).
+    {
+        let view = Rc::clone(&ui.view);
+        let items_box = items;
+        let player = Rc::clone(player);
+        let persist = persist.clone();
+        let worker = Rc::clone(worker);
+        let pending = Rc::clone(pending);
+        let timer = Rc::clone(timer);
+        play.on_click(move |_| {
+            let Some(selection) = items_box.get_selection() else {
+                return;
+            };
+            let item = view.borrow().showing.get(selection as usize).cloned();
+            let Some(item) = item else { return };
+            match item.kind {
+                VodKind::Movie => {
+                    if let Some(channel) = &item.channel {
+                        play_channel(&player, &persist, channel, status);
+                    }
+                }
+                VodKind::Series => {
+                    if !item.episodes.is_empty() {
+                        let mut view = view.borrow_mut();
+                        let previous = std::mem::take(&mut view.showing);
+                        view.stack.push(previous);
+                        view.showing.clone_from(&item.episodes);
+                        show_items(items_box, &view.showing);
+                    } else if let Some(series_id) = &item.series_id {
+                        let account = view
+                            .borrow()
+                            .accounts
+                            .iter()
+                            .find(|a| a.provider_id() == item.provider_id)
+                            .cloned();
+                        if let Some(account) = account {
+                            worker.episodes(account, series_id.clone());
+                            pending.set(true);
+                            assert!(timer.start(50, false));
+                            status.set_label("Loading episodes...");
+                        }
+                    }
+                }
+            }
+        });
+    }
+    // Back: return to the previous item list.
+    {
+        let view = Rc::clone(&ui.view);
+        let items_box = items;
+        back.on_click(move |_| {
+            let mut view = view.borrow_mut();
+            if let Some(previous) = view.stack.pop() {
+                view.showing = previous;
+                show_items(items_box, &view.showing);
+            }
+        });
+    }
+    // Closing the VOD window hides it; the window is reused.
+    {
+        let frame_hide = frame;
+        frame.on_close(move |event| {
+            frame_hide.hide();
+            event.skip(false);
+        });
+    }
+    *slot.borrow_mut() = Some(ui.clone());
+    ui
+}
+
+/// Fill the items list from `VodItem`s and select the first row.
+fn show_items(items_box: ListBox, showing: &[VodItem]) {
+    let names: Vec<String> = showing.iter().map(|i| i.name.clone()).collect();
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    items_box.set_items(&refs);
+    if !refs.is_empty() {
+        items_box.set_selection(0, true);
+    }
+}
+
+/// Collect VOD worker events into the window.
+fn poll_vod(wiring: &Wiring, status: Status) {
+    while let Some(event) = wiring.vod_worker.try_recv() {
+        wiring.vod_pending.set(false);
+        let Some(ui) = wiring.vod_ui.borrow().clone() else {
+            continue;
+        };
+        match event {
+            VodEvent::Catalog(catalog) => {
+                let groups_count = catalog.order.len();
+                let items_count: usize = catalog.groups.values().map(Vec::len).sum();
+                let labels = catalog.order.clone();
+                ui.view.borrow_mut().catalog = catalog;
+                let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+                ui.groups.set_items(&refs);
+                if !refs.is_empty() {
+                    ui.groups.set_selection(0, true);
+                }
+                ui.status.set_label(&format!(
+                    "VOD catalogue ready: {groups_count} groups, {items_count} items."
+                ));
+                status.set_label("VOD catalogue loaded.");
+            }
+            VodEvent::Episodes(Ok(episodes)) => {
+                let count = episodes.len();
+                let mut view = ui.view.borrow_mut();
+                let previous = std::mem::take(&mut view.showing);
+                view.stack.push(previous);
+                view.showing = episodes;
+                show_items(ui.items, &view.showing);
+                ui.status.set_label(&format!("{count} episodes loaded."));
+            }
+            VodEvent::Episodes(Err(error)) => {
+                ui.status
+                    .set_label(&format!("Could not load episodes: {error}"));
+            }
+        }
+    }
+}
+
+/// The cast window's handles and state.
+#[derive(Clone)]
+struct CastUi {
+    frame: Frame,
+    devices: ListBox,
+    status: Status,
+    view: Rc<RefCell<CastView>>,
+}
+
+#[derive(Default)]
+struct CastView {
+    devices: Vec<CastDevice>,
+    channel: Option<Channel>,
+}
+
+/// Open (creating on first use) the cast window and start discovery
+/// for the currently selected channel.
+fn bind_cast(wiring: &Wiring, controls: Controls) {
+    let cast = controls.cast;
+    let status = controls.status;
+    let list = controls.list;
+    let worker = Rc::clone(&wiring.cast_worker);
+    let pending = Rc::clone(&wiring.cast_pending);
+    let ui_slot = Rc::clone(&wiring.cast_ui);
+    let browser = Rc::clone(&wiring.browser);
+    let model = Rc::clone(&wiring.model);
+    let timer = Rc::clone(&wiring.timer);
+    cast.on_click(move |_| {
+        let ui = ensure_cast_ui(&ui_slot, &worker, &pending, &timer);
+        ui.frame.show(true);
+        ui.frame.raise();
+        let channel = selected_channel(&browser, &model, list);
+        ui.view.borrow_mut().channel.clone_from(&channel);
+        match &channel {
+            Some(channel) => {
+                ui.status
+                    .set_label(&format!("Looking for cast devices for {}...", channel.name));
+            }
+            None => {
+                ui.status
+                    .set_label("Choose a channel in the main window, then discover.");
+            }
+        }
+        worker.discover();
+        pending.set(true);
+        assert!(timer.start(50, false));
+        status.set_label("Looking for cast devices...");
+    });
+}
+
+/// Build the cast window once and keep it (closing hides it).
+fn ensure_cast_ui(
+    slot: &Rc<RefCell<Option<CastUi>>>,
+    worker: &Rc<CastWorker>,
+    pending: &Rc<std::cell::Cell<bool>>,
+    timer: &Rc<Timer<Frame>>,
+) -> CastUi {
+    if let Some(ui) = slot.borrow().as_ref() {
+        return ui.clone();
+    }
+    let frame = Frame::builder()
+        .with_title("Cast")
+        .with_size(Size::new(560, 420))
+        .build();
+    frame.set_accessibility_label("Cast");
+    let panel = Panel::builder(&frame).build();
+    let devices = ListBox::builder(&panel).build();
+    devices.set_accessibility_label("Cast devices");
+    devices.set_accessibility_description(
+        "Choose a device. Play sends the selected channel to it; Stop ends the cast.",
+    );
+    let play = Button::builder(&panel).with_label("&Play").build();
+    play.set_accessibility_label("Play on device");
+    let stop = Button::builder(&panel).with_label("&Stop").build();
+    stop.set_accessibility_label("Stop casting");
+    let refresh = Button::builder(&panel).with_label("&Refresh").build();
+    refresh.set_accessibility_label("Refresh devices");
+    let status_label = StaticText::builder(&panel)
+        .with_label("Cast status")
+        .build();
+    let details = TextCtrl::builder(&panel)
+        .with_style(TextCtrlStyle::ReadOnly | TextCtrlStyle::MultiLine)
+        .with_value("No devices yet. Refresh to search your network.")
+        .build();
+    details.set_accessibility_label("Cast status");
+    let status = Status {
+        label: status_label,
+        details,
+        bar: None,
+    };
+    let view = Rc::new(RefCell::new(CastView::default()));
+    let ui = CastUi {
+        frame,
+        devices,
+        status,
+        view,
+    };
+    {
+        let view = Rc::clone(&ui.view);
+        let devices_box = devices;
+        let worker = Rc::clone(worker);
+        let pending = Rc::clone(pending);
+        let timer = Rc::clone(timer);
+        play.on_click(move |_| {
+            let Some(selection) = devices_box.get_selection() else {
+                return;
+            };
+            let view = view.borrow();
+            let (Some(device), Some(channel)) =
+                (view.devices.get(selection as usize), view.channel.as_ref())
+            else {
+                return;
+            };
+            let (clean_url, _) = iptv_core::playback::split_stream_modifiers(&channel.url);
+            worker.play(device.clone(), clean_url, channel.name.clone());
+            pending.set(true);
+            assert!(timer.start(50, false));
+            status.set_label(&format!("Casting {} to {}...", channel.name, device.name));
+        });
+    }
+    {
+        let view = Rc::clone(&ui.view);
+        let devices_box = devices;
+        let worker = Rc::clone(worker);
+        stop.on_click(move |_| {
+            let Some(selection) = devices_box.get_selection() else {
+                return;
+            };
+            if let Some(device) = view.borrow().devices.get(selection as usize).cloned() {
+                worker.stop(device);
+                status.set_label("Stopping the cast...");
+            }
+        });
+    }
+    {
+        let worker = Rc::clone(worker);
+        let pending = Rc::clone(pending);
+        let timer = Rc::clone(timer);
+        refresh.on_click(move |_| {
+            worker.discover();
+            pending.set(true);
+            assert!(timer.start(50, false));
+            status.set_label("Looking for cast devices...");
+        });
+    }
+    {
+        let frame_hide = frame;
+        frame.on_close(move |event| {
+            frame_hide.hide();
+            event.skip(false);
+        });
+    }
+    *slot.borrow_mut() = Some(ui.clone());
+    ui
+}
+
+/// Collect cast worker events into the window.
+fn poll_cast(wiring: &Wiring, status: Status) {
+    while let Some(event) = wiring.cast_worker.try_recv() {
+        wiring.cast_pending.set(false);
+        let Some(ui) = wiring.cast_ui.borrow().clone() else {
+            continue;
+        };
+        match event {
+            CastEvent::Devices(devices) => {
+                let count = devices.len();
+                let names: Vec<String> = devices.iter().map(|d| d.name.clone()).collect();
+                ui.view.borrow_mut().devices = devices;
+                let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+                ui.devices.set_items(&refs);
+                if !refs.is_empty() {
+                    ui.devices.set_selection(0, true);
+                }
+                if count == 0 {
+                    ui.status
+                        .set_label("No cast devices found. Check the TV is on and on this network, then Refresh.");
+                } else {
+                    ui.status.set_label(&format!(
+                        "Found {count} cast device(s). Choose one and press Play."
+                    ));
+                }
+                status.set_label("Cast device search finished.");
+            }
+            CastEvent::Played(Ok(name)) => {
+                ui.status.set_label(&format!("Casting to {name}."));
+                status.set_label(&format!("Casting to {name}."));
+            }
+            CastEvent::Played(Err(error)) => {
+                ui.status.set_label(&format!("Casting failed: {error}"));
+            }
+            CastEvent::Stopped(name) => {
+                ui.status.set_label(&format!("Stopped casting to {name}."));
+            }
+        }
+    }
+}
+
+/// The guide window's handles and state.
+#[derive(Clone)]
+struct GuideUi {
+    frame: Frame,
+    toc: ListBox,
+    body: TextCtrl,
+    status: Status,
+    guide: Rc<RefCell<Guide>>,
+}
+
+/// Open (creating on first use) the User Guide window at the start of
+/// the manual, in the resolved language.
+fn bind_guide(wiring: &Wiring, controls: Controls) {
+    let button = controls.guide_button;
+    let status = controls.status;
+    let wiring = clone_wiring(wiring);
+    button.on_click(move |_| {
+        open_guide_window(&wiring, status);
+    });
+}
+
+/// Shallow-clone the wiring handles for menu handlers (every field
+/// is an Rc handle).
+fn clone_wiring(wiring: &Wiring) -> Wiring {
+    Wiring {
+        persist: Persist {
+            config: Rc::clone(&wiring.persist.config),
+            path: wiring.persist.path.clone(),
+        },
+        browser: Rc::clone(&wiring.browser),
+        categories: Rc::clone(&wiring.categories),
+        timer: Rc::clone(&wiring.timer),
+        model: Rc::clone(&wiring.model),
+        player: Rc::clone(&wiring.player),
+        epg: Rc::clone(&wiring.epg),
+        epg_worker: Rc::clone(&wiring.epg_worker),
+        epg_pending: Rc::clone(&wiring.epg_pending),
+        reminders: Rc::clone(&wiring.reminders),
+        provider_worker: Rc::clone(&wiring.provider_worker),
+        provider_pending: Rc::clone(&wiring.provider_pending),
+        pending_resolve: Rc::clone(&wiring.pending_resolve),
+        recordings: Rc::clone(&wiring.recordings),
+        cast_worker: Rc::clone(&wiring.cast_worker),
+        cast_pending: Rc::clone(&wiring.cast_pending),
+        cast_ui: Rc::clone(&wiring.cast_ui),
+        guide_ui: Rc::clone(&wiring.guide_ui),
+        update_worker: Rc::clone(&wiring.update_worker),
+        update_pending: Rc::clone(&wiring.update_pending),
+        tray: Rc::clone(&wiring.tray),
+        i18n: Rc::clone(&wiring.i18n),
+        vod_worker: Rc::clone(&wiring.vod_worker),
+        vod_pending: Rc::clone(&wiring.vod_pending),
+        vod_ui: Rc::clone(&wiring.vod_ui),
+        dvr: Rc::clone(&wiring.dvr),
+        recorded: Rc::clone(&wiring.recorded),
+        shutdown_attempted: Rc::clone(&wiring.shutdown_attempted),
+        last_dvr_tick: Rc::clone(&wiring.last_dvr_tick),
+    }
+}
+
+/// Open the User Guide window at the start of the manual.
+fn open_guide_window(wiring: &Wiring, status: Status) {
+    let ui = ensure_guide_ui(&wiring.guide_ui);
+    let language = wiring.i18n.resolved_language();
+    let (guide, section) = iptv_core::guide::open_topic(Some(&language), None, None);
+    show_guide(&ui, guide);
+    if let Some(section) = section {
+        move_caret(&ui, &section);
+    }
+    ui.frame.show(true);
+    ui.frame.raise();
+    status.set_label("User Guide opened.");
+}
+
+/// The tray icon (kept alive on the wiring): tooltip plus a
+/// Show/Exit popup menu.
+fn build_tray_icon() -> TaskBarIcon {
+    let icon = TaskBarIcon::builder()
+        .with_tooltip("Accessible IPTV Client")
+        .build();
+    if let Some(bitmap) = Bitmap::new(16, 16) {
+        icon.set_icon(&bitmap, "Accessible IPTV Client");
+    }
+    let mut popup = Menu::builder()
+        .append_item(5004, "&Show Accessible IPTV Client", "")
+        .append_item(4004, "E&xit", "")
+        .build();
+    icon.set_popup_menu(&mut popup);
+    icon
+}
+
+/// The main window's menu bar. Labels carry the effective shortcuts
+/// from the shortcuts engine, so a config override changes the menu
+/// the same way it changes the binding.
+fn build_menu(frame: Frame, wiring: &Wiring, controls: Controls) {
+    let status = controls.status;
+    let config_value = serde_json::Value::Object(wiring.persist.config.borrow().raw().clone());
+    let main_keys = iptv_core::shortcuts::effective(&config_value, "main");
+    let exit_key = main_keys.get("exit").cloned().unwrap_or_default();
+    let file_menu = Menu::builder()
+        .append_item(4004, &format!("E&xit\t{exit_key}"), "Close the application")
+        .build();
+    let help_menu = Menu::builder()
+        .append_item(5002, "User &Guide", "Open the User Guide")
+        .append_item(
+            5003,
+            "Check for &Updates",
+            "Check GitHub for a newer release",
+        )
+        .build();
+    let menu_bar = MenuBar::builder()
+        .append(file_menu, "&File")
+        .append(help_menu, "&Help")
+        .build();
+    frame.set_menu_bar(menu_bar);
+    let wiring = clone_wiring(wiring);
+    frame.on_menu(move |event| match event.get_id() {
+        4004 => {
+            frame.close(false);
+        }
+        5002 => {
+            open_guide_window(&wiring, status);
+        }
+        5003 => {
+            wiring.update_worker.check(
+                "serrebidev",
+                "Accessible-IPTV-Client-Rust",
+                "update-manifest.json",
+                env!("CARGO_PKG_VERSION"),
+            );
+            wiring.update_pending.set(true);
+            assert!(wiring.timer.start(50, false));
+            status.set_label("Checking for updates...");
+        }
+        5004 => {
+            frame.show(true);
+            frame.raise();
+        }
+        _ => {}
+    });
+}
+
+/// Collect update-check outcomes onto the status line.
+fn poll_updates(wiring: &Wiring, status: Status) {
+    while let Some(event) = wiring.update_worker.try_recv() {
+        wiring.update_pending.set(false);
+        match event {
+            UpdateEvent::Checked { manifest, newer } => {
+                if newer {
+                    status.set_label(&format!(
+                        "Version {} is available. You have {}.",
+                        manifest.version,
+                        env!("CARGO_PKG_VERSION")
+                    ));
+                } else {
+                    status.set_label(&format!(
+                        "Accessible IPTV Client is up to date ({}).",
+                        env!("CARGO_PKG_VERSION")
+                    ));
+                }
+            }
+            UpdateEvent::Failed(error) => {
+                status.set_label(&format!("Update check failed: {error}"));
+            }
+        }
+    }
+}
+
+/// Build the guide window once and keep it (closing hides it).
+fn ensure_guide_ui(slot: &Rc<RefCell<Option<GuideUi>>>) -> GuideUi {
+    if let Some(ui) = slot.borrow().as_ref() {
+        return ui.clone();
+    }
+    let frame = Frame::builder()
+        .with_title("User Guide")
+        .with_size(Size::new(760, 560))
+        .build();
+    frame.set_accessibility_label("User Guide");
+    let panel = Panel::builder(&frame).build();
+    let toc = ListBox::builder(&panel).build();
+    toc.set_accessibility_label("Table of contents");
+    toc.set_accessibility_description("Choose a section to read it in the guide text.");
+    let body = TextCtrl::builder(&panel)
+        .with_style(TextCtrlStyle::ReadOnly | TextCtrlStyle::MultiLine)
+        .build();
+    body.set_accessibility_label("Guide text");
+    let find_label = StaticText::builder(&panel).with_label("Find").build();
+    let _ = find_label;
+    let find_box = TextCtrl::builder(&panel).build();
+    find_box.set_accessibility_label("Find in guide");
+    let find_button = Button::builder(&panel).with_label("Fin&d").build();
+    find_button.set_accessibility_label("Find");
+    let status_label = StaticText::builder(&panel)
+        .with_label("Guide status")
+        .build();
+    let details = TextCtrl::builder(&panel)
+        .with_style(TextCtrlStyle::ReadOnly | TextCtrlStyle::MultiLine)
+        .with_value("The guide has not been opened yet.")
+        .build();
+    details.set_accessibility_label("Guide status");
+    let status = Status {
+        label: status_label,
+        details,
+        bar: None,
+    };
+    let guide = Rc::new(RefCell::new(iptv_core::guide::load_guide(None, None)));
+    let ui = GuideUi {
+        frame,
+        toc,
+        body,
+        status,
+        guide,
+    };
+    {
+        let guide = Rc::clone(&ui.guide);
+        toc.bind_internal(EventType::COMMAND_LISTBOX_SELECTED, move |event| {
+            event.skip(true);
+            let Some(selection) = toc.get_selection() else {
+                return;
+            };
+            let guide = guide.borrow();
+            if let Some(section) = guide.sections.get(selection as usize) {
+                body.set_insertion_point(i64::try_from(section.start).unwrap_or(0));
+                body.set_selection(
+                    i64::try_from(section.start).unwrap_or(0),
+                    i64::try_from(section.start).unwrap_or(0),
+                );
+                body.set_focus();
+            }
+        });
+    }
+    {
+        let guide = Rc::clone(&ui.guide);
+        find_button.on_click(move |_| {
+            let query = find_box.get_value();
+            if query.trim().is_empty() {
+                status.set_label("Type something to find first.");
+                return;
+            }
+            let guide = guide.borrow();
+            let haystack = guide.text.to_lowercase();
+            let needle = query.to_lowercase();
+            match haystack.find(&needle) {
+                Some(byte_index) => {
+                    let char_index = haystack[..byte_index].chars().count();
+                    body.set_insertion_point(i64::try_from(char_index).unwrap_or(0));
+                    body.set_focus();
+                    status.set_label(&format!("Found \"{query}\"."));
+                }
+                None => {
+                    status.set_label(&format!("Cannot find \"{query}\"."));
+                }
+            }
+        });
+    }
+    {
+        let frame_hide = frame;
+        frame.on_close(move |event| {
+            frame_hide.hide();
+            event.skip(false);
+        });
+    }
+    *slot.borrow_mut() = Some(ui.clone());
+    ui
+}
+
+/// Put a guide into the window: text, contents, spoken status.
+fn show_guide(ui: &GuideUi, guide: Guide) {
+    let titles: Vec<String> = guide
+        .sections
+        .iter()
+        .map(|section| section.title.clone())
+        .collect();
+    ui.body.change_value(&guide.text);
+    let refs: Vec<&str> = titles.iter().map(String::as_str).collect();
+    ui.toc.set_items(&refs);
+    if !refs.is_empty() {
+        ui.toc.set_selection(0, true);
+    }
+    ui.status.set_label(&format!(
+        "User Guide ({}). {} sections. Choose a section, or use Find.",
+        guide.language,
+        guide.sections.len()
+    ));
+    *ui.guide.borrow_mut() = guide;
+}
+
+/// Move the guide text caret to a section.
+fn move_caret(ui: &GuideUi, section: &iptv_core::guide::Section) {
+    ui.body
+        .set_insertion_point(i64::try_from(section.start).unwrap_or(0));
+}
+
+fn bind_playback(
+    wiring: &Wiring,
+    list: ListCtrl,
+    status: Status,
+    episode_description: TextCtrl,
+    stream_url: TextCtrl,
+) {
     let browser = Rc::clone(&wiring.browser);
     let model = Rc::clone(&wiring.model);
     let player = Rc::clone(&wiring.player);
@@ -682,12 +1855,18 @@ fn bind_playback(wiring: &Wiring, list: ListCtrl, status: Status) {
         }
         play_channel(&player, &persist, &channel, status);
     });
-    bind_epg_highlight(wiring, list, status);
+    bind_epg_highlight(wiring, list, status, episode_description, stream_url);
 }
 
 /// Moving through Channels announces the highlighted channel's now/next
 /// programme from the loaded guide, when it has one.
-fn bind_epg_highlight(wiring: &Wiring, list: ListCtrl, status: Status) {
+fn bind_epg_highlight(
+    wiring: &Wiring,
+    list: ListCtrl,
+    status: Status,
+    episode_description: TextCtrl,
+    stream_url: TextCtrl,
+) {
     let browser = Rc::clone(&wiring.browser);
     let model = Rc::clone(&wiring.model);
     let epg = Rc::clone(&wiring.epg);
@@ -701,8 +1880,10 @@ fn bind_epg_highlight(wiring: &Wiring, list: ListCtrl, status: Status) {
         let Some(channel) = browser.borrow().channel(index) else {
             return;
         };
+        stream_url.set_value(&channel.url);
         let guard = epg.borrow();
         let Some((guide, indexes)) = guard.as_ref() else {
+            episode_description.set_value("");
             return;
         };
         let known: std::collections::HashSet<String> =
@@ -715,6 +1896,12 @@ fn bind_epg_highlight(wiring: &Wiring, list: ListCtrl, status: Status) {
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(0));
         let (current, next) = guide.now_next(&guide_id, now);
+        let description_text = match &current {
+            Some(p) if !p.description.is_empty() => p.description.clone(),
+            Some(p) => p.title.clone(),
+            None => String::new(),
+        };
+        episode_description.set_value(&description_text);
         let mut parts: Vec<String> = Vec::new();
         if let Some(p) = current {
             parts.push(format!("Now: {} until {}.", p.title, local_hhmm(p.stop)));
@@ -728,6 +1915,13 @@ fn bind_epg_highlight(wiring: &Wiring, list: ListCtrl, status: Status) {
             status.set_label(&parts.join(" "));
         }
     });
+}
+
+#[allow(clippy::cast_precision_loss)] // epoch seconds fit comfortably for schedule math
+fn now_seconds() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0.0, |d| d.as_secs() as f64)
 }
 
 fn now_ms() -> i64 {
@@ -822,6 +2016,8 @@ fn play_builtin(
     let mut state = player.borrow_mut();
     state.current_channel = Some(channel.clone());
     state.pending_resume_ms = request.resume_ms;
+    state.subtitle_cues.clear();
+    state.last_spoken_cue = None;
     let action = state.session.play(request);
     let Some((frame, media)) = state.window else {
         return;
@@ -856,19 +2052,28 @@ fn ensure_player_window(player: &Rc<RefCell<PlayerState>>, persist: &Persist, st
     pause.set_accessibility_label("Pause or resume");
     let stop = Button::builder(&panel).with_label("&Stop").build();
     stop.set_accessibility_label("Stop");
+    let subs = Button::builder(&panel)
+        .with_label("Load &subtitles…")
+        .build();
+    subs.set_accessibility_label("Load subtitles");
+    subs.set_accessibility_description(
+        "Load an SRT, WebVTT or ASS subtitle file for this playback. When Speak subtitles is on in settings, cues are announced as they play.",
+    );
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     sizer.add(&media, 1, SizerFlag::Expand | SizerFlag::All, 4);
     let buttons = BoxSizer::builder(Orientation::Horizontal).build();
     buttons.add(&pause, 0, SizerFlag::All, 4);
     buttons.add(&stop, 0, SizerFlag::All, 4);
+    buttons.add(&subs, 0, SizerFlag::All, 4);
     sizer.add_sizer(&buttons, 0, SizerFlag::Expand, 0);
     panel.set_sizer(sizer, true);
 
-    wire_player_events(player, persist, status, frame, media, pause, stop);
+    wire_player_events(player, persist, status, frame, media, pause, stop, subs);
     player.borrow_mut().window = Some((frame, media));
 }
 
 /// Timer, buttons, media events and close behavior for the player window.
+#[allow(clippy::too_many_arguments)]
 fn wire_player_events(
     player: &Rc<RefCell<PlayerState>>,
     persist: &Persist,
@@ -877,6 +2082,7 @@ fn wire_player_events(
     media: MediaCtrl,
     pause: Button,
     stop: Button,
+    subs: Button,
 ) {
     let timer = Rc::new(Timer::new(&frame));
     let tick_player = Rc::clone(player);
@@ -884,9 +2090,11 @@ fn wire_player_events(
     let tick_media = media;
     timer.on_tick(move |_| {
         checkpoint_resume(&tick_player, &tick_persist, tick_media);
+        speak_subtitle_cue(&tick_player, &tick_persist, tick_media, status);
     });
     let _ = timer.start(1000, false);
 
+    bind_subtitle_load(subs, player, frame, status);
     let pause_player = Rc::clone(player);
     pause.on_click(move |_| {
         let mut state = pause_player.borrow_mut();
@@ -956,6 +2164,74 @@ fn wire_player_events(
         }
         event.skip(false);
     });
+}
+
+/// The player window's Load subtitles button: pick a file, parse it,
+/// and hold its cues on the player state for the speech path.
+fn bind_subtitle_load(
+    subs: Button,
+    player: &Rc<RefCell<PlayerState>>,
+    frame: Frame,
+    status: Status,
+) {
+    let subs_player = Rc::clone(player);
+    subs.on_click(move |_| {
+        let dialog = FileDialog::builder(&frame)
+            .with_message("Load subtitles")
+            .with_wildcard(
+                "Subtitles (*.srt;*.vtt;*.ass;*.ssa)|*.srt;*.vtt;*.ass;*.ssa|All files (*.*)|*.*",
+            )
+            .with_style(FileDialogStyle::Open | FileDialogStyle::FileMustExist)
+            .build();
+        if dialog.show_modal() != ID_OK {
+            return;
+        }
+        let Some(path) = dialog.get_path() else {
+            return;
+        };
+        match load_cues(std::path::Path::new(&path)) {
+            Ok(cues) => {
+                let count = cues.len();
+                let mut state = subs_player.borrow_mut();
+                state.subtitle_cues = cues;
+                state.last_spoken_cue = None;
+                status.set_label(&format!("Loaded {count} subtitle cues."));
+            }
+            Err(error) => {
+                status.set_label(&format!("Could not load subtitles: {error}"));
+            }
+        }
+    });
+}
+
+/// Announce the active subtitle cue when it changes, while the
+/// `speak_subtitles` setting is on (the reference's spoken-subtitle
+/// path, riding the live region).
+fn speak_subtitle_cue(
+    player: &Rc<RefCell<PlayerState>>,
+    persist: &Persist,
+    media: MediaCtrl,
+    status: Status,
+) {
+    if !persist.config.borrow().bool_or("speak_subtitles", false) {
+        return;
+    }
+    let position = media.tell();
+    if position <= 0 {
+        return;
+    }
+    let mut state = player.borrow_mut();
+    if state.subtitle_cues.is_empty() {
+        return;
+    }
+    let current = active_cue(&state.subtitle_cues, position);
+    if current != state.last_spoken_cue {
+        state.last_spoken_cue = current;
+        if let Some(index) = current {
+            let text = state.subtitle_cues[index].text.clone();
+            live_region::announce_with_priority(status.label, &text, live_region::Priority::Medium);
+        }
+    }
 }
 
 /// Persist the current position for seekable content (Python checkpoint
