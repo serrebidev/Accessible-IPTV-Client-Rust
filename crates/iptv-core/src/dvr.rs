@@ -767,4 +767,21 @@ mod tests {
         assert_eq!(schedule.get(&id).expect("job").status, STATUS_CANCELED);
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn late_resolution_success_cannot_resurrect_a_canceled_job() {
+        let dir =
+            std::env::temp_dir().join(format!("iptv-dvr-cancel-success-{}", std::process::id()));
+        let path = dir.join("scheduled_recordings.json");
+        let mut schedule = DvrSchedule::load(path, 0.0);
+        let due = build_job(&spec(&stalker_channel(), "Due", 100, 200, 0, 0), 0.0).expect("job");
+        let id = due.id.clone();
+        schedule.add_job(due);
+        assert_eq!(schedule.tick(150.0).len(), 1);
+        schedule.mark_resolving(&id);
+        assert!(schedule.cancel_job(&id));
+        assert!(!schedule.resolution_succeeded(&id));
+        assert_eq!(schedule.get(&id).expect("job").status, STATUS_CANCELED);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
