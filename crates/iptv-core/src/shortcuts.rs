@@ -336,13 +336,13 @@ pub fn main_entries(config: &serde_json::Value) -> Vec<(u32, u32, i32)> {
 }
 
 /// All configurable commands, searched (port of
-/// `searchable_commands`): (context, action, label, display) rows,
+/// `searchable_commands`): (context, action, label, binding, display) rows,
 /// player rows prefixed "Built-in Player — ".
 #[must_use]
 pub fn searchable_commands(
     config: &serde_json::Value,
     query: &str,
-) -> Vec<(String, String, String, String)> {
+) -> Vec<(String, String, String, String, String)> {
     let needle = query.trim().to_lowercase();
     let mut rows = Vec::new();
     for context in ["main", "player"] {
@@ -354,7 +354,8 @@ pub fn searchable_commands(
                 display = format!("Built-in Player — {display}");
             }
             if needle.is_empty() || display.to_lowercase().contains(&needle) {
-                rows.push((context.to_string(), action, name, display));
+                let binding = bindings[&action].clone();
+                rows.push((context.to_string(), action, name, binding, display));
             }
         }
     }
@@ -401,7 +402,8 @@ mod tests {
         assert_eq!(rows[0].0, "main");
         let rows = searchable_commands(&config, "record");
         assert_eq!(rows.len(), 2);
-        assert!(rows[1].3.starts_with("Built-in Player — "));
+        assert!(rows[1].4.starts_with("Built-in Player — "));
+        assert_eq!(rows[1].3, "Ctrl+R", "raw binding rides along for editors");
         let _ = &mut config;
     }
 

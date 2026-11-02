@@ -49,7 +49,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .with_style(TextCtrlStyle::ProcessEnter)
             .build();
         search.set_accessibility_label("Search channels");
-        search.set_accessibility_description("Type to filter channel names within the active category. Tab or Enter moves to Channels; Shift+Tab returns to Toggle favorite.");
+        search.set_accessibility_description("Type to filter channel names within the active category. Tab or Enter moves to Channels; Shift+Tab returns to Categories.");
         // Keep the label immediately before the list for native MSW accessible naming.
         let label = StaticText::builder(&panel).with_label("Channels").build();
         let list = ListCtrl::builder(&panel)
@@ -224,8 +224,8 @@ fn category_controls(panel: Panel) -> (StaticText, TreeCtrl, Button) {
     let category = TreeCtrl::builder(&panel)
         .with_style(TreeCtrlStyle::HideRoot)
         .build();
-    category.set_accessibility_label("Category");
-    category.set_accessibility_description("Choose All Channels, Favorites, or a playlist group. Tab moves to Toggle favorite; Shift+Tab returns to Cancel loading.");
+    category.set_accessibility_label("Categories");
+    category.set_accessibility_description("Choose All Channels, Favorites, or a playlist group. Tab moves to Search; Shift+Tab returns to Playlist view.");
     if let Some(root) = category.add_root("Categories", None, None) {
         category.append_item(&root, "All Channels", None, None);
         category.append_item(&root, "Favorites", None, None);
@@ -752,6 +752,12 @@ fn bind_actions(_frame: Frame, wiring: &Wiring, controls: Controls) {
     bind_f1_help(&list, wiring, "channel-list", status);
     bind_f1_help(&episode_description, wiring, "episode-description", status);
     bind_f1_help(&stream_url, wiring, "main-window", status);
+    bind_main_hotkeys(&scope_choice, wiring, controls, status);
+    bind_main_hotkeys(&category, wiring, controls, status);
+    bind_main_hotkeys(&search, wiring, controls, status);
+    bind_main_hotkeys(&list, wiring, controls, status);
+    bind_main_hotkeys(&episode_description, wiring, controls, status);
+    bind_main_hotkeys(&stream_url, wiring, controls, status);
 }
 
 /// The Toggle favorite action: toggles the channel behind the selected or
@@ -4663,7 +4669,7 @@ fn key_event_label(event: wxdragon::event::Event) -> Option<String> {
     let code = event.get_key_code()?;
     let key = match code {
         340..=351 => format!("F{}", code - 339),
-        27 => "Escape".to_string(),
+        27 => "Esc".to_string(),
         13 => "Enter".to_string(),
         32 => "Space".to_string(),
         315 => "Up".to_string(),
@@ -6061,6 +6067,62 @@ where
     });
 }
 
+/// Main-window keys that have no menu item (Python dispatches them
+/// as accelerators): volume up/down drive the built-in player in
+/// steps of 2, and Record toggles recording of the selected channel.
+/// wxdragon exposes no accelerator table, so the binding rides the
+/// focusable controls' `KEY_DOWN` events, next to the F1 bindings.
+fn bind_main_hotkeys<T>(control: &T, wiring: &Wiring, controls: Controls, status: Status)
+where
+    T: wxdragon::event::WxEvtHandler,
+{
+    let wiring = clone_wiring(wiring);
+    control.bind_internal(EventType::KEY_DOWN, move |event| {
+        dispatch_main_hotkey(&wiring, controls, status, event);
+        event.skip(true);
+    });
+}
+
+fn dispatch_main_hotkey(
+    wiring: &Wiring,
+    controls: Controls,
+    status: Status,
+    event: wxdragon::event::Event,
+) {
+    let Some(label) = key_event_label(event) else {
+        return;
+    };
+    let config = serde_json::Value::Object(wiring.persist.config.borrow().raw().clone());
+    let keys = iptv_core::shortcuts::effective(&config, "main");
+    let action = ["volume_up", "volume_down", "record"]
+        .into_iter()
+        .find(|name| keys.get(*name) == Some(&label));
+    match action {
+        Some("volume_up" | "volume_down") => {
+            let delta = if action == Some("volume_up") { 2 } else { -2 };
+            let player = Rc::clone(&wiring.player);
+            let current = player
+                .borrow()
+                .window
+                .as_ref()
+                .map(|win| win.volume.get_value());
+            if let Some(current) = current {
+                let value = (current + delta).clamp(0, 100);
+                player_set_volume(&player, value);
+                status.set_label(&format!("Volume {value} percent."));
+            }
+        }
+        Some("record") => {
+            if let Some(channel) = selected_channel(&wiring.browser, &wiring.model, controls.list) {
+                toggle_recording(&wiring.recordings, &wiring.persist, &channel, status);
+            } else {
+                status.set_label("Select a channel to record first.");
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Options > Keyboard Shortcuts...: list every command with its
 /// effective binding; Edit changes one (validated by the core
 /// engine with the Python error strings); Reset restores defaults.
@@ -6071,7 +6133,7 @@ fn open_shortcuts_editor(wiring: &Wiring, status: Status) {
         let rows = iptv_core::shortcuts::searchable_commands(&config, "");
         let labels: Vec<String> = rows
             .iter()
-            .map(|(context, _, label, binding)| {
+            .map(|(context, _, label, binding, _display)| {
                 let where_ = if context == "player" {
                     "Built-in Player"
                 } else {
@@ -6102,7 +6164,7 @@ fn open_shortcuts_editor(wiring: &Wiring, status: Status) {
         };
         let config = serde_json::Value::Object(wiring_e.persist.config.borrow().raw().clone());
         let rows = iptv_core::shortcuts::searchable_commands(&config, "");
-        let Some((context, action, label, binding)) =
+        let Some((context, action, label, binding, _display)) =
             rows.get(usize::try_from(index).unwrap_or(usize::MAX))
         else {
             return;
