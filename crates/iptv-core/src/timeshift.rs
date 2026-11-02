@@ -406,6 +406,21 @@ impl BufferWindow {
         self.ended
     }
 
+    /// The stable playlist target duration once a manifest has
+    /// been published (None before that; the playlist renderer
+    /// falls back to 2, Python's empty-window literal).
+    #[must_use]
+    pub fn target_duration(&self) -> Option<i64> {
+        self.target_duration
+    }
+
+    /// Mark input ended without an ENDLIST in the manifest:
+    /// the ingest process exited and its final uploads drained
+    /// (Python's `_finish_input` sets `window.ended` directly).
+    pub fn mark_ended(&mut self) {
+        self.ended = true;
+    }
+
     /// Whether the window has been closed.
     #[must_use]
     pub fn is_closed(&self) -> bool {
@@ -831,10 +846,20 @@ impl LiveBuffer {
             .map(|(_, view)| view.first_sequence)
     }
 
+    /// Whether a view still has its initial (trimmed)
+    /// playlist pending, without consuming the flag (the
+    /// HEAD request path renders but does not discard).
+    #[must_use]
+    pub fn view_is_initial(&self, view_id: u64) -> bool {
+        self.views
+            .iter()
+            .find(|(id, _)| *id == view_id)
+            .is_some_and(|(_, view)| view.initial)
+    }
+
     /// Read and clear a view's initial flag (Python's playlist
     /// fetch consumes it: the first playlist for a fresh view is
     /// trimmed until the input ends).
-    #[must_use]
     pub fn take_initial(&mut self, view_id: u64) -> bool {
         if let Some((_, view)) = self.views.iter_mut().find(|(id, _)| *id == view_id) {
             let was = view.initial;

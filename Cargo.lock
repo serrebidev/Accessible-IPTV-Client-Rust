@@ -767,6 +767,8 @@ dependencies = [
  "iptv-vlc",
  "live-region",
  "serde_json",
+ "sha2 0.10.9",
+ "ureq",
  "wxdragon",
 ]
 
