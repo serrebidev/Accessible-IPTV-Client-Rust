@@ -1,6 +1,7 @@
 //! wx-free domain types and playlist behavior for the Rust port.
 
 pub mod browser;
+pub mod category;
 pub mod favorites;
 pub mod loading;
 pub mod search;
@@ -21,10 +22,17 @@ pub struct Channel {
 }
 
 /// Widget-independent local playlist browse state.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BrowseModel {
     channels: Vec<Channel>,
     malformed: usize,
+    categories: Vec<category::Category>,
+}
+
+impl Default for BrowseModel {
+    fn default() -> Self {
+        Self::empty()
+    }
 }
 
 impl BrowseModel {
@@ -38,11 +46,17 @@ impl BrowseModel {
     }
 
     #[must_use]
-    pub const fn empty() -> Self {
+    pub fn empty() -> Self {
         Self {
             channels: Vec::new(),
             malformed: 0,
+            categories: vec![category::Category::All],
         }
+    }
+
+    #[must_use]
+    pub fn categories(&self) -> &[category::Category] {
+        &self.categories
     }
 
     #[must_use]
@@ -107,7 +121,18 @@ fn parse_cancellable(text: &str, current: impl Fn() -> bool) -> Option<BrowseMod
         }
     }
 
+    let mut groups = std::collections::BTreeSet::new();
+    for (index, channel) in channels.iter().enumerate() {
+        if index % 256 == 0 && !current() {
+            return None;
+        }
+        groups.insert(category::group_name(channel).to_owned());
+    }
+    let categories = std::iter::once(category::Category::All)
+        .chain(groups.into_iter().map(category::Category::Group))
+        .collect();
     current().then_some(BrowseModel {
+        categories,
         channels,
         malformed: malformed + usize::from(has_pending && !pending_malformed),
     })

@@ -1,5 +1,5 @@
 //! Single-flight, replaceable channel-name searches; no widget dependencies.
-use crate::{search_rank, BrowseModel, Channel};
+use crate::{category::Category, search_rank, BrowseModel, Channel};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     mpsc, Arc,
@@ -10,11 +10,23 @@ pub(crate) fn matching_rows(
     query: &str,
     current: impl Fn() -> bool,
 ) -> Option<Vec<usize>> {
+    matching_category_rows(channels, query, &Category::All, current)
+}
+
+fn matching_category_rows(
+    channels: &[Channel],
+    query: &str,
+    category: &Category,
+    current: impl Fn() -> bool,
+) -> Option<Vec<usize>> {
     let query = query.trim().to_lowercase();
     let mut matches = Vec::new();
     for (index, channel) in channels.iter().enumerate() {
         if index % 256 == 0 && !current() {
             return None;
+        }
+        if !category.includes(channel) {
+            continue;
         }
         if query.is_empty() {
             matches.push(((0, 0), index));
@@ -48,6 +60,7 @@ pub struct SearchResults {
     rows: Vec<usize>,
     positions: Vec<usize>,
     query: String,
+    category: Category,
 }
 
 impl Default for SearchResults {
@@ -58,11 +71,22 @@ impl Default for SearchResults {
             rows: Vec::new(),
             positions: Vec::new(),
             query: String::new(),
+            category: Category::All,
         }
     }
 }
 
 impl SearchResults {
+    #[must_use]
+    pub fn categories(&self) -> &[Category] {
+        &self.playlist.categories
+    }
+
+    #[must_use]
+    pub const fn category(&self) -> &Category {
+        &self.category
+    }
+
     #[must_use]
     pub fn len(&self) -> usize {
         self.rows.len()
@@ -109,6 +133,19 @@ impl SearchResults {
     pub fn status(&self) -> String {
         let message = if self.playlist.channels().is_empty() {
             "Channel list is empty. Open another playlist.".to_owned()
+        } else if self.category != Category::All {
+            if self.is_empty() {
+                format!(
+                    "No channels in category {}. Change category or clear Search channels.",
+                    self.category.label()
+                )
+            } else {
+                format!(
+                    "{} channels in category {}.",
+                    self.len(),
+                    self.category.label()
+                )
+            }
         } else if self.query.trim().is_empty() {
             format!(
                 "{} channels. Search cleared; showing all channels.",
@@ -131,6 +168,7 @@ struct Request {
     generation: u64,
     playlist: Arc<BrowseModel>,
     query: String,
+    category: Category,
 }
 
 /// One worker serializes searches, skips queued obsolete requests, and checks
@@ -153,9 +191,12 @@ impl Default for SearchWorker {
                     request = newer;
                 }
                 let current = || active.load(Ordering::Relaxed) == request.generation;
-                let Some(rows) =
-                    matching_rows(request.playlist.channels(), &request.query, current)
-                else {
+                let Some(rows) = matching_category_rows(
+                    request.playlist.channels(),
+                    &request.query,
+                    &request.category,
+                    current,
+                ) else {
                     continue;
                 };
                 let mut positions = vec![usize::MAX; request.playlist.channels().len()];
@@ -170,6 +211,7 @@ impl Default for SearchWorker {
                             rows,
                             positions,
                             query: request.query,
+                            category: request.category,
                         })
                         .is_err()
                 {
@@ -188,11 +230,17 @@ impl Default for SearchWorker {
 impl SearchWorker {
     /// Queue a cheap shared playlist snapshot. No channel scanning on the caller.
     pub fn submit(&self, playlist: Arc<BrowseModel>, query: String) {
+        self.submit_category(playlist, query, Category::All);
+    }
+
+    /// Compose a category projection with the existing ranked name search.
+    pub fn submit_category(&self, playlist: Arc<BrowseModel>, query: String, category: Category) {
         let generation = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
         let _ = self.requests.send(Request {
             generation,
             playlist,
             query,
+            category,
         });
     }
 
@@ -224,7 +272,7 @@ impl Drop for SearchWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parse_m3u;
+
     use std::{
         cell::Cell,
         time::{Duration, Instant},
@@ -237,10 +285,7 @@ mod tests {
             text.push_str(name);
             text.push_str("\nsame-url\n");
         }
-        Arc::new(BrowseModel {
-            channels: parse_m3u(&text),
-            malformed: 0,
-        })
+        Arc::new(crate::parse_cancellable(&text, || true).unwrap())
     }
 
     fn wait(worker: &SearchWorker) -> SearchResults {

@@ -1,4 +1,5 @@
 # Inspect the built prototype through Windows MSAA; no NVDA claims.
+param([string]$ExecutablePath)
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
@@ -22,6 +23,13 @@ public class FoundationAccessible {
     private static extern int GetClassName(IntPtr window, System.Text.StringBuilder name, int length);
     [DllImport("user32.dll")]
     private static extern IntPtr SendMessage(IntPtr window, uint message, IntPtr wParam, IntPtr lParam);
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetParent(IntPtr window);
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetNextDlgTabItem(IntPtr dialog, IntPtr control, bool previous);
+    public static bool NextTabIs(IntPtr from, IntPtr to) {
+        return GetNextDlgTabItem(GetParent(from), from, false) == to;
+    }
     [DllImport("oleacc.dll")]
     private static extern int AccessibleObjectFromWindow(IntPtr window, uint id,
         ref Guid iid, [MarshalAs(UnmanagedType.Interface)] out IAccessible accessible);
@@ -62,7 +70,9 @@ public class FoundationAccessible {
 }
 '@
 
-$appPath = if ($env:CARGO_TARGET_DIR) {
+$appPath = if ($ExecutablePath) {
+    $ExecutablePath
+} elseif ($env:CARGO_TARGET_DIR) {
     Join-Path $env:CARGO_TARGET_DIR 'debug\iptv-app.exe'
 } else {
     Join-Path $PSScriptRoot '..\target\debug\iptv-app.exe'
@@ -102,6 +112,7 @@ try {
     foreach ($controlSpec in @(
         @{ Class = 'Button'; Name = 'Open playlist' },
         @{ Class = 'Button'; Name = 'Cancel loading' },
+        @{ Class = 'ComboBox'; Name = 'Categories' },
         @{ Class = 'Edit'; Name = 'Search channels' }
     )) {
         $controlHandle = [FoundationAccessible]::FindDescendant(
@@ -114,6 +125,16 @@ try {
             throw "Missing or non-focusable control: $($controlSpec.Name)"
         }
     }
+    $cancelHandle = [FoundationAccessible]::FindDescendant($windowHandle, 'Button', 'Cancel loading')
+    $categoryHandle = [FoundationAccessible]::FindDescendant($windowHandle, 'ComboBox', 'Categories')
+    $searchHandle = [FoundationAccessible]::FindDescendant($windowHandle, 'Edit', 'Search channels')
+    if (-not [FoundationAccessible]::NextTabIs($cancelHandle, $categoryHandle) -or
+        -not [FoundationAccessible]::NextTabIs($categoryHandle, $searchHandle) -or
+        -not [FoundationAccessible]::NextTabIs($searchHandle, $listHandle)) {
+        throw 'Native tab order must be Cancel loading, Categories, Search channels, Channels.'
+    }
+    $category = [FoundationAccessible]::Read($categoryHandle)
+    if ($category.Value -ne 'All Channels') { throw "Unexpected initial category: $($category.Value)" }
     $statusHandle = [FoundationAccessible]::FindDescendant(
         $windowHandle, 'Edit', 'Playlist status')
     if ($statusHandle -eq [IntPtr]::Zero) {
@@ -125,7 +146,7 @@ try {
         $status.Value -ne 'No playlist loaded. Channel list is empty.') {
         throw 'Playlist status is not read-only or has incorrect initial empty guidance.'
     }
-    Write-Output "PASS: MSAA Channels, native list role, zero items; named focusable actions/search; focusable read-only empty status. HasKeyboardFocus=$([bool]($accessible.State -band 4)). Announcements and traversal require separate validation."
+    Write-Output "PASS: MSAA Channels, native list role, zero items; named focusable actions/categories/search; category value All Channels; native category/search/list tab order; focusable read-only empty status. HasKeyboardFocus=$([bool]($accessible.State -band 4)). Announcements and traversal require separate validation."
 
 } finally {
     if (-not $app.HasExited) {

@@ -11,8 +11,8 @@ from typing import Dict, List
 
 REVISION = "9aa89e053225ef2c83c4f3659775a00723012ff7"
 FIXTURES = Path(__file__).resolve().parents[1] / "crates/iptv-core/tests/fixtures"
-SOURCES = ("local.m3u", "recovery.m3u", "empty.m3u", "invalid-utf8.m3u")
-QUERIES = ("", "c", " CAT ", "news", "missing", "映画")
+SOURCES = ("local.m3u", "recovery.m3u", "empty.m3u", "invalid-utf8.m3u", "categories.m3u")
+QUERIES = ("", "c", " CAT ", "news", "missing", "æ˜ ç”»")
 
 
 def main():
@@ -37,11 +37,33 @@ def main():
     probe = type("Probe", (), {"_extract_stream_id": staticmethod(lambda url: "")})()
     channels_output = [f"# Python {REVISION}; source, name, group, url, tvg-id, tvg-name"]
     search_output = [f"# Python {REVISION}; source, query, ordered source indexes"]
+    # Extract actual grouping fallback, UI ordering and projection from main.py.
+    main_tree = ast.parse(committed("main.py"))
+    grouping = next(n.value for n in ast.walk(main_tree) if isinstance(n, ast.Assign)
+                    and any(isinstance(t, ast.Name) and t.id == "grp" for t in n.targets)
+                    and ast.unparse(n.value) == "ch.get('group') or 'Uncategorized'")
+    ordering = next(n.iter for n in ast.walk(node("main.py", "_refresh_group_ui"))
+                    if isinstance(n, ast.For) and ast.unparse(n.iter) == "sorted(scoped_groups)")
+    exec(compile(ast.Module(body=[node("main.py", "_source_for_group")], type_ignores=[]), "pinned-category-projection", "exec"), namespace)
+    namespace["favorites"] = type("Favorites", (), {"FAVORITES_GROUP": "Favorites"})
+    category_output = [f"# Python {REVISION}; source, kind, key, ordered source indexes"]
     outcomes = [f"# Python {REVISION}; source, outcome"]
     for source in SOURCES:
         # Same decoding policy as main.py local source loading, with universal newlines.
         text = (FIXTURES / source).read_bytes().decode("utf-8-sig", errors="ignore")
         channels = namespace["_parse_m3u_return"](probe, text)
+        groups = {}
+        for channel in channels:
+            group = eval(compile(ast.Expression(grouping), "pinned-group-key", "eval"), {}, {"ch": channel})
+            groups.setdefault(group, []).append(channel)
+        ordered = eval(compile(ast.Expression(ordering), "pinned-category-order", "eval"), {}, {"scoped_groups": groups})
+        scoped = type("Scoped", (), {"scoped_all_channels": lambda self: channels, "scoped_channels_by_group": lambda self: groups})()
+        for kind, key in [("all", "All Channels")] + [("group", group) for group in ordered]:
+            # Scope-aware reference keys distinguish literal groups from sentinels.
+            source_key = ("playlist-group", "", key) if kind == "group" else key
+            projected = namespace["_source_for_group"](scoped, source_key)
+            indexes = [i for i, channel in enumerate(channels) if any(channel is entry for entry in projected)]
+            category_output.append(f"{source}\t{kind}\t{key}\t{','.join(map(str, indexes))}\t.")
         outcomes.append(f"{source}\t{'loaded' if channels else 'empty'}")
         for channel in channels:
             fields = [source] + [channel.get(key, "") for key in ("name", "group", "url", "tvg-id", "tvg-name")]
@@ -53,14 +75,14 @@ def main():
             if normalized:
                 rows.sort(key=lambda i: namespace["search_rank"](channels[i]["name"], normalized))
             search_output.append(f"{source}\t{query}\t{','.join(map(str, rows))}\t.")
-    for name, lines in (("python-channels.tsv", channels_output), ("python-search.tsv", search_output), ("python-outcomes.tsv", outcomes)):
+    for name, lines in (("python-channels.tsv", channels_output), ("python-search.tsv", search_output), ("python-outcomes.tsv", outcomes), ("python-categories.tsv", category_output)):
         expected = "\n".join(lines) + "\n"
         path = FIXTURES / name
         if "--update" in sys.argv[2:]:
             path.write_text(expected, encoding="utf-8", newline="\n")
         else:
             assert path.read_text(encoding="utf-8") == expected, f"Parity mismatch: {name}"
-    print(f"PASS: four shared fixtures, parsed fields/order, 24 searches and load/empty outcomes; Python {REVISION}. Domain evidence only.")
+    print(f"PASS: five shared fixtures, parsed fields/order, 30 searches, category projections and load/empty outcomes; Python {REVISION}. Domain evidence only.")
 
 
 if __name__ == "__main__":
