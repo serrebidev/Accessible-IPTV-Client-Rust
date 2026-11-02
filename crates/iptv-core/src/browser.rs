@@ -1,5 +1,6 @@
 //! The local browse application seam, shared by the desktop and domain tests.
 use crate::{
+    category::Category,
     loading::{LoadFailure, LoadWorker},
     search::{SearchResults, SearchWorker},
     BrowseModel,
@@ -20,6 +21,7 @@ pub struct BrowserWorker {
     replacement: Option<Arc<BrowseModel>>,
     loading: bool,
     searching: bool,
+    category: Category,
 }
 
 impl BrowserWorker {
@@ -45,9 +47,16 @@ impl BrowserWorker {
     /// A new query supersedes a pending load and searches the last usable source.
     pub fn search(&mut self, query: String) -> bool {
         let cancelled = self.cancel_load();
-        self.searcher.submit(Arc::clone(&self.playlist), query);
+        self.searcher
+            .submit_category(Arc::clone(&self.playlist), query, self.category.clone());
         self.searching = true;
         cancelled
+    }
+
+    /// A category change supersedes pending work without changing keyboard focus.
+    pub fn select_category(&mut self, category: Category, query: String) -> bool {
+        self.category = category;
+        self.search(query)
     }
 
     /// Poll from the UI thread; never reads, parses or scans channels here.
@@ -67,13 +76,20 @@ impl BrowserWorker {
                 std::thread::spawn(move || drop(previous));
                 self.loading = false;
             }
+            self.category = results.category().clone();
             self.searching = false;
             BrowseEvent::Results(results)
         })
     }
 
     fn filter_loaded(&mut self, loaded: Arc<BrowseModel>, query: &str) {
-        self.searcher.submit(Arc::clone(&loaded), query.to_owned());
+        let category = if loaded.categories().contains(&self.category) {
+            self.category.clone()
+        } else {
+            Category::All
+        };
+        self.searcher
+            .submit_category(Arc::clone(&loaded), query.to_owned(), category);
         self.replacement = Some(loaded);
         self.searching = true;
     }
@@ -120,6 +136,38 @@ mod tests {
             BrowseEvent::Results(results) => results,
             BrowseEvent::Recovery(error) => panic!("{error:?}"),
         }
+    }
+
+    #[test]
+    fn categories_survive_failure_cancel_and_replacement_without_stale_rows() {
+        let mut browser = BrowserWorker::default();
+        browser.load(fixture("categories.m3u"));
+        let all = results(wait(&mut browser, ""));
+        let news = Category::Group("News".into());
+        browser.select_category(news.clone(), String::new());
+        let selected = results(wait(&mut browser, ""));
+        assert_eq!(selected.len(), 2);
+        assert_eq!(selected.restore_row(&all, Some(4)), Some(1));
+        browser.load(fixture("absent.m3u"));
+        assert!(matches!(wait(&mut browser, ""), BrowseEvent::Recovery(_)));
+        browser.search(String::new());
+        assert_eq!(results(wait(&mut browser, "")).category(), &news);
+        browser.loading = true;
+        browser.filter_loaded(Arc::new(BrowseModel::empty()), "");
+        assert!(browser.cancel_load());
+        browser.search(String::new());
+        assert_eq!(results(wait(&mut browser, "")).category(), &news);
+        browser.load(fixture("categories.m3u"));
+        assert_eq!(results(wait(&mut browser, "")).category(), &news);
+        browser.load(fixture("empty.m3u"));
+        let empty = results(wait(&mut browser, ""));
+        assert_eq!(empty.category(), &Category::All);
+        assert!(empty.is_empty());
+        assert_eq!(empty.restore_row(&selected, Some(1)), None);
+        assert_eq!(empty.categories(), &[Category::All]);
+        browser.load(fixture("categories.m3u"));
+        assert!(browser.select_category(news, String::new()));
+        assert!(results(wait(&mut browser, "")).is_empty());
     }
 
     #[test]

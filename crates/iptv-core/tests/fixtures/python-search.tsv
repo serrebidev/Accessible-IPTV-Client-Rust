@@ -23,3 +23,9 @@ invalid-utf8.m3u	 CAT 		.
 invalid-utf8.m3u	news	0	.
 invalid-utf8.m3u	missing		.
 invalid-utf8.m3u	映画		.
+categories.m3u		0,1,2,3,4,5,6	.
+categories.m3u	c	5	.
+categories.m3u	 CAT 		.
+categories.m3u	news		.
+categories.m3u	missing	2	.
+categories.m3u	映画		.

@@ -1,0 +1,15 @@
+﻿#EXTM3U
+#EXTINF:-1 group-title="zoo",Zoo
+fixture-zoo
+#EXTINF:-1 tvg-id="n1" group-title="News",Same
+fixture-n1
+#EXTINF:-1,Missing
+fixture-missing
+#EXTINF:-1 group-title="   ",Blank
+fixture-blank
+#EXTINF:-1 tvg-id="n2" group-title="News",Same
+fixture-n2
+#EXTINF:-1 group-title="Uncategorized",Explicit
+fixture-explicit
+#EXTINF:-1 group-title="All Channels",Literal
+fixture-literal

@@ -10,3 +10,10 @@ recovery.m3u	猫cat		https://example.invalid/unicode		TV	.
 recovery.m3u	Cat		https://example.invalid/duplicate			.
 recovery.m3u			https://example.invalid/plain			.
 invalid-utf8.m3u	Bad News		https://example.invalid/bytes			.
+categories.m3u	Zoo	zoo	fixture-zoo			.
+categories.m3u	Same	News	fixture-n1	n1		.
+categories.m3u	Missing		fixture-missing			.
+categories.m3u	Blank		fixture-blank			.
+categories.m3u	Same	News	fixture-n2	n2		.
+categories.m3u	Explicit	Uncategorized	fixture-explicit			.
+categories.m3u	Literal	All Channels	fixture-literal			.
