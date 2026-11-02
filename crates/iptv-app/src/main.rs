@@ -15,6 +15,7 @@ use iptv_core::{
     reminders::{normalize_reminders, Reminder, ReminderStatus},
     search::SearchResults,
     sources::PlaylistSource,
+    subtitles::{active as active_cue, load_cues, Cue},
     vod::{VodCatalog, VodEvent, VodItem, VodKind, VodWorker},
     Channel,
 };
@@ -212,6 +213,8 @@ struct PlayerState {
     window: Option<(Frame, MediaCtrl)>,
     current_channel: Option<Channel>,
     pending_resume_ms: Option<i64>,
+    subtitle_cues: Vec<Cue>,
+    last_spoken_cue: Option<usize>,
 }
 
 impl Default for PlayerState {
@@ -222,6 +225,8 @@ impl Default for PlayerState {
             window: None,
             current_channel: None,
             pending_resume_ms: None,
+            subtitle_cues: Vec::new(),
+            last_spoken_cue: None,
         }
     }
 }
@@ -1369,6 +1374,8 @@ fn play_builtin(
     let mut state = player.borrow_mut();
     state.current_channel = Some(channel.clone());
     state.pending_resume_ms = request.resume_ms;
+    state.subtitle_cues.clear();
+    state.last_spoken_cue = None;
     let action = state.session.play(request);
     let Some((frame, media)) = state.window else {
         return;
@@ -1403,19 +1410,28 @@ fn ensure_player_window(player: &Rc<RefCell<PlayerState>>, persist: &Persist, st
     pause.set_accessibility_label("Pause or resume");
     let stop = Button::builder(&panel).with_label("&Stop").build();
     stop.set_accessibility_label("Stop");
+    let subs = Button::builder(&panel)
+        .with_label("Load &subtitles…")
+        .build();
+    subs.set_accessibility_label("Load subtitles");
+    subs.set_accessibility_description(
+        "Load an SRT, WebVTT or ASS subtitle file for this playback. When Speak subtitles is on in settings, cues are announced as they play.",
+    );
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     sizer.add(&media, 1, SizerFlag::Expand | SizerFlag::All, 4);
     let buttons = BoxSizer::builder(Orientation::Horizontal).build();
     buttons.add(&pause, 0, SizerFlag::All, 4);
     buttons.add(&stop, 0, SizerFlag::All, 4);
+    buttons.add(&subs, 0, SizerFlag::All, 4);
     sizer.add_sizer(&buttons, 0, SizerFlag::Expand, 0);
     panel.set_sizer(sizer, true);
 
-    wire_player_events(player, persist, status, frame, media, pause, stop);
+    wire_player_events(player, persist, status, frame, media, pause, stop, subs);
     player.borrow_mut().window = Some((frame, media));
 }
 
 /// Timer, buttons, media events and close behavior for the player window.
+#[allow(clippy::too_many_arguments)]
 fn wire_player_events(
     player: &Rc<RefCell<PlayerState>>,
     persist: &Persist,
@@ -1424,6 +1440,7 @@ fn wire_player_events(
     media: MediaCtrl,
     pause: Button,
     stop: Button,
+    subs: Button,
 ) {
     let timer = Rc::new(Timer::new(&frame));
     let tick_player = Rc::clone(player);
@@ -1431,9 +1448,11 @@ fn wire_player_events(
     let tick_media = media;
     timer.on_tick(move |_| {
         checkpoint_resume(&tick_player, &tick_persist, tick_media);
+        speak_subtitle_cue(&tick_player, &tick_persist, tick_media, status);
     });
     let _ = timer.start(1000, false);
 
+    bind_subtitle_load(subs, player, frame, status);
     let pause_player = Rc::clone(player);
     pause.on_click(move |_| {
         let mut state = pause_player.borrow_mut();
@@ -1503,6 +1522,74 @@ fn wire_player_events(
         }
         event.skip(false);
     });
+}
+
+/// The player window's Load subtitles button: pick a file, parse it,
+/// and hold its cues on the player state for the speech path.
+fn bind_subtitle_load(
+    subs: Button,
+    player: &Rc<RefCell<PlayerState>>,
+    frame: Frame,
+    status: Status,
+) {
+    let subs_player = Rc::clone(player);
+    subs.on_click(move |_| {
+        let dialog = FileDialog::builder(&frame)
+            .with_message("Load subtitles")
+            .with_wildcard(
+                "Subtitles (*.srt;*.vtt;*.ass;*.ssa)|*.srt;*.vtt;*.ass;*.ssa|All files (*.*)|*.*",
+            )
+            .with_style(FileDialogStyle::Open | FileDialogStyle::FileMustExist)
+            .build();
+        if dialog.show_modal() != ID_OK {
+            return;
+        }
+        let Some(path) = dialog.get_path() else {
+            return;
+        };
+        match load_cues(std::path::Path::new(&path)) {
+            Ok(cues) => {
+                let count = cues.len();
+                let mut state = subs_player.borrow_mut();
+                state.subtitle_cues = cues;
+                state.last_spoken_cue = None;
+                status.set_label(&format!("Loaded {count} subtitle cues."));
+            }
+            Err(error) => {
+                status.set_label(&format!("Could not load subtitles: {error}"));
+            }
+        }
+    });
+}
+
+/// Announce the active subtitle cue when it changes, while the
+/// `speak_subtitles` setting is on (the reference's spoken-subtitle
+/// path, riding the live region).
+fn speak_subtitle_cue(
+    player: &Rc<RefCell<PlayerState>>,
+    persist: &Persist,
+    media: MediaCtrl,
+    status: Status,
+) {
+    if !persist.config.borrow().bool_or("speak_subtitles", false) {
+        return;
+    }
+    let position = media.tell();
+    if position <= 0 {
+        return;
+    }
+    let mut state = player.borrow_mut();
+    if state.subtitle_cues.is_empty() {
+        return;
+    }
+    let current = active_cue(&state.subtitle_cues, position);
+    if current != state.last_spoken_cue {
+        state.last_spoken_cue = current;
+        if let Some(index) = current {
+            let text = state.subtitle_cues[index].text.clone();
+            live_region::announce_with_priority(status.label, &text, live_region::Priority::Medium);
+        }
+    }
 }
 
 /// Persist the current position for seekable content (Python checkpoint
