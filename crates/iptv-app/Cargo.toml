@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+chrono.workspace = true
 serde_json.workspace = true
 iptv-core.workspace = true
 wxdragon = { workspace = true, features = ["media-ctrl"] }
