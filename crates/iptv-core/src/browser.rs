@@ -95,6 +95,12 @@ impl BrowserWorker {
         &self.favorites
     }
 
+    /// The channel at a playlist index in the current projection's source.
+    #[must_use]
+    pub fn channel(&self, playlist_index: usize) -> Option<crate::Channel> {
+        self.playlist.channels().get(playlist_index).cloned()
+    }
+
     /// Favorited channels present in the current playlist (display counts).
     #[must_use]
     pub fn favorite_count(&self) -> usize {

@@ -2,14 +2,21 @@ use iptv_core::{
     browser::{BrowseEvent, BrowserWorker},
     categories::Category,
     config::{self, Config},
-    favorites::{FavoriteSet, Toggle},
+    favorites::{channel_key, FavoriteSet, Toggle},
+    playback::{
+        candidate_executables, detect_from_path, external_argv, player_choice, resume_checkpoint,
+        resume_position, EngineAction, EngineEvent, LaunchGate, PlaybackRequest, PlaybackSession,
+        PlayerChoice, SessionState,
+    },
     search::SearchResults,
     sources::PlaylistSource,
+    Channel,
 };
-use std::{cell::RefCell, path::PathBuf, rc::Rc};
+use std::{cell::RefCell, collections::BTreeMap, path::PathBuf, process::Command, rc::Rc};
 use wxdragon::event::EventType;
 use wxdragon::prelude::*;
 use wxdragon::timer::Timer;
+use wxdragon::widgets::media_ctrl::SeekMode;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     SystemOptions::set_option_by_int("msw.no-manifest-check", 1);
@@ -168,6 +175,28 @@ struct Wiring {
     timer: Rc<Timer<Frame>>,
     model: Rc<RefCell<SearchResults>>,
     persist: Persist,
+    player: Rc<RefCell<PlayerState>>,
+}
+
+/// Built-in player window state, created lazily on first use.
+struct PlayerState {
+    session: PlaybackSession,
+    gate: LaunchGate,
+    window: Option<(Frame, MediaCtrl)>,
+    current_channel: Option<Channel>,
+    pending_resume_ms: Option<i64>,
+}
+
+impl Default for PlayerState {
+    fn default() -> Self {
+        Self {
+            session: PlaybackSession::new(),
+            gate: LaunchGate::default(),
+            window: None,
+            current_channel: None,
+            pending_resume_ms: None,
+        }
+    }
 }
 
 /// The loaded configuration and the path its saves go to.
@@ -183,6 +212,50 @@ impl Persist {
     fn save_favorites(&self, keys: &[String]) {
         let mut config = self.config.borrow_mut();
         config.set_favorites(keys.to_vec());
+        let _ = config.save(&self.path);
+    }
+
+    fn resume_entries(&self) -> BTreeMap<String, iptv_core::playback::ResumeEntry> {
+        let mut entries = BTreeMap::new();
+        if let Some(serde_json::Value::Object(map)) = self.config.borrow().value("resume_positions")
+        {
+            for (key, value) in map {
+                let fields = (
+                    value.get("position_ms").and_then(serde_json::Value::as_i64),
+                    value.get("length_ms").and_then(serde_json::Value::as_i64),
+                    value.get("updated").and_then(serde_json::Value::as_i64),
+                );
+                if let (Some(position_ms), Some(length_ms), Some(updated)) = fields {
+                    entries.insert(
+                        key.clone(),
+                        iptv_core::playback::ResumeEntry {
+                            position_ms,
+                            length_ms,
+                            updated,
+                        },
+                    );
+                }
+            }
+        }
+        entries
+    }
+
+    fn save_resume(&self, entries: &BTreeMap<String, iptv_core::playback::ResumeEntry>) {
+        let map: serde_json::Map<String, serde_json::Value> = entries
+            .iter()
+            .map(|(key, entry)| {
+                (
+                    key.clone(),
+                    serde_json::json!({
+                        "position_ms": entry.position_ms,
+                        "length_ms": entry.length_ms,
+                        "updated": entry.updated,
+                    }),
+                )
+            })
+            .collect();
+        let mut config = self.config.borrow_mut();
+        config.set_value("resume_positions", serde_json::Value::Object(map));
         let _ = config.save(&self.path);
     }
 }
@@ -201,6 +274,7 @@ fn bind_browser(frame: Frame, controls: Controls, model: Rc<RefCell<SearchResult
             config: Rc::new(RefCell::new(loaded.config)),
             path: loaded.path,
         },
+        player: Rc::new(RefCell::new(PlayerState::default())),
     };
     let configured = wiring.persist.config.borrow().string_list("playlists");
     if !configured.is_empty() {
@@ -302,6 +376,7 @@ fn bind_actions(frame: Frame, wiring: &Wiring, controls: Controls) {
         event.skip(true);
     });
     bind_toggle(wiring, toggle_favorite, list, search, status);
+    bind_playback(wiring, list, status);
     let request = Rc::clone(&browser);
     let poll = Rc::clone(&timer);
     open.on_click(move |_| {
@@ -373,6 +448,286 @@ fn bind_toggle(
             None => status.set_label("No channel selected. Choose a channel in Channels first."),
         }
     });
+}
+
+/// Enter (item activation) on Channels plays the selected channel through
+/// the configured player: the built-in window, or an external player.
+fn bind_playback(wiring: &Wiring, list: ListCtrl, status: Status) {
+    let browser = Rc::clone(&wiring.browser);
+    let model = Rc::clone(&wiring.model);
+    let player = Rc::clone(&wiring.player);
+    let persist = wiring.persist.clone();
+    list.on_item_activated(move |_| {
+        let selected = usize::try_from(list.get_first_selected_item()).ok();
+        let focused =
+            usize::try_from(list.get_next_item(-1, ListNextItemFlag::All, ListItemState::Focused))
+                .ok();
+        let Some(row) = pick_row(selected, focused) else {
+            status.set_label("No channel selected. Choose a channel in Channels first.");
+            return;
+        };
+        let Some(index) = model.borrow().playlist_index(row) else {
+            status.set_label("No channel selected. Choose a channel in Channels first.");
+            return;
+        };
+        let Some(channel) = browser.borrow().channel(index) else {
+            status.set_label("No channel selected. Choose a channel in Channels first.");
+            return;
+        };
+        play_channel(&player, &persist, &channel, status);
+    });
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+}
+
+fn play_channel(
+    player: &Rc<RefCell<PlayerState>>,
+    persist: &Persist,
+    channel: &Channel,
+    status: Status,
+) {
+    let key = channel_key(channel);
+    let entries = persist.resume_entries();
+    let probe = PlaybackRequest::for_channel(channel, None);
+    let resume = if probe.live {
+        None
+    } else {
+        resume_position(&entries, &key)
+    };
+    let request = PlaybackRequest::for_channel(channel, resume);
+    let (media_player, custom_path) = {
+        let config = persist.config.borrow();
+        (
+            config.string_or("media_player", "Built-in Player"),
+            config.string_or("custom_player_path", ""),
+        )
+    };
+    match player_choice(&media_player, &custom_path) {
+        PlayerChoice::BuiltIn => play_builtin(player, persist, channel, request, status),
+        PlayerChoice::Named(name) => {
+            let candidates = candidate_executables(&name, cfg!(windows), cfg!(target_os = "macos"));
+            let exe = if cfg!(windows) || cfg!(target_os = "macos") {
+                candidates
+                    .iter()
+                    .find(|path| std::path::Path::new(path).exists())
+                    .cloned()
+            } else {
+                candidates.into_iter().next()
+            };
+            match exe {
+                Some(exe) => launch_external(player, &name, &exe, &request, status),
+                None => status.set_label(&format!("Could not locate {name} executable.")),
+            }
+        }
+        PlayerChoice::Custom(path) => {
+            if path.is_empty() {
+                status.set_label("No custom player path is configured.");
+            } else {
+                let name = detect_from_path(&path);
+                launch_external(player, &name, &path, &request, status);
+            }
+        }
+    }
+}
+
+fn launch_external(
+    player: &Rc<RefCell<PlayerState>>,
+    name: &str,
+    exe: &str,
+    request: &PlaybackRequest,
+    status: Status,
+) {
+    let ipc = std::env::temp_dir()
+        .join("accessible-iptv-mpv.sock")
+        .to_string_lossy()
+        .into_owned();
+    let accepted = player
+        .borrow_mut()
+        .gate
+        .accept(name, exe, &request.url, now_ms());
+    if accepted.is_none() {
+        return; // Debounced duplicate, as in Python: accepted silently.
+    }
+    let argv = external_argv(name, exe, &request.url, &ipc);
+    match Command::new(&argv[0]).args(&argv[1..]).spawn() {
+        Ok(_) => status.set_label(&format!("Playing {} in {name}.", request.title)),
+        Err(error) => status.set_label(&format!("Could not start {name}: {error}")),
+    }
+}
+
+fn play_builtin(
+    player: &Rc<RefCell<PlayerState>>,
+    persist: &Persist,
+    channel: &Channel,
+    request: PlaybackRequest,
+    status: Status,
+) {
+    ensure_player_window(player, persist, status);
+    let mut state = player.borrow_mut();
+    state.current_channel = Some(channel.clone());
+    state.pending_resume_ms = request.resume_ms;
+    let action = state.session.play(request);
+    let Some((frame, media)) = state.window else {
+        return;
+    };
+    if let EngineAction::Load(load) = action {
+        media.load_uri(&load.url);
+        media.play();
+    }
+    frame.set_title(&format!("{} — Player", state.session.announcement()));
+    frame.show(true);
+    status.set_label(&state.session.announcement());
+}
+
+/// Build the built-in player window once: video surface, Pause/Resume and
+/// Stop buttons, media events feeding the session, and a 1 s timer that
+/// checkpoints resume positions for seekable content.
+fn ensure_player_window(player: &Rc<RefCell<PlayerState>>, persist: &Persist, status: Status) {
+    if player.borrow().window.is_some() {
+        return;
+    }
+    let frame = Frame::builder()
+        .with_title("Player")
+        .with_size(Size::new(560, 380))
+        .build();
+    frame.set_accessibility_label("Player");
+    let panel = Panel::builder(&frame).build();
+    let media = MediaCtrl::builder(&panel).build();
+    media.set_accessibility_label("Video");
+    let pause = Button::builder(&panel)
+        .with_label("&Pause or resume")
+        .build();
+    pause.set_accessibility_label("Pause or resume");
+    let stop = Button::builder(&panel).with_label("&Stop").build();
+    stop.set_accessibility_label("Stop");
+    let sizer = BoxSizer::builder(Orientation::Vertical).build();
+    sizer.add(&media, 1, SizerFlag::Expand | SizerFlag::All, 4);
+    let buttons = BoxSizer::builder(Orientation::Horizontal).build();
+    buttons.add(&pause, 0, SizerFlag::All, 4);
+    buttons.add(&stop, 0, SizerFlag::All, 4);
+    sizer.add_sizer(&buttons, 0, SizerFlag::Expand, 0);
+    panel.set_sizer(sizer, true);
+
+    wire_player_events(player, persist, status, frame, media, pause, stop);
+    player.borrow_mut().window = Some((frame, media));
+}
+
+/// Timer, buttons, media events and close behavior for the player window.
+fn wire_player_events(
+    player: &Rc<RefCell<PlayerState>>,
+    persist: &Persist,
+    status: Status,
+    frame: Frame,
+    media: MediaCtrl,
+    pause: Button,
+    stop: Button,
+) {
+    let timer = Rc::new(Timer::new(&frame));
+    let tick_player = Rc::clone(player);
+    let tick_persist = persist.clone();
+    let tick_media = media;
+    timer.on_tick(move |_| {
+        checkpoint_resume(&tick_player, &tick_persist, tick_media);
+    });
+    let _ = timer.start(1000, false);
+
+    let pause_player = Rc::clone(player);
+    pause.on_click(move |_| {
+        let mut state = pause_player.borrow_mut();
+        state.session.toggle_pause();
+        if let Some((_, media)) = state.window {
+            match state.session.state() {
+                SessionState::Paused => {
+                    media.pause();
+                }
+                SessionState::Playing => {
+                    media.play();
+                }
+                _ => {}
+            }
+        }
+        status.set_label(&state.session.announcement());
+    });
+    let stop_player = Rc::clone(player);
+    let stop_persist = persist.clone();
+    stop.on_click(move |_| {
+        checkpoint_resume(&stop_player, &stop_persist, media);
+        let mut state = stop_player.borrow_mut();
+        state.session.stop();
+        if let Some((frame, media)) = state.window {
+            media.stop();
+            frame.show(false);
+        }
+        status.set_label("Stopped.");
+    });
+    let loaded_player = Rc::clone(player);
+    media.on_loaded(move |_| {
+        let mut state = loaded_player.borrow_mut();
+        state.session.on_event(EngineEvent::Started);
+        if let (Some((_, media)), Some(ms)) = (state.window, state.pending_resume_ms.take()) {
+            media.seek(ms, SeekMode::FromStart);
+        }
+        status.set_label(&state.session.announcement());
+    });
+    let stopped_player = Rc::clone(player);
+    media.on_stop(move |_| {
+        let mut state = stopped_player.borrow_mut();
+        let near_end = state
+            .window
+            .is_some_and(|(_, media)| media.length() > 0 && media.tell() >= media.length() - 1500);
+        let event = if near_end {
+            EngineEvent::Ended
+        } else {
+            EngineEvent::Stalled
+        };
+        if let EngineAction::Reconnect(request) = state.session.on_event(event) {
+            if let Some((_, media)) = state.window {
+                media.load_uri(&request.url);
+                media.play();
+            }
+        }
+        status.set_label(&state.session.announcement());
+    });
+    let close_player = Rc::clone(player);
+    let close_persist = persist.clone();
+    frame.on_close(move |event| {
+        checkpoint_resume(&close_player, &close_persist, media);
+        let mut state = close_player.borrow_mut();
+        state.session.stop();
+        if let Some((frame, media)) = state.window {
+            media.stop();
+            frame.show(false);
+        }
+        event.skip(false);
+    });
+}
+
+/// Persist the current position for seekable content (Python checkpoint
+/// rules decide whether it is kept).
+fn checkpoint_resume(player: &Rc<RefCell<PlayerState>>, persist: &Persist, media: MediaCtrl) {
+    let state = player.borrow();
+    if state.session.current().is_none_or(|r| r.live) {
+        return;
+    }
+    let Some(channel) = &state.current_channel else {
+        return;
+    };
+    let key = channel_key(channel);
+    let channel = channel.clone();
+    drop(state);
+    let position = media.tell();
+    let length = media.length();
+    if position <= 0 || length <= 0 {
+        return;
+    }
+    let _ = channel;
+    let mut entries = persist.resume_entries();
+    resume_checkpoint(&mut entries, &key, position, length, now_ms() / 1000);
+    persist.save_resume(&entries);
 }
 
 /// The row an action applies to: the selected row, else the focused row.
