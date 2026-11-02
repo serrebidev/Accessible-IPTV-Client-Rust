@@ -259,7 +259,7 @@ Subtitle text appears in the video when the stream provides it. Playback > Load 
 Playback > Read Current Subtitle (C) reads the subtitle on screen, or the last one shown when none is on screen. Playback > Previous Subtitle (Page Up) and Next Subtitle (Page Down) move through the subtitles already shown, so you can hear a line you missed again. They never read ahead of playback, and they work whether Speak Subtitles is on or off.
 ### Audio output device {#audio-output-device}
 
-In this build the built-in player plays through the system default output device; there is no separate output-device choice yet. Change the default device in your operating system to route the sound elsewhere, for example to keep TV sound away from your screen reader.
+In the player window, open Playback > Audio Output Device to choose where the built-in player sends its sound, for example to keep TV sound away from your screen reader. The list starts with System default, followed by the output devices libVLC reports. Your choice is remembered and applied every time playback starts; System default leaves the choice to the operating system. The list comes from libVLC, so it is available when the libVLC engine is in use.
 
 ### Controlling the player from the main window {#player-from-main-window}
 

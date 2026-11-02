@@ -4201,6 +4201,9 @@ fn play_builtin(
         if via_vlc {
             state.vlc_active = true;
             state.vlc_tracks_ready = false;
+            drop(state);
+            apply_saved_audio_device(player, persist);
+            state = player.borrow_mut();
         }
         if !via_vlc {
             win.media.load_uri(&load.url);
@@ -4356,6 +4359,7 @@ const PM_SPEAK_SUBS: i32 = 5321;
 const PM_READ_SUB: i32 = 5322;
 const PM_PREV_SUB: i32 = 5323;
 const PM_NEXT_SUB: i32 = 5324;
+const PM_AUDIO_DEVICE: i32 = 5325;
 const PM_CAST: i32 = 5330;
 const PM_FULLSCREEN: i32 = 5331;
 const PM_WHATS_PLAYING: i32 = 5332;
@@ -4430,6 +4434,14 @@ fn build_playback_menu(
         ItemKind::Normal,
     );
     menu_add(&menu, PM_NEXT_SUB, "&Next Subtitle", "", ItemKind::Normal);
+    // Python shows a hard-coded D accelerator on this item.
+    menu_add(
+        &menu,
+        PM_AUDIO_DEVICE,
+        "Audio Output &Device...\tD",
+        "",
+        ItemKind::Normal,
+    );
     menu.append_separator();
     menu_add(&menu, PM_CAST, "&Cast...", "", ItemKind::Normal);
     menu_add(
@@ -4489,6 +4501,7 @@ fn dispatch_player_menu(
                 assert!(shared.timer.start(50, false));
             }
         }
+        PM_AUDIO_DEVICE => prompt_audio_device(player, win.frame, persist, status),
         PM_LOAD_SUBS => prompt_subtitle_file(player, win.frame, persist, status),
         PM_SPEAK_SUBS => {
             let next = !persist.config.borrow().bool_or("speak_subtitles", false);
@@ -4551,6 +4564,99 @@ fn audio_track_menu(player: &Rc<RefCell<PlayerState>>) -> Option<Menu> {
     playback_menu(player)?
         .find_item_by_position(5)?
         .get_sub_menu()
+}
+
+/// Apply the persisted audio output device to the libVLC
+/// engine, when one is set (Python applies it at every play
+/// start; empty = system default = no call).
+fn apply_saved_audio_device(player: &Rc<RefCell<PlayerState>>, persist: &Persist) {
+    let device = persist.config.borrow().string_or("audio_output_device", "");
+    if device.is_empty() {
+        return;
+    }
+    let mut state = player.borrow_mut();
+    if let Some(engine) = &mut state.vlc {
+        engine.set_audio_output_device(&device);
+    }
+}
+
+/// The Audio Output Device dialog (Python): "System default"
+/// first, then libVLC's devices (deduped, description or id);
+/// OK persists a changed choice and applies it live. With no
+/// devices at all, Python shows an information box instead.
+fn prompt_audio_device(
+    player: &Rc<RefCell<PlayerState>>,
+    frame: Frame,
+    persist: &Persist,
+    status: Status,
+) {
+    let devices = {
+        let state = player.borrow();
+        state
+            .vlc
+            .as_ref()
+            .map(iptv_vlc::VlcEngine::audio_output_devices)
+            .unwrap_or_default()
+    };
+    if devices.is_empty() {
+        let _ = MessageDialog::builder(
+            &frame,
+            "No audio output devices were found.",
+            "Audio Output Device",
+        )
+        .with_style(MessageDialogStyle::OK)
+        .build()
+        .show_modal();
+        return;
+    }
+    let mut entries: Vec<(String, String)> = vec![(String::new(), "System default".to_string())];
+    for (id, label) in devices {
+        if !entries.iter().any(|(existing, _)| *existing == id) {
+            entries.push((id, label));
+        }
+    }
+    let current = persist.config.borrow().string_or("audio_output_device", "");
+    let (dialog_frame, panel, list, dstatus) =
+        list_dialog("Audio Output Device", "Audio output devices");
+    let labels: Vec<String> = entries.iter().map(|(_, label)| label.clone()).collect();
+    list.set_items(&labels.iter().map(String::as_str).collect::<Vec<_>>());
+    let selected = entries
+        .iter()
+        .position(|(id, _)| *id == current)
+        .unwrap_or(0);
+    list.set_selection(u32::try_from(selected).unwrap_or(0), true);
+    dstatus.set_silent("Select the audio output device for the built-in player.");
+    let ok = Button::builder(&panel).with_label("&OK").build();
+    let cancel = Button::builder(&panel).with_label("&Cancel").build();
+    let entries = Rc::new(entries);
+    let choose = {
+        let player = Rc::clone(player);
+        let persist = persist.clone();
+        let entries = Rc::clone(&entries);
+        move |list: ListBox, dialog_frame: Frame| {
+            let Some(index) = list.get_selection() else {
+                return;
+            };
+            let Some((device_id, _)) = entries.get(usize::try_from(index).unwrap_or(usize::MAX))
+            else {
+                return;
+            };
+            let current = persist.config.borrow().string_or("audio_output_device", "");
+            if *device_id != current {
+                persist.set_and_save("audio_output_device", serde_json::json!(device_id));
+                apply_saved_audio_device(&player, &persist);
+                status.set_label("Audio output device saved.");
+            }
+            dialog_frame.hide();
+        }
+    };
+    let choose_ok = choose.clone();
+    ok.on_click(move |_| choose_ok(list, dialog_frame));
+    list.bind_internal(EventType::COMMAND_LISTBOX_DOUBLECLICKED, move |_| {
+        choose(list, dialog_frame);
+    });
+    cancel.on_click(move |_| dialog_frame.hide());
+    dialog_frame.show(true);
 }
 
 /// Select an audio track by Choice index (the Choice and the
