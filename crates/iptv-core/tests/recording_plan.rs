@@ -272,6 +272,15 @@ fn url_shaped_channel_name_is_not_a_display_diagnostic() {
 }
 
 #[test]
+fn ordinary_at_sign_in_channel_name_is_preserved() {
+    let result = plan(
+        &channel("K@Home TV", "https://example.invalid/live"),
+        "provider_mkv",
+    );
+    assert_eq!(result.display_label, "K@Home TV");
+}
+
+#[test]
 fn channel_extra_headers_and_authorization_reach_http_input_only() {
     let mut input = channel(
         "Sports",

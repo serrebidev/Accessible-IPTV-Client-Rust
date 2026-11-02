@@ -329,7 +329,7 @@ fn safe_display_name(channel: &Channel, headers: &StreamHeaders) -> String {
                 let value = value.trim();
                 !value.is_empty() && name.contains(value)
             });
-    if name.contains("://") || name.contains('@') || name.contains('|') || contains_header_value {
+    if name.contains("://") || name.contains('|') || contains_header_value {
         "Recording".to_string()
     } else {
         name.to_string()
