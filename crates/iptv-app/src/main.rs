@@ -331,6 +331,7 @@ struct Wiring {
     cast_worker: Rc<CastWorker>,
     cast_pending: Rc<std::cell::Cell<bool>>,
     cast_ui: Rc<RefCell<Option<CastUi>>>,
+    proxy: Rc<RefCell<Option<iptv_core::proxy::ProxyServer>>>,
     guide_ui: Rc<RefCell<Option<GuideUi>>>,
     update_worker: Rc<UpdateWorker>,
     update_pending: Rc<std::cell::Cell<bool>>,
@@ -525,6 +526,7 @@ fn bind_browser(frame: Frame, controls: Controls, model: Rc<RefCell<SearchResult
         cast_worker: Rc::new(CastWorker::new()),
         cast_pending: Rc::new(std::cell::Cell::new(false)),
         cast_ui: Rc::new(RefCell::new(None)),
+        proxy: Rc::new(RefCell::new(None)),
         guide_ui: Rc::new(RefCell::new(None)),
         update_worker: Rc::new(UpdateWorker::new()),
         update_pending: Rc::new(std::cell::Cell::new(false)),
@@ -547,6 +549,7 @@ fn bind_browser(frame: Frame, controls: Controls, model: Rc<RefCell<SearchResult
     wiring.player.borrow_mut().shared = Some(PlayerShared {
         recordings: Rc::clone(&wiring.recordings),
         cast_ui: Rc::clone(&wiring.cast_ui),
+        proxy: Rc::clone(&wiring.proxy),
         cast_worker: Rc::clone(&wiring.cast_worker),
         cast_pending: Rc::clone(&wiring.cast_pending),
         timer: Rc::clone(&wiring.timer),
@@ -566,6 +569,9 @@ fn bind_browser(frame: Frame, controls: Controls, model: Rc<RefCell<SearchResult
     bind_context_menu(frame, &wiring, controls);
     let browser = Rc::clone(&wiring.browser);
     let timer = Rc::clone(&wiring.timer);
+    wiring
+        .provider_worker
+        .set_cache_dir(iptv_core::config::user_config_dir().join("provider-cache"));
     let close_persist = wiring.persist.clone();
     frame.bind_internal(EventType::CLOSE_WINDOW, move |event| {
         if close_persist
@@ -1019,6 +1025,14 @@ fn start_recording(
     display_name: &str,
 ) -> Result<PathBuf, String> {
     let dir = recordings_dir(persist);
+    if let Some(free) = recording::free_space_bytes(&dir) {
+        if free < recording::MIN_FREE_BYTES {
+            return Err(format!(
+                "Not enough free space to record ({} MB free).",
+                free / (1024 * 1024)
+            ));
+        }
+    }
     let stamp = chrono::Local::now().format("%Y-%m-%d %H-%M-%S").to_string();
     let in_use = recordings.borrow().in_use_paths();
     let out = recording::unique_output_path(
@@ -1120,7 +1134,12 @@ fn poll_recordings(wiring: &Wiring, status: Status) {
             );
         }
         if finished.success {
-            status.set_label(&format!("Recording saved: {name}"));
+            let size = std::fs::metadata(&finished.out_path).map_or(0, |m| m.len());
+            status.set_label(&format!(
+                "Recording saved: {name} ({}.{} MB)",
+                size / 1_000_000,
+                (size % 1_000_000) / 100_000
+            ));
         } else {
             status.set_label(&format!("Recording failed: {name}"));
         }
@@ -1433,8 +1452,85 @@ fn open_cast_window(wiring: &Wiring, list: ListCtrl) {
         &wiring.cast_worker,
         &wiring.cast_pending,
         &wiring.timer,
+        &wiring.proxy,
         channel.as_ref(),
     );
+}
+
+/// The cast window's Play / Stop / Refresh bindings.
+#[allow(clippy::too_many_arguments)]
+fn bind_cast_buttons(
+    play: Button,
+    stop: Button,
+    refresh: Button,
+    devices: ListBox,
+    view: &Rc<RefCell<CastView>>,
+    worker: &Rc<CastWorker>,
+    pending: &Rc<std::cell::Cell<bool>>,
+    timer: &Rc<Timer<Frame>>,
+    proxy: &Rc<RefCell<Option<iptv_core::proxy::ProxyServer>>>,
+    status: Status,
+) {
+    {
+        let view = Rc::clone(view);
+        let worker = Rc::clone(worker);
+        let pending = Rc::clone(pending);
+        let timer = Rc::clone(timer);
+        let proxy = Rc::clone(proxy);
+        play.on_click(move |_| {
+            let Some(selection) = devices.get_selection() else {
+                return;
+            };
+            let view = view.borrow();
+            let (Some(device), Some(channel)) =
+                (view.devices.get(selection as usize), view.channel.as_ref())
+            else {
+                return;
+            };
+            let (clean_url, _) = iptv_core::playback::split_stream_modifiers(&channel.url);
+            let headers = iptv_core::downloads::channel_headers(channel);
+            let play_url = if headers.is_empty() {
+                clean_url
+            } else {
+                let mut slot = proxy.borrow_mut();
+                if slot.is_none() {
+                    *slot = iptv_core::proxy::ProxyServer::start().ok();
+                }
+                match slot.as_ref() {
+                    Some(server) => server.url_for(&clean_url, &headers),
+                    None => clean_url,
+                }
+            };
+            worker.play(device.clone(), play_url, channel.name.clone());
+            pending.set(true);
+            assert!(timer.start(50, false));
+            status.set_label(&format!("Casting {} to {}...", channel.name, device.name));
+        });
+    }
+    {
+        let view = Rc::clone(view);
+        let worker = Rc::clone(worker);
+        stop.on_click(move |_| {
+            let Some(selection) = devices.get_selection() else {
+                return;
+            };
+            if let Some(device) = view.borrow().devices.get(selection as usize).cloned() {
+                worker.stop(device);
+                status.set_label("Stopping the cast...");
+            }
+        });
+    }
+    {
+        let worker = Rc::clone(worker);
+        let pending = Rc::clone(pending);
+        let timer = Rc::clone(timer);
+        refresh.on_click(move |_| {
+            worker.discover();
+            pending.set(true);
+            assert!(timer.start(50, false));
+            status.set_label("Looking for cast devices...");
+        });
+    }
 }
 
 fn ensure_cast_ui(
@@ -1442,6 +1538,7 @@ fn ensure_cast_ui(
     worker: &Rc<CastWorker>,
     pending: &Rc<std::cell::Cell<bool>>,
     timer: &Rc<Timer<Frame>>,
+    proxy: &Rc<RefCell<Option<iptv_core::proxy::ProxyServer>>>,
 ) -> CastUi {
     if let Some(ui) = slot.borrow().as_ref() {
         return ui.clone();
@@ -1483,54 +1580,9 @@ fn ensure_cast_ui(
         status,
         view,
     };
-    {
-        let view = Rc::clone(&ui.view);
-        let devices_box = devices;
-        let worker = Rc::clone(worker);
-        let pending = Rc::clone(pending);
-        let timer = Rc::clone(timer);
-        play.on_click(move |_| {
-            let Some(selection) = devices_box.get_selection() else {
-                return;
-            };
-            let view = view.borrow();
-            let (Some(device), Some(channel)) =
-                (view.devices.get(selection as usize), view.channel.as_ref())
-            else {
-                return;
-            };
-            let (clean_url, _) = iptv_core::playback::split_stream_modifiers(&channel.url);
-            worker.play(device.clone(), clean_url, channel.name.clone());
-            pending.set(true);
-            assert!(timer.start(50, false));
-            status.set_label(&format!("Casting {} to {}...", channel.name, device.name));
-        });
-    }
-    {
-        let view = Rc::clone(&ui.view);
-        let devices_box = devices;
-        let worker = Rc::clone(worker);
-        stop.on_click(move |_| {
-            let Some(selection) = devices_box.get_selection() else {
-                return;
-            };
-            if let Some(device) = view.borrow().devices.get(selection as usize).cloned() {
-                worker.stop(device);
-                status.set_label("Stopping the cast...");
-            }
-        });
-    }
-    {
-        let worker = Rc::clone(worker);
-        let pending = Rc::clone(pending);
-        let timer = Rc::clone(timer);
-        refresh.on_click(move |_| {
-            worker.discover();
-            pending.set(true);
-            assert!(timer.start(50, false));
-            status.set_label("Looking for cast devices...");
-        });
-    }
+    bind_cast_buttons(
+        play, stop, refresh, devices, &ui.view, worker, pending, timer, proxy, status,
+    );
     {
         let frame_hide = frame;
         frame.on_close(move |event| {
@@ -1618,6 +1670,7 @@ fn clone_wiring(wiring: &Wiring) -> Wiring {
         cast_worker: Rc::clone(&wiring.cast_worker),
         cast_pending: Rc::clone(&wiring.cast_pending),
         cast_ui: Rc::clone(&wiring.cast_ui),
+        proxy: Rc::clone(&wiring.proxy),
         guide_ui: Rc::clone(&wiring.guide_ui),
         update_worker: Rc::clone(&wiring.update_worker),
         update_pending: Rc::clone(&wiring.update_pending),
@@ -3324,6 +3377,7 @@ struct PlayerWindow {
 struct PlayerShared {
     recordings: Rc<RefCell<RecordingEngine>>,
     cast_ui: Rc<RefCell<Option<CastUi>>>,
+    proxy: Rc<RefCell<Option<iptv_core::proxy::ProxyServer>>>,
     cast_worker: Rc<CastWorker>,
     cast_pending: Rc<std::cell::Cell<bool>>,
     timer: Rc<Timer<Frame>>,
@@ -3493,6 +3547,7 @@ fn wire_player_events(
             &shared.cast_worker,
             &shared.cast_pending,
             &shared.timer,
+            &shared.proxy,
             state.current_channel.as_ref(),
         );
     });
@@ -3896,6 +3951,7 @@ fn dispatch_player_key(
                     &shared.cast_worker,
                     &shared.cast_pending,
                     &shared.timer,
+                    &shared.proxy,
                     state.current_channel.as_ref(),
                 );
             }
@@ -3969,9 +4025,10 @@ fn show_cast_for(
     worker: &Rc<CastWorker>,
     pending: &Rc<std::cell::Cell<bool>>,
     timer: &Rc<Timer<Frame>>,
+    proxy: &Rc<RefCell<Option<iptv_core::proxy::ProxyServer>>>,
     channel: Option<&Channel>,
 ) {
-    let ui = ensure_cast_ui(ui_slot, worker, pending, timer);
+    let ui = ensure_cast_ui(ui_slot, worker, pending, timer, proxy);
     ui.frame.show(true);
     ui.frame.raise();
     ui.view.borrow_mut().channel = channel.cloned();
