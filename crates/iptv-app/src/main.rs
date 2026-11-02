@@ -41,9 +41,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let panel = Panel::builder(&frame).build();
         let (open, cancel) = open_cancel_buttons(panel);
         let record = record_button(panel);
-        let vod = vod_button(panel);
-        let cast = cast_button(panel);
-        let guide_button = guide_ui_button(panel);
         let (category_label, category, toggle_favorite) = category_controls(panel);
         let search_label = StaticText::builder(&panel)
             .with_label("&Search channels")
@@ -101,9 +98,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             open,
             cancel,
             record,
-            vod,
-            cast,
-            guide_button,
             category,
             toggle_favorite,
             search,
@@ -234,9 +228,6 @@ struct Controls {
     open: Button,
     cancel: Button,
     record: Button,
-    vod: Button,
-    cast: Button,
-    guide_button: Button,
     category: ListBox,
     toggle_favorite: Button,
     search: TextCtrl,
@@ -277,6 +268,7 @@ struct Wiring {
     recorded: Rc<std::cell::Cell<bool>>,
     shutdown_attempted: Rc<std::cell::Cell<bool>>,
     last_dvr_tick: Rc<std::cell::Cell<f64>>,
+    previous_channel: Rc<RefCell<Option<Channel>>>,
 }
 
 /// Built-in player window state, created lazily on first use.
@@ -314,6 +306,13 @@ struct Persist {
 impl Persist {
     /// Store the browser's current favorite keys. Best effort, like the
     /// reference's logged save failures: a failed write never breaks use.
+    /// Set one config value and persist it (menu preferences).
+    fn set_and_save(&self, key: &str, value: serde_json::Value) {
+        let mut config = self.config.borrow_mut();
+        config.set_value(key, value);
+        let _ = config.save(&self.path);
+    }
+
     fn save_favorites(&self, keys: &[String]) {
         let mut config = self.config.borrow_mut();
         config.set_favorites(keys.to_vec());
@@ -384,26 +383,6 @@ impl Persist {
     }
 }
 
-/// The Cast window button for the main window.
-fn cast_button(panel: Panel) -> Button {
-    let cast = Button::builder(&panel).with_label("Cas&t").build();
-    cast.set_accessibility_label("Cast");
-    cast.set_accessibility_description(
-        "Open the cast window to send the selected channel to a TV or speaker on your network.",
-    );
-    cast
-}
-
-/// The VOD window button for the main window.
-fn vod_button(panel: Panel) -> Button {
-    let vod = Button::builder(&panel).with_label("&VOD").build();
-    vod.set_accessibility_label("Video on demand");
-    vod.set_accessibility_description(
-        "Open the video-on-demand browser for movies and series from your providers and playlists.",
-    );
-    vod
-}
-
 /// The Open playlist / Cancel loading buttons for the main window.
 fn open_cancel_buttons(panel: Panel) -> (Button, Button) {
     let open = Button::builder(&panel)
@@ -415,14 +394,6 @@ fn open_cancel_buttons(panel: Panel) -> (Button, Button) {
         .build();
     cancel.set_accessibility_label("Cancel loading");
     (open, cancel)
-}
-
-/// The User Guide button for the main window.
-fn guide_ui_button(panel: Panel) -> Button {
-    let button = Button::builder(&panel).with_label("User &Guide").build();
-    button.set_accessibility_label("User Guide");
-    button.set_accessibility_description("Open the offline User Guide.");
-    button
 }
 
 /// The Record toggle button for the main window.
@@ -482,6 +453,7 @@ fn bind_browser(frame: Frame, controls: Controls, model: Rc<RefCell<SearchResult
         recorded: Rc::new(std::cell::Cell::new(false)),
         shutdown_attempted: Rc::new(std::cell::Cell::new(false)),
         last_dvr_tick: Rc::new(std::cell::Cell::new(0.0)),
+        previous_channel: Rc::new(RefCell::new(None)),
     };
     *wiring.reminders.borrow_mut() = wiring.persist.reminders();
     if wiring.dvr.borrow().pending_count() > 0 {
@@ -505,14 +477,22 @@ fn bind_browser(frame: Frame, controls: Controls, model: Rc<RefCell<SearchResult
     }
     bind_completion(&wiring, controls);
     bind_recording(&wiring, controls);
-    bind_vod(&wiring, controls);
-    bind_cast(&wiring, controls);
-    bind_guide(&wiring, controls);
     build_menu(frame, &wiring, controls);
+    maybe_auto_check_updates(&wiring);
     bind_actions(frame, &wiring, controls);
     let browser = Rc::clone(&wiring.browser);
     let timer = Rc::clone(&wiring.timer);
-    frame.on_close(move |event| {
+    let close_persist = wiring.persist.clone();
+    frame.bind_internal(EventType::CLOSE_WINDOW, move |event| {
+        if close_persist
+            .config
+            .borrow()
+            .bool_or("minimize_to_tray", false)
+        {
+            frame.hide();
+            event.veto();
+            return;
+        }
         browser.borrow_mut().cancel();
         timer.stop();
         event.skip(true);
@@ -571,9 +551,6 @@ fn bind_actions(frame: Frame, wiring: &Wiring, controls: Controls) {
         open,
         cancel,
         record: _,
-        vod: _,
-        cast: _,
-        guide_button: _,
         category,
         toggle_favorite,
         search,
@@ -670,34 +647,48 @@ fn bind_toggle(
     let model = Rc::clone(&wiring.model);
     let persist = wiring.persist.clone();
     toggle_favorite.on_click(move |_| {
-        let selected = usize::try_from(list.get_first_selected_item()).ok();
-        let focused =
-            usize::try_from(list.get_next_item(-1, ListNextItemFlag::All, ListItemState::Focused))
-                .ok();
-        let Some(row) = pick_row(selected, focused) else {
-            status.set_label("No channel selected. Choose a channel in Channels first.");
-            return;
-        };
-        let Some(index) = model.borrow().playlist_index(row) else {
-            status.set_label("No channel selected. Choose a channel in Channels first.");
-            return;
-        };
-        match browser
-            .borrow_mut()
-            .toggle_favorite(index, &search.get_value())
-        {
-            Some(outcome) if outcome.toggle == Toggle::Unchanged => {
-                status.set_label("This channel cannot be marked as a favorite.");
-            }
-            Some(outcome) => {
-                status.set_label(&outcome.announcement);
-                let keys = browser.borrow().favorites().keys().to_vec();
-                persist.save_favorites(&keys);
-                assert!(timer.start(50, false));
-            }
-            None => status.set_label("No channel selected. Choose a channel in Channels first."),
-        }
+        toggle_selected_favorite(&browser, &model, &persist, &timer, list, search, status);
     });
+}
+
+/// Toggle the favorite state of the channel behind the selected or
+/// focused Channels row (shared by the button and the View menu).
+#[allow(clippy::too_many_arguments)]
+fn toggle_selected_favorite(
+    browser: &Rc<RefCell<BrowserWorker>>,
+    model: &Rc<RefCell<SearchResults>>,
+    persist: &Persist,
+    timer: &Rc<Timer<Frame>>,
+    list: ListCtrl,
+    search: TextCtrl,
+    status: Status,
+) {
+    let selected = usize::try_from(list.get_first_selected_item()).ok();
+    let focused =
+        usize::try_from(list.get_next_item(-1, ListNextItemFlag::All, ListItemState::Focused)).ok();
+    let Some(row) = pick_row(selected, focused) else {
+        status.set_label("No channel selected. Choose a channel in Channels first.");
+        return;
+    };
+    let Some(index) = model.borrow().playlist_index(row) else {
+        status.set_label("No channel selected. Choose a channel in Channels first.");
+        return;
+    };
+    match browser
+        .borrow_mut()
+        .toggle_favorite(index, &search.get_value())
+    {
+        Some(outcome) if outcome.toggle == Toggle::Unchanged => {
+            status.set_label("This channel cannot be marked as a favorite.");
+        }
+        Some(outcome) => {
+            status.set_label(&outcome.announcement);
+            let keys = browser.borrow().favorites().keys().to_vec();
+            persist.save_favorites(&keys);
+            assert!(timer.start(50, false));
+        }
+        None => status.set_label("No channel selected. Choose a channel in Channels first."),
+    }
 }
 
 /// The configured `playlists` entries split into plain sources (strings)
@@ -1096,28 +1087,27 @@ fn vod_accounts(persist: &Persist) -> Vec<ProviderAccount> {
     accounts
 }
 
-/// Open (creating on first use) the VOD window and load the catalogue.
-fn bind_vod(wiring: &Wiring, controls: Controls) {
-    let vod = controls.vod;
-    let status = controls.status;
-    let worker = Rc::clone(&wiring.vod_worker);
-    let pending = Rc::clone(&wiring.vod_pending);
-    let ui_slot = Rc::clone(&wiring.vod_ui);
-    let player = Rc::clone(&wiring.player);
-    let persist = wiring.persist.clone();
-    let browser = Rc::clone(&wiring.browser);
-    let timer = Rc::clone(&wiring.timer);
-    vod.on_click(move |_| {
-        let ui = ensure_vod_ui(&ui_slot, &player, &persist, &worker, &pending, &timer);
-        ui.frame.show(true);
-        ui.frame.raise();
-        let accounts = vod_accounts(&persist);
-        ui.view.borrow_mut().accounts.clone_from(&accounts);
-        worker.build(accounts, browser.borrow().all_channels());
-        pending.set(true);
-        assert!(timer.start(50, false));
-        status.set_label("Loading video on demand catalogue...");
-    });
+/// Open (or raise) the VOD window and rebuild its catalogue
+/// (shared by the button and the View menu).
+fn open_vod_window(wiring: &Wiring, status: Status) {
+    let ui = ensure_vod_ui(
+        &wiring.vod_ui,
+        &wiring.player,
+        &wiring.persist,
+        &wiring.vod_worker,
+        &wiring.vod_pending,
+        &wiring.timer,
+    );
+    ui.frame.show(true);
+    ui.frame.raise();
+    let accounts = vod_accounts(&wiring.persist);
+    ui.view.borrow_mut().accounts.clone_from(&accounts);
+    wiring
+        .vod_worker
+        .build(accounts, wiring.browser.borrow().all_channels());
+    wiring.vod_pending.set(true);
+    assert!(wiring.timer.start(50, false));
+    status.set_label("Loading video on demand catalogue...");
 }
 
 /// Build the VOD window's widgets: (frame, groups, items, play, back,
@@ -1330,42 +1320,34 @@ struct CastView {
     channel: Option<Channel>,
 }
 
-/// Open (creating on first use) the cast window and start discovery
-/// for the currently selected channel.
-fn bind_cast(wiring: &Wiring, controls: Controls) {
-    let cast = controls.cast;
-    let status = controls.status;
-    let list = controls.list;
-    let worker = Rc::clone(&wiring.cast_worker);
-    let pending = Rc::clone(&wiring.cast_pending);
-    let ui_slot = Rc::clone(&wiring.cast_ui);
-    let browser = Rc::clone(&wiring.browser);
-    let model = Rc::clone(&wiring.model);
-    let timer = Rc::clone(&wiring.timer);
-    cast.on_click(move |_| {
-        let ui = ensure_cast_ui(&ui_slot, &worker, &pending, &timer);
-        ui.frame.show(true);
-        ui.frame.raise();
-        let channel = selected_channel(&browser, &model, list);
-        ui.view.borrow_mut().channel.clone_from(&channel);
-        match &channel {
-            Some(channel) => {
-                ui.status
-                    .set_label(&format!("Looking for cast devices for {}...", channel.name));
-            }
-            None => {
-                ui.status
-                    .set_label("Choose a channel in the main window, then discover.");
-            }
+/// Open (or raise) the Cast window and start discovery for the
+/// selected channel (shared by the button and the menus).
+fn open_cast_window(wiring: &Wiring, list: ListCtrl) {
+    let ui = ensure_cast_ui(
+        &wiring.cast_ui,
+        &wiring.cast_worker,
+        &wiring.cast_pending,
+        &wiring.timer,
+    );
+    ui.frame.show(true);
+    ui.frame.raise();
+    let channel = selected_channel(&wiring.browser, &wiring.model, list);
+    ui.view.borrow_mut().channel.clone_from(&channel);
+    match &channel {
+        Some(channel) => {
+            ui.status
+                .set_label(&format!("Looking for cast devices for {}...", channel.name));
         }
-        worker.discover();
-        pending.set(true);
-        assert!(timer.start(50, false));
-        status.set_label("Looking for cast devices...");
-    });
+        None => {
+            ui.status
+                .set_label("Choose a channel in the main window, then discover.");
+        }
+    }
+    wiring.cast_worker.discover();
+    wiring.cast_pending.set(true);
+    assert!(wiring.timer.start(50, false));
 }
 
-/// Build the cast window once and keep it (closing hides it).
 fn ensure_cast_ui(
     slot: &Rc<RefCell<Option<CastUi>>>,
     worker: &Rc<CastWorker>,
@@ -1522,17 +1504,6 @@ struct GuideUi {
     guide: Rc<RefCell<Guide>>,
 }
 
-/// Open (creating on first use) the User Guide window at the start of
-/// the manual, in the resolved language.
-fn bind_guide(wiring: &Wiring, controls: Controls) {
-    let button = controls.guide_button;
-    let status = controls.status;
-    let wiring = clone_wiring(wiring);
-    button.on_click(move |_| {
-        open_guide_window(&wiring, status);
-    });
-}
-
 /// Shallow-clone the wiring handles for menu handlers (every field
 /// is an Rc handle).
 fn clone_wiring(wiring: &Wiring) -> Wiring {
@@ -1569,6 +1540,7 @@ fn clone_wiring(wiring: &Wiring) -> Wiring {
         recorded: Rc::clone(&wiring.recorded),
         shutdown_attempted: Rc::clone(&wiring.shutdown_attempted),
         last_dvr_tick: Rc::clone(&wiring.last_dvr_tick),
+        previous_channel: Rc::clone(&wiring.previous_channel),
     }
 }
 
@@ -1605,53 +1577,845 @@ fn build_tray_icon() -> TaskBarIcon {
 
 /// The main window's menu bar. Labels carry the effective shortcuts
 /// from the shortcuts engine, so a config override changes the menu
-/// the same way it changes the binding.
+/// Menu command ids for the parity menu tree (G2). Ids 4004/5002/
+/// 5003/5004 predate the tree (exit, guide, updates, tray show).
+pub const PLAYLIST_MANAGER: i32 = 5101;
+pub const EPG_MANAGER: i32 = 5102;
+pub const IMPORT_EPG: i32 = 5103;
+pub const WHATS_ON_NOW: i32 = 5104;
+pub const WHAT_IS_PLAYING: i32 = 5105;
+pub const ACCOUNT_INFO: i32 = 5106;
+pub const CAST_TO: i32 = 5107;
+pub const SHOW_PLAYER: i32 = 5111;
+pub const PLAY_PAUSE: i32 = 5112;
+pub const STOP: i32 = 5113;
+pub const CAST_CONNECT: i32 = 5114;
+pub const VIEW_LIVE: i32 = 5121;
+pub const VIEW_VOD: i32 = 5122;
+pub const CONTINUE_WATCHING: i32 = 5123;
+pub const FAVORITE: i32 = 5124;
+pub const GO_TO_FAVORITES: i32 = 5125;
+pub const PREVIOUS_CHANNEL: i32 = 5126;
+pub const RECENT_CHANNELS: i32 = 5127;
+pub const CHANNEL_NUMBER: i32 = 5128;
+pub const SHOW_DOWNLOADS: i32 = 5129;
+pub const PLAYER_RADIO_BASE: i32 = 5131;
+pub const CUSTOM_PLAYER: i32 = 5141;
+pub const PREFERRED_AUDIO: i32 = 5142;
+pub const LANGUAGE_BASE: i32 = 5150;
+pub const MINIMIZE_TO_TRAY: i32 = 5171;
+pub const SHOW_PLAYER_ON_ENTER: i32 = 5172;
+pub const SHOW_STREAM_URL: i32 = 5173;
+pub const AUTO_CHECK_UPDATES: i32 = 5174;
+pub const EXPORT_SETTINGS: i32 = 5175;
+pub const IMPORT_SETTINGS: i32 = 5176;
+pub const ANNOUNCE_BASE: i32 = 5180;
+pub const SPEAK_SUBTITLES: i32 = 5185;
+pub const READ_CURRENT_SUBTITLE: i32 = 5186;
+pub const KEYBOARD_SHORTCUTS: i32 = 5190;
+pub const WHATS_NEW: i32 = 5191;
+pub const OPEN_LOGS: i32 = 5192;
+pub const COPY_DEBUG: i32 = 5193;
+pub const ABOUT: i32 = 5194;
+
+/// The "Media Player to Use" radio labels, in Python's order.
+const PLAYER_LABELS: [&str; 10] = [
+    "Built-in Player",
+    "VLC",
+    "MPC",
+    "MPC-BE",
+    "Kodi",
+    "Winamp",
+    "Foobar2000",
+    "MPV",
+    "SMPlayer",
+    "Totem",
+];
+
+/// Append one item to a menu under construction.
+fn menu_add(menu: &Menu, id: i32, label: &str, help: &str, kind: ItemKind) {
+    menu.append(id, label, help, kind);
+}
+
+/// Build the full Python-parity menu tree (File, Player, View,
+/// Options, Help) with initial check states from the config. Items
+/// whose dialogs land in later GUI slices are present but disabled,
+/// as the audit prescribes.
+/// A menu label carrying the command's effective shortcut, when set.
+fn menu_label(keys: &std::collections::BTreeMap<String, String>, text: &str, name: &str) -> String {
+    match keys.get(name) {
+        Some(k) if !k.is_empty() => format!("{text}\t{k}"),
+        _ => text.to_string(),
+    }
+}
+
 fn build_menu(frame: Frame, wiring: &Wiring, controls: Controls) {
-    let status = controls.status;
-    let config_value = serde_json::Value::Object(wiring.persist.config.borrow().raw().clone());
-    let main_keys = iptv_core::shortcuts::effective(&config_value, "main");
-    let exit_key = main_keys.get("exit").cloned().unwrap_or_default();
-    let file_menu = Menu::builder()
-        .append_item(4004, &format!("E&xit\t{exit_key}"), "Close the application")
-        .build();
-    let help_menu = Menu::builder()
-        .append_item(5002, "User &Guide", "Open the User Guide")
-        .append_item(
-            5003,
-            "Check for &Updates",
-            "Check GitHub for a newer release",
-        )
-        .build();
+    let config = wiring.persist.config.borrow();
+    let raw = serde_json::Value::Object(config.raw().clone());
+    let keys = iptv_core::shortcuts::effective(&raw, "main");
+    let file_menu = build_file_menu(&keys);
+    let player_menu = build_player_menu(&keys);
+    let view_menu = build_view_menu(&keys);
+    let options_menu = build_options_menu(&config);
+    let help_menu = build_help_menu();
     let menu_bar = MenuBar::builder()
         .append(file_menu, "&File")
+        .append(player_menu, "&Player")
+        .append(view_menu, "&View")
+        .append(options_menu, "&Options")
         .append(help_menu, "&Help")
         .build();
     frame.set_menu_bar(menu_bar);
+    bind_menu_actions(frame, wiring, controls);
+}
+
+#[allow(clippy::too_many_lines)]
+fn build_file_menu(keys: &std::collections::BTreeMap<String, String>) -> Menu {
+    let file_menu = Menu::builder().build();
+    menu_add(
+        &file_menu,
+        PLAYLIST_MANAGER,
+        &menu_label(keys, "&Playlist Manager", "playlist_manager"),
+        "",
+        ItemKind::Normal,
+    );
+    menu_add(
+        &file_menu,
+        EPG_MANAGER,
+        &menu_label(keys, "&EPG Manager", "epg_manager"),
+        "",
+        ItemKind::Normal,
+    );
+    menu_add(
+        &file_menu,
+        IMPORT_EPG,
+        &menu_label(keys, "Import EPG to &DB", "import_epg"),
+        "",
+        ItemKind::Normal,
+    );
+    menu_add(
+        &file_menu,
+        WHATS_ON_NOW,
+        &menu_label(keys, "What's on &Now", "whats_on_now"),
+        "",
+        ItemKind::Normal,
+    );
+    menu_add(
+        &file_menu,
+        WHAT_IS_PLAYING,
+        &menu_label(keys, "What Is &Playing", "what_is_playing"),
+        "",
+        ItemKind::Normal,
+    );
+    menu_add(
+        &file_menu,
+        ACCOUNT_INFO,
+        &menu_label(keys, "&Account Info", "account"),
+        "",
+        ItemKind::Normal,
+    );
+    file_menu.append_separator();
+    menu_add(&file_menu, CAST_TO, "Cast &To...", "", ItemKind::Normal);
+    file_menu.append_separator();
+    menu_add(
+        &file_menu,
+        4004,
+        &menu_label(keys, "E&xit", "exit"),
+        "Close the application",
+        ItemKind::Normal,
+    );
+    file_menu.enable_item(PLAYLIST_MANAGER, false);
+    file_menu.enable_item(EPG_MANAGER, false);
+    file_menu.enable_item(WHATS_ON_NOW, false);
+    file_menu.enable_item(ACCOUNT_INFO, false);
+
+    file_menu
+}
+
+fn build_player_menu(keys: &std::collections::BTreeMap<String, String>) -> Menu {
+    let player_menu = Menu::builder().build();
+    menu_add(
+        &player_menu,
+        SHOW_PLAYER,
+        &menu_label(keys, "Show &Built-in Player", "show_player"),
+        "",
+        ItemKind::Normal,
+    );
+    menu_add(
+        &player_menu,
+        PLAY_PAUSE,
+        &menu_label(keys, "Play/&Pause", "play_pause"),
+        "",
+        ItemKind::Normal,
+    );
+    menu_add(
+        &player_menu,
+        STOP,
+        &menu_label(keys, "&Stop", "stop"),
+        "",
+        ItemKind::Normal,
+    );
+    menu_add(
+        &player_menu,
+        CAST_CONNECT,
+        &menu_label(keys, "Cast / &Connect...", "cast"),
+        "",
+        ItemKind::Normal,
+    );
+
+    player_menu
+}
+
+fn build_view_menu(keys: &std::collections::BTreeMap<String, String>) -> Menu {
+    let view_menu = Menu::builder().build();
+    menu_add(
+        &view_menu,
+        VIEW_LIVE,
+        "Live TV && Catch-up",
+        "",
+        ItemKind::Radio,
+    );
+    menu_add(
+        &view_menu,
+        VIEW_VOD,
+        "Video on Demand (Movies && Series)",
+        "",
+        ItemKind::Radio,
+    );
+    view_menu.check_item(VIEW_LIVE, true);
+    view_menu.append_separator();
+    menu_add(
+        &view_menu,
+        CONTINUE_WATCHING,
+        "Continue &Watching...",
+        "",
+        ItemKind::Normal,
+    );
+    view_menu.enable_item(CONTINUE_WATCHING, false);
+    menu_add(
+        &view_menu,
+        FAVORITE,
+        &menu_label(keys, "&Add to Favorites", "favorite"),
+        "",
+        ItemKind::Normal,
+    );
+    menu_add(
+        &view_menu,
+        GO_TO_FAVORITES,
+        "Go to Favorites",
+        "",
+        ItemKind::Normal,
+    );
+    menu_add(
+        &view_menu,
+        PREVIOUS_CHANNEL,
+        &menu_label(keys, "Pre&vious Channel", "previous_channel"),
+        "",
+        ItemKind::Normal,
+    );
+    menu_add(
+        &view_menu,
+        RECENT_CHANNELS,
+        &menu_label(keys, "&Recently Watched...", "recent_channels"),
+        "",
+        ItemKind::Normal,
+    );
+    view_menu.enable_item(RECENT_CHANNELS, false);
+    menu_add(
+        &view_menu,
+        CHANNEL_NUMBER,
+        &menu_label(keys, "Go to Channel &Number...", "channel_number"),
+        "",
+        ItemKind::Normal,
+    );
+    view_menu.append_separator();
+    menu_add(
+        &view_menu,
+        SHOW_DOWNLOADS,
+        &menu_label(keys, "Show &Downloads", "downloads"),
+        "",
+        ItemKind::Normal,
+    );
+    view_menu.enable_item(SHOW_DOWNLOADS, false);
+
+    view_menu
+}
+
+/// The Options > Language radio submenu.
+fn build_language_menu(config: &Config) -> Menu {
+    let language_sub = Menu::builder().build();
+    let current_language = config.string_or("language", "automatic");
+    for (offset, (code, name)) in iptv_core::i18n::language_labels().iter().enumerate() {
+        let id = LANGUAGE_BASE + i32::try_from(offset).unwrap_or(0);
+        menu_add(&language_sub, id, name, "", ItemKind::Radio);
+        language_sub.check_item(id, *code == current_language);
+    }
+    language_sub
+}
+
+/// The Options > Automatic Announcements radio submenu.
+fn build_announce_menu(config: &Config) -> Menu {
+    let announce_sub = Menu::builder().build();
+    let level = config
+        .value("announcement_level")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(2);
+    for (offset, name) in ["Off", "Minimal", "Important events", "Detailed status"]
+        .iter()
+        .enumerate()
+    {
+        let id = ANNOUNCE_BASE + i32::try_from(offset).unwrap_or(0);
+        menu_add(&announce_sub, id, name, "", ItemKind::Radio);
+        announce_sub.check_item(id, i64::try_from(offset).unwrap_or(0) == level);
+    }
+    announce_sub
+}
+
+/// The Options > Subtitle Speech submenu.
+fn build_speech_menu(config: &Config) -> Menu {
+    let speech_sub = Menu::builder().build();
+    menu_add(
+        &speech_sub,
+        SPEAK_SUBTITLES,
+        "Speak subtitles",
+        "",
+        ItemKind::Check,
+    );
+    speech_sub.check_item(SPEAK_SUBTITLES, config.bool_or("speak_subtitles", false));
+    menu_add(
+        &speech_sub,
+        READ_CURRENT_SUBTITLE,
+        "Read current subtitle",
+        "",
+        ItemKind::Normal,
+    );
+    speech_sub
+}
+
+/// The Options menu's four preference check items, with initial
+/// states from the config.
+fn add_option_checks(options_menu: &Menu, config: &Config) {
+    menu_add(
+        options_menu,
+        MINIMIZE_TO_TRAY,
+        "Minimize to System &Tray",
+        "",
+        ItemKind::Check,
+    );
+    options_menu.check_item(MINIMIZE_TO_TRAY, config.bool_or("minimize_to_tray", false));
+    menu_add(
+        options_menu,
+        SHOW_PLAYER_ON_ENTER,
+        "Show Player on &Enter",
+        "",
+        ItemKind::Check,
+    );
+    options_menu.check_item(
+        SHOW_PLAYER_ON_ENTER,
+        config.bool_or("show_player_on_enter", true),
+    );
+    menu_add(
+        options_menu,
+        SHOW_STREAM_URL,
+        "Show Stream &URL",
+        "",
+        ItemKind::Check,
+    );
+    options_menu.check_item(SHOW_STREAM_URL, config.bool_or("show_channel_url", true));
+    menu_add(
+        options_menu,
+        AUTO_CHECK_UPDATES,
+        "Auto-check for &Updates",
+        "",
+        ItemKind::Check,
+    );
+    options_menu.check_item(
+        AUTO_CHECK_UPDATES,
+        config.bool_or("auto_check_updates", false),
+    );
+}
+
+fn build_options_menu(config: &Config) -> Menu {
+    let options_menu = Menu::builder().build();
+    let player_sub = Menu::builder().build();
+    let current_player = config.string_or("media_player", "Built-in Player");
+    for (offset, name) in PLAYER_LABELS.iter().enumerate() {
+        let id = PLAYER_RADIO_BASE + i32::try_from(offset).unwrap_or(0);
+        menu_add(&player_sub, id, name, "", ItemKind::Radio);
+        player_sub.check_item(id, *name == current_player);
+    }
+    player_sub.append_separator();
+    menu_add(
+        &player_sub,
+        CUSTOM_PLAYER,
+        "Custom Player...",
+        "",
+        ItemKind::Radio,
+    );
+    player_sub.check_item(CUSTOM_PLAYER, current_player == "Custom");
+    options_menu.append_submenu(player_sub, "Media Player to &Use", "");
+    menu_add(
+        &options_menu,
+        PREFERRED_AUDIO,
+        "Preferred &Audio Track...",
+        "",
+        ItemKind::Normal,
+    );
+    options_menu.enable_item(PREFERRED_AUDIO, false);
+    let language_sub = build_language_menu(config);
+    options_menu.append_submenu(language_sub, "&Language", "");
+    add_option_checks(&options_menu, config);
+    menu_add(
+        &options_menu,
+        EXPORT_SETTINGS,
+        "E&xport Settings...",
+        "",
+        ItemKind::Normal,
+    );
+    menu_add(
+        &options_menu,
+        IMPORT_SETTINGS,
+        "I&mport Settings...",
+        "",
+        ItemKind::Normal,
+    );
+    let announce_sub = build_announce_menu(config);
+    options_menu.append_submenu(announce_sub, "Automatic &Announcements", "");
+    let speech_sub = build_speech_menu(config);
+    options_menu.append_submenu(speech_sub, "Subtitle &Speech", "");
+    menu_add(
+        &options_menu,
+        KEYBOARD_SHORTCUTS,
+        "&Keyboard Shortcuts...",
+        "",
+        ItemKind::Normal,
+    );
+    options_menu.enable_item(KEYBOARD_SHORTCUTS, false);
+    menu_add(
+        &options_menu,
+        5003,
+        "Check for &Updates",
+        "Check GitHub for a newer release",
+        ItemKind::Normal,
+    );
+
+    options_menu
+}
+
+fn build_help_menu() -> Menu {
+    let help_menu = Menu::builder().build();
+    menu_add(
+        &help_menu,
+        5002,
+        "User &Guide\tF1",
+        "Open the User Guide",
+        ItemKind::Normal,
+    );
+    menu_add(&help_menu, WHATS_NEW, "What's &New", "", ItemKind::Normal);
+    help_menu.enable_item(WHATS_NEW, false);
+    menu_add(
+        &help_menu,
+        OPEN_LOGS,
+        "Open &Logs Folder",
+        "",
+        ItemKind::Normal,
+    );
+    menu_add(
+        &help_menu,
+        COPY_DEBUG,
+        "Copy Log and &Debug Information",
+        "",
+        ItemKind::Normal,
+    );
+    menu_add(&help_menu, ABOUT, "&About...", "", ItemKind::Normal);
+
+    help_menu
+}
+
+/// Dispatch for the parity menu tree.
+fn bind_menu_actions(frame: Frame, wiring: &Wiring, controls: Controls) {
+    bind_menu_option_actions(frame, wiring, controls);
+    let status = controls.status;
+    let list = controls.list;
+    let search = controls.search;
+    let category_box = controls.category;
     let wiring = clone_wiring(wiring);
-    frame.on_menu(move |event| match event.get_id() {
-        4004 => {
-            frame.close(false);
+    frame.on_menu(move |event| {
+        let id = event.get_id();
+        let persist = &wiring.persist;
+        match id {
+            4004 => frame.close(false),
+            5002 => open_guide_window(&wiring, status),
+            5003 => {
+                start_update_check(&wiring);
+                status.set_label("Checking for updates...");
+            }
+            5004 => {
+                frame.show(true);
+                frame.raise();
+            }
+            IMPORT_EPG => menu_import_epg(&wiring, frame, status),
+            WHAT_IS_PLAYING => {
+                let player = wiring.player.borrow();
+                match &player.current_channel {
+                    Some(channel) => {
+                        status.set_label(&format!("Now playing: {}", channel.name));
+                    }
+                    None => status.set_label("Nothing is playing."),
+                }
+            }
+            CAST_TO | CAST_CONNECT => open_cast_window(&wiring, list),
+            SHOW_PLAYER => {
+                let player = wiring.player.borrow();
+                match &player.window {
+                    Some((player_frame, _)) => {
+                        player_frame.show(true);
+                        player_frame.raise();
+                    }
+                    None => {
+                        status.set_label("The built-in player opens when you play a channel.");
+                    }
+                }
+            }
+            PLAY_PAUSE => {
+                let player = wiring.player.borrow();
+                if let Some((_, media)) = &player.window {
+                    if media.get_state() == MediaState::Playing {
+                        media.pause();
+                    } else {
+                        media.play();
+                    }
+                }
+            }
+            STOP => {
+                let mut player = wiring.player.borrow_mut();
+                if let Some((_, media)) = &player.window {
+                    media.stop();
+                }
+                player.session.stop();
+            }
+            VIEW_LIVE => status.set_label("Live TV and catch-up view."),
+            VIEW_VOD => open_vod_window(&wiring, status),
+            FAVORITE => toggle_selected_favorite(
+                &wiring.browser,
+                &wiring.model,
+                persist,
+                &wiring.timer,
+                list,
+                search,
+                status,
+            ),
+            GO_TO_FAVORITES => {
+                category_box.set_selection(1, true);
+                if wiring
+                    .browser
+                    .borrow_mut()
+                    .select_category(Category::Favorites, &search.get_value())
+                {
+                    status.set_label("Load cancelled. Browsing previous channels...");
+                }
+                assert!(wiring.timer.start(50, false));
+            }
+            PREVIOUS_CHANNEL => {
+                let previous = wiring.previous_channel.borrow().clone();
+                match previous {
+                    Some(channel) => {
+                        play_channel(&wiring.player, persist, &channel, status);
+                    }
+                    None => status.set_label("No previous channel yet."),
+                }
+            }
+            CHANNEL_NUMBER => menu_go_to_channel_number(&wiring, frame, list, status),
+            _ => {}
         }
-        5002 => {
-            open_guide_window(&wiring, status);
-        }
-        5003 => {
-            wiring.update_worker.check(
-                "serrebidev",
-                "Accessible-IPTV-Client-Rust",
-                "update-manifest.json",
-                env!("CARGO_PKG_VERSION"),
-            );
-            wiring.update_pending.set(true);
-            assert!(wiring.timer.start(50, false));
-            status.set_label("Checking for updates...");
-        }
-        5004 => {
-            frame.show(true);
-            frame.raise();
-        }
-        _ => {}
     });
+}
+fn bind_menu_option_actions(frame: Frame, wiring: &Wiring, controls: Controls) {
+    let status = controls.status;
+    let stream_url = controls.stream_url;
+    let wiring = clone_wiring(wiring);
+    frame.on_menu(move |event| {
+        let id = event.get_id();
+        if id < 5130 {
+            return;
+        }
+        let persist = &wiring.persist;
+        let flip = |key_name: &str| -> bool {
+            let next = !persist.config.borrow().bool_or(key_name, false);
+            persist.set_and_save(key_name, serde_json::json!(next));
+            next
+        };
+        match id {
+            CUSTOM_PLAYER => menu_custom_player(&wiring, frame, status),
+            EXPORT_SETTINGS => menu_export_settings(&wiring, frame, status),
+            IMPORT_SETTINGS => menu_import_settings(&wiring, frame, status),
+            MINIMIZE_TO_TRAY => {
+                flip("minimize_to_tray");
+            }
+            SHOW_PLAYER_ON_ENTER => {
+                let next = !persist.config.borrow().bool_or("show_player_on_enter", true);
+                persist.set_and_save("show_player_on_enter", serde_json::json!(next));
+            }
+            SHOW_STREAM_URL => {
+                let next = !persist.config.borrow().bool_or("show_channel_url", true);
+                persist.set_and_save("show_channel_url", serde_json::json!(next));
+                if next {
+                    stream_url.show(true);
+                } else {
+                    stream_url.hide();
+                }
+            }
+            AUTO_CHECK_UPDATES => {
+                flip("auto_check_updates");
+            }
+            SPEAK_SUBTITLES => {
+                flip("speak_subtitles");
+            }
+            READ_CURRENT_SUBTITLE => menu_read_current_subtitle(&wiring, status),
+            OPEN_LOGS => {
+                let dir = iptv_core::config::user_config_dir();
+                open_folder(&dir);
+                status.set_label("Opened the settings folder, which holds the logs.");
+            }
+            COPY_DEBUG => {
+                let text = format!(
+                    "Accessible IPTV Client {}\nOS: {}\nConfig: {}",
+                    env!("CARGO_PKG_VERSION"),
+                    std::env::consts::OS,
+                    persist.path.display()
+                );
+                if Clipboard::get().set_text(&text) {
+                    status.set_label("Log and debug information copied.");
+                }
+            }
+            ABOUT => {
+                let dialog = MessageDialog::builder(
+                    &frame,
+                    &format!(
+                        "Accessible IPTV Client\nVersion {}\nAccessible IPTV player — Rust port of the Python client.",
+                        env!("CARGO_PKG_VERSION")
+                    ),
+                    "About Accessible IPTV Client",
+                )
+                .build();
+                dialog.show_modal();
+            }
+            _ if (PLAYER_RADIO_BASE..PLAYER_RADIO_BASE + 10).contains(&id) => {
+                let index = usize::try_from(id - PLAYER_RADIO_BASE).unwrap_or(0);
+                if let Some(name) = PLAYER_LABELS.get(index) {
+                    persist.set_and_save("media_player", serde_json::json!(name));
+                    status.set_label(&format!("Media player set to {name}."));
+                }
+            }
+            _ if (LANGUAGE_BASE..LANGUAGE_BASE + 15).contains(&id) => {
+                let index = usize::try_from(id - LANGUAGE_BASE).unwrap_or(0);
+                if let Some((code, name)) = iptv_core::i18n::language_labels().get(index) {
+                    persist.set_and_save("language", serde_json::json!(code));
+                    status.set_label(&format!(
+                        "Language set to {name}. Restart to apply everywhere."
+                    ));
+                }
+            }
+            _ if (ANNOUNCE_BASE..ANNOUNCE_BASE + 4).contains(&id) => {
+                persist.set_and_save(
+                    "announcement_level",
+                    serde_json::json!(id - ANNOUNCE_BASE),
+                );
+            }
+            _ => {}
+        }
+    });
+}
+
+/// File > Import EPG to DB: pick an XMLTV file, remember it as a
+/// guide source, and load it now.
+fn menu_import_epg(wiring: &Wiring, frame: Frame, status: Status) {
+    let dialog = FileDialog::builder(&frame)
+        .with_message("Import EPG (XMLTV)")
+        .with_wildcard("XMLTV (*.xml;*.xml.gz)|*.xml;*.xml.gz|All files (*.*)|*.*")
+        .with_style(FileDialogStyle::Open | FileDialogStyle::FileMustExist)
+        .build();
+    if dialog.show_modal() != ID_OK {
+        return;
+    }
+    let Some(path) = dialog.get_path() else {
+        return;
+    };
+    let mut urls = wiring.persist.config.borrow().string_list("epg_urls");
+    if !urls.contains(&path) {
+        urls.push(path.clone());
+        wiring
+            .persist
+            .set_and_save("epg_urls", serde_json::json!(urls));
+    }
+    wiring.epg_worker.load(vec![path]);
+    wiring.epg_pending.set(true);
+    assert!(wiring.timer.start(50, false));
+    status.set_label("Importing EPG data...");
+}
+
+/// View > Go to Channel Number...: select the row by its 1-based
+/// number in the current view.
+fn menu_go_to_channel_number(wiring: &Wiring, frame: Frame, list: ListCtrl, status: Status) {
+    let dialog =
+        TextEntryDialog::builder(&frame, "Go to channel number:", "Go to Channel Number").build();
+    if dialog.show_modal() != ID_OK {
+        return;
+    }
+    let Some(text) = dialog.get_value() else {
+        return;
+    };
+    let Ok(number) = text.trim().parse::<usize>() else {
+        status.set_label("That is not a channel number.");
+        return;
+    };
+    if number == 0 {
+        status.set_label("Channel numbers start at 1.");
+        return;
+    }
+    let row = number - 1;
+    let Some(index) = wiring.model.borrow().playlist_index(row) else {
+        status.set_label("That channel number is not in the current view.");
+        return;
+    };
+    let row_i64 = i64::try_from(row).unwrap_or(0);
+    list.set_item_state(
+        row_i64,
+        ListItemState::Selected | ListItemState::Focused,
+        ListItemState::Selected | ListItemState::Focused,
+    );
+    list.ensure_visible(row_i64);
+    list.set_focus();
+    if let Some(channel) = wiring.browser.borrow().channel(index) {
+        status.set_label(&format!("Channel {}: {}", number, channel.name));
+    }
+}
+
+/// Options > Custom Player...: pick the player executable and make
+/// it the media player.
+fn menu_custom_player(wiring: &Wiring, frame: Frame, status: Status) {
+    let dialog = FileDialog::builder(&frame)
+        .with_message("Choose the custom player executable")
+        .with_style(FileDialogStyle::Open | FileDialogStyle::FileMustExist)
+        .build();
+    if dialog.show_modal() != ID_OK {
+        return;
+    }
+    let Some(path) = dialog.get_path() else {
+        return;
+    };
+    wiring
+        .persist
+        .set_and_save("custom_player_path", serde_json::json!(path));
+    wiring
+        .persist
+        .set_and_save("media_player", serde_json::json!("Custom"));
+    status.set_label("Custom player set.");
+}
+
+/// Options > Export Settings...: copy the config file out.
+fn menu_export_settings(wiring: &Wiring, frame: Frame, status: Status) {
+    let dialog = FileDialog::builder(&frame)
+        .with_message("Export settings")
+        .with_default_file("iptvclient-settings.json")
+        .with_wildcard("JSON (*.json)|*.json|All files (*.*)|*.*")
+        .with_style(FileDialogStyle::Save | FileDialogStyle::OverwritePrompt)
+        .build();
+    if dialog.show_modal() != ID_OK {
+        return;
+    }
+    let Some(path) = dialog.get_path() else {
+        return;
+    };
+    match std::fs::copy(&wiring.persist.path, &path) {
+        Ok(_) => status.set_label("Settings exported."),
+        Err(error) => status.set_label(&format!("Export failed: {error}")),
+    }
+}
+
+/// Options > Import Settings...: replace the config file with a
+/// previously exported one (validated as a JSON object first).
+fn menu_import_settings(wiring: &Wiring, frame: Frame, status: Status) {
+    let dialog = FileDialog::builder(&frame)
+        .with_message("Import settings")
+        .with_wildcard("JSON (*.json)|*.json|All files (*.*)|*.*")
+        .with_style(FileDialogStyle::Open | FileDialogStyle::FileMustExist)
+        .build();
+    if dialog.show_modal() != ID_OK {
+        return;
+    }
+    let Some(path) = dialog.get_path() else {
+        return;
+    };
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        status.set_label("Import failed: cannot read that file.");
+        return;
+    };
+    let valid =
+        serde_json::from_str::<serde_json::Value>(&text).is_ok_and(|value| value.is_object());
+    if !valid {
+        status.set_label("Import failed: that file is not a settings file.");
+        return;
+    }
+    match std::fs::write(&wiring.persist.path, text) {
+        Ok(()) => status.set_label("Settings imported. Restart to apply."),
+        Err(error) => status.set_label(&format!("Import failed: {error}")),
+    }
+}
+
+/// Subtitle Speech > Read current subtitle: announce the cue active
+/// at the player's current position.
+fn menu_read_current_subtitle(wiring: &Wiring, status: Status) {
+    let player = wiring.player.borrow();
+    let Some((_, media)) = &player.window else {
+        status.set_label("No subtitle is showing.");
+        return;
+    };
+    let position = media.tell();
+    match player
+        .subtitle_cues
+        .iter()
+        .find(|cue| cue.start <= position && position < cue.end)
+    {
+        Some(cue) => status.set_label(&cue.text),
+        None => status.set_label("No subtitle is showing."),
+    }
+}
+
+/// Open a folder in the platform file manager (best effort).
+fn open_folder(dir: &std::path::Path) {
+    #[cfg(target_os = "windows")]
+    let program = "explorer";
+    #[cfg(target_os = "macos")]
+    let program = "open";
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    let program = "xdg-open";
+    let _ = std::process::Command::new(program).arg(dir).spawn();
+}
+
+/// Start a background update check at launch when the user enabled
+/// auto-check in Options.
+fn maybe_auto_check_updates(wiring: &Wiring) {
+    if wiring
+        .persist
+        .config
+        .borrow()
+        .bool_or("auto_check_updates", false)
+    {
+        start_update_check(wiring);
+    }
+}
+
+/// Kick a background update check and arm the completion poll.
+fn start_update_check(wiring: &Wiring) {
+    wiring.update_worker.check(
+        "serrebidev",
+        "Accessible-IPTV-Client-Rust",
+        "update-manifest.json",
+        env!("CARGO_PKG_VERSION"),
+    );
+    wiring.update_pending.set(true);
+    assert!(wiring.timer.start(50, false));
 }
 
 /// Collect update-check outcomes onto the status line.
@@ -1812,6 +2576,7 @@ fn bind_playback(
     episode_description: TextCtrl,
     stream_url: TextCtrl,
 ) {
+    let previous = Rc::clone(&wiring.previous_channel);
     let browser = Rc::clone(&wiring.browser);
     let model = Rc::clone(&wiring.model);
     let player = Rc::clone(&wiring.player);
@@ -1852,6 +2617,11 @@ fn bind_playback(
             status.set_label("Resolving stream link...");
             assert!(timer.start(50, false));
             return;
+        }
+        if let Some(current) = player.borrow().current_channel.clone() {
+            if current.url != channel.url {
+                *previous.borrow_mut() = Some(current);
+            }
         }
         play_channel(&player, &persist, &channel, status);
     });
@@ -2027,7 +2797,13 @@ fn play_builtin(
         media.play();
     }
     frame.set_title(&format!("{} — Player", state.session.announcement()));
-    frame.show(true);
+    if persist
+        .config
+        .borrow()
+        .bool_or("show_player_on_enter", true)
+    {
+        frame.show(true);
+    }
     status.set_label(&state.session.announcement());
 }
 
