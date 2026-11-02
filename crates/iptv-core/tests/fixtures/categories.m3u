@@ -1,0 +1,15 @@
+#EXTM3U
+#EXTINF:-1 provider-type="xtream" provider-id="acct" stream-id="42" tvg-id="bbc.uk" group-title="News",BBC One
+http://user:pass@provider.invalid/live/42
+#EXTINF:-1 tvg-id="cnn.us" group-title="News",CNN
+http://provider.invalid/cnn
+#EXTINF:-1 group-title="Sport",Tennis Channel
+http://provider.invalid/tennis
+#EXTINF:-1,BBC One
+http://plain.invalid/bbc1
+#EXTINF:-1,BBC One
+http://plain.invalid/bbc2
+#EXTINF:-1 group-title="Sport",A|B Network
+http://plain.invalid/ab
+#EXTINF:-1 tvg-id="solo.id",
+http://plain.invalid/solo
