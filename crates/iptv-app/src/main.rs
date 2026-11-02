@@ -34,14 +34,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     wxdragon::main(|_| {
         let frame = Frame::builder()
             .with_title("Accessible IPTV Client")
-            .with_size(Size::new(720, 480))
+            .with_size(Size::new(800, 600))
             .build();
         frame.set_accessibility_label("Accessible IPTV Client");
 
         let panel = Panel::builder(&frame).build();
-        let record = record_button(panel);
         let (scope_label, scope_choice) = scope_controls(panel);
-        let (category_label, category, toggle_favorite) = category_controls(panel);
+        let (category_label, category) = category_controls(panel);
         let search_label = StaticText::builder(&panel)
             .with_label("&Search channels")
             .build();
@@ -87,7 +86,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .with_value("No playlist loaded. Channel list is empty.")
             .build();
         details.set_accessibility_label("Playlist status");
-        details.set_accessibility_description("Read loading and search results here. Open playlist chooses a file or retries a failed load.");
+        // Python's main window has no visible status field: the
+        // status text rides the frame status bar and the live
+        // region. Both carriers exist but stay hidden, exactly
+        // like Python's hidden announcer control.
+        status_label.hide();
+        details.hide();
         let status = Status {
             label: status_label,
             details,
@@ -95,10 +99,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         let (episode_description, stream_url) = info_panels(panel);
         let controls_all = Controls {
-            record,
             scope_choice,
             category,
-            toggle_favorite,
             search,
             list,
             episode_description,
@@ -119,8 +121,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     })
 }
 
-/// The main window layout: controls in browse/tab order, the frame
-/// status bar, then show and focus the channel list.
+/// The main window layout (Python): two columns — Playlist view
+/// and Categories on the left (proportion 1), Search, Channels,
+/// Episode description and Stream URL on the right (proportion
+/// 2). No button row; the status carriers stay hidden (see main).
 fn layout_main(
     frame: Frame,
     panel: Panel,
@@ -130,40 +134,36 @@ fn layout_main(
     search_label: StaticText,
     channels_label: StaticText,
 ) {
-    let layout = BoxSizer::builder(Orientation::Vertical).build();
-    layout.add(&scope_label, 0, SizerFlag::All, 8);
-    layout.add(
+    let left = BoxSizer::builder(Orientation::Vertical).build();
+    left.add(&scope_label, 0, SizerFlag::All, 8);
+    left.add(
         &controls.scope_choice,
         0,
         SizerFlag::Expand | SizerFlag::All,
         8,
     );
-    layout.add(&category_label, 0, SizerFlag::All, 8);
-    layout.add(&controls.category, 0, SizerFlag::Expand | SizerFlag::All, 8);
-    layout.add(&controls.toggle_favorite, 0, SizerFlag::All, 8);
-    layout.add(&search_label, 0, SizerFlag::All, 8);
-    layout.add(&controls.search, 0, SizerFlag::Expand | SizerFlag::All, 8);
-    layout.add(&channels_label, 0, SizerFlag::All, 8);
-    layout.add(&controls.list, 1, SizerFlag::Expand | SizerFlag::All, 8);
-    layout.add(
+    left.add(&category_label, 0, SizerFlag::All, 8);
+    left.add(&controls.category, 1, SizerFlag::Expand | SizerFlag::All, 8);
+    let right = BoxSizer::builder(Orientation::Vertical).build();
+    right.add(&search_label, 0, SizerFlag::All, 8);
+    right.add(&controls.search, 0, SizerFlag::Expand | SizerFlag::All, 8);
+    right.add(&channels_label, 0, SizerFlag::All, 8);
+    right.add(&controls.list, 1, SizerFlag::Expand | SizerFlag::All, 8);
+    right.add(
         &controls.episode_description,
         0,
         SizerFlag::Expand | SizerFlag::All,
         8,
     );
-    layout.add(
+    right.add(
         &controls.stream_url,
         0,
         SizerFlag::Expand | SizerFlag::All,
         8,
     );
-    layout.add(&controls.status.label, 0, SizerFlag::All, 8);
-    layout.add(
-        &controls.status.details,
-        0,
-        SizerFlag::Expand | SizerFlag::All,
-        8,
-    );
+    let layout = BoxSizer::builder(Orientation::Horizontal).build();
+    layout.add_sizer(&left, 1, SizerFlag::Expand, 0);
+    layout.add_sizer(&right, 2, SizerFlag::Expand, 0);
     panel.set_sizer(layout, true);
     let frame_layout = BoxSizer::builder(Orientation::Vertical).build();
     frame_layout.add(&panel, 1, SizerFlag::Expand, 0);
@@ -218,8 +218,8 @@ fn scope_display_name(location: &str) -> String {
     )
 }
 
-/// The Category list and the Toggle favorite action, in browse order.
-fn category_controls(panel: Panel) -> (StaticText, TreeCtrl, Button) {
+/// The Categories tree, in browse order.
+fn category_controls(panel: Panel) -> (StaticText, TreeCtrl) {
     let label = StaticText::builder(&panel).with_label("&Category").build();
     let category = TreeCtrl::builder(&panel)
         .with_style(TreeCtrlStyle::HideRoot)
@@ -231,14 +231,7 @@ fn category_controls(panel: Panel) -> (StaticText, TreeCtrl, Button) {
         category.append_item(&root, "Favorites", None, None);
         category.expand(&root);
     }
-    let toggle = Button::builder(&panel)
-        .with_label("&Toggle favorite")
-        .build();
-    toggle.set_accessibility_label("Toggle favorite");
-    toggle.set_accessibility_description(
-        "Mark or unmark the selected channel as a favorite without moving focus.",
-    );
-    (label, category, toggle)
+    (label, category)
 }
 
 /// The tree item at a top-level position (0-based), walking the
@@ -317,10 +310,8 @@ impl Status {
 
 #[derive(Clone, Copy)]
 struct Controls {
-    record: Button,
     scope_choice: Choice,
     category: TreeCtrl,
-    toggle_favorite: Button,
     search: TextCtrl,
     list: ListCtrl,
     episode_description: TextCtrl,
@@ -500,16 +491,6 @@ impl Persist {
     }
 }
 
-/// The Record toggle button for the main window.
-fn record_button(panel: Panel) -> Button {
-    let record = Button::builder(&panel).with_label("&Record").build();
-    record.set_accessibility_label("Record");
-    record.set_accessibility_description(
-        "Start or stop recording the selected channel to the recordings folder.",
-    );
-    record
-}
-
 fn bind_browser(frame: Frame, controls: Controls, model: Rc<RefCell<SearchResults>>) {
     let candidates = config::config_candidates();
     let loaded = config::load(&candidates, &candidates[0]);
@@ -585,7 +566,6 @@ fn bind_browser(frame: Frame, controls: Controls, model: Rc<RefCell<SearchResult
     reload_sources(&wiring);
     fill_scope_choices(&wiring, controls.scope_choice);
     bind_completion(&wiring, controls);
-    bind_recording(&wiring, controls);
     build_menu(frame, &wiring, controls);
     maybe_auto_check_updates(&wiring);
     bind_actions(frame, &wiring, controls);
@@ -690,10 +670,8 @@ fn bind_scope_choice(wiring: &Wiring, scope_choice: Choice, search: TextCtrl, st
 
 fn bind_actions(_frame: Frame, wiring: &Wiring, controls: Controls) {
     let Controls {
-        record: _,
         scope_choice,
         category,
-        toggle_favorite,
         search,
         list,
         episode_description,
@@ -744,7 +722,6 @@ fn bind_actions(_frame: Frame, wiring: &Wiring, controls: Controls) {
         event.skip(true);
     });
     bind_scope_choice(wiring, scope_choice, search, status);
-    bind_toggle(wiring, toggle_favorite, list, search, status);
     bind_playback(wiring, list, status, episode_description, stream_url);
     bind_f1_help(&scope_choice, wiring, "playlist-view", status);
     bind_f1_help(&category, wiring, "categories", status);
@@ -760,26 +737,8 @@ fn bind_actions(_frame: Frame, wiring: &Wiring, controls: Controls) {
     bind_main_hotkeys(&stream_url, wiring, controls, status);
 }
 
-/// The Toggle favorite action: toggles the channel behind the selected or
-/// focused Channels row and announces the result without moving focus.
-fn bind_toggle(
-    wiring: &Wiring,
-    toggle_favorite: Button,
-    list: ListCtrl,
-    search: TextCtrl,
-    status: Status,
-) {
-    let browser = Rc::clone(&wiring.browser);
-    let timer = Rc::clone(&wiring.timer);
-    let model = Rc::clone(&wiring.model);
-    let persist = wiring.persist.clone();
-    toggle_favorite.on_click(move |_| {
-        toggle_selected_favorite(&browser, &model, &persist, &timer, list, search, status);
-    });
-}
-
 /// Toggle the favorite state of the channel behind the selected or
-/// focused Channels row (shared by the button and the View menu).
+/// focused Channels row (View menu, Ctrl+D and the context menu).
 #[allow(clippy::too_many_arguments)]
 fn toggle_selected_favorite(
     browser: &Rc<RefCell<BrowserWorker>>,
@@ -1204,27 +1163,6 @@ fn poll_epg(wiring: &Wiring, status: Status) {
     if let Some(first) = fired.first() {
         status.set_label(first);
     }
-}
-
-/// Enter (item activation) on Channels plays the selected channel through
-/// the configured player: the built-in window, or an external player.
-fn bind_recording(wiring: &Wiring, controls: Controls) {
-    let record = controls.record;
-    let list = controls.list;
-    let status = controls.status;
-    let browser = Rc::clone(&wiring.browser);
-    let model = Rc::clone(&wiring.model);
-    let recordings = Rc::clone(&wiring.recordings);
-    let persist = wiring.persist.clone();
-    let timer = Rc::clone(&wiring.timer);
-    record.on_click(move |_| {
-        let Some(channel) = selected_channel(&browser, &model, list) else {
-            status.set_label("No channel selected. Choose a channel in Channels first.");
-            return;
-        };
-        toggle_recording(&recordings, &persist, &channel, status);
-        assert!(timer.start(50, false));
-    });
 }
 
 /// The channel behind the list's current selection, if any.
