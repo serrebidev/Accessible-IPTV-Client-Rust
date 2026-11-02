@@ -762,12 +762,11 @@ fn poll_providers(wiring: &Wiring, controls: Controls) {
                             let Some(job) = wiring.dvr.borrow().get(&job_id).cloned() else {
                                 continue;
                             };
-                            if job.status != "scheduled" {
-                                continue;
-                            }
                             let mut channel = channel_from_snapshot(&job.channel);
                             channel.url = url;
-                            wiring.dvr.borrow_mut().mark_recording(&job_id);
+                            if !wiring.dvr.borrow_mut().resolution_succeeded(&job_id) {
+                                continue;
+                            }
                             start_dvr_recording(
                                 wiring,
                                 status,
@@ -993,33 +992,6 @@ fn start_dvr_job(wiring: &Wiring, status: Status, job_id: &str, now: f64) {
     };
     let channel = channel_from_snapshot(&job.channel);
     if channel.url.is_empty() {
-        if channel
-            .unknown_attributes
-            .get("provider-type")
-            .map(String::as_str)
-            == Some("stalker")
-        {
-            let Some(provider_id) = channel.unknown_attributes.get("provider-id").cloned() else {
-                wiring.dvr.borrow_mut().mark_finished(
-                    job_id,
-                    false,
-                    "",
-                    "Scheduled recording has no provider account.",
-                    now,
-                );
-                return;
-            };
-            wiring.dvr.borrow_mut().mark_resolving(job_id);
-            let request_id = wiring
-                .provider_worker
-                .resolve(provider_id, channel.unknown_attributes.clone());
-            wiring
-                .pending_dvr_resolves
-                .borrow_mut()
-                .insert(request_id, job_id.to_string());
-            status.set_label("Resolving scheduled recording stream...");
-            return;
-        }
         wiring.dvr.borrow_mut().mark_finished(
             job_id,
             false,
@@ -1096,6 +1068,29 @@ fn poll_recordings(wiring: &Wiring, status: Status) {
         let actions = wiring.dvr.borrow_mut().tick(now);
         for action in actions {
             match action {
+                DvrAction::Resolve {
+                    job_id,
+                    provider_id,
+                    data,
+                } => {
+                    if provider_id.is_empty() {
+                        wiring.dvr.borrow_mut().mark_finished(
+                            &job_id,
+                            false,
+                            "",
+                            "Scheduled recording has no provider account.",
+                            now,
+                        );
+                        continue;
+                    }
+                    wiring.dvr.borrow_mut().mark_resolving(&job_id);
+                    let request_id = wiring.provider_worker.resolve(provider_id, data);
+                    wiring
+                        .pending_dvr_resolves
+                        .borrow_mut()
+                        .insert(request_id, job_id);
+                    status.set_label("Resolving scheduled recording stream...");
+                }
                 DvrAction::Stop(job_id) => {
                     wiring
                         .recordings
