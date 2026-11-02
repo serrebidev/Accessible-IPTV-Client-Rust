@@ -2,6 +2,7 @@
 //! `scheduled_recordings.json` (the same version-1 file shape), padding,
 //! the tick state machine, restart re-arming, and daily/weekly repeats.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use chrono::TimeZone as _;
@@ -228,6 +229,7 @@ pub enum DvrAction {
 pub struct DvrSchedule {
     jobs: Vec<DvrJob>,
     stopping_since: std::collections::BTreeMap<String, f64>,
+    resolving: BTreeSet<String>,
     path: PathBuf,
 }
 
@@ -239,6 +241,7 @@ impl DvrSchedule {
         let mut schedule = Self {
             jobs: Vec::new(),
             stopping_since: std::collections::BTreeMap::new(),
+            resolving: BTreeSet::new(),
             path,
         };
         let Ok(text) = std::fs::read_to_string(&schedule.path) else {
@@ -326,6 +329,7 @@ impl DvrSchedule {
         if DONE_STATUSES.contains(&job.status.as_str()) {
             return false;
         }
+        self.resolving.remove(job_id);
         job.status = STATUS_CANCELED.to_string();
         job.message = "Canceled by user.".to_string();
         self.save();
@@ -343,7 +347,24 @@ impl DvrSchedule {
 
     /// Record that a job's recording has started.
     pub fn mark_recording(&mut self, job_id: &str) {
+        self.resolving.remove(job_id);
         self.set_status(job_id, STATUS_RECORDING, "");
+        self.save();
+    }
+
+    /// Keep a due job scheduled while an asynchronous provider link is being
+    /// resolved. The transient ownership never enters the persisted store.
+    pub fn mark_resolving(&mut self, job_id: &str) {
+        self.resolving.insert(job_id.to_string());
+        self.set_status(job_id, STATUS_SCHEDULED, "");
+        self.save();
+    }
+
+    /// Return a failed or unavailable resolution to the normal due-job path.
+    /// The next scheduler tick may request another link.
+    pub fn defer_resolution(&mut self, job_id: &str) {
+        self.resolving.remove(job_id);
+        self.set_status(job_id, STATUS_SCHEDULED, "");
         self.save();
     }
 
@@ -359,6 +380,9 @@ impl DvrSchedule {
             };
             match job.status.as_str() {
                 STATUS_SCHEDULED => {
+                    if self.resolving.contains(&id) {
+                        continue;
+                    }
                     if job.stop_ts > 0.0 && now >= job.stop_ts {
                         self.set_status(&id, STATUS_MISSED, "Scheduled recording was missed.");
                         changed = true;
@@ -402,6 +426,7 @@ impl DvrSchedule {
         now: f64,
     ) {
         self.stopping_since.remove(job_id);
+        self.resolving.remove(job_id);
         let Some(job) = self.jobs.iter_mut().find(|j| j.id == job_id) else {
             return;
         };
@@ -559,6 +584,25 @@ mod tests {
         assert_eq!(stop_actions, vec![DvrAction::Stop(due_id.clone())]);
         schedule.mark_finished(&due_id, true, "/tmp/x.mkv", "", 260.0);
         assert_eq!(schedule.get(&due_id).expect("due").status, STATUS_COMPLETED);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolving_due_job_is_not_started_again_until_resolution_finishes() {
+        let dir = std::env::temp_dir().join(format!("iptv-dvr-resolve-{}", std::process::id()));
+        let path = dir.join("scheduled_recordings.json");
+        let mut schedule = DvrSchedule::load(path, 0.0);
+        let due = build_job(&spec(&channel(), "Due", 100, 200, 0, 0), 0.0).expect("job");
+        let id = due.id.clone();
+        schedule.add_job(due);
+
+        assert_eq!(schedule.tick(150.0), vec![DvrAction::Start(id.clone())]);
+        schedule.mark_resolving(&id);
+        assert!(schedule.tick(160.0).is_empty());
+        assert_eq!(schedule.get(&id).expect("job").status, STATUS_SCHEDULED);
+
+        schedule.defer_resolution(&id);
+        assert_eq!(schedule.tick(170.0), vec![DvrAction::Start(id)]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

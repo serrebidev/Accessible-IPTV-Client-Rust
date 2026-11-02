@@ -252,6 +252,7 @@ struct Wiring {
     provider_worker: Rc<ProviderWorker>,
     provider_pending: Rc<std::cell::Cell<bool>>,
     pending_resolve: Rc<RefCell<Option<(u64, Channel)>>>,
+    pending_dvr_resolves: Rc<RefCell<BTreeMap<u64, String>>>,
     recordings: Rc<RefCell<RecordingEngine>>,
     cast_worker: Rc<CastWorker>,
     cast_pending: Rc<std::cell::Cell<bool>>,
@@ -437,6 +438,7 @@ fn bind_browser(frame: Frame, controls: Controls, model: Rc<RefCell<SearchResult
         provider_worker: Rc::new(ProviderWorker::new()),
         provider_pending: Rc::new(std::cell::Cell::new(false)),
         pending_resolve: Rc::new(RefCell::new(None)),
+        pending_dvr_resolves: Rc::new(RefCell::new(BTreeMap::new())),
         recordings: Rc::new(RefCell::new(RecordingEngine::new())),
         cast_worker: Rc::new(CastWorker::new()),
         cast_pending: Rc::new(std::cell::Cell::new(false)),
@@ -753,6 +755,38 @@ fn poll_providers(wiring: &Wiring, controls: Controls) {
                 }
             }
             ProviderEvent::Resolved { request_id, result } => {
+                let dvr_job = wiring.pending_dvr_resolves.borrow_mut().remove(&request_id);
+                if let Some(job_id) = dvr_job {
+                    match result {
+                        Ok(url) => {
+                            let Some(job) = wiring.dvr.borrow().get(&job_id).cloned() else {
+                                continue;
+                            };
+                            if job.status != "scheduled" {
+                                continue;
+                            }
+                            let mut channel = channel_from_snapshot(&job.channel);
+                            channel.url = url;
+                            wiring.dvr.borrow_mut().mark_recording(&job_id);
+                            start_dvr_recording(
+                                wiring,
+                                status,
+                                &job_id,
+                                &job,
+                                &channel,
+                                now_seconds(),
+                            );
+                        }
+                        Err(error) => {
+                            wiring.dvr.borrow_mut().defer_resolution(&job_id);
+                            status.set_label(&format!(
+                                "Scheduled recording waiting for stream: {error}"
+                            ));
+                        }
+                    }
+                    continue;
+                }
+
                 let pending = wiring
                     .pending_resolve
                     .borrow()
@@ -768,8 +802,7 @@ fn poll_providers(wiring: &Wiring, controls: Controls) {
                         play_channel(&wiring.player, &wiring.persist, &channel, status);
                     }
                     (Some((_id, _)), Err(error)) => status.set_label(&error),
-                    (None, Ok(_)) => {}
-                    (None, Err(_)) => {}
+                    (None, Ok(_)) | (None, Err(_)) => {}
                 }
             }
             ProviderEvent::Account(result) => match result {
@@ -959,6 +992,33 @@ fn start_dvr_job(wiring: &Wiring, status: Status, job_id: &str, now: f64) {
     };
     let channel = channel_from_snapshot(&job.channel);
     if channel.url.is_empty() {
+        if channel
+            .unknown_attributes
+            .get("provider-type")
+            .map(String::as_str)
+            == Some("stalker")
+        {
+            let Some(provider_id) = channel.unknown_attributes.get("provider-id").cloned() else {
+                wiring.dvr.borrow_mut().mark_finished(
+                    job_id,
+                    false,
+                    "",
+                    "Scheduled recording has no provider account.",
+                    now,
+                );
+                return;
+            };
+            wiring.dvr.borrow_mut().mark_resolving(job_id);
+            let request_id = wiring
+                .provider_worker
+                .resolve(provider_id, channel.unknown_attributes.clone());
+            wiring
+                .pending_dvr_resolves
+                .borrow_mut()
+                .insert(request_id, job_id.to_string());
+            status.set_label("Resolving scheduled recording stream...");
+            return;
+        }
         wiring.dvr.borrow_mut().mark_finished(
             job_id,
             false,
@@ -968,6 +1028,17 @@ fn start_dvr_job(wiring: &Wiring, status: Status, job_id: &str, now: f64) {
         );
         return;
     }
+    start_dvr_recording(wiring, status, job_id, &job, &channel, now);
+}
+
+fn start_dvr_recording(
+    wiring: &Wiring,
+    status: Status,
+    job_id: &str,
+    job: &iptv_core::dvr::DvrJob,
+    channel: &Channel,
+    now: f64,
+) {
     let display = if job.title.is_empty() {
         channel.name.clone()
     } else {
@@ -977,7 +1048,7 @@ fn start_dvr_job(wiring: &Wiring, status: Status, job_id: &str, now: f64) {
         &wiring.recordings,
         &wiring.persist,
         &format!("dvr:{job_id}"),
-        &channel,
+        channel,
         &job.format.clone(),
         &display,
     ) {
