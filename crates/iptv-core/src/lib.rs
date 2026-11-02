@@ -7,6 +7,7 @@ pub mod epg;
 pub mod favorites;
 pub mod loading;
 pub mod playback;
+pub mod providers;
 pub mod reminders;
 pub mod search;
 pub mod sources;

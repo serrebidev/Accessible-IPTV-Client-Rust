@@ -1,0 +1,1538 @@
+//! Provider accounts: Xtream Codes and Stalker/Ministra portal clients,
+//! plus the spoken account report. Ports Python's `providers.py` and
+//! `account_info.py` (pinned revision in the parity tool).
+//!
+//! Credentials live only in the user's own config; reports redact them
+//! exactly like the reference (server URL credentials stripped, MAC
+//! masked, secret payload fields never echoed).
+
+use std::cell::RefCell;
+use std::collections::BTreeMap;
+
+use serde_json::Value;
+
+use crate::Channel;
+
+pub const DEFAULT_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36";
+const STALKER_UA: &str = "Mozilla/5.0 (QtEmbedded; U; Linux; C) AppleWebKit/535.21 (KHTML, like Gecko) MAG250 stbapp Safari/535.21";
+const PORTAL_FILENAMES: &[&str] = &[
+    "portal.php",
+    "load.php",
+    "get.php",
+    "xmltv.php",
+    "player_api.php",
+    "panel_api.php",
+    "api.php",
+];
+
+type ProviderResult<T> = Result<T, String>;
+
+// ---------------------------------------------------------------------------
+// URL helpers
+// ---------------------------------------------------------------------------
+
+/// Port of `_normalize_base_url`: default the scheme, drop userinfo, and
+/// strip a trailing portal filename so endpoints can be appended cleanly.
+#[must_use]
+pub fn normalize_base_url(url: &str) -> String {
+    let url = url.trim();
+    if url.is_empty() {
+        return String::new();
+    }
+    let with_scheme;
+    let url = if url.contains("://") {
+        url
+    } else {
+        with_scheme = format!("http://{url}");
+        &with_scheme
+    };
+    let (scheme, rest) = url.split_once("://").unwrap_or(("http", url));
+    let (authority, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, ""),
+    };
+    let host = authority.rsplit('@').next().unwrap_or(authority);
+    let mut path = path.to_string();
+    if !path.is_empty() && path != "/" {
+        let filename = path.rsplit('/').next().unwrap_or("").to_lowercase();
+        if PORTAL_FILENAMES.contains(&filename.as_str()) {
+            path = path
+                .rsplit_once('/')
+                .map_or(String::new(), |(head, _)| head.to_string());
+        }
+    }
+    let path = path.trim_end_matches('/');
+    format!("{scheme}://{host}{path}")
+}
+
+/// `application/x-www-form-urlencoded` encoding (Python `urlencode`).
+fn form_encode(value: &str) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'*' | b'-' | b'.' | b'_' => {
+                out.push(byte as char);
+            }
+            b' ' => out.push('+'),
+            _ => {
+                let _ = write!(out, "%{byte:02X}");
+            }
+        }
+    }
+    out
+}
+
+fn query(params: &[(&str, &str)]) -> String {
+    params
+        .iter()
+        .map(|(k, v)| format!("{}={}", form_encode(k), form_encode(v)))
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+/// Percent-encode a URL path segment (Python `quote(..., safe="")`).
+fn quote_segment(value: &str) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(byte as char);
+            }
+            _ => {
+                let _ = write!(out, "%{byte:02X}");
+            }
+        }
+    }
+    out
+}
+
+fn http_get_text(url: &str, user_agent: &str) -> ProviderResult<Vec<u8>> {
+    let mut response = ureq::get(url)
+        .header("User-Agent", user_agent)
+        .call()
+        .map_err(|e| e.to_string())?;
+    response.body_mut().read_to_vec().map_err(|e| e.to_string())
+}
+
+fn decode_text(bytes: &[u8]) -> String {
+    let without_bom = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);
+    String::from_utf8_lossy(without_bom).into_owned()
+}
+
+// ---------------------------------------------------------------------------
+// Xtream Codes
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug)]
+pub struct XtreamConfig {
+    pub base_url: String,
+    pub username: String,
+    pub password: String,
+    pub stream_type: String,
+    pub output: String,
+    pub name: Option<String>,
+    pub auto_epg: bool,
+    pub provider_id: Option<String>,
+    pub user_agent: String,
+}
+
+impl Default for XtreamConfig {
+    fn default() -> Self {
+        Self {
+            base_url: String::new(),
+            username: String::new(),
+            password: String::new(),
+            stream_type: "m3u_plus".to_string(),
+            output: "ts".to_string(),
+            name: None,
+            auto_epg: true,
+            provider_id: None,
+            user_agent: DEFAULT_UA.to_string(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct XtreamClient {
+    cfg: XtreamConfig,
+    base: String,
+}
+
+impl XtreamClient {
+    #[must_use]
+    pub fn new(cfg: XtreamConfig) -> Self {
+        let base = normalize_base_url(&cfg.base_url);
+        Self { cfg, base }
+    }
+
+    #[must_use]
+    pub fn describe(&self) -> String {
+        let label = self.cfg.name.clone().unwrap_or_else(|| host_of(&self.base));
+        format!("Xtream Codes ({label})")
+    }
+
+    #[must_use]
+    pub fn playlist_url(&self) -> String {
+        let params = query(&[
+            ("username", &self.cfg.username),
+            ("password", &self.cfg.password),
+            (
+                "type",
+                if self.cfg.stream_type.is_empty() {
+                    "m3u_plus"
+                } else {
+                    &self.cfg.stream_type
+                },
+            ),
+            (
+                "output",
+                if self.cfg.output.is_empty() {
+                    "ts"
+                } else {
+                    &self.cfg.output
+                },
+            ),
+        ]);
+        format!("{}/get.php?{params}", self.base)
+    }
+
+    #[must_use]
+    pub fn epg_urls(&self) -> Vec<String> {
+        if !self.cfg.auto_epg {
+            return Vec::new();
+        }
+        let params = query(&[
+            ("username", &self.cfg.username),
+            ("password", &self.cfg.password),
+        ]);
+        vec![format!("{}/xmltv.php?{params}", self.base)]
+    }
+
+    /// Download the get.php playlist; a 200 response that is not a
+    /// playlist means the credentials were rejected.
+    ///
+    /// # Errors
+    ///
+    /// Returns the provider error text when the server is unreachable, rejects the credentials, or answers invalid data.
+    pub fn fetch_playlist(&self) -> ProviderResult<String> {
+        let bytes = http_get_text(&self.playlist_url(), &self.cfg.user_agent)
+            .map_err(|e| format!("Could not reach the Xtream server: {e}"))?;
+        let text = decode_text(&bytes);
+        let head: String = text.chars().take(4096).collect();
+        if !head.contains("#EXTM3U") {
+            return Err(
+                "Authentication failed – the server rejected these credentials".to_string(),
+            );
+        }
+        Ok(text)
+    }
+
+    fn player_api_url(&self, action: Option<&str>, extra: &[(&str, String)]) -> String {
+        let mut params: Vec<(&str, String)> = vec![
+            ("username", self.cfg.username.clone()),
+            ("password", self.cfg.password.clone()),
+        ];
+        if let Some(action) = action {
+            params.push(("action", action.to_string()));
+        }
+        for (k, v) in extra {
+            params.push((k, v.clone()));
+        }
+        let pairs: Vec<(&str, &str)> = params.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        format!("{}/player_api.php?{}", self.base, query(&pairs))
+    }
+
+    ///
+    /// # Errors
+    ///
+    /// Returns the provider error text when the server is unreachable, rejects the credentials, or answers invalid data.
+    pub fn player_api(
+        &self,
+        action: Option<&str>,
+        extra: &[(&str, String)],
+    ) -> ProviderResult<Value> {
+        let bytes = http_get_text(&self.player_api_url(action, extra), &self.cfg.user_agent)
+            .map_err(|e| format!("Could not reach the Xtream server: {e}"))?;
+        serde_json::from_slice(&strip_bom(&bytes))
+            .map_err(|_| "Invalid response from Xtream player API".to_string())
+    }
+
+    /// The raw `player_api` authentication payload (account state).
+    ///
+    /// # Errors
+    ///
+    /// Returns the provider error text when the portal is unreachable, the handshake fails, or the answer is invalid.
+    pub fn account_info(&self) -> ProviderResult<Value> {
+        let data = self.player_api(None, &[])?;
+        if !data.is_object() {
+            return Err("Unexpected account response from the Xtream server".to_string());
+        }
+        Ok(data)
+    }
+
+    ///
+    /// # Errors
+    ///
+    /// Returns the provider error text when the server is unreachable, rejects the credentials, or answers invalid data.
+    pub fn vod_categories(&self) -> ProviderResult<Value> {
+        Ok(list_or_empty(
+            self.player_api(Some("get_vod_categories"), &[])?,
+        ))
+    }
+
+    ///
+    /// # Errors
+    ///
+    /// Returns the provider error text when the server is unreachable, rejects the credentials, or answers invalid data.
+    pub fn vod_streams(&self, category_id: Option<&str>) -> ProviderResult<Value> {
+        let extra: Vec<(&str, String)> = category_id
+            .map(|id| ("category_id", id.to_string()))
+            .into_iter()
+            .collect();
+        Ok(list_or_empty(
+            self.player_api(Some("get_vod_streams"), &extra)?,
+        ))
+    }
+
+    ///
+    /// # Errors
+    ///
+    /// Returns the provider error text when the server is unreachable, rejects the credentials, or answers invalid data.
+    pub fn series_categories(&self) -> ProviderResult<Value> {
+        Ok(list_or_empty(
+            self.player_api(Some("get_series_categories"), &[])?,
+        ))
+    }
+
+    ///
+    /// # Errors
+    ///
+    /// Returns the provider error text when the server is unreachable, rejects the credentials, or answers invalid data.
+    pub fn series(&self, category_id: Option<&str>) -> ProviderResult<Value> {
+        let extra: Vec<(&str, String)> = category_id
+            .map(|id| ("category_id", id.to_string()))
+            .into_iter()
+            .collect();
+        Ok(list_or_empty(self.player_api(Some("get_series"), &extra)?))
+    }
+
+    ///
+    /// # Errors
+    ///
+    /// Returns the provider error text when the server is unreachable, rejects the credentials, or answers invalid data.
+    pub fn series_info(&self, series_id: &str) -> ProviderResult<Value> {
+        let data = self.player_api(
+            Some("get_series_info"),
+            &[("series_id", series_id.to_string())],
+        )?;
+        Ok(if data.is_object() {
+            data
+        } else {
+            Value::Object(serde_json::Map::new())
+        })
+    }
+
+    #[must_use]
+    pub fn vod_stream_url(&self, stream_id: &str, ext: &str) -> String {
+        let ext = if ext.is_empty() {
+            "mp4"
+        } else {
+            ext.trim_start_matches('.')
+        };
+        format!(
+            "{}/movie/{}/{}/{}.{}",
+            self.base,
+            quote_segment(&self.cfg.username),
+            quote_segment(&self.cfg.password),
+            stream_id,
+            ext
+        )
+    }
+
+    #[must_use]
+    pub fn series_stream_url(&self, episode_id: &str, ext: &str) -> String {
+        let ext = if ext.is_empty() {
+            "mp4"
+        } else {
+            ext.trim_start_matches('.')
+        };
+        format!(
+            "{}/series/{}/{}/{}.{}",
+            self.base,
+            quote_segment(&self.cfg.username),
+            quote_segment(&self.cfg.password),
+            episode_id,
+            ext
+        )
+    }
+
+    #[must_use]
+    pub fn live_stream_url(&self, stream_id: &str) -> String {
+        let output = if self.cfg.output.is_empty() {
+            "ts"
+        } else {
+            &self.cfg.output
+        };
+        format!(
+            "{}/live/{}/{}/{}.{}",
+            self.base,
+            quote_segment(&self.cfg.username),
+            quote_segment(&self.cfg.password),
+            stream_id,
+            output
+        )
+    }
+}
+
+fn list_or_empty(value: Value) -> Value {
+    if value.is_array() {
+        value
+    } else {
+        Value::Array(Vec::new())
+    }
+}
+
+fn strip_bom(bytes: &[u8]) -> Vec<u8> {
+    bytes
+        .strip_prefix(&[0xEF, 0xBB, 0xBF])
+        .unwrap_or(bytes)
+        .to_vec()
+}
+
+fn host_of(url: &str) -> String {
+    let rest = url.split_once("://").map_or(url, |(_, r)| r);
+    rest.split('/').next().unwrap_or(rest).to_string()
+}
+
+// ---------------------------------------------------------------------------
+// Stalker / Ministra portal
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug)]
+pub struct StalkerConfig {
+    pub base_url: String,
+    pub mac: String,
+    pub username: String,
+    pub password: String,
+    pub name: Option<String>,
+    pub auto_epg: bool,
+    pub provider_id: Option<String>,
+    pub user_agent: String,
+    pub profile_user_agent: String,
+    pub timezone: String,
+}
+
+impl Default for StalkerConfig {
+    fn default() -> Self {
+        Self {
+            base_url: String::new(),
+            mac: String::new(),
+            username: String::new(),
+            password: String::new(),
+            name: None,
+            auto_epg: true,
+            provider_id: None,
+            user_agent: STALKER_UA.to_string(),
+            profile_user_agent: "Model: MAG420; Link: WiFi".to_string(),
+            timezone: "UTC".to_string(),
+        }
+    }
+}
+
+pub struct StalkerClient {
+    cfg: StalkerConfig,
+    base: String,
+    endpoint: String,
+    token: RefCell<Option<(String, i64)>>,
+}
+
+impl StalkerClient {
+    #[must_use]
+    pub fn new(cfg: StalkerConfig) -> Self {
+        let base = normalize_base_url(&cfg.base_url);
+        let raw = cfg.base_url.trim().to_lowercase();
+        let endpoint = if raw.ends_with("portal.php") || raw.ends_with("load.php") {
+            cfg.base_url.trim().to_string()
+        } else {
+            format!("{base}/portal.php")
+        };
+        Self {
+            cfg,
+            base,
+            endpoint,
+            token: RefCell::new(None),
+        }
+    }
+
+    #[must_use]
+    pub fn describe(&self) -> String {
+        let label = self.cfg.name.clone().unwrap_or_else(|| host_of(&self.base));
+        format!("Stalker Portal ({label})")
+    }
+
+    fn portal_call(&self, params: &[(&str, &str)], include_token: bool) -> ProviderResult<Value> {
+        let pairs: Vec<(&str, &str)> = params.to_vec();
+        let url = format!("{}?{}", self.endpoint, query(&pairs));
+        let mut request = ureq::get(&url)
+            .header("User-Agent", &self.cfg.user_agent)
+            .header("Accept", "application/json")
+            .header("Connection", "keep-alive")
+            .header("X-User-Agent", &self.cfg.profile_user_agent)
+            .header("Referer", &format!("{}/c/", self.base))
+            .header(
+                "Cookie",
+                &format!(
+                    "stb_lang=en; timezone={}; mac={}",
+                    self.cfg.timezone, self.cfg.mac
+                ),
+            );
+        if include_token {
+            if let Some((token, _)) = self.token.borrow().as_ref() {
+                request = request.header("Authorization", &format!("Bearer {token}"));
+            }
+        }
+        let mut response = request.call().map_err(|e| {
+            if matches!(e, ureq::Error::StatusCode(401 | 403)) {
+                // The portal dropped the token; forgetting it costs one
+                // handshake, keeping it fails every later call for 25 min.
+                *self.token.borrow_mut() = None;
+            }
+            format!("Could not reach the portal: {e}")
+        })?;
+        let bytes = response
+            .body_mut()
+            .read_to_vec()
+            .map_err(|e| format!("Could not reach the portal: {e}"))?;
+        let data: Value = serde_json::from_slice(&bytes)
+            .map_err(|_| "Invalid response from portal".to_string())?;
+        if !data.is_object() {
+            return Err("Invalid response from portal".to_string());
+        }
+        Ok(data)
+    }
+
+    fn ensure_token(&self, now: i64) -> ProviderResult<()> {
+        if let Some((_, issued)) = self.token.borrow().as_ref() {
+            if now - *issued < 60 * 25 {
+                return Ok(());
+            }
+        }
+        let data = self.portal_call(
+            &[
+                ("type", "stb"),
+                ("action", "handshake"),
+                ("token", ""),
+                ("prehash", "0"),
+                ("JsHttpRequest", "1-xml"),
+            ],
+            false,
+        )?;
+        let token = data
+            .get("js")
+            .and_then(|js| js.get("token"))
+            .and_then(Value::as_str)
+            .filter(|t| !t.is_empty())
+            .ok_or_else(|| "Portal handshake failed: no token returned".to_string())?;
+        *self.token.borrow_mut() = Some((token.to_string(), now));
+        if !self.cfg.username.is_empty() || !self.cfg.password.is_empty() {
+            let auth = self.portal_call(
+                &[
+                    ("type", "stb"),
+                    ("action", "login"),
+                    ("login", &self.cfg.username),
+                    ("password", &self.cfg.password),
+                    ("JsHttpRequest", "1-xml"),
+                ],
+                true,
+            )?;
+            if let Some(new_token) = auth
+                .get("js")
+                .and_then(|js| js.get("token"))
+                .and_then(Value::as_str)
+                .filter(|t| !t.is_empty())
+            {
+                *self.token.borrow_mut() = Some((new_token.to_string(), now));
+            }
+        }
+        Ok(())
+    }
+
+    /// All portal channels as playlist channels with unresolved URLs,
+    /// plus the best-effort EPG source list.
+    ///
+    /// # Errors
+    ///
+    /// Returns the provider error text when the portal is unreachable, the handshake fails, or the answer is invalid.
+    pub fn fetch_channels(&self, now: i64) -> ProviderResult<(Vec<Channel>, Vec<String>)> {
+        self.ensure_token(now)?;
+        let payload = self.portal_call(
+            &[
+                ("type", "itv"),
+                ("action", "get_all_channels"),
+                ("include", "genres"),
+                ("force_ch_link_check", "1"),
+                ("JsHttpRequest", "1-xml"),
+            ],
+            true,
+        )?;
+        let rows = payload
+            .get("js")
+            .and_then(|js| js.get("data"))
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let mut channels = Vec::new();
+        for row in &rows {
+            let name = string_field(row, "name")
+                .or_else(|| string_field(row, "tv_genre_title"))
+                .unwrap_or_default();
+            let cmd = string_field(row, "cmd").unwrap_or_default();
+            if name.is_empty() || cmd.is_empty() {
+                continue;
+            }
+            let group = string_field(row, "tv_genre_title")
+                .or_else(|| string_field(row, "tv_genre_id"))
+                .unwrap_or_else(|| "Stalker".to_string());
+            let mut attrs = BTreeMap::new();
+            attrs.insert("provider-type".to_string(), "stalker".to_string());
+            if let Some(id) = &self.cfg.provider_id {
+                attrs.insert("provider-id".to_string(), id.clone());
+            }
+            attrs.insert("cmd".to_string(), cmd);
+            for key in [
+                "use_http_tmp_link",
+                "id",
+                "number",
+                "allow_timeshift",
+                "archive",
+            ] {
+                if let Some(v) = row.get(key) {
+                    attrs.insert(key.to_string(), value_text(v));
+                }
+            }
+            if let Some(days) = row.get("tv_archive_duration") {
+                if !value_text(days).is_empty() {
+                    attrs.insert("catchup-days".to_string(), value_text(days));
+                }
+            }
+            if truthy(row.get("allow_timeshift")) || truthy(row.get("archive")) {
+                attrs.insert("catchup".to_string(), "stalker".to_string());
+            }
+            channels.push(Channel {
+                name: name.clone(),
+                group,
+                url: String::new(),
+                tvg_id: string_field(row, "epg_id").unwrap_or_default(),
+                tvg_name: string_field(row, "display_name").unwrap_or(name),
+                tvg_logo: String::new(),
+                unknown_attributes: attrs,
+            });
+        }
+        let epg_urls = if self.cfg.auto_epg {
+            vec![format!("{}/xmltv.php", self.base)]
+        } else {
+            Vec::new()
+        };
+        Ok((channels, epg_urls))
+    }
+
+    ///
+    /// # Errors
+    ///
+    /// Returns the provider error text when the portal is unreachable, the handshake fails, or the answer is invalid.
+    pub fn account_info(&self, now: i64) -> ProviderResult<Value> {
+        self.ensure_token(now)?;
+        let payload = self.portal_call(
+            &[
+                ("type", "account_info"),
+                ("action", "get_main_info"),
+                ("JsHttpRequest", "1-xml"),
+            ],
+            true,
+        )?;
+        let data = payload.get("js").cloned().unwrap_or(Value::Null);
+        if !data.is_object() {
+            return Err("Portal did not return account information".to_string());
+        }
+        Ok(data)
+    }
+
+    /// Resolve a channel's temporary stream link (`create_link`).
+    ///
+    /// # Errors
+    ///
+    /// Returns the provider error text when the portal is unreachable, the handshake fails, or the answer is invalid.
+    pub fn resolve_stream(
+        &self,
+        provider_data: &BTreeMap<String, String>,
+        now: i64,
+    ) -> ProviderResult<String> {
+        self.ensure_token(now)?;
+        let cmd = provider_data
+            .get("cmd")
+            .filter(|c| !c.is_empty())
+            .ok_or_else(|| "Channel missing command reference".to_string())?;
+        let payload = self.portal_call(
+            &[
+                ("type", "itv"),
+                ("action", "create_link"),
+                ("cmd", cmd),
+                ("JsHttpRequest", "1-xml"),
+            ],
+            true,
+        )?;
+        portal_link(&payload).ok_or_else(|| "Portal did not return stream URL".to_string())
+    }
+
+    /// Resolve a catch-up (archive) link for a programme start + duration.
+    ///
+    /// # Errors
+    ///
+    /// Returns the provider error text when the portal is unreachable, the handshake fails, or the answer is invalid.
+    pub fn resolve_catchup(
+        &self,
+        provider_data: &BTreeMap<String, String>,
+        start: &str,
+        duration: i64,
+        now: i64,
+    ) -> ProviderResult<String> {
+        self.ensure_token(now)?;
+        let cmd = provider_data
+            .get("cmd")
+            .filter(|c| !c.is_empty())
+            .ok_or_else(|| "Channel missing command reference".to_string())?;
+        let duration_text = duration.to_string();
+        let payload = self.portal_call(
+            &[
+                ("type", "itv"),
+                ("action", "create_link"),
+                ("cmd", cmd),
+                ("JsHttpRequest", "1-xml"),
+                ("download", "0"),
+                ("save", "0"),
+                ("series", "1"),
+                ("forced_storage", "0"),
+                ("start", start),
+                ("duration", &duration_text),
+            ],
+            true,
+        )?;
+        portal_link(&payload).ok_or_else(|| "Portal did not provide catch-up link".to_string())
+    }
+}
+
+fn portal_link(payload: &Value) -> Option<String> {
+    let raw = payload
+        .get("js")
+        .and_then(|js| js.get("cmd"))
+        .and_then(Value::as_str)
+        .or_else(|| payload.get("cmd").and_then(Value::as_str))?;
+    let mut link = raw.to_string();
+    for prefix in ["ffmpeg ", "auto "] {
+        if let Some(rest) = link.strip_prefix(prefix) {
+            link = rest.to_string();
+        }
+    }
+    if link.is_empty() {
+        None
+    } else {
+        Some(link)
+    }
+}
+
+fn string_field(row: &Value, key: &str) -> Option<String> {
+    row.get(key).map(value_text).filter(|s| !s.is_empty())
+}
+
+fn value_text(value: &Value) -> String {
+    match value {
+        Value::String(s) => s.clone(),
+        Value::Number(n) => n.to_string(),
+        Value::Bool(b) => b.to_string(),
+        _ => String::new(),
+    }
+}
+
+fn truthy(value: Option<&Value>) -> bool {
+    match value {
+        Some(Value::Bool(b)) => *b,
+        Some(Value::Number(n)) => n.as_i64().is_some_and(|i| i != 0),
+        Some(Value::String(s)) => matches!(s.trim().to_lowercase().as_str(), "1" | "true" | "yes"),
+        _ => false,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Config entries and the background provider worker
+// ---------------------------------------------------------------------------
+
+/// One provider account from a `playlists` config entry.
+#[derive(Clone, Debug)]
+pub enum ProviderAccount {
+    Xtream(XtreamConfig),
+    Stalker(StalkerConfig),
+}
+
+impl ProviderAccount {
+    #[must_use]
+    pub fn provider_id(&self) -> Option<String> {
+        match self {
+            Self::Xtream(cfg) => cfg.provider_id.clone(),
+            Self::Stalker(cfg) => cfg.provider_id.clone(),
+        }
+    }
+
+    #[must_use]
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Xtream(cfg) => XtreamClient::new(cfg.clone()).describe(),
+            Self::Stalker(cfg) => {
+                let label = cfg.name.clone().unwrap_or_else(|| host_of(&cfg.base_url));
+                format!("Stalker Portal ({label})")
+            }
+        }
+    }
+
+    /// Parse one config dict entry; None for non-provider entries.
+    #[must_use]
+    pub fn from_config(entry: &Value) -> Option<Self> {
+        let obj = entry.as_object()?;
+        let kind = obj
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_lowercase();
+        let text = |keys: &[&str]| -> String {
+            keys.iter()
+                .find_map(|k| obj.get(*k).and_then(Value::as_str))
+                .unwrap_or("")
+                .to_string()
+        };
+        let provider_id = text(&["id", "provider_id"]);
+        let provider_id = if provider_id.is_empty() {
+            None
+        } else {
+            Some(provider_id)
+        };
+        let auto_epg = obj.get("auto_epg").and_then(Value::as_bool).unwrap_or(true);
+        match kind.as_str() {
+            "xtream" => Some(Self::Xtream(XtreamConfig {
+                base_url: text(&["base_url", "url"]),
+                username: text(&["username"]),
+                password: text(&["password"]),
+                stream_type: {
+                    let v = text(&["stream_type"]);
+                    if v.is_empty() {
+                        "m3u_plus".to_string()
+                    } else {
+                        v
+                    }
+                },
+                output: {
+                    let v = text(&["output"]);
+                    if v.is_empty() {
+                        "ts".to_string()
+                    } else {
+                        v
+                    }
+                },
+                name: {
+                    let v = text(&["name"]);
+                    if v.is_empty() {
+                        None
+                    } else {
+                        Some(v)
+                    }
+                },
+                auto_epg,
+                provider_id,
+                user_agent: DEFAULT_UA.to_string(),
+            })),
+            "stalker" => Some(Self::Stalker(StalkerConfig {
+                base_url: text(&["base_url", "url"]),
+                mac: text(&["mac"]),
+                username: text(&["username"]),
+                password: text(&["password"]),
+                name: {
+                    let v = text(&["name"]);
+                    if v.is_empty() {
+                        None
+                    } else {
+                        Some(v)
+                    }
+                },
+                auto_epg,
+                provider_id,
+                ..StalkerConfig::default()
+            })),
+            _ => None,
+        }
+    }
+}
+
+enum ProviderJob {
+    Load(Vec<ProviderAccount>),
+    Resolve {
+        provider_id: String,
+        data: BTreeMap<String, String>,
+    },
+    Account {
+        provider_id: String,
+    },
+}
+
+/// What the provider worker reports back to the UI thread.
+pub enum ProviderEvent {
+    Loaded {
+        channels: Vec<Channel>,
+        epg_urls: Vec<String>,
+        failures: Vec<String>,
+    },
+    Resolved(ProviderResult<String>),
+    Account(ProviderResult<String>),
+}
+
+enum Client {
+    Xtream(XtreamClient),
+    Stalker(StalkerClient),
+}
+
+/// Background worker owning the provider clients (Stalker tokens live
+/// here), mirroring the other workers' shape.
+pub struct ProviderWorker {
+    jobs: std::sync::mpsc::Sender<ProviderJob>,
+    events: std::sync::Mutex<std::sync::mpsc::Receiver<ProviderEvent>>,
+}
+
+impl Default for ProviderWorker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ProviderWorker {
+    #[must_use]
+    pub fn new() -> Self {
+        let (job_sender, job_receiver) = std::sync::mpsc::channel::<ProviderJob>();
+        let (event_sender, event_receiver) = std::sync::mpsc::channel::<ProviderEvent>();
+        std::thread::spawn(move || {
+            let mut clients: BTreeMap<String, (ProviderAccount, Client)> = BTreeMap::new();
+            while let Ok(job) = job_receiver.recv() {
+                let event = match job {
+                    ProviderJob::Load(accounts) => {
+                        let mut channels = Vec::new();
+                        let mut epg_urls = Vec::new();
+                        let mut failures = Vec::new();
+                        for account in accounts {
+                            let now = now_epoch();
+                            let key = account.provider_id().unwrap_or_else(|| account.describe());
+                            match &account {
+                                ProviderAccount::Xtream(cfg) => {
+                                    let client = XtreamClient::new(cfg.clone());
+                                    match client.fetch_playlist() {
+                                        Ok(text) => {
+                                            let mut parsed = crate::parse_m3u(&text);
+                                            for channel in &mut parsed {
+                                                channel.unknown_attributes.insert(
+                                                    "provider-type".to_string(),
+                                                    "xtream".to_string(),
+                                                );
+                                                if let Some(id) = &cfg.provider_id {
+                                                    channel.unknown_attributes.insert(
+                                                        "provider-id".to_string(),
+                                                        id.clone(),
+                                                    );
+                                                }
+                                            }
+                                            channels.extend(parsed);
+                                            epg_urls.extend(client.epg_urls());
+                                        }
+                                        Err(e) => {
+                                            failures.push(format!("{}: {e}", client.describe()));
+                                        }
+                                    }
+                                    clients.insert(key, (account, Client::Xtream(client)));
+                                }
+                                ProviderAccount::Stalker(cfg) => {
+                                    let client = StalkerClient::new(cfg.clone());
+                                    match client.fetch_channels(now) {
+                                        Ok((found, urls)) => {
+                                            channels.extend(found);
+                                            epg_urls.extend(urls);
+                                        }
+                                        Err(e) => {
+                                            failures.push(format!("{}: {e}", client.describe()));
+                                        }
+                                    }
+                                    clients.insert(key, (account, Client::Stalker(client)));
+                                }
+                            }
+                        }
+                        ProviderEvent::Loaded {
+                            channels,
+                            epg_urls,
+                            failures,
+                        }
+                    }
+                    ProviderJob::Resolve { provider_id, data } => {
+                        let result = match clients.get(&provider_id) {
+                            Some((_, Client::Stalker(client))) => {
+                                client.resolve_stream(&data, now_epoch())
+                            }
+                            _ => Err("No Stalker portal for this channel".to_string()),
+                        };
+                        ProviderEvent::Resolved(result)
+                    }
+                    ProviderJob::Account { provider_id } => {
+                        let result = match clients.get(&provider_id) {
+                            Some((account, client)) => {
+                                let payload = match client {
+                                    Client::Xtream(c) => c.account_info(),
+                                    Client::Stalker(c) => c.account_info(now_epoch()),
+                                };
+                                payload.map(|p| format_account_report(account, &p, now_epoch()))
+                            }
+                            None => Err("Unknown provider account".to_string()),
+                        };
+                        ProviderEvent::Account(result)
+                    }
+                };
+                if event_sender.send(event).is_err() {
+                    break;
+                }
+            }
+        });
+        Self {
+            jobs: job_sender,
+            events: std::sync::Mutex::new(event_receiver),
+        }
+    }
+
+    pub fn load(&self, accounts: Vec<ProviderAccount>) {
+        let _ = self.jobs.send(ProviderJob::Load(accounts));
+    }
+
+    pub fn resolve(&self, provider_id: String, data: BTreeMap<String, String>) {
+        let _ = self.jobs.send(ProviderJob::Resolve { provider_id, data });
+    }
+
+    pub fn account(&self, provider_id: String) {
+        let _ = self.jobs.send(ProviderJob::Account { provider_id });
+    }
+
+    #[must_use]
+    pub fn try_recv(&self) -> Option<ProviderEvent> {
+        self.events.lock().ok()?.try_recv().ok()
+    }
+}
+
+fn now_epoch() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(0))
+}
+
+// ---------------------------------------------------------------------------
+// Account report (port of account_info.py formatting)
+// ---------------------------------------------------------------------------
+
+const SECRET_KEY_PARTS: &[&str] = &[
+    "password", "passwd", "pwd", "secret", "token", "api_key", "apikey", "auth",
+];
+
+fn is_secret_key(lowered: &str) -> bool {
+    SECRET_KEY_PARTS.iter().any(|part| lowered.contains(part))
+}
+
+/// The server address with any credentials it carries stripped.
+#[must_use]
+pub fn redact_server_url(url: &str, username: &str, password: &str) -> String {
+    let mut text = url.trim().to_string();
+    if let Some((_, rest)) = text.split_once("://") {
+        if let Some((_, after)) = rest.split_once('@') {
+            let scheme = text.split("://").next().unwrap_or("http").to_string();
+            text = format!("{scheme}://{after}");
+        }
+    }
+    // Path/query credentials (path-form Xtream URLs embed user/password).
+    let redact = |text: &str| -> String {
+        text.split('/')
+            .map(|seg| {
+                if !username.is_empty() && seg == username
+                    || !password.is_empty() && seg == password
+                {
+                    "***"
+                } else {
+                    seg
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("/")
+    };
+    let mut text = redact(&text);
+    if let Some((head, query_string)) = text.clone().split_once('?') {
+        let pairs: Vec<String> = query_string
+            .split('&')
+            .map(|pair| {
+                let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+                if (k == "username" && v == username) || (k == "password" && v == password) {
+                    format!("{k}=***")
+                } else {
+                    pair.to_string()
+                }
+            })
+            .collect();
+        text = format!("{}?{}", head, pairs.join("&"));
+    }
+    text
+}
+
+/// A MAC with everything but the first two octets hidden.
+#[must_use]
+pub fn mask_mac(mac: &str) -> String {
+    let text = mac.trim();
+    if text.is_empty() {
+        return String::new();
+    }
+    let parts: Vec<&str> = text.split(':').collect();
+    if parts.len() >= 3 {
+        let mut masked = vec![parts[0], parts[1]];
+        masked.extend(vec!["**"; parts.len() - 2]);
+        masked.join(":")
+    } else {
+        text.to_string()
+    }
+}
+
+#[allow(clippy::cast_possible_truncation)] // Python int(float()) truncates identically
+fn as_timestamp(value: Option<&Value>) -> Option<i64> {
+    let raw = value?;
+    let parsed = match raw {
+        Value::Number(n) => n.as_f64(),
+        Value::String(s) => s.trim().parse::<f64>().ok(),
+        _ => None,
+    }?;
+    let ts = parsed as i64;
+    (ts > 0).then_some(ts)
+}
+
+fn local_datetime(epoch: i64) -> String {
+    chrono::DateTime::from_timestamp(epoch, 0).map_or_else(
+        || epoch.to_string(),
+        |utc| {
+            utc.with_timezone(&chrono::Local)
+                .format("%Y-%m-%d %H:%M")
+                .to_string()
+        },
+    )
+}
+
+fn truthy_flag(value: Option<&Value>) -> bool {
+    truthy(value)
+}
+
+fn status_label(raw: &str) -> String {
+    match raw.trim().to_lowercase().as_str() {
+        "active" => "Active".to_string(),
+        "expired" => "Expired".to_string(),
+        "banned" => "Banned".to_string(),
+        "disabled" => "Disabled".to_string(),
+        "pending" => "Pending".to_string(),
+        _ => raw.to_string(),
+    }
+}
+
+fn extra_lines(data: &Value, handled: &[&str]) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(obj) = data.as_object() {
+        let mut keys: Vec<&String> = obj.keys().collect();
+        keys.sort();
+        for key in keys {
+            if handled.contains(&key.as_str()) || is_secret_key(&key.to_lowercase()) {
+                continue;
+            }
+            let value = &obj[key];
+            let text = match value {
+                Value::Array(items) => items
+                    .iter()
+                    .map(value_text)
+                    .filter(|s| !s.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                Value::Object(_) => continue,
+                Value::Bool(b) => {
+                    if *b {
+                        "Yes".to_string()
+                    } else {
+                        "No".to_string()
+                    }
+                }
+                other => value_text(other),
+            };
+            if !text.trim().is_empty() {
+                lines.push(format!("{key}: {}", text.trim()));
+            }
+        }
+    }
+    lines
+}
+
+/// The linear, screen-reader-friendly account report for one provider.
+#[must_use]
+pub fn format_account_report(account: &ProviderAccount, payload: &Value, now: i64) -> String {
+    let (kind_label, name, base, username, mac) = match account {
+        ProviderAccount::Xtream(cfg) => (
+            "Xtream Codes",
+            cfg.name.clone().unwrap_or_else(|| cfg.username.clone()),
+            cfg.base_url.clone(),
+            cfg.username.clone(),
+            String::new(),
+        ),
+        ProviderAccount::Stalker(cfg) => (
+            "Stalker Portal",
+            cfg.name.clone().unwrap_or_else(|| cfg.username.clone()),
+            cfg.base_url.clone(),
+            cfg.username.clone(),
+            cfg.mac.clone(),
+        ),
+    };
+    let (username_for_redact, password) = match account {
+        ProviderAccount::Xtream(cfg) => (cfg.username.clone(), cfg.password.clone()),
+        ProviderAccount::Stalker(cfg) => (cfg.username.clone(), cfg.password.clone()),
+    };
+    let mut lines = vec![
+        format!(
+            "Account: {}",
+            if name.is_empty() {
+                host_of(&base)
+            } else {
+                name
+            }
+        ),
+        format!("Type: {kind_label}"),
+        format!(
+            "Server: {}",
+            redact_server_url(&base, &username_for_redact, &password)
+        ),
+    ];
+    if !username.is_empty() {
+        lines.push(format!("Username: {username}"));
+    }
+    if !mac.is_empty() {
+        lines.push(format!("MAC address: {}", mask_mac(&mac)));
+    }
+    match account {
+        ProviderAccount::Xtream(_) => lines.extend(xtream_report(payload, now)),
+        ProviderAccount::Stalker(_) => lines.extend(stalker_report(payload)),
+    }
+    if payload.is_null() || payload.as_object().is_some_and(serde_json::Map::is_empty) {
+        lines.push(String::new());
+        lines.push("The server did not report any account details.".to_string());
+    }
+    lines.join("\n")
+}
+
+fn expiry_lines(value: Option<&Value>, now: i64) -> Vec<String> {
+    let Some(ts) = as_timestamp(value) else {
+        return vec!["Expires: Never (no expiry date set)".to_string()];
+    };
+    let mut lines = vec![format!("Expires: {}", local_datetime(ts))];
+    let days = (ts - now) / 86_400;
+    if ts >= now {
+        lines.push(format!("Days remaining: {days}"));
+    } else {
+        lines.push(format!("Days since expiry: {}", (now - ts) / 86_400));
+    }
+    lines
+}
+
+fn xtream_report(payload: &Value, now: i64) -> Vec<String> {
+    let user = payload.get("user_info").cloned().unwrap_or(Value::Null);
+    let server = payload.get("server_info").cloned().unwrap_or(Value::Null);
+    let mut lines = vec![String::new(), "Subscription".to_string()];
+    let auth_failed = user.get("auth").is_some() && !truthy_flag(user.get("auth"));
+    if auth_failed {
+        lines.push(
+            "Status: Authentication failed – the server rejected these credentials".to_string(),
+        );
+    } else if let Some(status) = user.get("status").and_then(|v| match v {
+        Value::String(s) if !s.is_empty() => Some(s.clone()),
+        _ => None,
+    }) {
+        lines.push(format!("Status: {}", status_label(&status)));
+    } else {
+        lines.push("Status: Not reported by the server".to_string());
+    }
+    if !auth_failed {
+        if user.is_object() {
+            lines.extend(expiry_lines(user.get("exp_date"), now));
+        } else {
+            lines.push("Expires: Not reported by the server".to_string());
+        }
+    }
+    if user.get("is_trial").is_some() {
+        lines.push(format!(
+            "Trial account: {}",
+            if truthy_flag(user.get("is_trial")) {
+                "Yes"
+            } else {
+                "No"
+            }
+        ));
+    }
+    for (key, label) in [
+        ("active_cons", "Connections in use"),
+        ("max_connections", "Maximum connections"),
+    ] {
+        if let Some(v) = user.get(key) {
+            if !matches!(v, Value::Null) && !value_text(v).is_empty() {
+                lines.push(format!("{label}: {}", value_text(v)));
+            }
+        }
+    }
+    if let Some(created) = as_timestamp(user.get("created_at")) {
+        lines.push(format!("Created: {}", local_datetime(created)));
+    }
+    if let Some(formats) = user.get("allowed_output_formats").and_then(Value::as_array) {
+        if !formats.is_empty() {
+            let joined = formats
+                .iter()
+                .map(value_text)
+                .collect::<Vec<_>>()
+                .join(", ");
+            lines.push(format!("Allowed formats: {joined}"));
+        }
+    }
+    if let Some(message) = user
+        .get("message")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+    {
+        lines.push(format!("Message from provider: {message}"));
+    }
+    let extras = extra_lines(
+        &user,
+        &[
+            "username",
+            "password",
+            "auth",
+            "status",
+            "exp_date",
+            "is_trial",
+            "active_cons",
+            "max_connections",
+            "created_at",
+            "allowed_output_formats",
+            "message",
+        ],
+    );
+    if server.is_object() {
+        lines.extend(xtream_server_lines(&server));
+    }
+    if !extras.is_empty() {
+        lines.push(String::new());
+        lines.push("Other details reported by the server".to_string());
+        lines.extend(extras);
+    }
+    lines
+}
+
+/// The Xtream report's server block.
+fn xtream_server_lines(server: &Value) -> Vec<String> {
+    let mut lines = vec![String::new(), "Server".to_string()];
+    if let Some(t) = server.get("time_now") {
+        lines.push(format!("Server time: {}", value_text(t)));
+    }
+    if let Some(t) = server.get("timezone") {
+        lines.push(format!("Server time zone: {}", value_text(t)));
+    }
+    if let Some(host) = server.get("url").and_then(Value::as_str) {
+        let port = server.get("port").map(value_text).unwrap_or_default();
+        if port.is_empty() {
+            lines.push(format!("Server address: {host}"));
+        } else {
+            lines.push(format!("Server address: {host}:{port}"));
+        }
+    }
+    lines.extend(extra_lines(
+        server,
+        &[
+            "time_now",
+            "timezone",
+            "url",
+            "port",
+            "https_port",
+            "server_protocol",
+        ],
+    ));
+    lines
+}
+
+fn stalker_report(payload: &Value) -> Vec<String> {
+    let mut lines = vec![String::new(), "Subscription".to_string()];
+    if let Some(status) = payload.get("status") {
+        if !matches!(status, Value::Null) && !value_text(status).is_empty() {
+            let text = value_text(status);
+            let label = match text.trim() {
+                "0" => "Disabled".to_string(),
+                "1" => "Active".to_string(),
+                other => status_label(other),
+            };
+            lines.push(format!("Status: {label}"));
+        }
+    }
+    let end_date = payload
+        .get("end_date")
+        .map(value_text)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if end_date.is_empty() {
+        lines.push("Expires: Not reported by the server".to_string());
+    } else if let Some(ts) = as_timestamp(payload.get("end_date")) {
+        lines.push(format!("Expires: {}", local_datetime(ts)));
+    } else {
+        lines.push(format!("Expires: {end_date}"));
+    }
+    if let Some(plan) = payload.get("tariff_plan") {
+        if !value_text(plan).is_empty() {
+            lines.push(format!("Package: {}", value_text(plan)));
+        }
+    }
+    for (key, label) in [("account_balance", "Account balance"), ("phone", "Phone")] {
+        if let Some(v) = payload.get(key) {
+            if !matches!(v, Value::Null) && !value_text(v).is_empty() {
+                lines.push(format!("{label}: {}", value_text(v)));
+            }
+        }
+    }
+    let extras = extra_lines(
+        payload,
+        &[
+            "status",
+            "end_date",
+            "tariff_plan",
+            "account_balance",
+            "phone",
+            "mac",
+            "fname",
+            "login",
+        ],
+    );
+    if !extras.is_empty() {
+        lines.push(String::new());
+        lines.push("Other details reported by the server".to_string());
+        lines.extend(extras);
+    }
+    lines
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn base_url_normalization() {
+        assert_eq!(normalize_base_url("example.com"), "http://example.com");
+        assert_eq!(
+            normalize_base_url("http://user:pw@example.com:8080/portal.php"),
+            "http://example.com:8080"
+        );
+        assert_eq!(
+            normalize_base_url("https://example.com/c/"),
+            "https://example.com/c"
+        );
+    }
+
+    #[test]
+    fn xtream_urls() {
+        let client = XtreamClient::new(XtreamConfig {
+            base_url: "http://example.com:8080".to_string(),
+            username: "u s".to_string(),
+            password: "p&w".to_string(),
+            ..XtreamConfig::default()
+        });
+        assert_eq!(
+            client.playlist_url(),
+            "http://example.com:8080/get.php?username=u+s&password=p%26w&type=m3u_plus&output=ts"
+        );
+        assert_eq!(
+            client.vod_stream_url("42", "mkv"),
+            "http://example.com:8080/movie/u%20s/p%26w/42.mkv"
+        );
+    }
+
+    #[test]
+    fn stalker_channel_mapping() {
+        // Portal payload rows map to channels with resolution data kept.
+        let row = serde_json::json!({
+            "name": "Portal News", "cmd": "ffmpeg http://x/1",
+            "tv_genre_title": "News", "epg_id": "news.tv",
+            "use_http_tmp_link": 1, "id": 7, "archive": 1,
+            "tv_archive_duration": 3
+        });
+        let name = string_field(&row, "name").expect("name");
+        assert_eq!(name, "Portal News");
+        assert!(truthy(row.get("archive")));
+    }
+
+    #[test]
+    fn report_redacts_and_masks() {
+        let report = format_account_report(
+            &ProviderAccount::Stalker(StalkerConfig {
+                base_url: "http://portal.example".to_string(),
+                mac: "00:1A:79:AA:BB:CC".to_string(),
+                username: "bob".to_string(),
+                ..StalkerConfig::default()
+            }),
+            &serde_json::json!({"status": 1, "end_date": "2030-01-01", "tariff_plan": "Full", "password_hint": "x"}),
+            1_762_000_000,
+        );
+        assert!(report.contains("MAC address: 00:1A:**:**:**"), "{report}");
+        assert!(report.contains("Status: Active"), "{report}");
+        assert!(!report.contains("password_hint"), "{report}");
+        assert_eq!(
+            redact_server_url(
+                "http://user:pw@example.com/get.php?username=u&password=p",
+                "u",
+                "p"
+            ),
+            "http://example.com/get.php?username=***&password=***"
+        );
+    }
+
+    #[test]
+    fn xtream_report_lines() {
+        let report = format_account_report(
+            &ProviderAccount::Xtream(XtreamConfig {
+                base_url: "http://example.com".to_string(),
+                username: "u".to_string(),
+                ..XtreamConfig::default()
+            }),
+            &serde_json::json!({
+                "user_info": {"auth": 1, "status": "Active", "exp_date": "1798761600", "is_trial": "0", "max_connections": "2"},
+                "server_info": {"url": "example.com", "port": "8080", "timezone": "UTC"}
+            }),
+            1_762_000_000,
+        );
+        assert!(report.contains("Status: Active"), "{report}");
+        assert!(report.contains("Days remaining:"), "{report}");
+        assert!(
+            report.contains("Server address: example.com:8080"),
+            "{report}"
+        );
+    }
+
+    #[test]
+    fn config_entries_parse() {
+        let xtream = ProviderAccount::from_config(&serde_json::json!({
+            "type": "xtream", "url": "http://x", "username": "u", "password": "p", "id": "prov1"
+        }))
+        .expect("xtream");
+        assert_eq!(xtream.provider_id().as_deref(), Some("prov1"));
+        assert!(ProviderAccount::from_config(&serde_json::json!({"type": "m3u"})).is_none());
+    }
+}
