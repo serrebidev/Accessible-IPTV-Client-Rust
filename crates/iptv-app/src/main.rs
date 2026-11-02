@@ -4,6 +4,7 @@ use iptv_core::{
     config::{self, Config},
     favorites::{FavoriteSet, Toggle},
     search::SearchResults,
+    sources::PlaylistSource,
 };
 use std::{cell::RefCell, path::PathBuf, rc::Rc};
 use wxdragon::event::EventType;
@@ -197,6 +198,13 @@ fn bind_browser(frame: Frame, controls: Controls, model: Rc<RefCell<SearchResult
             path: loaded.path,
         },
     };
+    let configured = wiring.persist.config.borrow().string_list("playlists");
+    if !configured.is_empty() {
+        let sources: Vec<PlaylistSource> =
+            configured.into_iter().map(PlaylistSource::new).collect();
+        wiring.browser.borrow_mut().load_sources(sources);
+        assert!(wiring.timer.start(50, false));
+    }
     bind_completion(&wiring, controls);
     bind_actions(frame, &wiring, controls);
     let browser = Rc::clone(&wiring.browser);
