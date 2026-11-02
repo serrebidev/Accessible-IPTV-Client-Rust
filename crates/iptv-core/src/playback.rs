@@ -88,7 +88,7 @@ pub fn split_stream_modifiers(url: &str) -> (String, StreamHeaders) {
         let Some((key, value)) = part.split_once('=') else {
             continue;
         };
-        let value = value.trim().replace('+', " ");
+        let value = decode_modifier_value(value.trim());
         apply_modifier(
             &mut headers,
             key.trim().to_lowercase().as_str(),
@@ -97,6 +97,38 @@ pub fn split_stream_modifiers(url: &str) -> (String, StreamHeaders) {
         );
     }
     (base.trim().to_string(), headers)
+}
+
+fn decode_modifier_value(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) = (hex_digit(bytes[index + 1]), hex_digit(bytes[index + 2]))
+            {
+                decoded.push((hi << 4) | lo);
+                index += 3;
+                continue;
+            }
+        }
+        decoded.push(if bytes[index] == b'+' {
+            b' '
+        } else {
+            bytes[index]
+        });
+        index += 1;
+    }
+    String::from_utf8_lossy(&decoded).into_owned()
+}
+
+fn hex_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 impl StreamHeaders {
@@ -112,6 +144,7 @@ impl StreamHeaders {
             ("http-origin", "origin"),
             ("http-cookie", "cookie"),
             ("http-authorization", "authorization"),
+            ("http-accept", "accept"),
         ] {
             if let Some(value) = channel.unknown_attributes.get(attr) {
                 apply_modifier(&mut headers, alias, value.trim(), false);
@@ -125,6 +158,15 @@ impl StreamHeaders {
             }
         }
         headers.extra.extend(modifiers.extra);
+        if let Some(extra) = channel.unknown_attributes.get("http-headers") {
+            if let Some((name, value)) = extra.split_once(':') {
+                let name = name.trim();
+                let value = value.trim();
+                if !name.is_empty() && !value.is_empty() {
+                    headers.extra.push(format!("{name}: {value}"));
+                }
+            }
+        }
         headers
     }
 
