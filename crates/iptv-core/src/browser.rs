@@ -1,7 +1,7 @@
 //! The local browse application seam, shared by the desktop and domain tests.
 use crate::{
-    category::Category,
-    favorites::{FavoriteSet, ToggleOutcome},
+    categories::{categories, category_rows, Category},
+    favorites::{display_name, FavoriteSet, Toggle},
     loading::{LoadFailure, LoadWorker},
     search::{SearchResults, SearchWorker},
     BrowseModel,
@@ -11,6 +11,14 @@ use std::{path::PathBuf, sync::Arc};
 pub enum BrowseEvent {
     Results(SearchResults),
     Recovery(LoadFailure),
+}
+
+/// The UI-neutral outcome of a favorite toggle, ready to announce.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FavoriteToggle {
+    pub toggle: Toggle,
+    /// Status text for the live-region path; empty when nothing changed.
+    pub announcement: String,
 }
 
 /// Coordinates load/search generations while retaining the last usable playlist.
@@ -23,7 +31,7 @@ pub struct BrowserWorker {
     loading: bool,
     searching: bool,
     category: Category,
-    favorites: Arc<FavoriteSet>,
+    favorites: FavoriteSet,
 }
 
 impl BrowserWorker {
@@ -49,41 +57,94 @@ impl BrowserWorker {
     /// A new query supersedes a pending load and searches the last usable source.
     pub fn search(&mut self, query: String) -> bool {
         let cancelled = self.cancel_load();
-        self.searcher.submit_favorites(
-            Arc::clone(&self.playlist),
-            query,
-            self.category.clone(),
-            Arc::clone(&self.favorites),
-        );
-        self.searching = true;
+        self.submit_current(query);
         cancelled
     }
 
-    /// A category change supersedes pending work without changing keyboard focus.
-    pub fn select_category(&mut self, category: Category, query: String) -> bool {
+    /// Switch the active category and re-run the current query inside it.
+    /// Like a new search, this supersedes a pending load.
+    pub fn select_category(&mut self, category: Category, query: &str) -> bool {
+        let cancelled = self.cancel_load();
         self.category = category;
-        self.search(query)
+        self.submit_current(query.to_owned());
+        cancelled
     }
 
-    /// Toggle one real row from the active playlist, never a retired snapshot.
-    /// Supersede pending projections before publishing the changed favorite set.
+    #[must_use]
+    pub fn active_category(&self) -> &Category {
+        &self.category
+    }
+
+    /// Categories of the last usable playlist, in deterministic order.
+    #[must_use]
+    pub fn categories(&self) -> Vec<Category> {
+        categories(self.playlist.channels())
+    }
+
+    #[must_use]
+    pub fn favorites(&self) -> &FavoriteSet {
+        &self.favorites
+    }
+
+    /// Favorited channels present in the current playlist (display counts).
+    #[must_use]
+    pub fn favorite_count(&self) -> usize {
+        self.favorites
+            .favorite_indexes(self.playlist.channels())
+            .len()
+    }
+
+    #[must_use]
+    pub fn is_favorite(&self, playlist_index: usize) -> bool {
+        self.playlist
+            .channels()
+            .get(playlist_index)
+            .is_some_and(|channel| self.favorites.is_favorite(channel))
+    }
+
+    /// Replace the favorite set (for example from stored configuration),
+    /// normalized defensively by [`FavoriteSet::from_stored`].
+    pub fn set_favorites(&mut self, favorites: FavoriteSet) {
+        self.favorites = favorites;
+    }
+
+    /// Toggle the favorite state of one channel by playlist identity and
+    /// refresh the active projection. Returns `None` when the index does not
+    /// name a channel in the current playlist.
     pub fn toggle_favorite(
         &mut self,
-        visible: &SearchResults,
-        row: usize,
-        query: String,
-    ) -> Option<ToggleOutcome> {
-        if !visible.is_source(&self.playlist) {
-            return None;
+        playlist_index: usize,
+        query: &str,
+    ) -> Option<FavoriteToggle> {
+        let channel = self.playlist.channels().get(playlist_index)?;
+        let name = display_name(channel).to_owned();
+        let toggle = self.favorites.toggle(channel);
+        let announcement = match toggle {
+            Toggle::Added => format!("Added {} to Favorites.", announced_name(&name)),
+            Toggle::Removed => {
+                format!("Removed {} from Favorites.", announced_name(&name))
+            }
+            Toggle::Unchanged => String::new(),
+        };
+        if toggle != Toggle::Unchanged {
+            self.submit_current(query.to_owned());
         }
-        let channel = visible.channel(row)?;
-        let outcome = Arc::make_mut(&mut self.favorites).toggle(channel);
-        // Other categories have unchanged rows: keep their selection, focus and
-        // accessible row cache rather than needlessly publishing the same list.
-        if outcome != ToggleOutcome::Unkeyable && self.category == Category::Favorites {
-            self.search(query);
-        }
-        Some(outcome)
+        Some(FavoriteToggle {
+            toggle,
+            announcement,
+        })
+    }
+
+    /// Submit the current category scope of the last usable playlist.
+    fn submit_current(&mut self, query: String) {
+        let scope = category_rows(self.playlist.channels(), &self.category, &self.favorites);
+        self.searcher.submit_scoped(
+            Arc::clone(&self.playlist),
+            scope,
+            self.category.clone(),
+            query,
+        );
+        self.searching = true;
     }
 
     /// Poll from the UI thread; never reads, parses or scans channels here.
@@ -103,23 +164,25 @@ impl BrowserWorker {
                 std::thread::spawn(move || drop(previous));
                 self.loading = false;
             }
-            self.category = results.category().clone();
             self.searching = false;
             BrowseEvent::Results(results)
         })
     }
 
     fn filter_loaded(&mut self, loaded: Arc<BrowseModel>, query: &str) {
-        let category = if loaded.categories().contains(&self.category) {
-            self.category.clone()
-        } else {
-            Category::All
-        };
-        self.searcher.submit_favorites(
+        // A group that vanished from the replacement cannot stay active;
+        // the sentinels always exist. Favorites survive by stable key.
+        if matches!(self.category, Category::Group(_))
+            && !categories(loaded.channels()).contains(&self.category)
+        {
+            self.category = Category::All;
+        }
+        let scope = category_rows(loaded.channels(), &self.category, &self.favorites);
+        self.searcher.submit_scoped(
             Arc::clone(&loaded),
+            scope,
+            self.category.clone(),
             query.to_owned(),
-            category,
-            Arc::clone(&self.favorites),
         );
         self.replacement = Some(loaded);
         self.searching = true;
@@ -134,6 +197,14 @@ impl BrowserWorker {
         self.cancel_load();
         self.searcher.cancel();
         self.searching = false;
+    }
+}
+
+fn announced_name(name: &str) -> &str {
+    if name.is_empty() {
+        "Unnamed channel"
+    } else {
+        name
     }
 }
 
@@ -167,38 +238,6 @@ mod tests {
             BrowseEvent::Results(results) => results,
             BrowseEvent::Recovery(error) => panic!("{error:?}"),
         }
-    }
-
-    #[test]
-    fn categories_survive_failure_cancel_and_replacement_without_stale_rows() {
-        let mut browser = BrowserWorker::default();
-        browser.load(fixture("categories.m3u"));
-        let all = results(wait(&mut browser, ""));
-        let news = Category::Group("News".into());
-        browser.select_category(news.clone(), String::new());
-        let selected = results(wait(&mut browser, ""));
-        assert_eq!(selected.len(), 2);
-        assert_eq!(selected.restore_row(&all, Some(4)), Some(1));
-        browser.load(fixture("absent.m3u"));
-        assert!(matches!(wait(&mut browser, ""), BrowseEvent::Recovery(_)));
-        browser.search(String::new());
-        assert_eq!(results(wait(&mut browser, "")).category(), &news);
-        browser.loading = true;
-        browser.filter_loaded(Arc::new(BrowseModel::empty()), "");
-        assert!(browser.cancel_load());
-        browser.search(String::new());
-        assert_eq!(results(wait(&mut browser, "")).category(), &news);
-        browser.load(fixture("categories.m3u"));
-        assert_eq!(results(wait(&mut browser, "")).category(), &news);
-        browser.load(fixture("empty.m3u"));
-        let empty = results(wait(&mut browser, ""));
-        assert_eq!(empty.category(), &Category::All);
-        assert!(empty.is_empty());
-        assert_eq!(empty.restore_row(&selected, Some(1)), None);
-        assert_eq!(empty.categories(), &[Category::All, Category::Favorites]);
-        browser.load(fixture("categories.m3u"));
-        assert!(browser.select_category(news, String::new()));
-        assert!(results(wait(&mut browser, "")).is_empty());
     }
 
     #[test]
@@ -264,25 +303,6 @@ mod tests {
         browser.load(fixture("local.m3u"));
         browser.cancel();
         assert!(!browser.is_busy());
-        assert!(browser.poll("").is_none());
-    }
-
-    #[test]
-    fn favorite_toggle_supersedes_a_parsed_replacement_and_queued_projection() {
-        let mut browser = BrowserWorker::default();
-        browser.load(fixture("categories.m3u"));
-        let all = results(wait(&mut browser, ""));
-        browser.toggle_favorite(&all, 1, String::new());
-        browser.select_category(Category::Favorites, String::new());
-        let favorite = results(wait(&mut browser, ""));
-        browser.loading = true;
-        browser.filter_loaded(Arc::new(BrowseModel::empty()), "");
-        browser.toggle_favorite(&favorite, 0, String::new());
-        let removed = results(wait(&mut browser, ""));
-        assert_eq!(removed.category(), &Category::Favorites);
-        assert!(removed.is_empty());
-        browser.select_category(Category::All, String::new());
-        assert_eq!(results(wait(&mut browser, "")).len(), 7);
         assert!(browser.poll("").is_none());
     }
 }

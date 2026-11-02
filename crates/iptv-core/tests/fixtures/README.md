@@ -44,84 +44,18 @@ requirements of this slice, not byte-identical Python strings. Worker/controller
 tests cover missing/unreadable/retry, retention, cancellation, and replacement.
 Domain tests and these goldens do not prove desktop announcements or focus.
 
-## Stable favorites fixtures (issue #11, ticket 02)
+## Category/Favorites fixtures (issues #10–#13)
 
-`favorite-channels.tsv` supplies synthetic loaded-channel fields, including
-provider/stream identity, URL refreshes, credentials in inert URLs, duplicate
-names across groups, missing/whitespace fields, aliases, pipes and backslashes.
-The first column names each case; subsequent columns use Python metadata names.
-Empty values model absent optional strings in Rust's loaded `Channel` type.
-`favorite-stored.tsv` supplies typed stored-value cases: `s:` marks strings;
-nulls, numbers, booleans, maps and lists are invalid entries. Missing, bare-string
-and bytes containers normalize to no keys. A final `.` preserves empty TSV fields.
+`categories.m3u` is synthetic: grouped channels (News, Sport), plain-M3U
+channels with duplicate names, a separator-bearing name (`A|B Network`), a
+credential-bearing provider URL, a provider-identified channel
+(provider-type/provider-id/stream-id attributes), and a nameless channel
+keyed only by tvg-id. No URL is fetched.
 
-`python-favorites.tsv` records 27 keys, six normalization results, and 54
-successive toggle/filter outcomes from committed `favorites.py` at Python
-revision `9aa89e053225ef2c83c4f3659775a00723012ff7`. The Rust integration test
-consumes the same inputs and goldens without invoking Python or copying its
-implementation. The oracle runs the committed, GUI-free module itself:
-
-```powershell
-python tools/check-favorites-parity.py <Python-checkout> --update
-python tools/check-favorites-parity.py <Python-checkout>
-cargo test -p iptv-core --test favorites
-```
-
-Rules match `tests/test_favorites.py`'s identity, normalize, filter and toggle
-cases. Plain M3U namesakes share one favorite across groups. Provider keys include
-display name as well as provider type/ID, stream ID and XMLTV ID; renaming a
-channel changes its key in this reference. Fields are omitted when absent, not
-given invented IDs. Group, logo, resolved URL and credential attributes are never
-used. Backslash is escaped before pipe. Keys remain case-sensitive. Stored keys
-are opaque: trim, drop blanks/invalid entries, deduplicate in first-seen order;
-do not parse, unescape, or discard unknown nonblank keys.
-
-Rust accepts typed optional strings at the storage boundary: a future config
-adapter must map invalid entries to `None` and missing/non-list configuration
-to an empty iterator. Persistence and desktop Favorites controls are outside
-this ticket. Filtering scans the supplied playlist in source order and should
-run on a worker for large playlists. This evidence does not prove NVDA speech,
-keyboard traversal or focus preservation after future desktop integration.
-## Grouped categories (issue #10)
-
-`categories.m3u` adds out-of-order groups, missing/whitespace-only metadata,
-explicit Uncategorized, duplicate channel names with distinct tvg-id values,
-and a literal All Channels group. The same pinned Python revision above is
-used by `python-categories.tsv`. The oracle extracts the real grouping fallback
-from `main.py`, the `sorted(scoped_groups)` expression in `_refresh_group_ui`,
-and `_source_for_group`; scoped group keys distinguish a literal group from
-the All Channels sentinel. No user config, UI modules or network are loaded.
-The parser trims group values; missing, empty and whitespace-only groups join
-Uncategorized. All Channels is first, then case-sensitive lexical group order;
-category projections retain source order. Nonempty searches retain existing
-Python name ranking within the selected category. All five fixtures now cover
-30 searches as well as fields, load outcomes and category projections.
-
-Rust uses a typed All sentinel and displays a literal All Channels group as
-`All Channels (playlist group)`. This avoids the ambiguous unscoped string-key
-path in Python while matching its scope-aware group projection. Categories
-are flat in this local seam: Python tree hierarchy/provider branches and
-Favorites are outside this ticket. Selection identity is the existing source
-index within the same immutable playlist snapshot; duplicate names/URLs remain
-separate rows. A successful playlist replacement keeps an existing category
-key or falls back to All Channels, and keeps the existing first-row selection
-policy for a new snapshot. Persistent/favorite identities remain #11/#12.
-
-## Favorites category integration (issue #12)
-
-`favorite-projection-cases.tsv` supplies a current playlist, a seed playlist,
-and rows toggled in order. `python-favorite-projections.tsv` records seven
-observable results through committed `main.py` `_source_for_group` and
-`_favorite_channels`, using the real pinned parser and `favorites.py` above.
-The Rust browse/controller test consumes the same cases and expected indexes.
-`favorites-refresh.m3u` reorders stable IDs, changes inert stream URLs, and
-includes a literal Favorites group. Cases cover empty, reversed toggle order,
-refresh, absent channels, literal-group collision, distinct IDs with the same
-name, and toggling twice. Run `check-favorites-parity.py` to check or regenerate.
-
-Ticket #12 deliberately keeps the typed Favorites sentinel present even when
-empty; Python removes the empty category and uses a dialog. Rust uses zero real
-rows and live-region/status guidance, as required by the published parent spec.
-The literal group displays as `Favorites (playlist group)`. Empty-state wording,
-native controls and focus-free announcements are ticket requirements, not claims
-of byte-identical Python UI behavior. Ticket #13 search interaction stays separate.
+`python-favorites.tsv` holds favorite-key goldens produced by the pinned
+Python reference's own `favorites.channel_key` (revision
+`9aa89e053225ef2c83c4f3659775a00723012ff7`, whose `favorites.py` is
+byte-identical to the current Python checkout) over the fixture channels
+plus an escaped-backslash name and an unkeyable entry. The Rust test
+`favorite_keys_match_pinned_python_goldens` compares `channel_key` output
+against every row, including the empty key.

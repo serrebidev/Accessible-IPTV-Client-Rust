@@ -1,38 +1,102 @@
-//! Stable favorites for loaded channels, independent of widgets and storage.
+//! Widget-free stable favorite identity and favorite-set behavior.
+//!
+//! Observable rules ported from the Python reference `favorites.py` (pinned
+//! revision recorded in `tests/fixtures/README.md`): a favorite key is built
+//! from provider-stable identity fields, never from a resolved stream URL, so
+//! favorites survive playlist refreshes and never persist credentials. Plain
+//! M3U channels fall back to their display name.
 use crate::Channel;
-use std::collections::HashSet;
 
-/// UI-neutral result; an unkeyable channel leaves favorites unchanged.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ToggleOutcome {
-    Added,
-    Removed,
-    Unkeyable,
+/// Stored sentinel for the Favorites category. Compared and persisted in this
+/// exact form; localization happens only where it is displayed.
+pub const FAVORITES_SENTINEL: &str = "Favorites";
+
+/// The name a channel is listed under: display name, then tvg-name, then
+/// tvg-id, matching the Python reference's precedence.
+#[must_use]
+pub fn display_name(channel: &Channel) -> &str {
+    for value in [&channel.name, &channel.tvg_name, &channel.tvg_id] {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return trimmed;
+        }
+    }
+    ""
 }
 
-/// Ordered storage keys with constant-time membership for playlist scans.
-#[derive(Clone, Debug, Default)]
+/// Stable identity for a channel, or an empty string when there is nothing
+/// to key on. Parts are provider type, provider id, stream id, tvg-id and
+/// display name, in that order, with blank parts dropped. The stream URL is
+/// never a part, so credential-bearing or refreshed URLs cannot leak into
+/// stored favorite state.
+#[must_use]
+pub fn channel_key(channel: &Channel) -> String {
+    let attribute = |key: &str| {
+        channel
+            .unknown_attributes
+            .get(key)
+            .map_or("", |value| value.trim())
+    };
+    let stream_id = match attribute("stream-id") {
+        "" => attribute("stream_id"),
+        value => value,
+    };
+    [
+        attribute("provider-type"),
+        attribute("provider-id"),
+        stream_id,
+        channel.tvg_id.trim(),
+        display_name(channel),
+    ]
+    .into_iter()
+    .filter(|part| !part.is_empty())
+    .map(escape_key_part)
+    .collect::<Vec<_>>()
+    .join("|")
+}
+
+/// Keep the separator out of a field: playlists do name channels "A|B".
+/// Backslashes are escaped first so an escaped separator stays unambiguous.
+fn escape_key_part(part: &str) -> String {
+    part.replace('\\', "\\\\").replace('|', "\\|")
+}
+
+/// Coerce stored favorite values into an ordered, duplicate-free key list:
+/// blank values are dropped, duplicates collapse to their first occurrence,
+/// and the surviving order is preserved. Hand-edited or stale configuration
+/// data therefore degrades to fewer favorites, never to an error.
+#[must_use]
+pub fn normalize_keys(values: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    values
+        .into_iter()
+        .map(|value| value.trim().to_owned())
+        .filter(|key| !key.is_empty() && seen.insert(key.clone()))
+        .collect()
+}
+
+/// The outcome of toggling one channel in a [`FavoriteSet`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Toggle {
+    Added,
+    Removed,
+    /// The channel has no stable key; the set was left unchanged.
+    Unchanged,
+}
+
+/// An ordered set of stable favorite keys.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct FavoriteSet {
     keys: Vec<String>,
-    membership: HashSet<String>,
 }
 
 impl FavoriteSet {
-    /// Normalize stored values, retaining the first occurrence of each trimmed key.
-    ///
-    /// A storage adapter supplies strings as `Some` and invalid values as `None`;
-    /// missing or non-list configuration (including a bare string) supplies an
-    /// empty iterator. No configuration format or parser is required by core.
-    /// Nonblank strings are opaque keys, including unknown/old keys and escapes.
+    /// Build a set from stored values, normalized defensively.
     #[must_use]
-    pub fn from_stored<'a>(values: impl IntoIterator<Item = Option<&'a str>>) -> Self {
-        let mut favorites = Self::default();
-        for key in values.into_iter().flatten().map(str::trim) {
-            if !key.is_empty() && favorites.membership.insert(key.to_owned()) {
-                favorites.keys.push(key.to_owned());
-            }
+    pub fn from_stored(values: impl IntoIterator<Item = String>) -> Self {
+        Self {
+            keys: normalize_keys(values),
         }
-        favorites
     }
 
     #[must_use]
@@ -41,82 +105,146 @@ impl FavoriteSet {
     }
 
     #[must_use]
-    pub fn contains(&self, channel: &Channel) -> bool {
-        channel_key(channel).is_some_and(|key| self.membership.contains(&key))
+    pub fn len(&self) -> usize {
+        self.keys.len()
     }
 
-    pub fn toggle(&mut self, channel: &Channel) -> ToggleOutcome {
-        let Some(key) = channel_key(channel) else {
-            return ToggleOutcome::Unkeyable;
-        };
-        if self.membership.remove(&key) {
-            self.keys.retain(|existing| existing != &key);
-            ToggleOutcome::Removed
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+
+    #[must_use]
+    pub fn is_favorite(&self, channel: &Channel) -> bool {
+        let key = channel_key(channel);
+        !key.is_empty() && self.keys.iter().any(|stored| stored == &key)
+    }
+
+    /// Add the channel when absent, remove it when present. Toggling the
+    /// same channel twice restores the original set exactly.
+    pub fn toggle(&mut self, channel: &Channel) -> Toggle {
+        let key = channel_key(channel);
+        if key.is_empty() {
+            return Toggle::Unchanged;
+        }
+        if let Some(position) = self.keys.iter().position(|stored| stored == &key) {
+            self.keys.remove(position);
+            Toggle::Removed
         } else {
-            self.membership.insert(key.clone());
             self.keys.push(key);
-            ToggleOutcome::Added
+            Toggle::Added
         }
     }
 
-    /// Favorited channels in current playlist order, including duplicate rows.
-    ///
-    /// Scans the supplied snapshot without changing search/category/recovery state.
-    /// Call from a worker for large playlists; no UI scheduling is performed here.
+    /// Playlist indexes of favorited channels, in current playlist order.
+    /// Keys with no matching channel are ignored.
     #[must_use]
-    pub fn filter_channels<'a>(&self, channels: &'a [Channel]) -> Vec<&'a Channel> {
-        if self.membership.is_empty() {
+    pub fn favorite_indexes(&self, channels: &[Channel]) -> Vec<usize> {
+        if self.keys.is_empty() {
             return Vec::new();
         }
         channels
             .iter()
-            .filter(|channel| self.contains(channel))
+            .enumerate()
+            .filter(|(_, channel)| self.is_favorite(channel))
+            .map(|(index, _)| index)
             .collect()
     }
 }
 
-/// Python-compatible identity, never derived from the stream URL or credentials.
-///
-/// Nonempty provider type, provider ID, stream ID, XMLTV ID and display name are
-/// trimmed and joined in that order. Backslashes and pipes are escaped. Plain
-/// M3U entries fall back to display name, so namesakes in different groups share
-/// a favorite. Display name falls back to TVG name, then XMLTV ID. Names remain
-/// case-sensitive; a rename changes identity even when provider IDs are present.
-/// Missing fields are omitted, matching the pinned Python reference.
-#[must_use]
-pub fn channel_key(channel: &Channel) -> Option<String> {
-    let attribute = |name: &str| {
-        channel
-            .unknown_attributes
-            .get(name)
-            .map_or("", String::as_str)
-    };
-    // Choose aliases before trimming: a whitespace-only primary field blocks
-    // fallback in Python, whereas an empty primary field permits it.
-    let stream_id = nonempty(attribute("stream-id"), attribute("stream_id"));
-    let tvg_id = nonempty(&channel.tvg_id, attribute("tvg_id"));
-    let tvg_name = nonempty(&channel.tvg_name, attribute("tvg_name"));
-    let name = nonempty(&channel.name, nonempty(tvg_name, tvg_id));
-    let key = [
-        attribute("provider-type"),
-        attribute("provider-id"),
-        stream_id,
-        tvg_id,
-        name,
-    ]
-    .into_iter()
-    .map(str::trim)
-    .filter(|part| !part.is_empty())
-    .map(|part| part.replace('\\', "\\\\").replace('|', "\\|"))
-    .collect::<Vec<_>>()
-    .join("|");
-    (!key.is_empty()).then_some(key)
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parse_m3u;
 
-fn nonempty<'a>(primary: &'a str, fallback: &'a str) -> &'a str {
-    if primary.is_empty() {
-        fallback
-    } else {
-        primary
+    fn channel(text: &str) -> Channel {
+        parse_m3u(text).into_iter().next().unwrap()
+    }
+
+    #[test]
+    fn plain_m3u_channels_key_on_display_name_only() {
+        let entry = channel("#EXTINF:-1,BBC One\nhttp://a/1\n");
+        assert_eq!(channel_key(&entry), "BBC One");
+        // Same name in another group shares one favorite, as in Python.
+        let other_group = channel("#EXTINF:-1 group-title=\"News\",BBC One\nhttp://b/2\n");
+        assert_eq!(channel_key(&other_group), "BBC One");
+    }
+
+    #[test]
+    fn provider_fields_and_tvg_id_form_the_key_before_the_name() {
+        let entry = channel(
+            "#EXTINF:-1 provider-type=\"xtream\" provider-id=\"acct\" stream-id=\"42\" tvg-id=\"bbc.uk\",BBC One\nhttp://a/1\n",
+        );
+        assert_eq!(channel_key(&entry), "xtream|acct|42|bbc.uk|BBC One");
+    }
+
+    #[test]
+    fn url_changes_never_change_the_key_and_credentials_never_enter_it() {
+        let first = channel("#EXTINF:-1 tvg-id=\"bbc.uk\",BBC One\nhttp://user:pass@a/1\n");
+        let refreshed = channel("#EXTINF:-1 tvg-id=\"bbc.uk\",BBC One\nhttp://other:secret@b/9\n");
+        assert_eq!(channel_key(&first), channel_key(&refreshed));
+        assert!(!channel_key(&first).contains("pass"));
+        assert!(!channel_key(&first).contains("http"));
+        // A changed tvg-id is a changed identity.
+        let moved = channel("#EXTINF:-1 tvg-id=\"bbc.us\",BBC One\nhttp://a/1\n");
+        assert_ne!(channel_key(&first), channel_key(&moved));
+    }
+
+    #[test]
+    fn separators_and_backslashes_in_names_are_escaped() {
+        let entry = channel("#EXTINF:-1,A|B \\ C\nhttp://a/1\n");
+        assert_eq!(channel_key(&entry), "A\\|B \\\\ C");
+        let plain = channel("#EXTINF:-1,A\nhttp://a/1\n");
+        let piped = channel("#EXTINF:-1,A|B\nhttp://a/1\n");
+        assert_ne!(channel_key(&plain), channel_key(&piped));
+    }
+
+    #[test]
+    fn display_name_falls_back_to_tvg_name_then_tvg_id() {
+        let named = channel("#EXTINF:-1 tvg-id=\"id1\" tvg-name=\"Tvg Name\",\nhttp://a\n");
+        assert_eq!(display_name(&named), "Tvg Name");
+        let id_only = channel("#EXTINF:-1 tvg-id=\"id2\",\nhttp://a\n");
+        assert_eq!(display_name(&id_only), "id2");
+        let bare = channel("http://a\n");
+        assert_eq!(display_name(&bare), "");
+        assert_eq!(channel_key(&bare), "");
+    }
+
+    #[test]
+    fn normalization_drops_blanks_and_duplicates_preserving_order() {
+        let stored = vec![
+            "  BBC One ".to_owned(),
+            String::new(),
+            "   ".to_owned(),
+            "CNN".to_owned(),
+            "BBC One".to_owned(),
+        ];
+        assert_eq!(normalize_keys(stored), ["BBC One", "CNN"]);
+    }
+
+    #[test]
+    fn toggle_is_exactly_once_and_unkeyable_channels_do_not_change_the_set() {
+        let mut set = FavoriteSet::default();
+        let entry = channel("#EXTINF:-1,BBC One\nhttp://a/1\n");
+        assert_eq!(set.toggle(&entry), Toggle::Added);
+        assert!(set.is_favorite(&entry));
+        assert_eq!(set.toggle(&entry), Toggle::Removed);
+        assert!(!set.is_favorite(&entry));
+        assert!(set.is_empty());
+        let bare = channel("http://a\n");
+        assert_eq!(set.toggle(&bare), Toggle::Unchanged);
+        assert!(set.is_empty());
+    }
+
+    #[test]
+    fn filtering_uses_playlist_order_and_ignores_unknown_keys() {
+        let channels =
+            parse_m3u("#EXTINF:-1,Alpha\nu1\n#EXTINF:-1,Bravo\nu2\n#EXTINF:-1,Charlie\nu3\n");
+        let set = FavoriteSet::from_stored([
+            "Charlie".to_owned(),
+            "Ghost".to_owned(),
+            "Alpha".to_owned(),
+        ]);
+        assert_eq!(set.favorite_indexes(&channels), [0, 2]);
     }
 }

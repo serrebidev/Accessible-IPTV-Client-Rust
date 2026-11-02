@@ -1,7 +1,0 @@
-# case, container type, typed values (s: string; other tags invalid), terminator
-mixed	list	s:a	s:a	s:  	null	int:7	s: b 	bool:true	map	list	.
-empty	list	.
-missing	null	.
-bare-string	string	s:a,b	.
-wrong-container	bytes	.
-opaque	list	s: ITV\|1 	s:ITV\|1	s:old\key	s:gone	.
