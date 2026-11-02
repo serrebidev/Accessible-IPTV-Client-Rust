@@ -1,9 +1,10 @@
 # Packaging the Rust client
 
-Status: layout agreed, automation pending one approval. Adding or
-editing `.github/workflows` needs Brandon's direct OK under this
-project's standing rules, so the release workflow is described here
-and lands as its own change once approved.
+Status: live. Brandon approved the workflow on 2026-11-01;
+`.github/workflows/release.yml` implements this layout: per-OS
+gates (fmt, Clippy, tests), a package per platform, and a publish
+job that writes `update-manifest.json` and creates the release for
+a `v*` tag.
 
 ## Local build
 
@@ -16,7 +17,7 @@ It runs with no beside-files: the English User Guide is compiled in,
 and configuration is created on first save in the user's config
 directory.
 
-## Release layout (what the workflow will produce)
+## Release layout (what the workflow produces)
 
 One archive per platform, mirroring where the app looks for its
 data files at runtime:
