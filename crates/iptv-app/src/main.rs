@@ -354,7 +354,10 @@ struct Wiring {
 struct PlayerState {
     session: PlaybackSession,
     gate: LaunchGate,
-    window: Option<(Frame, MediaCtrl)>,
+    window: Option<PlayerWindow>,
+    shared: Option<PlayerShared>,
+    desired_track: Option<String>,
+    last_label_cue: Option<usize>,
     current_channel: Option<Channel>,
     pending_resume_ms: Option<i64>,
     subtitle_cues: Vec<Cue>,
@@ -368,6 +371,9 @@ impl Default for PlayerState {
             session: PlaybackSession::new(),
             gate: LaunchGate::default(),
             window: None,
+            shared: None,
+            desired_track: None,
+            last_label_cue: None,
             current_channel: None,
             pending_resume_ms: None,
             subtitle_cues: Vec::new(),
@@ -528,6 +534,13 @@ fn bind_browser(frame: Frame, controls: Controls, model: Rc<RefCell<SearchResult
         downloads_active: Rc::new(std::cell::Cell::new(false)),
         account_text: Rc::new(RefCell::new(None)),
     };
+    wiring.player.borrow_mut().shared = Some(PlayerShared {
+        recordings: Rc::clone(&wiring.recordings),
+        cast_ui: Rc::clone(&wiring.cast_ui),
+        cast_worker: Rc::clone(&wiring.cast_worker),
+        cast_pending: Rc::clone(&wiring.cast_pending),
+        timer: Rc::clone(&wiring.timer),
+    });
     *wiring.reminders.borrow_mut() = wiring.persist.reminders();
     if wiring.dvr.borrow().pending_count() > 0 {
         assert!(wiring.timer.start(50, false));
@@ -1403,29 +1416,14 @@ struct CastView {
 /// Open (or raise) the Cast window and start discovery for the
 /// selected channel (shared by the button and the menus).
 fn open_cast_window(wiring: &Wiring, list: ListCtrl) {
-    let ui = ensure_cast_ui(
+    let channel = selected_channel(&wiring.browser, &wiring.model, list);
+    show_cast_for(
         &wiring.cast_ui,
         &wiring.cast_worker,
         &wiring.cast_pending,
         &wiring.timer,
+        channel.as_ref(),
     );
-    ui.frame.show(true);
-    ui.frame.raise();
-    let channel = selected_channel(&wiring.browser, &wiring.model, list);
-    ui.view.borrow_mut().channel.clone_from(&channel);
-    match &channel {
-        Some(channel) => {
-            ui.status
-                .set_label(&format!("Looking for cast devices for {}...", channel.name));
-        }
-        None => {
-            ui.status
-                .set_label("Choose a channel in the main window, then discover.");
-        }
-    }
-    wiring.cast_worker.discover();
-    wiring.cast_pending.set(true);
-    assert!(wiring.timer.start(50, false));
 }
 
 fn ensure_cast_ui(
@@ -2161,9 +2159,9 @@ fn bind_menu_actions(frame: Frame, wiring: &Wiring, controls: Controls) {
             SHOW_PLAYER => {
                 let player = wiring.player.borrow();
                 match &player.window {
-                    Some((player_frame, _)) => {
-                        player_frame.show(true);
-                        player_frame.raise();
+                    Some(win) => {
+                        win.frame.show(true);
+                        win.frame.raise();
                     }
                     None => {
                         status.set_label("The built-in player opens when you play a channel.");
@@ -2172,18 +2170,18 @@ fn bind_menu_actions(frame: Frame, wiring: &Wiring, controls: Controls) {
             }
             PLAY_PAUSE => {
                 let player = wiring.player.borrow();
-                if let Some((_, media)) = &player.window {
-                    if media.get_state() == MediaState::Playing {
-                        media.pause();
+                if let Some(win) = &player.window {
+                    if win.media.get_state() == MediaState::Playing {
+                        win.media.pause();
                     } else {
-                        media.play();
+                        win.media.play();
                     }
                 }
             }
             STOP => {
                 let mut player = wiring.player.borrow_mut();
-                if let Some((_, media)) = &player.window {
-                    media.stop();
+                if let Some(win) = &player.window {
+                    win.media.stop();
                 }
                 player.session.stop();
             }
@@ -2465,11 +2463,11 @@ fn menu_import_settings(wiring: &Wiring, frame: Frame, status: Status) {
 /// at the player's current position.
 fn menu_read_current_subtitle(wiring: &Wiring, status: Status) {
     let player = wiring.player.borrow();
-    let Some((_, media)) = &player.window else {
+    let Some(win) = &player.window else {
         status.set_label("No subtitle is showing.");
         return;
     };
-    let position = media.tell();
+    let position = win.media.tell();
     match player
         .subtitle_cues
         .iter()
@@ -3200,45 +3198,96 @@ fn play_builtin(
     state.subtitle_cues.clear();
     state.last_spoken_cue = None;
     let action = state.session.play(request);
-    let Some((frame, media)) = state.window else {
+    let Some(win) = state.window.clone() else {
         return;
     };
     if let EngineAction::Load(load) = action {
-        media.load_uri(&load.url);
-        media.play();
+        win.media.load_uri(&load.url);
+        win.media.play();
     }
-    frame.set_title(&format!("{} — Player", state.session.announcement()));
+    win.frame
+        .set_title(&format!("{} — Player", state.session.announcement()));
     if persist
         .config
         .borrow()
         .bool_or("show_player_on_enter", true)
     {
-        frame.show(true);
+        win.frame.show(true);
     }
     status.set_label(&state.session.announcement());
 }
 
-/// Build the built-in player window once: video surface, Pause/Resume and
-/// Stop buttons, media events feeding the session, and a 1 s timer that
-/// checkpoints resume positions for seekable content.
+/// The built-in player window's widgets.
+#[derive(Clone)]
+struct PlayerWindow {
+    frame: Frame,
+    media: MediaCtrl,
+    seek: Slider,
+    volume: Slider,
+    time_label: StaticText,
+    subtitle_label: StaticText,
+    tracks: Choice,
+}
+
+/// Handles the player window needs from the main wiring (record and
+/// cast), installed when the browser wiring is built.
+#[derive(Clone)]
+struct PlayerShared {
+    recordings: Rc<RefCell<RecordingEngine>>,
+    cast_ui: Rc<RefCell<Option<CastUi>>>,
+    cast_worker: Rc<CastWorker>,
+    cast_pending: Rc<std::cell::Cell<bool>>,
+    timer: Rc<Timer<Frame>>,
+}
+
+/// Build the built-in player window once: video surface, seek and
+/// volume sliders, time and subtitle labels, the audio track
+/// choice, and the action buttons.
 fn ensure_player_window(player: &Rc<RefCell<PlayerState>>, persist: &Persist, status: Status) {
     if player.borrow().window.is_some() {
         return;
     }
     let frame = Frame::builder()
         .with_title("Player")
-        .with_size(Size::new(560, 380))
+        .with_size(Size::new(560, 460))
         .build();
     frame.set_accessibility_label("Player");
     let panel = Panel::builder(&frame).build();
     let media = MediaCtrl::builder(&panel).build();
     media.set_accessibility_label("Video");
+    let seek = Slider::builder(&panel).build();
+    seek.set_range(0, 1000);
+    seek.set_accessibility_label("Seek");
+    let time_label = StaticText::builder(&panel).with_label("Live").build();
+    time_label.set_accessibility_label("Playback position");
+    let subtitle_label = StaticText::builder(&panel).with_label("").build();
+    subtitle_label.set_accessibility_label("Current subtitle");
+    let volume_caption = StaticText::builder(&panel).with_label("&Volume").build();
+    let _ = volume_caption;
+    let volume = Slider::builder(&panel).build();
+    volume.set_range(0, 100);
+    volume.set_value(100);
+    volume.set_accessibility_label("Volume");
+    let tracks_caption = StaticText::builder(&panel)
+        .with_label("Choose &Audio Track")
+        .build();
+    let _ = tracks_caption;
+    let tracks = Choice::builder(&panel).build();
+    tracks.append("Default");
+    tracks.set_selection(0);
+    tracks.set_accessibility_label("Choose Audio Track");
     let pause = Button::builder(&panel)
         .with_label("&Pause or resume")
         .build();
     pause.set_accessibility_label("Pause or resume");
     let stop = Button::builder(&panel).with_label("&Stop").build();
     stop.set_accessibility_label("Stop");
+    let record = Button::builder(&panel).with_label("&Record").build();
+    record.set_accessibility_label("Record");
+    let cast = Button::builder(&panel).with_label("&Cast").build();
+    cast.set_accessibility_label("Cast");
+    let fullscreen = Button::builder(&panel).with_label("&Full Screen").build();
+    fullscreen.set_accessibility_label("Full screen");
     let subs = Button::builder(&panel)
         .with_label("Load &subtitles…")
         .build();
@@ -3248,93 +3297,143 @@ fn ensure_player_window(player: &Rc<RefCell<PlayerState>>, persist: &Persist, st
     );
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     sizer.add(&media, 1, SizerFlag::Expand | SizerFlag::All, 4);
+    sizer.add(&seek, 0, SizerFlag::Expand | SizerFlag::All, 4);
+    sizer.add(&time_label, 0, SizerFlag::All, 4);
+    sizer.add(&subtitle_label, 0, SizerFlag::All, 4);
+    sizer.add(&volume_caption, 0, SizerFlag::All, 4);
+    sizer.add(&volume, 0, SizerFlag::Expand | SizerFlag::All, 4);
+    sizer.add(&tracks_caption, 0, SizerFlag::All, 4);
+    sizer.add(&tracks, 0, SizerFlag::Expand | SizerFlag::All, 4);
     let buttons = BoxSizer::builder(Orientation::Horizontal).build();
     buttons.add(&pause, 0, SizerFlag::All, 4);
     buttons.add(&stop, 0, SizerFlag::All, 4);
+    buttons.add(&record, 0, SizerFlag::All, 4);
+    buttons.add(&cast, 0, SizerFlag::All, 4);
+    buttons.add(&fullscreen, 0, SizerFlag::All, 4);
     buttons.add(&subs, 0, SizerFlag::All, 4);
     sizer.add_sizer(&buttons, 0, SizerFlag::Expand, 0);
     panel.set_sizer(sizer, true);
 
-    wire_player_events(player, persist, status, frame, media, pause, stop, subs);
-    player.borrow_mut().window = Some((frame, media));
+    let win = PlayerWindow {
+        frame,
+        media,
+        seek,
+        volume,
+        time_label,
+        subtitle_label,
+        tracks,
+    };
+    wire_player_events(
+        player,
+        persist,
+        status,
+        &win,
+        &PlayerButtons {
+            pause,
+            stop,
+            record,
+            cast,
+            fullscreen,
+            subs,
+        },
+    );
+    bind_player_controls(player, persist, status, &win);
+    player.borrow_mut().window = Some(win);
 }
 
-/// Timer, buttons, media events and close behavior for the player window.
-#[allow(clippy::too_many_arguments)]
+/// The player window's buttons.
+struct PlayerButtons {
+    pause: Button,
+    stop: Button,
+    record: Button,
+    cast: Button,
+    fullscreen: Button,
+    subs: Button,
+}
+
+/// Timer, buttons, media events, keys and close behavior for the
+/// player window.
 fn wire_player_events(
     player: &Rc<RefCell<PlayerState>>,
     persist: &Persist,
     status: Status,
-    frame: Frame,
-    media: MediaCtrl,
-    pause: Button,
-    stop: Button,
-    subs: Button,
+    win: &PlayerWindow,
+    buttons: &PlayerButtons,
 ) {
+    let frame = win.frame;
+    let media = win.media;
     let timer = Rc::new(Timer::new(&frame));
     let tick_player = Rc::clone(player);
     let tick_persist = persist.clone();
-    let tick_media = media;
     timer.on_tick(move |_| {
-        checkpoint_resume(&tick_player, &tick_persist, tick_media);
-        speak_subtitle_cue(&tick_player, &tick_persist, tick_media, status);
+        checkpoint_resume(&tick_player, &tick_persist, media);
+        speak_subtitle_cue(&tick_player, &tick_persist, media, status);
+        update_player_chrome(&tick_player, media);
     });
     let _ = timer.start(1000, false);
 
-    bind_subtitle_load(subs, player, frame, status);
+    bind_subtitle_load(buttons.subs, player, frame, status);
     let pause_player = Rc::clone(player);
-    pause.on_click(move |_| {
-        let mut state = pause_player.borrow_mut();
-        state.session.toggle_pause();
-        if let Some((_, media)) = state.window {
-            match state.session.state() {
-                SessionState::Paused => {
-                    media.pause();
-                }
-                SessionState::Playing => {
-                    media.play();
-                }
-                _ => {}
-            }
-        }
-        status.set_label(&state.session.announcement());
-    });
+    buttons
+        .pause
+        .on_click(move |_| toggle_pause_state(&pause_player, status));
     let stop_player = Rc::clone(player);
     let stop_persist = persist.clone();
-    stop.on_click(move |_| {
-        checkpoint_resume(&stop_player, &stop_persist, media);
-        let mut state = stop_player.borrow_mut();
-        state.session.stop();
-        if let Some((frame, media)) = state.window {
-            media.stop();
-            frame.show(false);
-        }
-        status.set_label("Stopped.");
+    buttons.stop.on_click(move |_| {
+        player_stop(&stop_player, &stop_persist, status);
+    });
+    let record_player = Rc::clone(player);
+    let record_persist = persist.clone();
+    buttons.record.on_click(move |_| {
+        let state = record_player.borrow();
+        let (Some(shared), Some(channel)) = (&state.shared, &state.current_channel) else {
+            return;
+        };
+        toggle_recording(&shared.recordings, &record_persist, channel, status);
+        assert!(shared.timer.start(50, false));
+    });
+    let cast_player = Rc::clone(player);
+    buttons.cast.on_click(move |_| {
+        let state = cast_player.borrow();
+        let Some(shared) = &state.shared else {
+            return;
+        };
+        show_cast_for(
+            &shared.cast_ui,
+            &shared.cast_worker,
+            &shared.cast_pending,
+            &shared.timer,
+            state.current_channel.as_ref(),
+        );
+    });
+    buttons.fullscreen.on_click(move |_| {
+        frame.show_full_screen(!frame.is_full_screen());
     });
     let loaded_player = Rc::clone(player);
     media.on_loaded(move |_| {
         let mut state = loaded_player.borrow_mut();
         state.session.on_event(EngineEvent::Started);
-        if let (Some((_, media)), Some(ms)) = (state.window, state.pending_resume_ms.take()) {
-            media.seek(ms, SeekMode::FromStart);
+        let resume_ms = state.pending_resume_ms.take();
+        if let (Some(win), Some(ms)) = (state.window.clone(), resume_ms) {
+            win.media.seek(ms, SeekMode::FromStart);
         }
         status.set_label(&state.session.announcement());
     });
     let stopped_player = Rc::clone(player);
     media.on_stop(move |_| {
         let mut state = stopped_player.borrow_mut();
-        let near_end = state
-            .window
-            .is_some_and(|(_, media)| media.length() > 0 && media.tell() >= media.length() - 1500);
+        let near_end = state.window.as_ref().is_some_and(|win| {
+            win.media.length() > 0 && win.media.tell() >= win.media.length() - 1500
+        });
         let event = if near_end {
             EngineEvent::Ended
         } else {
             EngineEvent::Stalled
         };
         if let EngineAction::Reconnect(request) = state.session.on_event(event) {
-            if let Some((_, media)) = state.window {
-                media.load_uri(&request.url);
-                media.play();
+            if let Some(win) = &state.window {
+                win.media.load_uri(&request.url);
+                win.media.play();
             }
         }
         status.set_label(&state.session.announcement());
@@ -3345,16 +3444,299 @@ fn wire_player_events(
         checkpoint_resume(&close_player, &close_persist, media);
         let mut state = close_player.borrow_mut();
         state.session.stop();
-        if let Some((frame, media)) = state.window {
-            media.stop();
-            frame.show(false);
+        if let Some(win) = &state.window {
+            win.media.stop();
+            win.frame.show(false);
         }
         event.skip(false);
     });
 }
 
-/// The player window's Load subtitles button: pick a file, parse it,
-/// and hold its cues on the player state for the speech path.
+/// Seek/volume slider, track choice and player shortcut bindings.
+fn bind_player_controls(
+    player: &Rc<RefCell<PlayerState>>,
+    persist: &Persist,
+    status: Status,
+    win: &PlayerWindow,
+) {
+    let seek_handle = win.seek;
+    let seek_media = win.media;
+    seek_handle.bind_internal(EventType::SLIDER, move |_| {
+        let length = seek_media.length();
+        if length > 0 {
+            let target = i64::from(seek_handle.get_value()) * length / 1000;
+            seek_media.seek(target, SeekMode::FromStart);
+        }
+    });
+    let volume_handle = win.volume;
+    let volume_media = win.media;
+    volume_handle.bind_internal(EventType::SLIDER, move |_| {
+        volume_media.set_volume(f64::from(volume_handle.get_value()) / 100.0);
+    });
+    let tracks_handle = win.tracks;
+    let tracks_player = Rc::clone(player);
+    tracks_handle.bind_internal(EventType::COMMAND_CHOICE_SELECTED, move |_| {
+        let label = tracks_handle.get_string_selection().unwrap_or_default();
+        tracks_player.borrow_mut().desired_track = Some(label.clone());
+        status.set_label(&format!("Audio track preference: {label}"));
+    });
+    let keys_player = Rc::clone(player);
+    let keys_persist = persist.clone();
+    win.frame.bind_internal(EventType::KEY_DOWN, move |event| {
+        let handled = dispatch_player_key(&keys_player, &keys_persist, status, event);
+        event.skip(!handled);
+    });
+}
+
+/// Pause or resume through the session machine (the Pause button
+/// and the `play_pause` shortcut share this).
+fn toggle_pause_state(player: &Rc<RefCell<PlayerState>>, status: Status) {
+    let mut state = player.borrow_mut();
+    state.session.toggle_pause();
+    if let Some(win) = &state.window {
+        match state.session.state() {
+            SessionState::Paused => {
+                win.media.pause();
+            }
+            SessionState::Playing => {
+                win.media.play();
+            }
+            _ => {}
+        }
+    }
+    status.set_label(&state.session.announcement());
+}
+
+/// Stop playback and hide the player window (Stop button, the stop
+/// and exit shortcuts).
+fn player_stop(player: &Rc<RefCell<PlayerState>>, persist: &Persist, status: Status) {
+    if let Some(win) = player.borrow().window.clone() {
+        checkpoint_resume(player, persist, win.media);
+    }
+    let mut state = player.borrow_mut();
+    state.session.stop();
+    if let Some(win) = &state.window {
+        win.media.stop();
+        win.frame.show(false);
+    }
+    status.set_label("Stopped.");
+}
+
+/// Refresh the player window's time label, seek position and
+/// subtitle label from the media position (1 s tick).
+fn update_player_chrome(player: &Rc<RefCell<PlayerState>>, media: MediaCtrl) {
+    let mut state = player.borrow_mut();
+    let Some(win) = state.window.clone() else {
+        return;
+    };
+    let position = media.tell();
+    let length = media.length();
+    let text = if length > 0 {
+        format!(
+            "{} / {}",
+            format_duration_ms(position),
+            format_duration_ms(length)
+        )
+    } else if position > 0 {
+        format!("{} — Live", format_duration_ms(position))
+    } else {
+        "Live".to_string()
+    };
+    win.time_label.set_label(&text);
+    if length > 0 {
+        win.seek
+            .set_value(i32::try_from(position * 1000 / length).unwrap_or(0));
+    }
+    let current = active_cue(&state.subtitle_cues, position);
+    if current != state.last_label_cue {
+        state.last_label_cue = current;
+        let label = current.map_or("", |index| state.subtitle_cues[index].text.as_str());
+        win.subtitle_label.set_label(label);
+    }
+}
+
+/// The canonical shortcut label for a key event, matching the
+/// shortcuts engine's spelling ("Ctrl+P", "Shift+S", "F11", "Up").
+fn key_event_label(event: wxdragon::event::Event) -> Option<String> {
+    let code = event.get_key_code()?;
+    let key = match code {
+        340..=351 => format!("F{}", code - 339),
+        27 => "Escape".to_string(),
+        13 => "Enter".to_string(),
+        32 => "Space".to_string(),
+        315 => "Up".to_string(),
+        317 => "Down".to_string(),
+        314 => "Left".to_string(),
+        316 => "Right".to_string(),
+        366 => "PageUp".to_string(),
+        367 => "PageDown".to_string(),
+        _ => {
+            let ch = event
+                .get_unicode_key()
+                .and_then(|code| u32::try_from(code).ok())
+                .and_then(char::from_u32)?;
+            if !ch.is_alphanumeric() {
+                return None;
+            }
+            ch.to_uppercase().collect()
+        }
+    };
+    let mut label = String::new();
+    if event.control_down() {
+        label.push_str("Ctrl+");
+    }
+    if event.alt_down() {
+        label.push_str("Alt+");
+    }
+    if event.shift_down() {
+        label.push_str("Shift+");
+    }
+    label.push_str(&key);
+    Some(label)
+}
+
+/// Dispatch one player-window key against the effective player
+/// shortcuts. Returns whether the key was a command.
+fn dispatch_player_key(
+    player: &Rc<RefCell<PlayerState>>,
+    persist: &Persist,
+    status: Status,
+    event: wxdragon::event::Event,
+) -> bool {
+    let Some(label) = key_event_label(event) else {
+        return false;
+    };
+    let config = serde_json::Value::Object(persist.config.borrow().raw().clone());
+    let bindings = iptv_core::shortcuts::effective(&config, "player");
+    let Some(action) = bindings
+        .iter()
+        .find(|(_, binding)| binding.eq_ignore_ascii_case(&label))
+        .map(|(action, _)| action.clone())
+    else {
+        return false;
+    };
+    let win = player.borrow().window.clone();
+    let Some(win) = win else {
+        return false;
+    };
+    match action.as_str() {
+        "play_pause" => toggle_pause_state(player, status),
+        "stop" | "exit" => player_stop(player, persist, status),
+        "record" => {
+            let state = player.borrow();
+            if let (Some(shared), Some(channel)) = (&state.shared, &state.current_channel) {
+                toggle_recording(&shared.recordings, persist, channel, status);
+                assert!(shared.timer.start(50, false));
+            }
+        }
+        "cast" => {
+            let state = player.borrow();
+            if let Some(shared) = &state.shared {
+                show_cast_for(
+                    &shared.cast_ui,
+                    &shared.cast_worker,
+                    &shared.cast_pending,
+                    &shared.timer,
+                    state.current_channel.as_ref(),
+                );
+            }
+        }
+        "volume_up" | "volume_down" => {
+            let delta = if action == "volume_up" { 10 } else { -10 };
+            let value = (win.volume.get_value() + delta).clamp(0, 100);
+            win.volume.set_value(value);
+            win.media.set_volume(f64::from(value) / 100.0);
+            status.set_label(&format!("Volume {value} percent."));
+        }
+        "audio_track" => win.tracks.set_focus(),
+        "subtitles" => prompt_subtitle_file(player, win.frame, status),
+        "speak_subtitles" => {
+            let next = !persist.config.borrow().bool_or("speak_subtitles", false);
+            persist.set_and_save("speak_subtitles", serde_json::json!(next));
+            status.set_label(if next {
+                "Subtitle speech on."
+            } else {
+                "Subtitle speech off."
+            });
+        }
+        "read_subtitle" | "previous_subtitle" | "next_subtitle" => {
+            announce_cue(player, &win, &action, status);
+        }
+        "fullscreen" => win.frame.show_full_screen(!win.frame.is_full_screen()),
+        "hide" => win.frame.hide(),
+        "what_is_playing" => {
+            let state = player.borrow();
+            match &state.current_channel {
+                Some(channel) => status.set_label(&format!("Now playing: {}", channel.name)),
+                None => status.set_label("Nothing is playing."),
+            }
+        }
+        _ => return false,
+    }
+    true
+}
+
+/// Announce the current, previous, or next subtitle cue's text.
+fn announce_cue(
+    player: &Rc<RefCell<PlayerState>>,
+    win: &PlayerWindow,
+    action: &str,
+    status: Status,
+) {
+    let state = player.borrow();
+    if state.subtitle_cues.is_empty() {
+        status.set_label("No subtitles are loaded.");
+        return;
+    }
+    let position = win.media.tell();
+    let current = active_cue(&state.subtitle_cues, position);
+    let index = match action {
+        "previous_subtitle" => current.and_then(|i| i.checked_sub(1)).or(current),
+        "next_subtitle" => current
+            .map(|i| (i + 1).min(state.subtitle_cues.len() - 1))
+            .or(Some(0)),
+        _ => current,
+    };
+    match index.and_then(|i| state.subtitle_cues.get(i)) {
+        Some(cue) => {
+            live_region::announce_with_priority(
+                status.label,
+                &cue.text,
+                live_region::Priority::Medium,
+            );
+        }
+        None => status.set_label("No subtitle is showing."),
+    }
+}
+
+/// Open the cast window for an explicit channel (the player
+/// window's Cast action; the main window passes its selection).
+fn show_cast_for(
+    ui_slot: &Rc<RefCell<Option<CastUi>>>,
+    worker: &Rc<CastWorker>,
+    pending: &Rc<std::cell::Cell<bool>>,
+    timer: &Rc<Timer<Frame>>,
+    channel: Option<&Channel>,
+) {
+    let ui = ensure_cast_ui(ui_slot, worker, pending, timer);
+    ui.frame.show(true);
+    ui.frame.raise();
+    ui.view.borrow_mut().channel = channel.cloned();
+    match channel {
+        Some(channel) => {
+            ui.status
+                .set_label(&format!("Looking for cast devices for {}...", channel.name));
+        }
+        None => {
+            ui.status
+                .set_label("Choose a channel in the main window, then discover.");
+        }
+    }
+    worker.discover();
+    pending.set(true);
+    assert!(timer.start(50, false));
+}
+
 fn bind_subtitle_load(
     subs: Button,
     player: &Rc<RefCell<PlayerState>>,
@@ -3362,7 +3744,13 @@ fn bind_subtitle_load(
     status: Status,
 ) {
     let subs_player = Rc::clone(player);
-    subs.on_click(move |_| {
+    subs.on_click(move |_| prompt_subtitle_file(&subs_player, frame, status));
+}
+
+/// Ask for a subtitle file and load its cues into the player state.
+fn prompt_subtitle_file(player: &Rc<RefCell<PlayerState>>, frame: Frame, status: Status) {
+    let subs_player = Rc::clone(player);
+    {
         let dialog = FileDialog::builder(&frame)
             .with_message("Load subtitles")
             .with_wildcard(
@@ -3388,7 +3776,7 @@ fn bind_subtitle_load(
                 status.set_label(&format!("Could not load subtitles: {error}"));
             }
         }
-    });
+    }
 }
 
 /// Announce the active subtitle cue when it changes, while the
