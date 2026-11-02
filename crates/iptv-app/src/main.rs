@@ -694,6 +694,12 @@ fn bind_actions(_frame: Frame, wiring: &Wiring, controls: Controls) {
     bind_scope_choice(wiring, scope_choice, search, status);
     bind_toggle(wiring, toggle_favorite, list, search, status);
     bind_playback(wiring, list, status, episode_description, stream_url);
+    bind_f1_help(&scope_choice, wiring, "playlist-view", status);
+    bind_f1_help(&category, wiring, "categories", status);
+    bind_f1_help(&search, wiring, "search", status);
+    bind_f1_help(&list, wiring, "channel-list", status);
+    bind_f1_help(&episode_description, wiring, "episode-description", status);
+    bind_f1_help(&stream_url, wiring, "main-window", status);
 }
 
 /// The Toggle favorite action: toggles the channel behind the selected or
@@ -1124,18 +1130,7 @@ fn poll_recordings(wiring: &Wiring, status: Status) {
         )
     {
         wiring.shutdown_attempted.set(true);
-        let system = if cfg!(windows) {
-            "windows"
-        } else if cfg!(target_os = "macos") {
-            "darwin"
-        } else {
-            "linux"
-        };
-        let root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
-        match recording::shutdown_computer(system, &root) {
-            Ok(_) => status.set_label("All recordings finished. Shutting down."),
-            Err(error) => status.set_label(&format!("Shutdown failed: {error}")),
-        }
+        open_shutdown_countdown(status);
     }
 }
 
@@ -2044,7 +2039,6 @@ fn build_options_menu(config: &Config) -> Menu {
         "",
         ItemKind::Normal,
     );
-    options_menu.enable_item(PREFERRED_AUDIO, false);
     let language_sub = build_language_menu(config);
     options_menu.append_submenu(language_sub, "&Language", "");
     add_option_checks(&options_menu, config);
@@ -2073,7 +2067,6 @@ fn build_options_menu(config: &Config) -> Menu {
         "",
         ItemKind::Normal,
     );
-    options_menu.enable_item(KEYBOARD_SHORTCUTS, false);
     menu_add(
         &options_menu,
         5003,
@@ -2095,7 +2088,6 @@ fn build_help_menu() -> Menu {
         ItemKind::Normal,
     );
     menu_add(&help_menu, WHATS_NEW, "What's &New", "", ItemKind::Normal);
-    help_menu.enable_item(WHATS_NEW, false);
     menu_add(
         &help_menu,
         OPEN_LOGS,
@@ -2274,6 +2266,9 @@ fn bind_menu_option_actions(frame: Frame, wiring: &Wiring, controls: Controls) {
             SPEAK_SUBTITLES => {
                 flip("speak_subtitles");
             }
+            PREFERRED_AUDIO => open_audio_prefs(&wiring, status),
+            KEYBOARD_SHORTCUTS => open_shortcuts_editor(&wiring, status),
+            WHATS_NEW => open_whats_new(status),
             READ_CURRENT_SUBTITLE => menu_read_current_subtitle(&wiring, status),
             OPEN_LOGS => {
                 let dir = iptv_core::config::user_config_dir();
@@ -4470,6 +4465,253 @@ fn format_bytes(bytes: u64) -> String {
     } else {
         format!("{bytes} B")
     }
+}
+
+/// Open the User Guide at a specific help topic (per-control F1).
+fn open_guide_window_at(wiring: &Wiring, status: Status, topic: &str) {
+    let ui = ensure_guide_ui(&wiring.guide_ui);
+    let language = wiring.i18n.resolved_language();
+    let (guide, section) = iptv_core::guide::open_topic(Some(&language), Some(topic), None);
+    show_guide(&ui, guide);
+    if let Some(section) = section {
+        move_caret(&ui, &section);
+    }
+    ui.frame.show(true);
+    ui.frame.raise();
+    status.set_label("User Guide opened.");
+}
+
+/// Attach F1 help to one main-window control: F1 opens the guide
+/// at the control's topic, as Python's `set_help_topic` does.
+fn bind_f1_help<T>(control: &T, wiring: &Wiring, topic: &'static str, status: Status)
+where
+    T: wxdragon::event::WxEvtHandler,
+{
+    let wiring = clone_wiring(wiring);
+    control.bind_internal(EventType::KEY_DOWN, move |event| {
+        if event.get_key_code() == Some(340) {
+            open_guide_window_at(&wiring, status, topic);
+        }
+        event.skip(true);
+    });
+}
+
+/// Options > Keyboard Shortcuts...: list every command with its
+/// effective binding; Edit changes one (validated by the core
+/// engine with the Python error strings); Reset restores defaults.
+fn open_shortcuts_editor(wiring: &Wiring, status: Status) {
+    let (frame, panel, list, dstatus) = list_dialog("Keyboard Shortcuts", "Commands");
+    let render = |wiring: &Wiring, list: ListBox| {
+        let config = serde_json::Value::Object(wiring.persist.config.borrow().raw().clone());
+        let rows = iptv_core::shortcuts::searchable_commands(&config, "");
+        let labels: Vec<String> = rows
+            .iter()
+            .map(|(context, _, label, binding)| {
+                let where_ = if context == "player" {
+                    "Built-in Player"
+                } else {
+                    "Main window"
+                };
+                if binding.is_empty() {
+                    format!("{where_} — {label} — (not assigned)")
+                } else {
+                    format!("{where_} — {label} — {binding}")
+                }
+            })
+            .collect();
+        list.set_items(&labels.iter().map(String::as_str).collect::<Vec<_>>());
+        labels.len()
+    };
+    let count = render(wiring, list);
+    dstatus.set_label(&format!(
+        "{count} commands. Edit changes a binding; menus pick up changes on restart."
+    ));
+    let edit = Button::builder(&panel).with_label("&Edit Binding").build();
+    let reset = Button::builder(&panel).with_label("&Reset All").build();
+    let close = Button::builder(&panel).with_label("&Close").build();
+    let wiring_e = clone_wiring(wiring);
+    edit.on_click(move |_| {
+        let Some(index) = list.get_selection() else {
+            dstatus.set_label("Choose a command to edit first.");
+            return;
+        };
+        let config = serde_json::Value::Object(wiring_e.persist.config.borrow().raw().clone());
+        let rows = iptv_core::shortcuts::searchable_commands(&config, "");
+        let Some((context, action, label, binding)) =
+            rows.get(usize::try_from(index).unwrap_or(usize::MAX))
+        else {
+            return;
+        };
+        let dialog = TextEntryDialog::builder(
+            &frame,
+            &format!("Shortcut for {label} (blank restores the default):"),
+            "Edit Shortcut",
+        )
+        .with_default_value(binding)
+        .build();
+        if dialog.show_modal() != ID_OK {
+            return;
+        }
+        let Some(value) = dialog.get_value() else {
+            return;
+        };
+        let mut raw = wiring_e.persist.config.borrow().raw().clone();
+        match iptv_core::shortcuts::set_shortcut(&mut raw, context, action, value.trim()) {
+            Ok(()) => {
+                let shortcuts = raw
+                    .get("shortcuts")
+                    .cloned()
+                    .unwrap_or(serde_json::json!({}));
+                wiring_e.persist.set_and_save("shortcuts", shortcuts);
+                render(&wiring_e, list);
+                dstatus.set_label(&format!("Shortcut for {label} updated."));
+            }
+            Err(error) => dstatus.set_label(&error),
+        }
+    });
+    let wiring_r = clone_wiring(wiring);
+    reset.on_click(move |_| {
+        wiring_r
+            .persist
+            .set_and_save("shortcuts", serde_json::json!({}));
+        render(&wiring_r, list);
+        dstatus.set_label("All shortcuts reset to defaults.");
+    });
+    close.on_click(move |_| frame.hide());
+    frame.show(true);
+    let _ = status;
+}
+
+/// Options > Preferred Audio Track...: user keywords plus the
+/// audio-description preference (slice 9's selection engine).
+fn open_audio_prefs(wiring: &Wiring, status: Status) {
+    let frame = Frame::builder()
+        .with_title("Preferred Audio Track")
+        .with_size(Size::new(560, 360))
+        .build();
+    frame.set_accessibility_label("Preferred Audio Track");
+    let panel = Panel::builder(&frame).build();
+    let caption = StaticText::builder(&panel)
+        .with_label("Preferred track keywords (comma separated)")
+        .build();
+    let _ = caption;
+    let keywords = TextCtrl::builder(&panel)
+        .with_value(
+            &wiring
+                .persist
+                .config
+                .borrow()
+                .string_list("preferred_audio_tracks")
+                .join(", "),
+        )
+        .build();
+    keywords.set_accessibility_label("Preferred track keywords");
+    let ad_check = CheckBox::builder(&panel)
+        .with_label("Prefer audio description tracks")
+        .build();
+    ad_check.set_value(
+        wiring
+            .persist
+            .config
+            .borrow()
+            .bool_or("prefer_audio_description", false),
+    );
+    let ok = Button::builder(&panel).with_label("&OK").build();
+    let cancel = Button::builder(&panel).with_label("&Cancel").build();
+    let wiring_ok = clone_wiring(wiring);
+    ok.on_click(move |_| {
+        let words: Vec<String> = keywords
+            .get_value()
+            .split(',')
+            .map(|word| word.trim().to_string())
+            .filter(|word| !word.is_empty())
+            .collect();
+        wiring_ok
+            .persist
+            .set_and_save("preferred_audio_tracks", serde_json::json!(words));
+        wiring_ok.persist.set_and_save(
+            "prefer_audio_description",
+            serde_json::json!(ad_check.get_value()),
+        );
+        status.set_label("Audio track preferences saved.");
+        frame.hide();
+    });
+    cancel.on_click(move |_| frame.hide());
+    frame.show(true);
+}
+
+/// Help > What's New: the current version's notes.
+fn open_whats_new(status: Status) {
+    let (frame, _panel, _list, dstatus) = list_dialog("What's New", "Changes");
+    dstatus.details.set_value(WHATS_NEW_TEXT);
+    dstatus.set_label(&format!(
+        "What's new in version {}",
+        env!("CARGO_PKG_VERSION")
+    ));
+    frame.show(true);
+    let _ = status;
+}
+
+/// The What's New text for the running version (updated per release).
+const WHATS_NEW_TEXT: &str = "Version 0.2.0\n\nThe graphical interface now matches the Python client: full menus (File, Player, View, Options, Help), Playlist view scope, a Categories tree, the channel context menu, Playlist and EPG Managers, What's on Now, Continue Watching, Recently Watched, Downloads, Catch-up, Reminders and Scheduled Recordings dialogs, a Keyboard Shortcuts editor, per-control F1 help, and the libVLC playback engine with audio track selection.";
+
+/// Run the platform shutdown (factored out of the recordings poll
+/// for the countdown dialog).
+fn execute_shutdown(status: Status) {
+    let system = if cfg!(windows) {
+        "windows"
+    } else if cfg!(target_os = "macos") {
+        "darwin"
+    } else {
+        "linux"
+    };
+    let root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
+    match recording::shutdown_computer(system, &root) {
+        Ok(_) => status.set_label("All recordings finished. Shutting down."),
+        Err(error) => status.set_label(&format!("Shutdown failed: {error}")),
+    }
+}
+
+/// The shutdown countdown window: 30 seconds to cancel before the
+/// computer shuts down after recordings (Python's dialog).
+fn open_shutdown_countdown(status: Status) {
+    let frame = Frame::builder()
+        .with_title("Shutdown")
+        .with_size(Size::new(440, 240))
+        .build();
+    frame.set_accessibility_label("Shutdown countdown");
+    let panel = Panel::builder(&frame).build();
+    let label = StaticText::builder(&panel)
+        .with_label("All recordings finished. Shutting down in 30 seconds.")
+        .build();
+    let cancel = Button::builder(&panel)
+        .with_label("&Cancel Shutdown")
+        .build();
+    let remaining = Rc::new(std::cell::Cell::new(30_i64));
+    let timer = Rc::new(Timer::new(&frame));
+    let timer_tick = Rc::clone(&timer);
+    let remaining_tick = Rc::clone(&remaining);
+    timer.on_tick(move |_| {
+        let next = remaining_tick.get() - 1;
+        remaining_tick.set(next);
+        if next <= 0 {
+            timer_tick.stop();
+            execute_shutdown(status);
+            frame.hide();
+        } else {
+            label.set_label(&format!(
+                "All recordings finished. Shutting down in {next} seconds."
+            ));
+        }
+    });
+    let timer_cancel = Rc::clone(&timer);
+    cancel.on_click(move |_| {
+        timer_cancel.stop();
+        status.set_label("Shutdown cancelled.");
+        frame.hide();
+    });
+    assert!(timer.start(1000, false));
+    frame.show(true);
 }
 
 /// Display text for a category row. The sentinel is never decorated; the
