@@ -281,8 +281,25 @@ struct Status {
     bar: Option<Frame>,
 }
 
+/// The UI translator, installed once the configuration (and its
+/// language) is loaded. `tr` is the gettext choke point for menu
+/// labels and status announcements; untranslated strings pass
+/// through unchanged.
+static TRANSLATOR: std::sync::OnceLock<I18n> = std::sync::OnceLock::new();
+
+fn set_translator(i18n: &I18n) {
+    let _ = TRANSLATOR.set(i18n.clone());
+}
+
+fn tr(text: &str) -> String {
+    TRANSLATOR
+        .get()
+        .map_or_else(|| text.to_string(), |i18n| i18n.gettext(text))
+}
+
 impl Status {
     fn set_label(self, message: &str) {
+        let message = &tr(message);
         self.details.change_value(message);
         if let Some(frame) = self.bar {
             frame.set_status_text(message, 0);
@@ -335,6 +352,8 @@ struct Wiring {
     guide_ui: Rc<RefCell<Option<GuideUi>>>,
     update_worker: Rc<UpdateWorker>,
     update_pending: Rc<std::cell::Cell<bool>>,
+    pending_update: Rc<RefCell<Option<iptv_core::updater::UpdateManifest>>>,
+    pending_dvr_record: Rc<RefCell<Option<String>>>,
     tray: Rc<TaskBarIcon>,
     i18n: Rc<I18n>,
     vod_worker: Rc<VodWorker>,
@@ -530,6 +549,8 @@ fn bind_browser(frame: Frame, controls: Controls, model: Rc<RefCell<SearchResult
         guide_ui: Rc::new(RefCell::new(None)),
         update_worker: Rc::new(UpdateWorker::new()),
         update_pending: Rc::new(std::cell::Cell::new(false)),
+        pending_update: Rc::new(RefCell::new(None)),
+        pending_dvr_record: Rc::new(RefCell::new(None)),
         tray: Rc::new(build_tray_icon()),
         i18n,
         vod_worker: Rc::new(VodWorker::new()),
@@ -841,6 +862,34 @@ fn configured_entries(wiring: &Wiring) -> (Vec<PlaylistSource>, Vec<ProviderAcco
 
 /// Drain provider worker events on the poll tick: merged channels, guide
 /// sources, and a finished Stalker link resolution that completes a play.
+/// A Stalker resolve for a scheduled recording finished: record
+/// with the resolved URL, or fail the job with the error.
+fn handle_dvr_resolve(
+    wiring: &Wiring,
+    status: Status,
+    job_id: &str,
+    result: Result<String, String>,
+) {
+    let now = now_seconds();
+    let Some(job) = wiring.dvr.borrow().get(job_id).cloned() else {
+        return;
+    };
+    match result {
+        Ok(url) => {
+            let mut channel = channel_from_snapshot(&job.channel);
+            channel.url = url;
+            record_dvr_channel(wiring, status, &job, &channel, now);
+        }
+        Err(error) => {
+            wiring
+                .dvr
+                .borrow_mut()
+                .mark_finished(job_id, false, "", &error, now);
+            status.set_label(&error);
+        }
+    }
+}
+
 fn poll_providers(wiring: &Wiring, controls: Controls) {
     let status = controls.status;
     while let Some(event) = wiring.provider_worker.try_recv() {
@@ -870,6 +919,10 @@ fn poll_providers(wiring: &Wiring, controls: Controls) {
                 }
             }
             ProviderEvent::Resolved(result) => {
+                if let Some(job_id) = wiring.pending_dvr_record.borrow_mut().take() {
+                    handle_dvr_resolve(wiring, status, &job_id, result);
+                    continue;
+                }
                 let pending = wiring.pending_resolve.borrow_mut().take();
                 match (pending, result) {
                     (Some(mut channel), Ok(url)) => {
@@ -1079,15 +1132,48 @@ fn start_dvr_job(wiring: &Wiring, status: Status, job_id: &str, now: f64) {
     };
     let channel = channel_from_snapshot(&job.channel);
     if channel.url.is_empty() {
-        wiring.dvr.borrow_mut().mark_finished(
-            job_id,
-            false,
-            "",
-            "Scheduled recordings from portal channels are not supported yet.",
-            now,
-        );
+        let is_stalker = channel
+            .unknown_attributes
+            .get("provider-type")
+            .map(String::as_str)
+            == Some("stalker");
+        let key = channel.unknown_attributes.get("provider-id").cloned();
+        match (is_stalker, key) {
+            (true, Some(key)) => {
+                *wiring.pending_dvr_record.borrow_mut() = Some(job_id.to_string());
+                wiring
+                    .provider_worker
+                    .resolve(key, channel.unknown_attributes.clone());
+                status.set_label(&format!(
+                    "Resolving the stream link for the scheduled recording of {}.",
+                    channel.name
+                ));
+                assert!(wiring.timer.start(50, false));
+            }
+            _ => {
+                wiring.dvr.borrow_mut().mark_finished(
+                    job_id,
+                    false,
+                    "",
+                    "This channel has no stream link to record.",
+                    now,
+                );
+            }
+        }
         return;
     }
+    record_dvr_channel(wiring, status, &job, &channel, now);
+}
+
+/// Start the ffmpeg side of a DVR job once its channel has a
+/// playable URL (directly, or after a Stalker resolve).
+fn record_dvr_channel(
+    wiring: &Wiring,
+    status: Status,
+    job: &iptv_core::dvr::DvrJob,
+    channel: &Channel,
+    now: f64,
+) {
     let display = if job.title.is_empty() {
         channel.name.clone()
     } else {
@@ -1096,8 +1182,8 @@ fn start_dvr_job(wiring: &Wiring, status: Status, job_id: &str, now: f64) {
     match start_recording(
         &wiring.recordings,
         &wiring.persist,
-        &format!("dvr:{job_id}"),
-        &channel,
+        &format!("dvr:{}", job.id),
+        channel,
         &job.format.clone(),
         &display,
     ) {
@@ -1106,7 +1192,7 @@ fn start_dvr_job(wiring: &Wiring, status: Status, job_id: &str, now: f64) {
             wiring
                 .dvr
                 .borrow_mut()
-                .mark_finished(job_id, false, "", &error, now);
+                .mark_finished(&job.id, false, "", &error, now);
         }
     }
 }
@@ -1674,6 +1760,8 @@ fn clone_wiring(wiring: &Wiring) -> Wiring {
         guide_ui: Rc::clone(&wiring.guide_ui),
         update_worker: Rc::clone(&wiring.update_worker),
         update_pending: Rc::clone(&wiring.update_pending),
+        pending_update: Rc::clone(&wiring.pending_update),
+        pending_dvr_record: Rc::clone(&wiring.pending_dvr_record),
         tray: Rc::clone(&wiring.tray),
         i18n: Rc::clone(&wiring.i18n),
         vod_worker: Rc::clone(&wiring.vod_worker),
@@ -1782,7 +1870,7 @@ const PLAYER_LABELS: [&str; 10] = [
 
 /// Append one item to a menu under construction.
 fn menu_add(menu: &Menu, id: i32, label: &str, help: &str, kind: ItemKind) {
-    menu.append(id, label, help, kind);
+    menu.append(id, &tr(label), &tr(help), kind);
 }
 
 /// Build the full Python-parity menu tree (File, Player, View,
@@ -1798,6 +1886,7 @@ fn menu_label(keys: &std::collections::BTreeMap<String, String>, text: &str, nam
 }
 
 fn build_menu(frame: Frame, wiring: &Wiring, controls: Controls) {
+    set_translator(&wiring.i18n);
     let config = wiring.persist.config.borrow();
     let raw = serde_json::Value::Object(config.raw().clone());
     let keys = iptv_core::shortcuts::effective(&raw, "main");
@@ -2204,10 +2293,7 @@ fn bind_menu_actions(frame: Frame, wiring: &Wiring, controls: Controls) {
         match id {
             4004 => frame.close(false),
             5002 => open_guide_window(&wiring, status),
-            5003 => {
-                start_update_check(&wiring);
-                status.set_label("Checking for updates...");
-            }
+            5003 => open_update_prompt(&wiring, frame, status),
             5004 => {
                 frame.show(true);
                 frame.raise();
@@ -2601,10 +2687,11 @@ fn poll_updates(wiring: &Wiring, status: Status) {
             UpdateEvent::Checked { manifest, newer } => {
                 if newer {
                     status.set_label(&format!(
-                        "Version {} is available. You have {}.",
+                        "Version {} is available. You have {}. Choose Check for Updates in the Help menu to download and install it.",
                         manifest.version,
                         env!("CARGO_PKG_VERSION")
                     ));
+                    *wiring.pending_update.borrow_mut() = Some(manifest);
                 } else {
                     status.set_label(&format!(
                         "Accessible IPTV Client is up to date ({}).",
@@ -2612,11 +2699,57 @@ fn poll_updates(wiring: &Wiring, status: Status) {
                     ));
                 }
             }
+            UpdateEvent::Downloaded { path } => {
+                status.set_label(&format!(
+                    "Update downloaded and verified: {}. Opening it now.",
+                    path.display()
+                ));
+                open_downloaded_package(&path);
+            }
             UpdateEvent::Failed(error) => {
-                status.set_label(&format!("Update check failed: {error}"));
+                status.set_label(&format!("Update failed: {error}"));
             }
         }
     }
+}
+
+/// Ask whether to download the pending update, then queue it.
+fn open_update_prompt(wiring: &Wiring, frame: Frame, status: Status) {
+    let Some(manifest) = wiring.pending_update.borrow().clone() else {
+        start_update_check(wiring);
+        status.set_label("Checking for updates...");
+        return;
+    };
+    let dialog = MessageDialog::builder(
+        &frame,
+        &format!(
+            "Version {} is available. Download and open it now?",
+            manifest.version
+        ),
+        "Update Accessible IPTV Client",
+    )
+    .with_style(MessageDialogStyle::YesNo)
+    .build();
+    if dialog.show_modal() != ID_YES {
+        status.set_label("Update postponed.");
+        return;
+    }
+    let dest = iptv_core::config::user_config_dir().join("updates");
+    wiring.update_worker.download(&manifest, dest);
+    wiring.update_pending.set(true);
+    assert!(wiring.timer.start(50, false));
+    status.set_label(&format!("Downloading version {}...", manifest.version));
+}
+
+/// Open a downloaded package with the platform's handler.
+fn open_downloaded_package(path: &std::path::Path) {
+    #[cfg(target_os = "windows")]
+    let program = "explorer";
+    #[cfg(target_os = "macos")]
+    let program = "open";
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let program = "xdg-open";
+    let _ = std::process::Command::new(program).arg(path).spawn();
 }
 
 /// Build the guide window once and keep it (closing hides it).
@@ -4651,14 +4784,15 @@ struct DownloadRow {
 
 /// Build a simple list dialog shell: frame, panel, list, status.
 fn list_dialog(title: &str, list_label: &str) -> (Frame, Panel, ListBox, Status) {
+    let title = tr(title);
     let frame = Frame::builder()
-        .with_title(title)
+        .with_title(&title)
         .with_size(Size::new(680, 520))
         .build();
-    frame.set_accessibility_label(title);
+    frame.set_accessibility_label(&title);
     let panel = Panel::builder(&frame).build();
     let list = ListBox::builder(&panel).build();
-    list.set_accessibility_label(list_label);
+    list.set_accessibility_label(&tr(list_label));
     let status_label = StaticText::builder(&panel)
         .with_label("Dialog status")
         .build();

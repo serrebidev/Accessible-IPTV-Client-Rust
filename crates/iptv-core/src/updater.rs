@@ -182,13 +182,33 @@ pub enum UpdateEvent {
         /// Whether the manifest version beats the running version.
         newer: bool,
     },
-    /// The check failed with a user-facing message.
+    /// The update package downloaded and verified; the path is
+    /// ready to open.
+    Downloaded {
+        /// The downloaded package's path.
+        path: std::path::PathBuf,
+    },
+    /// The check or download failed with a user-facing message.
     Failed(String),
+}
+
+/// One unit of update work.
+enum UpdateJob {
+    Check {
+        owner: String,
+        repo: String,
+        manifest_name: String,
+        current: String,
+    },
+    Download {
+        manifest: UpdateManifest,
+        dest_dir: std::path::PathBuf,
+    },
 }
 
 /// Runs update checks off the UI thread.
 pub struct UpdateWorker {
-    sender: Sender<(String, String, String, String)>,
+    sender: Sender<UpdateJob>,
     receiver: Receiver<UpdateEvent>,
 }
 
@@ -202,12 +222,19 @@ impl UpdateWorker {
     /// Create the worker.
     #[must_use]
     pub fn new() -> Self {
-        let (job_sender, job_receiver) =
-            std::sync::mpsc::channel::<(String, String, String, String)>();
+        let (job_sender, job_receiver) = std::sync::mpsc::channel::<UpdateJob>();
         let (event_sender, event_receiver) = std::sync::mpsc::channel::<UpdateEvent>();
         thread::spawn(move || {
-            while let Ok((owner, repo, manifest_name, current)) = job_receiver.recv() {
-                let event = check(&owner, &repo, &manifest_name, &current);
+            while let Ok(job) = job_receiver.recv() {
+                let event = match job {
+                    UpdateJob::Check {
+                        owner,
+                        repo,
+                        manifest_name,
+                        current,
+                    } => check(&owner, &repo, &manifest_name, &current),
+                    UpdateJob::Download { manifest, dest_dir } => download(&manifest, &dest_dir),
+                };
                 if event_sender.send(event).is_err() {
                     return;
                 }
@@ -221,12 +248,23 @@ impl UpdateWorker {
 
     /// Queue a check of `owner/repo`'s latest release.
     pub fn check(&self, owner: &str, repo: &str, manifest_name: &str, current_version: &str) {
-        let _ = self.sender.send((
-            owner.to_string(),
-            repo.to_string(),
-            manifest_name.to_string(),
-            current_version.to_string(),
-        ));
+        let _ = self.sender.send(UpdateJob::Check {
+            owner: owner.to_string(),
+            repo: repo.to_string(),
+            manifest_name: manifest_name.to_string(),
+            current: current_version.to_string(),
+        });
+    }
+
+    /// Queue a download of the manifest's package (the installer
+    /// asset when present, else the portable asset) into a
+    /// directory; the result is verified against the manifest's
+    /// SHA-256 before `Downloaded` is reported.
+    pub fn download(&self, manifest: &UpdateManifest, dest_dir: std::path::PathBuf) {
+        let _ = self.sender.send(UpdateJob::Download {
+            manifest: manifest.clone(),
+            dest_dir,
+        });
     }
 
     /// Take the next pending check outcome, when one is ready.
@@ -277,6 +315,39 @@ fn check(owner: &str, repo: &str, manifest_name: &str, current: &str) -> UpdateE
             Err(error) => UpdateEvent::Failed(error),
         },
         Err(error) => UpdateEvent::Failed(error),
+    }
+}
+
+/// Download the manifest's package into `dest_dir` and verify
+/// its SHA-256.
+fn download(manifest: &UpdateManifest, dest_dir: &std::path::Path) -> UpdateEvent {
+    let (filename, url, sha) = match (
+        &manifest.installer_asset_filename,
+        &manifest.installer_download_url,
+    ) {
+        (Some(name), Some(url)) => (
+            name.clone(),
+            url.clone(),
+            manifest.installer_sha256.clone().unwrap_or_default(),
+        ),
+        _ => (
+            manifest.asset_filename.clone(),
+            manifest.download_url.clone(),
+            manifest.sha256.clone(),
+        ),
+    };
+    if let Err(error) = std::fs::create_dir_all(dest_dir) {
+        return UpdateEvent::Failed(format!("Could not create the updates folder: {error}"));
+    }
+    let dest = dest_dir.join(filename);
+    match download_file_sha256(&url, &dest) {
+        Ok(actual) if sha.is_empty() || actual.eq_ignore_ascii_case(&sha) => {
+            UpdateEvent::Downloaded { path: dest }
+        }
+        Ok(_) => UpdateEvent::Failed(
+            "The downloaded update failed its integrity check and was not used.".to_string(),
+        ),
+        Err(error) => UpdateEvent::Failed(format!("Update download failed: {error}")),
     }
 }
 
