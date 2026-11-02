@@ -928,6 +928,54 @@ fn dispatch_resolve_catchup(
     request
 }
 
+/// Recordings > Schedule Padding... (Python's dialog fields and
+/// 0..=180 range, asked one at a time).
+fn prompt_schedule_padding(wiring: &Wiring, frame: Frame, status: Status) {
+    let ask = |label: &str, current: i64| -> Option<i64> {
+        let dialog = TextEntryDialog::builder(&frame, label, "Schedule Padding")
+            .with_default_value(&current.to_string())
+            .build();
+        if dialog.show_modal() != ID_OK {
+            return None;
+        }
+        dialog
+            .get_value()
+            .unwrap_or_default()
+            .trim()
+            .parse::<i64>()
+            .ok()
+    };
+    let config = wiring.persist.config.borrow();
+    let pre = config
+        .value("recording_pre_padding_minutes")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(0);
+    let post = config
+        .value("recording_post_padding_minutes")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(2);
+    drop(config);
+    let Some(pre) = ask("Minutes before programme:", pre) else {
+        return;
+    };
+    let Some(post) = ask("Minutes after programme:", post) else {
+        return;
+    };
+    if !(0..=180).contains(&pre) || !(0..=180).contains(&post) {
+        status.set_label("Padding must be between 0 and 180 minutes.");
+        return;
+    }
+    wiring
+        .persist
+        .set_and_save("recording_pre_padding_minutes", serde_json::json!(pre));
+    wiring
+        .persist
+        .set_and_save("recording_post_padding_minutes", serde_json::json!(post));
+    status.set_label(&format!(
+        "Schedule padding: {pre} minutes before, {post} minutes after."
+    ));
+}
+
 /// Retry due Stalker DVR resolutions on the DVR tick: at most
 /// one in-flight request per job, only while the padded window
 /// is open; an expired window fails the job durably.
@@ -1230,11 +1278,19 @@ fn start_recording(
     display_name: &str,
 ) -> Result<PathBuf, String> {
     let dir = recordings_dir(persist);
+    let reserve_mib = recording::normalize_reserve_mib(
+        persist
+            .config
+            .borrow()
+            .value("recording_min_free_mib")
+            .and_then(serde_json::Value::as_i64),
+    );
     if let Some(free) = recording::free_space_bytes(&dir) {
-        if free < recording::MIN_FREE_BYTES {
+        if free < reserve_mib * 1024 * 1024 {
             return Err(format!(
-                "Not enough free space to record ({} MB free).",
-                free / (1024 * 1024)
+                "Not enough free space to record ({} MB free, {} MiB must stay free).",
+                free / (1024 * 1024),
+                reserve_mib
             ));
         }
     }
@@ -2019,6 +2075,21 @@ pub const WHATS_NEW: i32 = 5191;
 pub const OPEN_LOGS: i32 = 5192;
 pub const COPY_DEBUG: i32 = 5193;
 pub const ABOUT: i32 = 5194;
+pub const READ_PREVIOUS_SUBTITLE: i32 = 5187;
+pub const REVIEW_SUBTITLES: i32 = 5188;
+pub const SUBTITLE_CAPABILITIES: i32 = 5189;
+pub const REC_START: i32 = 5201;
+pub const REC_STOP: i32 = 5202;
+pub const REC_STOP_ALL: i32 = 5203;
+pub const REC_REMINDERS: i32 = 5204;
+pub const REC_STORAGE: i32 = 5205;
+pub const REC_MIN_FREE: i32 = 5206;
+pub const REC_SCHEDULED: i32 = 5207;
+pub const REC_FORMAT_BASE: i32 = 5210;
+pub const REC_PADDING: i32 = 5208;
+pub const REC_OPEN_FOLDER: i32 = 5221;
+pub const REC_SET_FOLDER: i32 = 5222;
+pub const REC_SHUTDOWN_AFTER: i32 = 5223;
 
 /// The "Media Player to Use" radio labels, in Python's order.
 const PLAYER_LABELS: [&str; 10] = [
@@ -2060,12 +2131,14 @@ fn build_menu(frame: Frame, wiring: &Wiring, controls: Controls) {
     let player_menu = build_player_menu(&keys);
     let view_menu = build_view_menu(&keys);
     let options_menu = build_options_menu(&config);
+    let recordings_menu = build_recordings_menu(&config);
     let help_menu = build_help_menu();
     let menu_bar = MenuBar::builder()
         .append(file_menu, "&File")
         .append(player_menu, "&Player")
         .append(view_menu, "&View")
         .append(options_menu, "&Options")
+        .append(recordings_menu, "&Recordings")
         .append(help_menu, "&Help")
         .build();
     frame.set_menu_bar(menu_bar);
@@ -2256,7 +2329,7 @@ fn build_announce_menu(config: &Config) -> Menu {
         .value("announcement_level")
         .and_then(serde_json::Value::as_i64)
         .unwrap_or(2);
-    for (offset, name) in ["Off", "Minimal", "Important events", "Detailed status"]
+    for (offset, name) in ["None", "Errors only", "Important events", "Detailed status"]
         .iter()
         .enumerate()
     {
@@ -2268,6 +2341,213 @@ fn build_announce_menu(config: &Config) -> Menu {
 }
 
 /// The Options > Subtitle Speech submenu.
+/// The Recordings menu, mirroring Python's `_populate_recordings_menu`.
+fn build_recordings_menu(config: &Config) -> Menu {
+    let menu = Menu::builder().build();
+    menu_add(
+        &menu,
+        REC_START,
+        "Start &Recording",
+        "Record the selected channel",
+        ItemKind::Normal,
+    );
+    menu_add(&menu, REC_STOP, "Sto&p Recording", "", ItemKind::Normal);
+    menu_add(
+        &menu,
+        REC_STOP_ALL,
+        "Stop &All Recordings",
+        "",
+        ItemKind::Normal,
+    );
+    menu.append_separator();
+    menu_add(
+        &menu,
+        REC_REMINDERS,
+        "Programme &Reminders...",
+        "",
+        ItemKind::Normal,
+    );
+    menu_add(
+        &menu,
+        REC_STORAGE,
+        "Check Recording &Storage...",
+        "",
+        ItemKind::Normal,
+    );
+    menu_add(
+        &menu,
+        REC_MIN_FREE,
+        "&Minimum Free Space...",
+        "",
+        ItemKind::Normal,
+    );
+    menu_add(
+        &menu,
+        REC_SCHEDULED,
+        "&Scheduled Recordings...",
+        "",
+        ItemKind::Normal,
+    );
+    menu.append_separator();
+    let format_sub = Menu::builder().build();
+    let current = config.string_or("recording_format", "provider_mkv");
+    for (offset, (id, label, _, _)) in iptv_core::recording::RECORDING_FORMATS.iter().enumerate() {
+        let radio_id = REC_FORMAT_BASE + i32::try_from(offset).unwrap_or(0);
+        menu_add(&format_sub, radio_id, label, "", ItemKind::Radio);
+        format_sub.check_item(radio_id, *id == current);
+    }
+    menu.append_submenu(format_sub, "Recording &Format", "");
+    menu_add(
+        &menu,
+        REC_PADDING,
+        "Schedule &Padding...",
+        "",
+        ItemKind::Normal,
+    );
+    menu.append_separator();
+    menu_add(
+        &menu,
+        REC_OPEN_FOLDER,
+        "&Open Recordings Folder",
+        "",
+        ItemKind::Normal,
+    );
+    menu_add(
+        &menu,
+        REC_SET_FOLDER,
+        "Set &Download Folder...",
+        "",
+        ItemKind::Normal,
+    );
+    menu.append_separator();
+    menu_add(
+        &menu,
+        REC_SHUTDOWN_AFTER,
+        "Shut Down the Computer &When Recordings Finish",
+        "",
+        ItemKind::Check,
+    );
+    menu.check_item(
+        REC_SHUTDOWN_AFTER,
+        config.bool_or("shutdown_after_recordings", false),
+    );
+    menu
+}
+
+/// Options > Subtitle Speech > Read previous subtitle.
+fn menu_read_previous_subtitle(wiring: &Wiring, status: Status) {
+    let player = wiring.player.borrow();
+    if player.window.is_none() {
+        status.set_label("No subtitle is showing.");
+        return;
+    }
+    let position = position_length(&player).0;
+    match player
+        .subtitle_cues
+        .iter()
+        .rev()
+        .find(|cue| cue.end <= position)
+    {
+        Some(cue) => status.set_label(&cue.text),
+        None => status.set_label("No previous subtitle."),
+    }
+}
+
+/// Options > Subtitle Speech > Review recent subtitles...
+fn open_review_subtitles(wiring: &Wiring, status: Status) {
+    let recent: Vec<String> = {
+        let player = wiring.player.borrow();
+        if player.window.is_none() {
+            status.set_label("No subtitles are loaded.");
+            return;
+        }
+        let cues = &player.subtitle_cues;
+        let start = cues.len().saturating_sub(20);
+        cues[start..].iter().map(|c| c.text.clone()).collect()
+    };
+    if recent.is_empty() {
+        status.set_label("No subtitles are loaded.");
+        return;
+    }
+    let (frame, _panel, list, dstatus) = list_dialog("Recent Subtitles", "Recent subtitles");
+    list.set_items(&recent.iter().map(String::as_str).collect::<Vec<_>>());
+    if !recent.is_empty() {
+        list.set_selection(u32::try_from(recent.len() - 1).unwrap_or(0), true);
+    }
+    dstatus.set_label(&format!("{} recent subtitles.", recent.len()));
+    frame.show(true);
+}
+
+/// Options > Subtitle Speech > Subtitle capabilities...
+fn show_subtitle_capabilities(frame: Frame, status: Status) {
+    let text = "Subtitle support in this build:\n\n- The built-in player shows sidecar subtitle files (SRT, WebVTT, ASS/SSA) loaded with Load Subtitles.\n- Speak subtitles announces each cue through your screen reader when it appears.\n- Read current subtitle and Read previous subtitle speak on demand from the Options > Subtitle Speech menu.\n- External players handle subtitles themselves; their support varies by player.";
+    let dialog = MessageDialog::builder(&frame, text, "Subtitle Capabilities")
+        .with_style(MessageDialogStyle::OK)
+        .build();
+    dialog.show_modal();
+    status.set_label("Subtitle capabilities shown.");
+}
+
+/// Recordings > Check Recording Storage...
+fn show_recording_storage(wiring: &Wiring, frame: Frame, status: Status) {
+    let dir = recordings_dir(&wiring.persist);
+    let reserve = recording::normalize_reserve_mib(
+        wiring
+            .persist
+            .config
+            .borrow()
+            .value("recording_min_free_mib")
+            .and_then(serde_json::Value::as_i64),
+    );
+    let free_text = match recording::free_space_bytes(&dir) {
+        Some(free) => format!("{} MB free", free / (1024 * 1024)),
+        None => "free space unavailable".to_string(),
+    };
+    let text = format!(
+        "Recordings folder: {}\nSpace: {free_text}\nMinimum free space before a recording starts: {reserve} MiB",
+        dir.display()
+    );
+    let dialog = MessageDialog::builder(&frame, &text, "Recording Storage")
+        .with_style(MessageDialogStyle::OK)
+        .build();
+    dialog.show_modal();
+    status.set_label("Recording storage shown.");
+}
+
+/// Recordings > Minimum Free Space...
+fn prompt_min_free_space(wiring: &Wiring, frame: Frame, status: Status) {
+    let current = recording::normalize_reserve_mib(
+        wiring
+            .persist
+            .config
+            .borrow()
+            .value("recording_min_free_mib")
+            .and_then(serde_json::Value::as_i64),
+    );
+    let dialog = TextEntryDialog::builder(
+        &frame,
+        "Minimum free space to keep on the recordings drive, in MiB (0-65536):",
+        "Minimum Free Space",
+    )
+    .with_default_value(&current.to_string())
+    .build();
+    if dialog.show_modal() != ID_OK {
+        return;
+    }
+    let text = dialog.get_value().unwrap_or_default();
+    let Ok(value) = text.trim().parse::<i64>() else {
+        status.set_label("Enter a whole number of MiB.");
+        return;
+    };
+    let normalized = recording::normalize_reserve_mib(Some(value));
+    wiring
+        .persist
+        .set_and_save("recording_min_free_mib", serde_json::json!(normalized));
+    status.set_label(&format!(
+        "Minimum free space before recording: {normalized} MiB."
+    ));
+}
+
 fn build_speech_menu(config: &Config) -> Menu {
     let speech_sub = Menu::builder().build();
     menu_add(
@@ -2282,6 +2562,28 @@ fn build_speech_menu(config: &Config) -> Menu {
         &speech_sub,
         READ_CURRENT_SUBTITLE,
         "Read current subtitle",
+        "",
+        ItemKind::Normal,
+    );
+    menu_add(
+        &speech_sub,
+        READ_PREVIOUS_SUBTITLE,
+        "Read previous subtitle",
+        "",
+        ItemKind::Normal,
+    );
+    menu_add(
+        &speech_sub,
+        REVIEW_SUBTITLES,
+        "Review recent subtitles...",
+        "",
+        ItemKind::Normal,
+    );
+    speech_sub.append_separator();
+    menu_add(
+        &speech_sub,
+        SUBTITLE_CAPABILITIES,
+        "Subtitle capabilities...",
         "",
         ItemKind::Normal,
     );
@@ -2385,14 +2687,6 @@ fn build_options_menu(config: &Config) -> Menu {
         "",
         ItemKind::Normal,
     );
-    menu_add(
-        &options_menu,
-        5003,
-        "Check for &Updates",
-        "Check GitHub for a newer release",
-        ItemKind::Normal,
-    );
-
     options_menu
 }
 
@@ -2406,6 +2700,14 @@ fn build_help_menu() -> Menu {
         ItemKind::Normal,
     );
     menu_add(&help_menu, WHATS_NEW, "What's &New", "", ItemKind::Normal);
+    help_menu.append_separator();
+    menu_add(
+        &help_menu,
+        5003,
+        "Check for &Updates...",
+        "Check GitHub for a newer release",
+        ItemKind::Normal,
+    );
     menu_add(
         &help_menu,
         OPEN_LOGS,
@@ -2420,6 +2722,7 @@ fn build_help_menu() -> Menu {
         "",
         ItemKind::Normal,
     );
+    help_menu.append_separator();
     menu_add(&help_menu, ABOUT, "&About...", "", ItemKind::Normal);
 
     help_menu
@@ -2524,6 +2827,131 @@ fn bind_menu_actions(frame: Frame, wiring: &Wiring, controls: Controls) {
         }
     });
 }
+
+/// Recordings menu dispatch. Returns true when the id belonged
+/// to the Recordings menu.
+fn menu_recordings_action(
+    id: i32,
+    wiring: &Wiring,
+    frame: Frame,
+    list: ListCtrl,
+    status: Status,
+) -> bool {
+    let persist = &wiring.persist;
+    match id {
+        REC_START => {
+            if let Some(channel) = selected_channel(&wiring.browser, &wiring.model, list) {
+                toggle_recording(&wiring.recordings, &wiring.persist, &channel, status);
+            } else {
+                status.set_label("Select a channel to record first.");
+            }
+        }
+        REC_STOP => {
+            if let Some(channel) = selected_channel(&wiring.browser, &wiring.model, list) {
+                let key = channel_key(&channel);
+                if wiring.recordings.borrow().is_recording(&key) {
+                    wiring.recordings.borrow_mut().stop(&key);
+                    status.set_label(&format!("Stopping recording of {}.", channel.name));
+                } else {
+                    status.set_label("That channel is not recording.");
+                }
+            } else {
+                status.set_label("Select a channel first.");
+            }
+        }
+        REC_STOP_ALL => {
+            let keys = wiring.recordings.borrow().active_keys();
+            if keys.is_empty() {
+                status.set_label("No recordings are in progress.");
+            } else {
+                let count = keys.len();
+                for key in &keys {
+                    wiring.recordings.borrow_mut().stop(key);
+                }
+                status.set_label(&format!("Stopping {count} recordings."));
+            }
+        }
+        REC_REMINDERS => open_reminders_dialog(wiring, status),
+        REC_SCHEDULED => open_scheduled_dialog(wiring, status),
+        REC_STORAGE => show_recording_storage(wiring, frame, status),
+        REC_MIN_FREE => prompt_min_free_space(wiring, frame, status),
+        REC_PADDING => prompt_schedule_padding(wiring, frame, status),
+        REC_OPEN_FOLDER => {
+            let dir = recordings_dir(&wiring.persist);
+            let _ = std::fs::create_dir_all(&dir);
+            open_folder(&dir);
+            status.set_label("Opened the recordings folder.");
+        }
+        REC_SET_FOLDER => {
+            let dialog =
+                DirDialog::builder(&frame, "Choose the folder for recordings and downloads", "")
+                    .build();
+            if dialog.show_modal() == ID_OK {
+                if let Some(path) = dialog.get_path() {
+                    wiring
+                        .persist
+                        .set_and_save("recordings_dir", serde_json::json!(path));
+                    status.set_label("Download folder updated.");
+                }
+            }
+        }
+        REC_SHUTDOWN_AFTER => {
+            let next = !persist
+                .config
+                .borrow()
+                .bool_or("shutdown_after_recordings", false);
+            persist.set_and_save("shutdown_after_recordings", serde_json::json!(next));
+            status.set_label(if next {
+                "The computer will shut down when recordings finish."
+            } else {
+                "Shutdown after recordings is off."
+            });
+        }
+        REC_FORMAT_BASE..=5219 => {
+            let offset = usize::try_from(id - REC_FORMAT_BASE).unwrap_or(0);
+            if let Some((format_id, label, _, _)) =
+                iptv_core::recording::RECORDING_FORMATS.get(offset)
+            {
+                wiring
+                    .persist
+                    .set_and_save("recording_format", serde_json::json!(format_id));
+                status.set_label(&format!("Recording format: {label}."));
+            }
+        }
+        _ => return false,
+    }
+    true
+}
+
+/// Radio-range menu dispatch (player choice, language,
+/// announcement level). Returns true when the id was a radio.
+fn menu_radio_action(id: i32, wiring: &Wiring, status: Status) -> bool {
+    let persist = &wiring.persist;
+    if (PLAYER_RADIO_BASE..PLAYER_RADIO_BASE + 10).contains(&id) {
+        let index = usize::try_from(id - PLAYER_RADIO_BASE).unwrap_or(0);
+        if let Some(name) = PLAYER_LABELS.get(index) {
+            persist.set_and_save("media_player", serde_json::json!(name));
+            status.set_label(&format!("Media player set to {name}."));
+        }
+        return true;
+    }
+    if (LANGUAGE_BASE..LANGUAGE_BASE + 15).contains(&id) {
+        let index = usize::try_from(id - LANGUAGE_BASE).unwrap_or(0);
+        if let Some((code, name)) = iptv_core::i18n::language_labels().get(index) {
+            persist.set_and_save("language", serde_json::json!(code));
+            status.set_label(&format!(
+                "Language set to {name}. Restart to apply everywhere."
+            ));
+        }
+        return true;
+    }
+    if (ANNOUNCE_BASE..ANNOUNCE_BASE + 4).contains(&id) {
+        persist.set_and_save("announcement_level", serde_json::json!(id - ANNOUNCE_BASE));
+        return true;
+    }
+    false
+}
+
 fn bind_menu_option_actions(frame: Frame, wiring: &Wiring, controls: Controls) {
     let status = controls.status;
     let stream_url = controls.stream_url;
@@ -2531,6 +2959,11 @@ fn bind_menu_option_actions(frame: Frame, wiring: &Wiring, controls: Controls) {
     frame.on_menu(move |event| {
         let id = event.get_id();
         if id < 5130 {
+            return;
+        }
+        if menu_recordings_action(id, &wiring, frame, controls.list, status)
+            || menu_radio_action(id, &wiring, status)
+        {
             return;
         }
         let persist = &wiring.persist;
@@ -2569,6 +3002,9 @@ fn bind_menu_option_actions(frame: Frame, wiring: &Wiring, controls: Controls) {
             KEYBOARD_SHORTCUTS => open_shortcuts_editor(&wiring, status),
             WHATS_NEW => open_whats_new(status),
             READ_CURRENT_SUBTITLE => menu_read_current_subtitle(&wiring, status),
+            READ_PREVIOUS_SUBTITLE => menu_read_previous_subtitle(&wiring, status),
+            REVIEW_SUBTITLES => open_review_subtitles(&wiring, status),
+            SUBTITLE_CAPABILITIES => show_subtitle_capabilities(frame, status),
             OPEN_LOGS => {
                 let dir = iptv_core::config::user_config_dir();
                 open_folder(&dir);
@@ -2596,28 +3032,6 @@ fn bind_menu_option_actions(frame: Frame, wiring: &Wiring, controls: Controls) {
                 )
                 .build();
                 dialog.show_modal();
-            }
-            _ if (PLAYER_RADIO_BASE..PLAYER_RADIO_BASE + 10).contains(&id) => {
-                let index = usize::try_from(id - PLAYER_RADIO_BASE).unwrap_or(0);
-                if let Some(name) = PLAYER_LABELS.get(index) {
-                    persist.set_and_save("media_player", serde_json::json!(name));
-                    status.set_label(&format!("Media player set to {name}."));
-                }
-            }
-            _ if (LANGUAGE_BASE..LANGUAGE_BASE + 15).contains(&id) => {
-                let index = usize::try_from(id - LANGUAGE_BASE).unwrap_or(0);
-                if let Some((code, name)) = iptv_core::i18n::language_labels().get(index) {
-                    persist.set_and_save("language", serde_json::json!(code));
-                    status.set_label(&format!(
-                        "Language set to {name}. Restart to apply everywhere."
-                    ));
-                }
-            }
-            _ if (ANNOUNCE_BASE..ANNOUNCE_BASE + 4).contains(&id) => {
-                persist.set_and_save(
-                    "announcement_level",
-                    serde_json::json!(id - ANNOUNCE_BASE),
-                );
             }
             _ => {}
         }
@@ -3153,8 +3567,20 @@ fn add_dvr_job(wiring: &Wiring, channel: &Channel, programme: &Programme, status
         programme_start: programme.start,
         programme_stop: programme.stop,
         format: &format,
-        pre_padding_minutes: 2,
-        post_padding_minutes: 5,
+        pre_padding_minutes: wiring
+            .persist
+            .config
+            .borrow()
+            .value("recording_pre_padding_minutes")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0),
+        post_padding_minutes: wiring
+            .persist
+            .config
+            .borrow()
+            .value("recording_post_padding_minutes")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(2),
         repeat: "none",
     };
     match iptv_core::dvr::build_job(&spec, now_seconds()) {
@@ -5222,6 +5648,8 @@ fn open_scheduled_dialog(wiring: &Wiring, main_status: Status) {
     let cancel_job = Button::builder(&panel)
         .with_label("&Cancel Recording")
         .build();
+    let delete_job = Button::builder(&panel).with_label("&Delete").build();
+    let refresh = Button::builder(&panel).with_label("&Refresh").build();
     let close = Button::builder(&panel).with_label("&Close").build();
     let wiring_c = clone_wiring(wiring);
     cancel_job.on_click(move |_| {
@@ -5248,6 +5676,31 @@ fn open_scheduled_dialog(wiring: &Wiring, main_status: Status) {
                 render(&wiring_c, list, dstatus);
             }
         }
+    });
+    let wiring_d = clone_wiring(wiring);
+    delete_job.on_click(move |_| {
+        let Some(index) = list.get_selection() else {
+            dstatus.set_label("Choose a finished recording to delete first.");
+            return;
+        };
+        let index = usize::try_from(index).unwrap_or(usize::MAX);
+        let id = wiring_d
+            .dvr
+            .borrow()
+            .jobs()
+            .get(index)
+            .map(|job| job.id.clone());
+        if let Some(id) = id {
+            if wiring_d.dvr.borrow_mut().remove_job(&id) {
+                render(&wiring_d, list, dstatus);
+            } else {
+                dstatus.set_label("Only finished recordings can be deleted.");
+            }
+        }
+    });
+    let wiring_r = clone_wiring(wiring);
+    refresh.on_click(move |_| {
+        render(&wiring_r, list, dstatus);
     });
     close.on_click(move |_| frame.hide());
     frame.show(true);
@@ -5703,7 +6156,7 @@ fn open_whats_new(status: Status) {
 }
 
 /// The What's New text for the running version (updated per release).
-const WHATS_NEW_TEXT: &str = "Version 0.2.0\n\nThe graphical interface now matches the Python client: full menus (File, Player, View, Options, Help), Playlist view scope, a Categories tree, the channel context menu, Playlist and EPG Managers, What's on Now, Continue Watching, Recently Watched, Downloads, Catch-up, Reminders and Scheduled Recordings dialogs, a Keyboard Shortcuts editor, per-control F1 help, and the libVLC playback engine with audio track selection.";
+const WHATS_NEW_TEXT: &str = "Version 0.2.0\n\nThe graphical interface now matches the Python client: menus (File, Player, View, Options, Recordings, Help), Playlist view scope, a Categories tree, the channel context menu, Playlist and EPG Managers, and per-control F1 help.\n\nPlayer: the libVLC engine drives the built-in player when VLC is installed (the system media control is the fallback), with audio track enumeration, preferred-track selection and resume-position checkpoints. The player window adds a seek slider, time display, subtitle readout, volume slider and track list.\n\nGuide and library: What's on Now, an on-disk EPG database that keeps the guide browsable between sessions, Continue Watching, Recently Watched and a 50-entry play history.\n\nProviders: playlists load from local files, remote URLs, Xtream and Stalker accounts, with a six-hour on-disk cache and stale-cache fallback when a portal is unreachable. Stalker channels resolve at play time; scheduled Stalker recordings resolve a fresh link at their start time and retry until their window closes. Catch-up downloads work for portal channels too.\n\nRecording: a Recordings menu with start/stop, Programme Reminders, Scheduled Recordings, a Recording Format submenu, a storage check and a configurable minimum-free-space reserve.\n\nCasting: discovered devices play through a local pairing proxy that rewrites playlists and passes ranges through; Sonos devices get their native metadata format.\n\nUpdates: Check for Updates in the Help menu offers to download the new package, verifies its SHA-256, and opens it for install.";
 
 /// Run the platform shutdown (factored out of the recordings poll
 /// for the countdown dialog).
@@ -5726,18 +6179,19 @@ fn execute_shutdown(status: Status) {
 /// computer shuts down after recordings (Python's dialog).
 fn open_shutdown_countdown(status: Status) {
     let frame = Frame::builder()
-        .with_title("Shutdown")
+        .with_title("Shut Down After Recordings")
         .with_size(Size::new(440, 240))
         .build();
-    frame.set_accessibility_label("Shutdown countdown");
+    frame.set_accessibility_label("Shut Down After Recordings");
     let panel = Panel::builder(&frame).build();
     let label = StaticText::builder(&panel)
-        .with_label("All recordings finished. Shutting down in 30 seconds.")
+        .with_label("All recordings have finished.\n\nThe computer will shut down by itself. Seconds remaining: 60")
         .build();
     let cancel = Button::builder(&panel)
         .with_label("&Cancel Shutdown")
         .build();
-    let remaining = Rc::new(std::cell::Cell::new(30_i64));
+    let now_button = Button::builder(&panel).with_label("Shut Down &Now").build();
+    let remaining = Rc::new(std::cell::Cell::new(60_i64));
     let timer = Rc::new(Timer::new(&frame));
     let timer_tick = Rc::clone(&timer);
     let remaining_tick = Rc::clone(&remaining);
@@ -5750,7 +6204,7 @@ fn open_shutdown_countdown(status: Status) {
             frame.hide();
         } else {
             label.set_label(&format!(
-                "All recordings finished. Shutting down in {next} seconds."
+                "All recordings have finished.\n\nThe computer will shut down by itself. Seconds remaining: {next}"
             ));
         }
     });
@@ -5760,8 +6214,15 @@ fn open_shutdown_countdown(status: Status) {
         status.set_label("Shutdown cancelled.");
         frame.hide();
     });
+    let timer_now = Rc::clone(&timer);
+    now_button.on_click(move |_| {
+        timer_now.stop();
+        execute_shutdown(status);
+        frame.hide();
+    });
     assert!(timer.start(1000, false));
     frame.show(true);
+    cancel.set_focus();
 }
 
 /// Display text for a category row. The sentinel is never decorated; the

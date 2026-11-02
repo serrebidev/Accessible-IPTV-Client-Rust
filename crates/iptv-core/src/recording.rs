@@ -375,6 +375,12 @@ impl RecordingEngine {
         self.active.len()
     }
 
+    /// The keys of all active recordings.
+    #[must_use]
+    pub fn active_keys(&self) -> Vec<String> {
+        self.active.keys().cloned().collect()
+    }
+
     /// Paths held by running recordings (for collision checks).
     #[must_use]
     pub fn in_use_paths(&self) -> Vec<PathBuf> {
@@ -449,6 +455,24 @@ impl RecordingEngine {
 /// Whether the computer may shut down now (port of
 /// Minimum free space required before a recording may start.
 pub const MIN_FREE_BYTES: u64 = 500 * 1024 * 1024;
+
+/// Default minimum-free-space reserve in MiB (Python
+/// `recording_storage.DEFAULT_RESERVE_MIB`).
+pub const DEFAULT_RESERVE_MIB: i64 = 256;
+
+/// Largest reserve the setting accepts (Python `MAX_RESERVE_MIB`).
+pub const MAX_RESERVE_MIB: i64 = 65536;
+
+/// Normalize a configured reserve: an integer inside
+/// 0..=`MAX_RESERVE_MIB` stands, anything else falls back to the
+/// default (Python `normalize_reserve`).
+#[must_use]
+pub fn normalize_reserve_mib(value: Option<i64>) -> u64 {
+    match value {
+        Some(v) if (0..=MAX_RESERVE_MIB).contains(&v) => u64::try_from(v).unwrap_or(0),
+        _ => u64::try_from(DEFAULT_RESERVE_MIB).unwrap_or(0),
+    }
+}
 
 /// Free bytes on the filesystem holding `path`, when the
 /// platform can report it (Unix `df`; `None` elsewhere, which
@@ -533,6 +557,16 @@ pub fn shutdown_computer(system: &str, windows_root: &str) -> Result<Vec<String>
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn reserve_normalization_matches_python() {
+        assert_eq!(normalize_reserve_mib(Some(0)), 0);
+        assert_eq!(normalize_reserve_mib(Some(1024)), 1024);
+        assert_eq!(normalize_reserve_mib(Some(65536)), 65536);
+        assert_eq!(normalize_reserve_mib(Some(65537)), 256);
+        assert_eq!(normalize_reserve_mib(Some(-5)), 256);
+        assert_eq!(normalize_reserve_mib(None), 256);
+    }
+
     use super::*;
 
     #[test]
