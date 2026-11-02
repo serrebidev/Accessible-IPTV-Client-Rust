@@ -7,7 +7,7 @@ use iptv_core::{
     categories::Category,
     config::{self, Config},
     dvr::{channel_from_snapshot, DvrAction, DvrSchedule},
-    epg::{local_hhmm, match_guide_channel, EpgGuide, EpgWorker, GuideIndexes},
+    epg::{local_hhmm, match_guide_channel, EpgGuide, EpgWorker, GuideIndexes, Programme},
     favorites::{channel_key, FavoriteSet, Toggle},
     playback::{
         candidate_executables, detect_from_path, external_argv, player_choice, resume_checkpoint,
@@ -41,6 +41,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let panel = Panel::builder(&frame).build();
         let (open, cancel) = open_cancel_buttons(panel);
         let record = record_button(panel);
+        let (scope_label, scope_choice) = scope_controls(panel);
         let (category_label, category, toggle_favorite) = category_controls(panel);
         let search_label = StaticText::builder(&panel)
             .with_label("&Search channels")
@@ -98,6 +99,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             open,
             cancel,
             record,
+            scope_choice,
             category,
             toggle_favorite,
             search,
@@ -112,6 +114,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             frame,
             panel,
             controls_for_layout,
+            scope_label,
             category_label,
             search_label,
             label,
@@ -125,6 +128,7 @@ fn layout_main(
     frame: Frame,
     panel: Panel,
     controls: Controls,
+    scope_label: StaticText,
     category_label: StaticText,
     search_label: StaticText,
     channels_label: StaticText,
@@ -132,6 +136,13 @@ fn layout_main(
     let layout = BoxSizer::builder(Orientation::Vertical).build();
     layout.add(&controls.open, 0, SizerFlag::All, 8);
     layout.add(&controls.cancel, 0, SizerFlag::All, 8);
+    layout.add(&scope_label, 0, SizerFlag::All, 8);
+    layout.add(
+        &controls.scope_choice,
+        0,
+        SizerFlag::Expand | SizerFlag::All,
+        8,
+    );
     layout.add(&category_label, 0, SizerFlag::All, 8);
     layout.add(&controls.category, 0, SizerFlag::Expand | SizerFlag::All, 8);
     layout.add(&controls.toggle_favorite, 0, SizerFlag::All, 8);
@@ -183,6 +194,35 @@ fn info_panels(panel: Panel) -> (TextCtrl, TextCtrl) {
     (episode_description, stream_url)
 }
 
+/// The Playlist view scope picker, one Tab stop before Categories,
+/// as in the Python main window.
+fn scope_controls(panel: Panel) -> (StaticText, Choice) {
+    let label = StaticText::builder(&panel)
+        .with_label("Playlist &view")
+        .build();
+    let choice = Choice::builder(&panel).build();
+    choice.set_accessibility_label("Playlist view");
+    choice.set_accessibility_description(
+        "Choose one playlist or All playlists. Categories and Channels show only the chosen playlist.",
+    );
+    choice.append("All playlists");
+    choice.set_selection(0);
+    (label, choice)
+}
+
+/// A short display name for a playlist source location: the file
+/// name for files, the host for URLs.
+fn scope_display_name(location: &str) -> String {
+    if location.starts_with("http://") || location.starts_with("https://") {
+        let rest = location.split("://").nth(1).unwrap_or(location);
+        return rest.split('/').next().unwrap_or(rest).to_string();
+    }
+    std::path::Path::new(location).file_name().map_or_else(
+        || location.to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    )
+}
+
 /// The Category list and the Toggle favorite action, in browse order.
 fn category_controls(panel: Panel) -> (StaticText, ListBox, Button) {
     let label = StaticText::builder(&panel).with_label("&Category").build();
@@ -228,6 +268,7 @@ struct Controls {
     open: Button,
     cancel: Button,
     record: Button,
+    scope_choice: Choice,
     category: ListBox,
     toggle_favorite: Button,
     search: TextCtrl,
@@ -269,6 +310,7 @@ struct Wiring {
     shutdown_attempted: Rc<std::cell::Cell<bool>>,
     last_dvr_tick: Rc<std::cell::Cell<f64>>,
     previous_channel: Rc<RefCell<Option<Channel>>>,
+    scope_ids: Rc<RefCell<Vec<Option<String>>>>,
 }
 
 /// Built-in player window state, created lazily on first use.
@@ -454,6 +496,7 @@ fn bind_browser(frame: Frame, controls: Controls, model: Rc<RefCell<SearchResult
         shutdown_attempted: Rc::new(std::cell::Cell::new(false)),
         last_dvr_tick: Rc::new(std::cell::Cell::new(0.0)),
         previous_channel: Rc::new(RefCell::new(None)),
+        scope_ids: Rc::new(RefCell::new(vec![None])),
     };
     *wiring.reminders.borrow_mut() = wiring.persist.reminders();
     if wiring.dvr.borrow().pending_count() > 0 {
@@ -475,11 +518,13 @@ fn bind_browser(frame: Frame, controls: Controls, model: Rc<RefCell<SearchResult
         wiring.provider_pending.set(true);
         assert!(wiring.timer.start(50, false));
     }
+    fill_scope_choices(&wiring, controls.scope_choice);
     bind_completion(&wiring, controls);
     bind_recording(&wiring, controls);
     build_menu(frame, &wiring, controls);
     maybe_auto_check_updates(&wiring);
     bind_actions(frame, &wiring, controls);
+    bind_context_menu(frame, &wiring, controls);
     let browser = Rc::clone(&wiring.browser);
     let timer = Rc::clone(&wiring.timer);
     let close_persist = wiring.persist.clone();
@@ -546,11 +591,39 @@ fn bind_completion(wiring: &Wiring, controls: Controls) {
     });
 }
 
+/// The Playlist view picker: switching scope re-runs the current
+/// query inside the chosen playlist (or all of them).
+fn bind_scope_choice(wiring: &Wiring, scope_choice: Choice, search: TextCtrl, status: Status) {
+    let scope_browser = Rc::clone(&wiring.browser);
+    let scope_timer = Rc::clone(&wiring.timer);
+    let scope_ids = Rc::clone(&wiring.scope_ids);
+    scope_choice.bind_internal(EventType::COMMAND_CHOICE_SELECTED, move |event| {
+        let Some(selection) = scope_choice.get_selection() else {
+            event.skip(true);
+            return;
+        };
+        let id = scope_ids
+            .borrow()
+            .get(usize::try_from(selection).unwrap_or(usize::MAX))
+            .cloned()
+            .flatten();
+        if scope_browser
+            .borrow_mut()
+            .set_scope(id, &search.get_value())
+        {
+            status.set_label("Load cancelled. Browsing previous channels...");
+        }
+        assert!(scope_timer.start(50, false));
+        event.skip(true);
+    });
+}
+
 fn bind_actions(frame: Frame, wiring: &Wiring, controls: Controls) {
     let Controls {
         open,
         cancel,
         record: _,
+        scope_choice,
         category,
         toggle_favorite,
         search,
@@ -602,6 +675,7 @@ fn bind_actions(frame: Frame, wiring: &Wiring, controls: Controls) {
         assert!(category_timer.start(50, false));
         event.skip(true);
     });
+    bind_scope_choice(wiring, scope_choice, search, status);
     bind_toggle(wiring, toggle_favorite, list, search, status);
     bind_playback(wiring, list, status, episode_description, stream_url);
     let request = Rc::clone(&browser);
@@ -689,6 +763,22 @@ fn toggle_selected_favorite(
         }
         None => status.set_label("No channel selected. Choose a channel in Channels first."),
     }
+}
+
+/// Fill the Playlist view picker from the configured sources and
+/// accounts; the parallel scope-id list lives on the wiring.
+fn fill_scope_choices(wiring: &Wiring, choice: Choice) {
+    let (sources, accounts) = configured_entries(wiring);
+    let mut ids: Vec<Option<String>> = vec![None];
+    for source in &sources {
+        choice.append(&scope_display_name(source.location()));
+        ids.push(Some(source.scope_id()));
+    }
+    for account in &accounts {
+        choice.append(&account.describe());
+        ids.push(account.provider_id());
+    }
+    *wiring.scope_ids.borrow_mut() = ids;
 }
 
 /// The configured `playlists` entries split into plain sources (strings)
@@ -1541,6 +1631,7 @@ fn clone_wiring(wiring: &Wiring) -> Wiring {
         shutdown_attempted: Rc::clone(&wiring.shutdown_attempted),
         last_dvr_tick: Rc::clone(&wiring.last_dvr_tick),
         previous_channel: Rc::clone(&wiring.previous_channel),
+        scope_ids: Rc::clone(&wiring.scope_ids),
     }
 }
 
@@ -2569,6 +2660,289 @@ fn move_caret(ui: &GuideUi, section: &iptv_core::guide::Section) {
         .set_insertion_point(i64::try_from(section.start).unwrap_or(0));
 }
 
+/// Context menu command ids on the Channels list (G3).
+const CTX_PLAY: i32 = 6001;
+const CTX_FAVORITE: i32 = 6002;
+const CTX_RECORD: i32 = 6003;
+const CTX_REMINDER: i32 = 6004;
+const CTX_SCHEDULE: i32 = 6005;
+const CTX_EPG: i32 = 6006;
+const CTX_CATCHUP: i32 = 6007;
+
+/// All guide programmes for a channel (empty without a guide match).
+fn guide_programmes(wiring: &Wiring, channel: &Channel) -> Vec<Programme> {
+    let guard = wiring.epg.borrow();
+    let Some((guide, indexes)) = guard.as_ref() else {
+        return Vec::new();
+    };
+    let known: std::collections::HashSet<String> =
+        guide.channels.iter().map(|c| c.id.to_lowercase()).collect();
+    let Some(id) = match_guide_channel(channel, indexes, Some(&known)) else {
+        return Vec::new();
+    };
+    guide.programmes.get(&id).cloned().unwrap_or_default()
+}
+
+/// The programme airing now on a channel, when the guide has one.
+fn current_programme(wiring: &Wiring, channel: &Channel) -> Option<Programme> {
+    let now = now_epoch();
+    guide_programmes(wiring, channel)
+        .into_iter()
+        .find(|p| p.start <= now && now < p.stop)
+}
+
+/// Add a reminder for a programme (5-minute lead from the context
+/// menu; the Reminders dialog in G6 offers lead choices).
+fn add_reminder(wiring: &Wiring, channel: &Channel, programme: &Programme, status: Status) {
+    let now = now_epoch();
+    match iptv_core::reminders::build_reminder(channel, programme, 5, now) {
+        Ok(reminder) => {
+            wiring.reminders.borrow_mut().push(reminder);
+            let rows = wiring.reminders.borrow().clone();
+            wiring.persist.save_reminders(&rows);
+            status.set_label(&format!(
+                "Reminder set for {} at {}.",
+                programme.title,
+                local_hhmm(programme.start)
+            ));
+        }
+        Err(_) => {
+            status.set_label("Reminders can only be set for programmes that have not started.");
+        }
+    }
+}
+
+/// Schedule a DVR recording for a programme window.
+fn add_dvr_job(wiring: &Wiring, channel: &Channel, programme: &Programme, status: Status) {
+    let format = wiring
+        .persist
+        .config
+        .borrow()
+        .string_or("recording_format", "provider_mkv");
+    let spec = iptv_core::dvr::NewJob {
+        channel,
+        programme_title: &programme.title,
+        programme_start: programme.start,
+        programme_stop: programme.stop,
+        format: &format,
+        pre_padding_minutes: 2,
+        post_padding_minutes: 5,
+        repeat: "none",
+    };
+    match iptv_core::dvr::build_job(&spec, now_seconds()) {
+        Ok(job) => {
+            let mut dvr = wiring.dvr.borrow_mut();
+            dvr.add_job(job);
+            dvr.save();
+            status.set_label(&format!(
+                "Recording scheduled: {} at {}.",
+                programme.title,
+                local_hhmm(programme.start)
+            ));
+        }
+        Err(error) => status.set_label(&error),
+    }
+}
+
+/// The Channels right-click menu (Python's channel context menu):
+/// Play, Favorite, Record, Set Reminder..., Schedule Recording...,
+/// View EPG..., Catch-up...
+fn bind_context_menu(frame: Frame, wiring: &Wiring, controls: Controls) {
+    let list = controls.list;
+    let status = controls.status;
+    let search = controls.search;
+    let wiring = clone_wiring(wiring);
+    let wiring_menu = clone_wiring(&wiring);
+    list.bind_internal(EventType::CONTEXT_MENU, move |_| {
+        let Some(channel) = selected_channel(&wiring.browser, &wiring.model, list) else {
+            return;
+        };
+        let favorite_label = if wiring.browser.borrow().favorites().is_favorite(&channel) {
+            "Remove from Favorites"
+        } else {
+            "Add to Favorites"
+        };
+        let record_label = if wiring
+            .recordings
+            .borrow()
+            .is_recording(&channel_key(&channel))
+        {
+            "Stop Recording"
+        } else {
+            "Record"
+        };
+        let mut menu = Menu::builder()
+            .append_item(CTX_PLAY, "Play", "")
+            .append_item(CTX_FAVORITE, favorite_label, "")
+            .append_item(CTX_RECORD, record_label, "")
+            .append_item(CTX_REMINDER, "Set Reminder...", "")
+            .append_item(CTX_SCHEDULE, "Schedule Recording...", "")
+            .append_item(CTX_EPG, "View EPG...", "")
+            .append_item(CTX_CATCHUP, "Catch-up...", "")
+            .build();
+        list.popup_menu(&mut menu, None);
+    });
+    // Popup-menu selections arrive as menu events on the frame
+    // (command events propagate up from the list).
+    frame.on_menu(move |event| {
+        let Some(channel) = selected_channel(&wiring_menu.browser, &wiring_menu.model, list) else {
+            return;
+        };
+        match event.get_id() {
+            CTX_PLAY => activate_channel(&wiring_menu, list, status),
+            CTX_FAVORITE => toggle_selected_favorite(
+                &wiring_menu.browser,
+                &wiring_menu.model,
+                &wiring_menu.persist,
+                &wiring_menu.timer,
+                list,
+                search,
+                status,
+            ),
+            CTX_RECORD => {
+                toggle_recording(
+                    &wiring_menu.recordings,
+                    &wiring_menu.persist,
+                    &channel,
+                    status,
+                );
+                assert!(wiring_menu.timer.start(50, false));
+            }
+            CTX_REMINDER => match current_programme(&wiring_menu, &channel) {
+                Some(programme) => add_reminder(&wiring_menu, &channel, &programme, status),
+                None => status.set_label("No current programme to set a reminder for."),
+            },
+            CTX_SCHEDULE => match current_programme(&wiring_menu, &channel) {
+                Some(programme) => add_dvr_job(&wiring_menu, &channel, &programme, status),
+                None => status.set_label("No current programme to schedule a recording for."),
+            },
+            CTX_EPG => open_channel_epg(&wiring_menu, &channel, status),
+            CTX_CATCHUP => play_catchup(&wiring_menu, &channel, status),
+            _ => {}
+        }
+    });
+}
+
+/// Resolve and play the catch-up stream for the channel's current
+/// programme (Python's Catch-up context action).
+fn play_catchup(wiring: &Wiring, channel: &Channel, status: Status) {
+    let Some(programme) = current_programme(wiring, channel) else {
+        status.set_label("No current programme to catch up.");
+        return;
+    };
+    let now = now_epoch();
+    match iptv_core::catchup::resolve_show_url(channel, programme.start, programme.stop, now) {
+        Ok(
+            iptv_core::catchup::ShowResolution::Live(_)
+            | iptv_core::catchup::ShowResolution::StalkerLive,
+        ) => {
+            play_channel(&wiring.player, &wiring.persist, channel, status);
+        }
+        Ok(iptv_core::catchup::ShowResolution::Catchup(url)) => {
+            let mut shifted = channel.clone();
+            shifted.url = url;
+            play_channel(&wiring.player, &wiring.persist, &shifted, status);
+        }
+        Ok(iptv_core::catchup::ShowResolution::StalkerCatchup {
+            start_text,
+            duration_minutes,
+        }) => {
+            let Some(key) = channel.unknown_attributes.get("provider-id").cloned() else {
+                status.set_label("This Stalker channel has no provider account configured.");
+                return;
+            };
+            *wiring.pending_resolve.borrow_mut() = Some(channel.clone());
+            wiring.provider_worker.resolve_catchup(
+                key,
+                channel.unknown_attributes.clone(),
+                start_text,
+                duration_minutes,
+            );
+            status.set_label("Resolving catch-up link...");
+            assert!(wiring.timer.start(50, false));
+        }
+        Err(error) => status.set_label(&error),
+    }
+}
+
+/// The Channel EPG window: the channel's upcoming programmes with
+/// Set Reminder and Schedule Recording actions on the selection.
+/// G6 grows this into the full EPG viewer.
+fn open_channel_epg(wiring: &Wiring, channel: &Channel, main_status: Status) {
+    let now = now_epoch();
+    let programmes: Vec<Programme> = guide_programmes(wiring, channel)
+        .into_iter()
+        .filter(|p| p.stop > now - 3600)
+        .take(200)
+        .collect();
+    if programmes.is_empty() {
+        main_status.set_label("No guide information for this channel.");
+        return;
+    }
+    let frame = Frame::builder()
+        .with_title(&format!("EPG — {}", channel.name))
+        .with_size(Size::new(640, 480))
+        .build();
+    frame.set_accessibility_label("Channel EPG");
+    let panel = Panel::builder(&frame).build();
+    let list = ListBox::builder(&panel).build();
+    list.set_accessibility_label("Programmes");
+    let labels: Vec<String> = programmes
+        .iter()
+        .map(|p| format!("{}-{} {}", local_hhmm(p.start), local_hhmm(p.stop), p.title))
+        .collect();
+    list.set_items(&labels.iter().map(String::as_str).collect::<Vec<_>>());
+    list.set_selection(0, true);
+    let reminder_button = Button::builder(&panel).with_label("Set &Reminder").build();
+    let schedule_button = Button::builder(&panel)
+        .with_label("Schedule &Recording")
+        .build();
+    let close_button = Button::builder(&panel).with_label("&Close").build();
+    let status_label = StaticText::builder(&panel).with_label("EPG status").build();
+    let details = TextCtrl::builder(&panel)
+        .with_style(TextCtrlStyle::ReadOnly | TextCtrlStyle::MultiLine)
+        .with_value("Choose a programme, then Set Reminder or Schedule Recording.")
+        .build();
+    details.set_accessibility_label("EPG status");
+    let status = Status {
+        label: status_label,
+        details,
+        bar: None,
+    };
+    let programmes = Rc::new(RefCell::new(programmes));
+    let channel_r = channel.clone();
+    let wiring_r = clone_wiring(wiring);
+    let programmes_r = Rc::clone(&programmes);
+    reminder_button.on_click(move |_| {
+        let Some(index) = list.get_selection() else {
+            return;
+        };
+        if let Some(programme) = programmes_r
+            .borrow()
+            .get(usize::try_from(index).unwrap_or(usize::MAX))
+        {
+            add_reminder(&wiring_r, &channel_r, programme, status);
+        }
+    });
+    let wiring_s = clone_wiring(wiring);
+    let programmes_s = Rc::clone(&programmes);
+    let channel_s = channel.clone();
+    schedule_button.on_click(move |_| {
+        let Some(index) = list.get_selection() else {
+            return;
+        };
+        if let Some(programme) = programmes_s
+            .borrow()
+            .get(usize::try_from(index).unwrap_or(usize::MAX))
+        {
+            add_dvr_job(&wiring_s, &channel_s, programme, status);
+        }
+    });
+    let frame_hide = frame;
+    close_button.on_click(move |_| frame_hide.hide());
+    frame.show(true);
+}
+
 fn bind_playback(
     wiring: &Wiring,
     list: ListCtrl,
@@ -2576,56 +2950,55 @@ fn bind_playback(
     episode_description: TextCtrl,
     stream_url: TextCtrl,
 ) {
-    let previous = Rc::clone(&wiring.previous_channel);
-    let browser = Rc::clone(&wiring.browser);
-    let model = Rc::clone(&wiring.model);
-    let player = Rc::clone(&wiring.player);
-    let persist = wiring.persist.clone();
-    let provider_worker = Rc::clone(&wiring.provider_worker);
-    let pending_resolve = Rc::clone(&wiring.pending_resolve);
-    let timer = Rc::clone(&wiring.timer);
-    list.on_item_activated(move |_| {
-        let selected = usize::try_from(list.get_first_selected_item()).ok();
-        let focused =
-            usize::try_from(list.get_next_item(-1, ListNextItemFlag::All, ListItemState::Focused))
-                .ok();
-        let Some(row) = pick_row(selected, focused) else {
-            status.set_label("No channel selected. Choose a channel in Channels first.");
-            return;
-        };
-        let Some(index) = model.borrow().playlist_index(row) else {
-            status.set_label("No channel selected. Choose a channel in Channels first.");
-            return;
-        };
-        let Some(channel) = browser.borrow().channel(index) else {
-            status.set_label("No channel selected. Choose a channel in Channels first.");
-            return;
-        };
-        if channel.url.is_empty()
-            && channel
-                .unknown_attributes
-                .get("provider-type")
-                .map(String::as_str)
-                == Some("stalker")
-        {
-            let Some(key) = channel.unknown_attributes.get("provider-id").cloned() else {
-                status.set_label("This Stalker channel has no provider account configured.");
-                return;
-            };
-            *pending_resolve.borrow_mut() = Some(channel.clone());
-            provider_worker.resolve(key, channel.unknown_attributes.clone());
-            status.set_label("Resolving stream link...");
-            assert!(timer.start(50, false));
-            return;
-        }
-        if let Some(current) = player.borrow().current_channel.clone() {
-            if current.url != channel.url {
-                *previous.borrow_mut() = Some(current);
-            }
-        }
-        play_channel(&player, &persist, &channel, status);
-    });
     bind_epg_highlight(wiring, list, status, episode_description, stream_url);
+    let wiring = clone_wiring(wiring);
+    list.on_item_activated(move |_| activate_channel(&wiring, list, status));
+}
+
+/// Play the channel behind the selected or focused Channels row
+/// (Enter, and the context menu's Play). Stalker channels resolve
+/// their link through the provider worker first.
+fn activate_channel(wiring: &Wiring, list: ListCtrl, status: Status) {
+    let selected = usize::try_from(list.get_first_selected_item()).ok();
+    let focused =
+        usize::try_from(list.get_next_item(-1, ListNextItemFlag::All, ListItemState::Focused)).ok();
+    let Some(row) = pick_row(selected, focused) else {
+        status.set_label("No channel selected. Choose a channel in Channels first.");
+        return;
+    };
+    let Some(index) = wiring.model.borrow().playlist_index(row) else {
+        status.set_label("No channel selected. Choose a channel in Channels first.");
+        return;
+    };
+    let Some(channel) = wiring.browser.borrow().channel(index) else {
+        status.set_label("No channel selected. Choose a channel in Channels first.");
+        return;
+    };
+    if channel.url.is_empty()
+        && channel
+            .unknown_attributes
+            .get("provider-type")
+            .map(String::as_str)
+            == Some("stalker")
+    {
+        let Some(key) = channel.unknown_attributes.get("provider-id").cloned() else {
+            status.set_label("This Stalker channel has no provider account configured.");
+            return;
+        };
+        *wiring.pending_resolve.borrow_mut() = Some(channel.clone());
+        wiring
+            .provider_worker
+            .resolve(key, channel.unknown_attributes.clone());
+        status.set_label("Resolving stream link...");
+        assert!(wiring.timer.start(50, false));
+        return;
+    }
+    if let Some(current) = wiring.player.borrow().current_channel.clone() {
+        if current.url != channel.url {
+            *wiring.previous_channel.borrow_mut() = Some(current);
+        }
+    }
+    play_channel(&wiring.player, &wiring.persist, &channel, status);
 }
 
 /// Moving through Channels announces the highlighted channel's now/next
@@ -2685,6 +3058,13 @@ fn bind_epg_highlight(
             status.set_label(&parts.join(" "));
         }
     });
+}
+
+/// Current Unix time in whole seconds (EPG/DVR math).
+fn now_epoch() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(0))
 }
 
 #[allow(clippy::cast_precision_loss)] // epoch seconds fit comfortably for schedule math
