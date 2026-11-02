@@ -37,3 +37,11 @@ _Avoid_: station, item
 **M3U Plus metadata**:
 The optional channel attributes carried alongside an M3U entry, including identity, display name, logo, and group information.
 _Avoid_: tags, playlist fields
+
+**Category**:
+A named subset of the playlist a user browses: the All Channels and Favorites sentinels, or one M3U group. Channels with no group belong to Uncategorized.
+_Avoid_: folder, filter
+
+**Favorite**:
+A channel the user marked for the Favorites category, identified by a stable key built from provider identity fields or the display name — never from a stream URL.
+_Avoid_: bookmark, starred item
