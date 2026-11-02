@@ -9,6 +9,7 @@ license.workspace = true
 chrono.workspace = true
 serde_json.workspace = true
 iptv-core.workspace = true
+iptv-vlc = { path = "../iptv-vlc" }
 wxdragon = { workspace = true, features = ["media-ctrl"] }
 live-region.workspace = true
 

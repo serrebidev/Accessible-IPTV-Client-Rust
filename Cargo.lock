@@ -657,6 +657,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "iptv-core",
+ "iptv-vlc",
  "live-region",
  "serde_json",
  "wxdragon",
@@ -674,6 +675,14 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "ureq",
+]
+
+[[package]]
+name = "iptv-vlc"
+version = "0.1.0"
+dependencies = [
+ "iptv-core",
+ "libloading",
 ]
 
 [[package]]

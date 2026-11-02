@@ -1,0 +1,19 @@
+[package]
+name = "iptv-vlc"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.97.1"
+description = "Dynamically loaded libVLC playback engine for Accessible IPTV Client."
+license = "MIT"
+publish = false
+
+[dependencies]
+iptv-core = { path = "../iptv-core" }
+libloading.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[lints.clippy]
+all = "deny"
+pedantic = "warn"
