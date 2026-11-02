@@ -3173,11 +3173,59 @@ fn menu_custom_player(wiring: &Wiring, frame: Frame, status: Status) {
 }
 
 /// Options > Export Settings...: copy the config file out.
+/// Ask for a settings-backup password (Python's flow): a
+/// masked entry dialog captioned "Settings Backup"; empty is
+/// an error, and export confirms with a second entry.
+fn backup_password(frame: Frame, confirm: bool) -> Option<String> {
+    let dialog = TextEntryDialog::builder(
+        &frame,
+        "Enter a password for the settings backup:",
+        "Settings Backup",
+    )
+    .password()
+    .build();
+    if dialog.show_modal() != ID_OK {
+        return None;
+    }
+    let password = dialog.get_value().unwrap_or_default();
+    if password.is_empty() {
+        let _ = MessageDialog::builder(&frame, "A backup password is required.", "Settings Backup")
+            .with_style(MessageDialogStyle::OK)
+            .build()
+            .show_modal();
+        return None;
+    }
+    if confirm {
+        let verify =
+            TextEntryDialog::builder(&frame, "Enter the password again:", "Settings Backup")
+                .password()
+                .build();
+        if verify.show_modal() != ID_OK {
+            return None;
+        }
+        if verify.get_value().unwrap_or_default() != password {
+            let _ =
+                MessageDialog::builder(&frame, "The passwords do not match.", "Settings Backup")
+                    .with_style(MessageDialogStyle::OK)
+                    .build()
+                    .show_modal();
+            return None;
+        }
+    }
+    Some(password)
+}
+
+/// Options > Export Settings...: write the encrypted backup
+/// (Python's Fernet format, interchangeable with the Python
+/// client) after the two-entry password prompt.
 fn menu_export_settings(wiring: &Wiring, frame: Frame, status: Status) {
+    let Some(password) = backup_password(frame, true) else {
+        return;
+    };
     let dialog = FileDialog::builder(&frame)
-        .with_message("Export settings")
-        .with_default_file("iptvclient-settings.json")
-        .with_wildcard("JSON (*.json)|*.json|All files (*.*)|*.*")
+        .with_message("Export Settings")
+        .with_default_file("settings.aiptv")
+        .with_wildcard("Accessible IPTV backup (*.aiptv)|*.aiptv|All files (*.*)|*.*")
         .with_style(FileDialogStyle::Save | FileDialogStyle::OverwritePrompt)
         .build();
     if dialog.show_modal() != ID_OK {
@@ -3186,18 +3234,36 @@ fn menu_export_settings(wiring: &Wiring, frame: Frame, status: Status) {
     let Some(path) = dialog.get_path() else {
         return;
     };
-    match std::fs::copy(&wiring.persist.path, &path) {
-        Ok(_) => status.set_label("Settings exported."),
-        Err(error) => status.set_label(&format!("Export failed: {error}")),
+    let config_json = {
+        let config = wiring.persist.config.borrow();
+        serde_json::to_vec(&serde_json::Value::Object(config.raw().clone())).unwrap_or_default()
+    };
+    match iptv_core::settings_backup::export_settings(&config_json, &password) {
+        Ok(bytes) => match std::fs::write(&path, bytes) {
+            Ok(()) => {
+                let _ = MessageDialog::builder(
+                    &frame,
+                    "Encrypted settings backup saved.",
+                    "Settings Backup",
+                )
+                .with_style(MessageDialogStyle::OK)
+                .build()
+                .show_modal();
+                status.set_label("Encrypted settings backup saved.");
+            }
+            Err(error) => status.set_label(&format!("Could not export settings: {error}")),
+        },
+        Err(error) => status.set_label(&format!("Could not export settings: {error}")),
     }
 }
 
-/// Options > Import Settings...: replace the config file with a
-/// previously exported one (validated as a JSON object first).
+/// Options > Import Settings...: choose a backup, enter its
+/// password once, confirm the replace, then swap the config
+/// file (restart applies, as Python instructs).
 fn menu_import_settings(wiring: &Wiring, frame: Frame, status: Status) {
     let dialog = FileDialog::builder(&frame)
-        .with_message("Import settings")
-        .with_wildcard("JSON (*.json)|*.json|All files (*.*)|*.*")
+        .with_message("Import Settings")
+        .with_wildcard("Accessible IPTV backup (*.aiptv)|*.aiptv|All files (*.*)|*.*")
         .with_style(FileDialogStyle::Open | FileDialogStyle::FileMustExist)
         .build();
     if dialog.show_modal() != ID_OK {
@@ -3206,19 +3272,39 @@ fn menu_import_settings(wiring: &Wiring, frame: Frame, status: Status) {
     let Some(path) = dialog.get_path() else {
         return;
     };
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        status.set_label("Import failed: cannot read that file.");
+    let Some(password) = backup_password(frame, false) else {
         return;
     };
+    let Ok(bytes) = std::fs::read(&path) else {
+        status.set_label("Could not import settings: cannot read that file.");
+        return;
+    };
+    let decrypted = match iptv_core::settings_backup::import_settings(&bytes, &password) {
+        Ok(decrypted) => decrypted,
+        Err(error) => {
+            status.set_label(&format!("Could not import settings: {error}"));
+            return;
+        }
+    };
     let valid =
-        serde_json::from_str::<serde_json::Value>(&text).is_ok_and(|value| value.is_object());
+        serde_json::from_slice::<serde_json::Value>(&decrypted).is_ok_and(|v| v.is_object());
     if !valid {
-        status.set_label("Import failed: that file is not a settings file.");
+        status.set_label("Could not import settings: that backup holds no settings object.");
         return;
     }
-    match std::fs::write(&wiring.persist.path, text) {
-        Ok(()) => status.set_label("Settings imported. Restart to apply."),
-        Err(error) => status.set_label(&format!("Import failed: {error}")),
+    let confirm = MessageDialog::builder(
+        &frame,
+        "Replace current settings with this backup? Restart the app after importing.",
+        "Import Settings",
+    )
+    .with_style(MessageDialogStyle::YesNo)
+    .build();
+    if confirm.show_modal() != ID_YES {
+        return;
+    }
+    match std::fs::write(&wiring.persist.path, decrypted) {
+        Ok(()) => status.set_label("Settings imported. Restart the app to use them."),
+        Err(error) => status.set_label(&format!("Could not import settings: {error}")),
     }
 }
 
