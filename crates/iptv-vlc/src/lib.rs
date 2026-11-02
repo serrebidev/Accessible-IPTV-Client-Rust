@@ -38,7 +38,18 @@ type GetTrackDescFn = unsafe extern "C" fn(*mut c_void) -> *mut TrackDescription
 type SetTrackFn = unsafe extern "C" fn(*mut c_void, c_int) -> c_int;
 type TrackDescReleaseFn = unsafe extern "C" fn(*mut TrackDescription);
 type SetHwndFn = unsafe extern "C" fn(*mut c_void, *mut c_void);
+type AudioOutputEnumFn = unsafe extern "C" fn(*mut c_void) -> *mut AudioOutputDevice;
+type AudioOutputReleaseFn = unsafe extern "C" fn(*mut AudioOutputDevice);
+type AudioOutputSetFn = unsafe extern "C" fn(*mut c_void, *const c_char) -> c_int;
 type SetNsObjectFn = unsafe extern "C" fn(*mut c_void, *mut c_void);
+
+/// `libvlc_audio_output_device_t` (linked list node).
+#[repr(C)]
+struct AudioOutputDevice {
+    device: *mut c_char,
+    description: *mut c_char,
+    next: *mut AudioOutputDevice,
+}
 
 #[repr(C)]
 struct TrackDescription {
@@ -71,6 +82,22 @@ fn map_state(raw: c_int) -> VlcState {
         7 => VlcState::Error,
         _ => VlcState::Nothing,
     }
+}
+
+/// Read a libVLC-owned C string as a lossy Rust string; null
+/// reads as empty.
+///
+/// # Safety
+/// `ptr` must be null or point at a NUL-terminated string that
+/// stays alive for the call (libVLC list nodes qualify until
+/// their list is released).
+unsafe fn c_string(ptr: *const c_char) -> String {
+    if ptr.is_null() {
+        return String::new();
+    }
+    unsafe { std::ffi::CStr::from_ptr(ptr) }
+        .to_string_lossy()
+        .into_owned()
 }
 
 /// Candidate library names per platform, most specific first.
@@ -127,6 +154,9 @@ struct Functions {
     track_description_release: TrackDescReleaseFn,
     set_hwnd: Option<SetHwndFn>,
     set_nsobject: Option<SetNsObjectFn>,
+    audio_output_enum: Option<AudioOutputEnumFn>,
+    audio_output_release: Option<AudioOutputReleaseFn>,
+    audio_output_set: Option<AudioOutputSetFn>,
 }
 
 /// A loaded libVLC instance with one media player.
@@ -193,6 +223,21 @@ impl VlcEngine {
             set_nsobject: unsafe { lib.get::<SetNsObjectFn>(b"libvlc_media_player_set_nsobject") }
                 .ok()
                 .map(|s| *s),
+            audio_output_enum: unsafe {
+                lib.get::<AudioOutputEnumFn>(b"libvlc_audio_output_device_enum")
+            }
+            .ok()
+            .map(|s| *s),
+            audio_output_release: unsafe {
+                lib.get::<AudioOutputReleaseFn>(b"libvlc_audio_output_device_list_release")
+            }
+            .ok()
+            .map(|s| *s),
+            audio_output_set: unsafe {
+                lib.get::<AudioOutputSetFn>(b"libvlc_audio_output_device_set")
+            }
+            .ok()
+            .map(|s| *s),
         };
         Ok(Self {
             _lib: lib,
@@ -322,6 +367,57 @@ impl VlcEngine {
         }
         unsafe { (self.fns.track_description_release)(head) };
         tracks
+    }
+
+    /// Every audio output device libVLC reports, as (id,
+    /// description) pairs with Python's filtering: the empty id
+    /// (libVLC's own system-default entry) is skipped because
+    /// the dialog offers its own. The native list is walked via
+    /// `next` pointers and released before returning — walking
+    /// it any other way reads off the end (Python's crash note).
+    #[must_use]
+    pub fn audio_output_devices(&self) -> Vec<(String, String)> {
+        let mut pairs = Vec::new();
+        let (Some(enumerate), Some(release)) =
+            (self.fns.audio_output_enum, self.fns.audio_output_release)
+        else {
+            return pairs;
+        };
+        let head = unsafe { enumerate(self.player) };
+        if head.is_null() {
+            return pairs;
+        }
+        let mut node = head;
+        while !node.is_null() {
+            let (device, description, next) =
+                unsafe { ((*node).device, (*node).description, (*node).next) };
+            let id = unsafe { c_string(device) };
+            if !id.is_empty() {
+                let label = unsafe { c_string(description) };
+                pairs.push((id.clone(), if label.is_empty() { id } else { label }));
+            }
+            node = next;
+        }
+        unsafe { release(head) };
+        pairs
+    }
+
+    /// Point playback at one audio output device. Returns
+    /// libVLC's success flag; an empty id is the caller's
+    /// "system default" case and is not sent (Python's apply
+    /// returns early on empty, leaving a fresh player's
+    /// default in charge).
+    pub fn set_audio_output_device(&mut self, device_id: &str) -> bool {
+        if device_id.is_empty() {
+            return false;
+        }
+        let Some(set) = self.fns.audio_output_set else {
+            return false;
+        };
+        let Ok(c_id) = CString::new(device_id) else {
+            return false;
+        };
+        unsafe { set(self.player, c_id.as_ptr()) == 0 }
     }
 
     /// Select an audio track by id.
