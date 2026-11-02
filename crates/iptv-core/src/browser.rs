@@ -31,6 +31,7 @@ pub struct BrowserWorker {
     loading: bool,
     searching: bool,
     category: Category,
+    scope: Option<String>,
     favorites: FavoriteSet,
     extras: Vec<crate::Channel>,
     raw: Option<Arc<BrowseModel>>,
@@ -87,14 +88,74 @@ impl BrowserWorker {
     }
 
     /// Categories of the last usable playlist, in deterministic order.
+    /// When a playlist scope is set, only that playlist's groups are
+    /// listed (Python's Playlist view behavior).
     #[must_use]
     pub fn categories(&self) -> Vec<Category> {
-        categories(self.playlist.channels())
+        if self.scope.is_none() {
+            return categories(self.playlist.channels());
+        }
+        let scoped: Vec<crate::Channel> = self
+            .playlist
+            .channels()
+            .iter()
+            .filter(|channel| self.in_scope(channel))
+            .cloned()
+            .collect();
+        categories(&scoped)
+    }
+
+    /// The active playlist scope id, when scoped to one playlist.
+    #[must_use]
+    pub fn scope(&self) -> Option<&str> {
+        self.scope.as_deref()
+    }
+
+    /// Set the playlist scope (None = all playlists) and re-run the
+    /// current query inside it. Returns whether a load was cancelled.
+    pub fn set_scope(&mut self, scope: Option<String>, query: &str) -> bool {
+        let cancelled = self.cancel_load();
+        self.scope = scope;
+        self.submit_current(query.to_owned());
+        cancelled
+    }
+
+    fn in_scope(&self, channel: &crate::Channel) -> bool {
+        match &self.scope {
+            None => true,
+            Some(id) => {
+                channel
+                    .unknown_attributes
+                    .get("playlist-id")
+                    .map(String::as_str)
+                    == Some(id.as_str())
+            }
+        }
+    }
+
+    /// Drop rows whose channel is outside the playlist scope.
+    /// `channels` is the slice the rows index into.
+    fn scoped_rows(&self, channels: &[crate::Channel], rows: Vec<usize>) -> Vec<usize> {
+        if self.scope.is_none() {
+            return rows;
+        }
+        rows.into_iter()
+            .filter(|&index| channels.get(index).is_some_and(|c| self.in_scope(c)))
+            .collect()
     }
 
     #[must_use]
     pub fn favorites(&self) -> &FavoriteSet {
         &self.favorites
+    }
+
+    /// Every loaded channel (playlist plus provider extras), for
+    /// catalogue builders that scan the whole browse state.
+    #[must_use]
+    pub fn all_channels(&self) -> Vec<crate::Channel> {
+        let mut out: Vec<crate::Channel> = self.playlist.channels().to_vec();
+        out.extend(self.extras.iter().cloned());
+        out
     }
 
     /// The channel at a playlist index in the current projection's source.
@@ -154,7 +215,10 @@ impl BrowserWorker {
 
     /// Submit the current category scope of the last usable playlist.
     fn submit_current(&mut self, query: String) {
-        let scope = category_rows(self.playlist.channels(), &self.category, &self.favorites);
+        let scope = self.scoped_rows(
+            self.playlist.channels(),
+            category_rows(self.playlist.channels(), &self.category, &self.favorites),
+        );
         self.searcher.submit_scoped(
             Arc::clone(&self.playlist),
             scope,
@@ -215,7 +279,10 @@ impl BrowserWorker {
         {
             self.category = Category::All;
         }
-        let scope = category_rows(loaded.channels(), &self.category, &self.favorites);
+        let scope = self.scoped_rows(
+            loaded.channels(),
+            category_rows(loaded.channels(), &self.category, &self.favorites),
+        );
         self.searcher.submit_scoped(
             Arc::clone(&loaded),
             scope,
@@ -286,6 +353,43 @@ mod tests {
             BrowseEvent::Results(results) => results,
             BrowseEvent::Recovery(error) => panic!("{error:?}"),
         }
+    }
+
+    #[test]
+    fn playlist_scope_limits_rows_and_categories() {
+        let dir = std::env::temp_dir().join("iptv-scope-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let first = dir.join("first.m3u");
+        let second = dir.join("second.m3u");
+        std::fs::write(
+            &first,
+            "#EXTM3U\n#EXTINF:-1 group-title=\"News\",Alpha One\nhttp://example.com/a1\n#EXTINF:-1 group-title=\"News\",Alpha Two\nhttp://example.com/a2\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &second,
+            "#EXTM3U\n#EXTINF:-1 group-title=\"Sport\",Beta One\nhttp://example.com/b1\n",
+        )
+        .unwrap();
+        let sources = vec![
+            crate::sources::PlaylistSource::new(first.to_string_lossy()),
+            crate::sources::PlaylistSource::new(second.to_string_lossy()),
+        ];
+        let first_id = sources[0].scope_id();
+        let mut browser = BrowserWorker::default();
+        browser.load_sources(sources);
+        assert_eq!(results(wait(&mut browser, "")).len(), 3);
+        browser.set_scope(Some(first_id), "");
+        assert_eq!(results(wait(&mut browser, "")).len(), 2);
+        let groups: Vec<String> = browser
+            .categories()
+            .iter()
+            .map(|c| c.label().to_string())
+            .collect();
+        assert!(groups.iter().any(|g| g == "News"), "{groups:?}");
+        assert!(!groups.iter().any(|g| g == "Sport"), "{groups:?}");
+        browser.set_scope(None, "");
+        assert_eq!(results(wait(&mut browser, "")).len(), 3);
     }
 
     #[test]

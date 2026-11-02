@@ -1,24 +1,37 @@
 //! wx-free domain types and playlist behavior for the Rust port.
 
+pub mod audiotracks;
 pub mod browser;
+pub mod cache;
+pub mod cast;
 pub mod catchup;
 pub mod categories;
 pub mod config;
 pub mod downloads;
+pub mod dvr;
 pub mod epg;
+pub mod epgstore;
 pub mod favorites;
+pub mod guide;
+pub mod i18n;
 pub mod loading;
 pub mod playback;
 pub mod providers;
+pub mod proxy;
+pub mod recording;
 pub mod reminders;
 pub mod search;
+pub mod shortcuts;
 pub mod sources;
+pub mod subtitles;
+pub mod updater;
+pub mod vod;
 
 use std::collections::BTreeMap;
 use std::path::Path;
 
 /// A channel as it appears in a playlist.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Channel {
     pub name: String,
     pub group: String,
