@@ -1,6 +1,6 @@
 # Issues #9–#13: accessible category and Favorites browsing
 
-Status: **automated gates PASS; owner-heard NVDA validation still owed**.
+Status: **automated gates PASS; owner-heard results reported, formal provenance still open**.
 Implemented 2026-11-01 on branch `agent/category-favorites`. Python remains
 the shipping product and the behavior oracle; nothing here closes the
 replacement gate.
@@ -60,8 +60,8 @@ Manual session reported by the product owner on 2026-11-01:
 
 - PASS: initial focus and the accessible Channels list name/role.
 - PASS: empty startup status with no fake selectable channel row.
-- PASS: Tab/Shift+Tab traversal through Open playlist, Category, Search,
-  Channels, Toggle favorite, and Playlist status.
+- PASS: Tab/Shift+Tab traversal through Open playlist, Cancel loading,
+  Category, Toggle favorite, Search, Channels, and Playlist status.
 - PASS: populated category browsing and readable source-order rows.
 - PASS: Favorites add/remove announcements, focus usability, and empty
   Favorites status.
@@ -72,7 +72,14 @@ Manual session reported by the product owner on 2026-11-01:
 - PASS: playlist replacement/recovery announcements and rows remained usable
   without stale state.
 
-The native MSAA smoke check also passed against an isolated copy of the built
-executable: it found the named Channels list, list role, keyboard focusability,
-zero startup rows, named focusable actions/search, and the read-only empty
-status. It did not populate a playlist or claim NVDA speech.
+The native MSAA smoke script covers the named Channels list, list role,
+keyboard focusability, zero startup rows, named focusable actions/search,
+Category and Toggle favorite controls, and the read-only empty status. A fresh
+smoke run against the reviewed executable remains pending because the isolated
+wxDragon/CMake rebuild was blocked by the native build environment. It did not
+claim NVDA speech or populated-list behavior.
+
+The owner-heard results above were reported interactively, but the NVDA version,
+settings, executable hash, and exact session timestamp were not captured. Keep
+the formal replacement/owner-heard acceptance gate open until that provenance
+is recorded against a fresh reviewed build.
