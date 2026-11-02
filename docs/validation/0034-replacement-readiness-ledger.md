@@ -1,6 +1,6 @@
 # Validation 0034: replacement-readiness evidence ledger
 
-Issue: #84. Current revision: `19cc678` on
+Issue: #84. Current revision: `2be90e3` on
 `integration/stalker-dvr-resolution`.
 
 This ledger closes the documentation and deterministic implementation work for
@@ -10,7 +10,7 @@ the replacement-gate pack. It is an evidence summary, not a release approval.
 
 | Area | Status | Evidence | Boundary / next action |
 | --- | --- | --- | --- |
-| Workspace source gates | Pass | `cargo fmt --all -- --check`; `cargo check --workspace`; `cargo clippy --workspace --all-targets -- -D warnings`; `cargo test --workspace --quiet` (122 tests); `git diff --check` | Automated evidence only. |
+| Workspace source gates | Pass | `cargo fmt --all -- --check`; `cargo check --workspace`; `cargo clippy --workspace --all-targets -- -D warnings`; `cargo test --workspace --quiet` (124 tests); `git diff --check` | Automated evidence only. |
 | Python playlist parity | Pass | `tools/check-playlist-parity.py` against pinned Python revision `9aa89e053225ef2c83c4f3659775a00723012ff7` | Domain evidence; not desktop accessibility evidence. |
 | Playback/DVR deterministic behavior | Pass | [Validation 0030](0030-replacement-playback-dvr.md), including stale/canceled DVR resolution regression | Live libVLC and ffmpeg recording checks remain open. |
 | Owner-heard accessibility | Not run for this revision | [Validation 0031](0031-replacement-owner-heard-accessibility.md) defines the gate; [Validation 0006](0006-owner-heard-accessibility.md) records an older limited owner session | Owner must rerun the checklist against this revision with NVDA and record speech/focus. |
