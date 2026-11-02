@@ -308,6 +308,28 @@ impl Status {
     }
 }
 
+/// Player status announcements, gated by the announcement
+/// level (issue #102, Python's `live_announce` law): the visual
+/// surfaces (status bar + details) always update; speech fires
+/// only when the configured level (0-3, default 2) reaches the
+/// message priority — 1 errors, 2 state changes and
+/// confirmations, 3 detailed/default. Main-window announcements
+/// are never gated (they keep using `Status::set_label`).
+fn player_status(status: Status, persist: &Persist, message: &str, priority: i64) {
+    let message = &tr(message);
+    status.set_silent(message);
+    let level = persist
+        .config
+        .borrow()
+        .value("announcement_level")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(2)
+        .clamp(0, 3);
+    if !message.is_empty() && level >= priority {
+        live_region::announce_with_priority(status.label, message, live_region::Priority::Medium);
+    }
+}
+
 #[derive(Clone, Copy)]
 struct Controls {
     scope_choice: Choice,
@@ -4098,7 +4120,7 @@ fn play_builtin(
     {
         win.frame.show(true);
     }
-    status.set_label(&state.session.announcement());
+    player_status(status, persist, &state.session.announcement(), 3);
 }
 
 /// The built-in player window's widgets.
@@ -4259,7 +4281,7 @@ fn build_playback_menu(
     let keys = iptv_core::shortcuts::effective(&config, "player")
         .into_iter()
         .collect::<std::collections::BTreeMap<_, _>>();
-    let mut menu = Menu::builder().build();
+    let menu = Menu::builder().build();
     menu_add(
         &menu,
         PM_PLAY_PAUSE,
@@ -4271,7 +4293,7 @@ fn build_playback_menu(
     menu_add(&menu, PM_SLEEP, "Sleep &Timer...", "", ItemKind::Normal);
     menu_add(&menu, PM_RECORD, "&Record", "", ItemKind::Normal);
     menu.append_separator();
-    let mut audio_menu = Menu::builder().build();
+    let audio_menu = Menu::builder().build();
     menu_add(
         &audio_menu,
         PM_NO_TRACKS,
@@ -4353,7 +4375,7 @@ fn dispatch_player_menu(
         if let Some(win) = player.borrow().window.clone() {
             win.tracks.set_selection(index);
         }
-        choose_audio_track(player, index, status);
+        choose_audio_track(player, persist, index, status);
         return;
     }
     let win = player.borrow().window.clone();
@@ -4361,7 +4383,7 @@ fn dispatch_player_menu(
         return;
     };
     match id {
-        PM_PLAY_PAUSE => toggle_pause_state(player, status),
+        PM_PLAY_PAUSE => toggle_pause_state(player, persist, status),
         PM_STOP | PM_EXIT => player_stop(player, persist, status),
         PM_SLEEP => prompt_sleep_timer(player, win.frame, persist, status),
         PM_RECORD => {
@@ -4371,18 +4393,23 @@ fn dispatch_player_menu(
                 assert!(shared.timer.start(50, false));
             }
         }
-        PM_LOAD_SUBS => prompt_subtitle_file(player, win.frame, status),
+        PM_LOAD_SUBS => prompt_subtitle_file(player, win.frame, persist, status),
         PM_SPEAK_SUBS => {
             let next = !persist.config.borrow().bool_or("speak_subtitles", false);
             persist.set_and_save("speak_subtitles", serde_json::json!(next));
             if let Some(menu) = playback_menu(player) {
                 menu.check_item(PM_SPEAK_SUBS, next);
             }
-            status.set_label(if next {
-                "Subtitle speech on."
-            } else {
-                "Subtitle speech off."
-            });
+            player_status(
+                status,
+                persist,
+                if next {
+                    "Subtitle speech on."
+                } else {
+                    "Subtitle speech off."
+                },
+                2,
+            );
         }
         PM_READ_SUB => announce_cue(player, "read_subtitle", status),
         PM_PREV_SUB => announce_cue(player, "previous_subtitle", status),
@@ -4415,7 +4442,7 @@ fn dispatch_player_menu(
 
 /// The player frame's Playback menu, as a borrowed handle (wx
 /// menus are owning wrappers; the frame's menu bar owns the
-/// real one after set_menu_bar).
+/// real one after `set_menu_bar`).
 fn playback_menu(player: &Rc<RefCell<PlayerState>>) -> Option<Menu> {
     let state = player.borrow();
     let win = state.window.as_ref()?;
@@ -4432,7 +4459,12 @@ fn audio_track_menu(player: &Rc<RefCell<PlayerState>>) -> Option<Menu> {
 
 /// Select an audio track by Choice index (the Choice and the
 /// Audio Track menu share this).
-fn choose_audio_track(player: &Rc<RefCell<PlayerState>>, index: u32, status: Status) {
+fn choose_audio_track(
+    player: &Rc<RefCell<PlayerState>>,
+    persist: &Persist,
+    index: u32,
+    status: Status,
+) {
     let mut state = player.borrow_mut();
     let label = state
         .window
@@ -4447,12 +4479,17 @@ fn choose_audio_track(player: &Rc<RefCell<PlayerState>>, index: u32, status: Sta
             }
         }
     }
-    status.set_label(&format!("Audio track preference: {label}"));
+    player_status(
+        status,
+        persist,
+        &format!("Audio track preference: {label}"),
+        2,
+    );
 }
 
 /// Python's Sleep Timer prompts: minutes (0-1440, 0 cancels),
 /// then the fade-out seconds (0-min(300, minutes*60), default
-/// from the sleep_fade_seconds setting, 5).
+/// from the `sleep_fade_seconds` setting, 5).
 fn prompt_sleep_timer(
     player: &Rc<RefCell<PlayerState>>,
     frame: Frame,
@@ -4578,11 +4615,14 @@ fn drive_sleep_timer(player: &Rc<RefCell<PlayerState>>, persist: &Persist, statu
             let mut state = player.borrow_mut();
             state.sleep_fading = true;
             state.sleep_start_volume = start_volume;
-            // Priority 2 in Python; the announcement-level gate
-            // arrives with issue #102.
-            status.set_label("Playback volume is fading before the sleep timer stops it.");
+            player_status(
+                status,
+                persist,
+                "Playback volume is fading before the sleep timer stops it.",
+                2,
+            );
         }
-        let (start, _) = (player.borrow().sleep_start_volume, ());
+        let start = player.borrow().sleep_start_volume;
         let remaining = deadline - now;
         let level = (i64::from(start) * remaining / fade).clamp(0, i64::from(start));
         player_set_volume(player, i32::try_from(level).unwrap_or(0));
@@ -4622,11 +4662,12 @@ fn wire_player_events(
     });
     let _ = timer.start(1000, false);
 
-    bind_subtitle_load(buttons.subs, player, frame, status);
+    bind_subtitle_load(buttons.subs, player, frame, persist, status);
     let pause_player = Rc::clone(player);
+    let pause_persist = persist.clone();
     buttons
         .pause
-        .on_click(move |_| toggle_pause_state(&pause_player, status));
+        .on_click(move |_| toggle_pause_state(&pause_player, &pause_persist, status));
     let stop_player = Rc::clone(player);
     let stop_persist = persist.clone();
     buttons.stop.on_click(move |_| {
@@ -4661,6 +4702,7 @@ fn wire_player_events(
         frame.show_full_screen(!frame.is_full_screen());
     });
     let loaded_player = Rc::clone(player);
+    let loaded_persist = persist.clone();
     media.on_loaded(move |_| {
         let mut state = loaded_player.borrow_mut();
         state.session.on_event(EngineEvent::Started);
@@ -4668,9 +4710,10 @@ fn wire_player_events(
         if let (Some(win), Some(ms)) = (state.window.clone(), resume_ms) {
             win.media.seek(ms, SeekMode::FromStart);
         }
-        status.set_label(&state.session.announcement());
+        player_status(status, &loaded_persist, &state.session.announcement(), 3);
     });
     let stopped_player = Rc::clone(player);
+    let stopped_persist = persist.clone();
     media.on_stop(move |_| {
         let mut state = stopped_player.borrow_mut();
         let near_end = state.window.as_ref().is_some_and(|win| {
@@ -4687,7 +4730,7 @@ fn wire_player_events(
                 win.media.play();
             }
         }
-        status.set_label(&state.session.announcement());
+        player_status(status, &stopped_persist, &state.session.announcement(), 3);
     });
     let close_player = Rc::clone(player);
     let close_persist = persist.clone();
@@ -4726,9 +4769,10 @@ fn bind_player_controls(
     });
     let tracks_handle = win.tracks;
     let tracks_player = Rc::clone(player);
+    let tracks_persist = persist.clone();
     tracks_handle.bind_internal(EventType::COMMAND_CHOICE_SELECTED, move |_| {
         if let Some(index) = tracks_handle.get_selection() {
-            choose_audio_track(&tracks_player, index, status);
+            choose_audio_track(&tracks_player, &tracks_persist, index, status);
         }
     });
     let keys_player = Rc::clone(player);
@@ -4741,7 +4785,7 @@ fn bind_player_controls(
 
 /// Pause or resume through the session machine (the Pause button
 /// and the `play_pause` shortcut share this).
-fn toggle_pause_state(player: &Rc<RefCell<PlayerState>>, status: Status) {
+fn toggle_pause_state(player: &Rc<RefCell<PlayerState>>, persist: &Persist, status: Status) {
     let mut state = player.borrow_mut();
     state.session.toggle_pause();
     let session_state = state.session.state().clone();
@@ -4763,7 +4807,7 @@ fn toggle_pause_state(player: &Rc<RefCell<PlayerState>>, status: Status) {
             _ => {}
         }
     }
-    status.set_label(&state.session.announcement());
+    player_status(status, persist, &state.session.announcement(), 3);
 }
 
 /// Stop playback and hide the player window (Stop button, the stop
@@ -4782,7 +4826,7 @@ fn player_stop(player: &Rc<RefCell<PlayerState>>, persist: &Persist, status: Sta
         win.media.stop();
         win.frame.show(false);
     }
-    status.set_label("Stopped.");
+    player_status(status, persist, "Stopped.", 2);
 }
 
 /// Seek the active engine (libVLC when it drives playback, else
@@ -4857,7 +4901,7 @@ fn poll_vlc_state(player: &Rc<RefCell<PlayerState>>, persist: &Persist, status: 
                         }
                     }
                 }
-                status.set_label(&state.session.announcement());
+                player_status(status, persist, &state.session.announcement(), 3);
             }
             _ => {}
         }
@@ -5046,7 +5090,7 @@ fn dispatch_player_key(
         return false;
     };
     match action.as_str() {
-        "play_pause" => toggle_pause_state(player, status),
+        "play_pause" => toggle_pause_state(player, persist, status),
         "stop" | "exit" => player_stop(player, persist, status),
         "record" => {
             let state = player.borrow();
@@ -5072,18 +5116,23 @@ fn dispatch_player_key(
             let delta = if action == "volume_up" { 10 } else { -10 };
             let value = (win.volume.get_value() + delta).clamp(0, 100);
             player_set_volume(player, value);
-            status.set_label(&format!("Volume {value} percent."));
+            status.set_silent(&format!("Volume {value} percent."));
         }
         "audio_track" => win.tracks.set_focus(),
-        "subtitles" => prompt_subtitle_file(player, win.frame, status),
+        "subtitles" => prompt_subtitle_file(player, win.frame, persist, status),
         "speak_subtitles" => {
             let next = !persist.config.borrow().bool_or("speak_subtitles", false);
             persist.set_and_save("speak_subtitles", serde_json::json!(next));
-            status.set_label(if next {
-                "Subtitle speech on."
-            } else {
-                "Subtitle speech off."
-            });
+            player_status(
+                status,
+                persist,
+                if next {
+                    "Subtitle speech on."
+                } else {
+                    "Subtitle speech off."
+                },
+                2,
+            );
         }
         "read_subtitle" | "previous_subtitle" | "next_subtitle" => {
             announce_cue(player, &action, status);
@@ -5163,14 +5212,21 @@ fn bind_subtitle_load(
     subs: Button,
     player: &Rc<RefCell<PlayerState>>,
     frame: Frame,
+    persist: &Persist,
     status: Status,
 ) {
     let subs_player = Rc::clone(player);
-    subs.on_click(move |_| prompt_subtitle_file(&subs_player, frame, status));
+    let subs_persist = persist.clone();
+    subs.on_click(move |_| prompt_subtitle_file(&subs_player, frame, &subs_persist, status));
 }
 
 /// Ask for a subtitle file and load its cues into the player state.
-fn prompt_subtitle_file(player: &Rc<RefCell<PlayerState>>, frame: Frame, status: Status) {
+fn prompt_subtitle_file(
+    player: &Rc<RefCell<PlayerState>>,
+    frame: Frame,
+    persist: &Persist,
+    status: Status,
+) {
     let subs_player = Rc::clone(player);
     {
         let dialog = FileDialog::builder(&frame)
@@ -5192,10 +5248,20 @@ fn prompt_subtitle_file(player: &Rc<RefCell<PlayerState>>, frame: Frame, status:
                 let mut state = subs_player.borrow_mut();
                 state.subtitle_cues = cues;
                 state.last_spoken_cue = None;
-                status.set_label(&format!("Loaded {count} subtitle cues."));
+                player_status(
+                    status,
+                    persist,
+                    &format!("Loaded {count} subtitle cues."),
+                    2,
+                );
             }
             Err(error) => {
-                status.set_label(&format!("Could not load subtitles: {error}"));
+                player_status(
+                    status,
+                    persist,
+                    &format!("Could not load subtitles: {error}"),
+                    1,
+                );
             }
         }
     }
