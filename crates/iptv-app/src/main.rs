@@ -39,7 +39,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         frame.set_accessibility_label("Accessible IPTV Client");
 
         let panel = Panel::builder(&frame).build();
-        let (open, cancel) = open_cancel_buttons(panel);
         let record = record_button(panel);
         let (scope_label, scope_choice) = scope_controls(panel);
         let (category_label, category, toggle_favorite) = category_controls(panel);
@@ -96,8 +95,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         let (episode_description, stream_url) = info_panels(panel);
         let controls_all = Controls {
-            open,
-            cancel,
             record,
             scope_choice,
             category,
@@ -134,8 +131,6 @@ fn layout_main(
     channels_label: StaticText,
 ) {
     let layout = BoxSizer::builder(Orientation::Vertical).build();
-    layout.add(&controls.open, 0, SizerFlag::All, 8);
-    layout.add(&controls.cancel, 0, SizerFlag::All, 8);
     layout.add(&scope_label, 0, SizerFlag::All, 8);
     layout.add(
         &controls.scope_choice,
@@ -305,8 +300,6 @@ impl Status {
 
 #[derive(Clone, Copy)]
 struct Controls {
-    open: Button,
-    cancel: Button,
     record: Button,
     scope_choice: Choice,
     category: TreeCtrl,
@@ -465,19 +458,6 @@ impl Persist {
     }
 }
 
-/// The Open playlist / Cancel loading buttons for the main window.
-fn open_cancel_buttons(panel: Panel) -> (Button, Button) {
-    let open = Button::builder(&panel)
-        .with_label("&Open playlist…")
-        .build();
-    open.set_accessibility_label("Open playlist");
-    let cancel = Button::builder(&panel)
-        .with_label("&Cancel loading")
-        .build();
-    cancel.set_accessibility_label("Cancel loading");
-    (open, cancel)
-}
-
 /// The Record toggle button for the main window.
 fn record_button(panel: Panel) -> Button {
     let record = Button::builder(&panel).with_label("&Record").build();
@@ -542,22 +522,8 @@ fn bind_browser(frame: Frame, controls: Controls, model: Rc<RefCell<SearchResult
     if wiring.dvr.borrow().pending_count() > 0 {
         assert!(wiring.timer.start(50, false));
     }
-    let epg_urls = wiring.persist.config.borrow().string_list("epg_urls");
-    if !epg_urls.is_empty() {
-        wiring.epg_worker.load(epg_urls);
-        wiring.epg_pending.set(true);
-        assert!(wiring.timer.start(50, false));
-    }
-    let (sources, accounts) = configured_entries(&wiring);
-    if !sources.is_empty() {
-        wiring.browser.borrow_mut().load_sources(sources);
-        assert!(wiring.timer.start(50, false));
-    }
-    if !accounts.is_empty() {
-        wiring.provider_worker.load(accounts);
-        wiring.provider_pending.set(true);
-        assert!(wiring.timer.start(50, false));
-    }
+    reload_epg(&wiring);
+    reload_sources(&wiring);
     fill_scope_choices(&wiring, controls.scope_choice);
     bind_completion(&wiring, controls);
     bind_recording(&wiring, controls);
@@ -658,10 +624,8 @@ fn bind_scope_choice(wiring: &Wiring, scope_choice: Choice, search: TextCtrl, st
     });
 }
 
-fn bind_actions(frame: Frame, wiring: &Wiring, controls: Controls) {
+fn bind_actions(_frame: Frame, wiring: &Wiring, controls: Controls) {
     let Controls {
-        open,
-        cancel,
         record: _,
         scope_choice,
         category,
@@ -718,33 +682,6 @@ fn bind_actions(frame: Frame, wiring: &Wiring, controls: Controls) {
     bind_scope_choice(wiring, scope_choice, search, status);
     bind_toggle(wiring, toggle_favorite, list, search, status);
     bind_playback(wiring, list, status, episode_description, stream_url);
-    let request = Rc::clone(&browser);
-    let poll = Rc::clone(&timer);
-    open.on_click(move |_| {
-        let dialog = FileDialog::builder(&frame)
-            .with_message("Open local playlist")
-            .with_wildcard("M3U playlists (*.m3u;*.m3u8)|*.m3u;*.m3u8|All files (*.*)|*.*")
-            .with_style(FileDialogStyle::Open | FileDialogStyle::FileMustExist)
-            .build();
-        if dialog.show_modal() != ID_OK {
-            return;
-        }
-        let Some(path) = dialog.get_path() else {
-            return;
-        };
-        request.borrow_mut().load(std::path::PathBuf::from(path));
-        status
-            .set_label("Loading playlist. Cancel loading or open another playlist to replace it.");
-        assert!(poll.start(50, false));
-    });
-    let cancel_browser = Rc::clone(&browser);
-    cancel.on_click(move |_| {
-        if cancel_browser.borrow_mut().cancel_load() {
-            status.set_label(
-                "Load cancelled. Previous channels kept. Open playlist to choose a file or retry.",
-            );
-        }
-    });
 }
 
 /// The Toggle favorite action: toggles the channel behind the selected or
@@ -808,6 +745,9 @@ fn toggle_selected_favorite(
 /// Fill the Playlist view picker from the configured sources and
 /// accounts; the parallel scope-id list lives on the wiring.
 fn fill_scope_choices(wiring: &Wiring, choice: Choice) {
+    choice.clear();
+    choice.append("All playlists");
+    choice.set_selection(0);
     let (sources, accounts) = configured_entries(wiring);
     let mut ids: Vec<Option<String>> = vec![None];
     for source in &sources {
@@ -1855,8 +1795,6 @@ fn build_file_menu(keys: &std::collections::BTreeMap<String, String>) -> Menu {
         "Close the application",
         ItemKind::Normal,
     );
-    file_menu.enable_item(PLAYLIST_MANAGER, false);
-    file_menu.enable_item(EPG_MANAGER, false);
     file_menu.enable_item(WHATS_ON_NOW, false);
     file_menu.enable_item(ACCOUNT_INFO, false);
 
@@ -2170,12 +2108,15 @@ fn bind_menu_actions(frame: Frame, wiring: &Wiring, controls: Controls) {
     let list = controls.list;
     let search = controls.search;
     let category_box = controls.category;
+    let scope_choice = controls.scope_choice;
     let wiring = clone_wiring(wiring);
     frame.on_menu(move |event| {
         let id = event.get_id();
         let persist = &wiring.persist;
         match id {
             4004 => frame.close(false),
+            PLAYLIST_MANAGER => open_playlist_manager(&wiring, status, scope_choice),
+            EPG_MANAGER => open_epg_manager(&wiring, status),
             5002 => open_guide_window(&wiring, status),
             5003 => {
                 start_update_check(&wiring);
@@ -3459,6 +3400,490 @@ fn checkpoint_resume(player: &Rc<RefCell<PlayerState>>, persist: &Persist, media
 /// The row an action applies to: the selected row, else the focused row.
 fn pick_row(selected: Option<usize>, focused: Option<usize>) -> Option<usize> {
     selected.or(focused)
+}
+
+/// Reload playlists and provider accounts from the config (startup
+/// and after the Playlist Manager saves).
+fn reload_sources(wiring: &Wiring) {
+    let (sources, accounts) = configured_entries(wiring);
+    if !sources.is_empty() {
+        wiring.browser.borrow_mut().load_sources(sources);
+        assert!(wiring.timer.start(50, false));
+    }
+    if !accounts.is_empty() {
+        wiring.provider_worker.load(accounts);
+        wiring.provider_pending.set(true);
+        assert!(wiring.timer.start(50, false));
+    }
+}
+
+/// Reload the guide from the configured EPG URLs.
+fn reload_epg(wiring: &Wiring) {
+    let epg_urls = wiring.persist.config.borrow().string_list("epg_urls");
+    if !epg_urls.is_empty() {
+        wiring.epg_worker.load(epg_urls);
+        wiring.epg_pending.set(true);
+        assert!(wiring.timer.start(50, false));
+    }
+}
+
+/// Display name for one `playlists` config entry in the manager.
+fn entry_display(entry: &serde_json::Value) -> String {
+    match entry {
+        serde_json::Value::String(text) => {
+            if text.starts_with("http://") || text.starts_with("https://") {
+                text.clone()
+            } else {
+                scope_display_name(text)
+            }
+        }
+        serde_json::Value::Object(_) => ProviderAccount::from_config(entry)
+            .map_or_else(|| "Account".to_string(), |account| account.describe()),
+        _ => "Entry".to_string(),
+    }
+}
+
+/// Refresh a manager list box from its working entries.
+fn manager_refresh(list: ListBox, entries: &[serde_json::Value]) {
+    let labels: Vec<String> = entries.iter().map(entry_display).collect();
+    list.set_items(&labels.iter().map(String::as_str).collect::<Vec<_>>());
+}
+
+/// A small deterministic id for a manager-created account, so its
+/// channels carry a stable playlist scope id.
+fn generated_account_id(kind: &str, base_url: &str, user: &str) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in format!("{base_url}|{user}").bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    format!("{kind}-{hash:012x}")
+}
+
+/// The buttons of the Playlist Manager window.
+struct PlaylistManagerButtons {
+    add_file: Button,
+    add_url: Button,
+    add_xtream: Button,
+    add_stalker: Button,
+    edit: Button,
+    remove: Button,
+}
+
+/// Bind the Playlist Manager's add/edit/remove actions.
+#[allow(clippy::too_many_arguments)]
+fn bind_playlist_manager_buttons(
+    wiring: &Wiring,
+    manager_frame: Frame,
+    list: ListBox,
+    entries: &Rc<RefCell<Vec<serde_json::Value>>>,
+    buttons: &PlaylistManagerButtons,
+    mstatus: Status,
+) {
+    let PlaylistManagerButtons {
+        add_file,
+        add_url,
+        add_xtream,
+        add_stalker,
+        edit,
+        remove,
+    } = *buttons;
+    let entries = Rc::clone(entries);
+    let entries_f = Rc::clone(&entries);
+    add_file.on_click(move |_| {
+        let dialog = FileDialog::builder(&manager_frame)
+            .with_message("Add playlist file")
+            .with_wildcard("M3U playlists (*.m3u;*.m3u8)|*.m3u;*.m3u8|All files (*.*)|*.*")
+            .with_style(FileDialogStyle::Open | FileDialogStyle::FileMustExist)
+            .build();
+        if dialog.show_modal() != ID_OK {
+            return;
+        }
+        if let Some(path) = dialog.get_path() {
+            entries_f.borrow_mut().push(serde_json::Value::String(path));
+            manager_refresh(list, &entries_f.borrow());
+        }
+    });
+    let entries_u = Rc::clone(&entries);
+    add_url.on_click(move |_| {
+        let dialog = TextEntryDialog::builder(&manager_frame, "Playlist URL:", "Add URL").build();
+        if dialog.show_modal() != ID_OK {
+            return;
+        }
+        if let Some(url) = dialog.get_value() {
+            if !url.trim().is_empty() {
+                entries_u
+                    .borrow_mut()
+                    .push(serde_json::Value::String(url.trim().to_string()));
+                manager_refresh(list, &entries_u.borrow());
+            }
+        }
+    });
+    let wiring_x = clone_wiring(wiring);
+    let entries_x = Rc::clone(&entries);
+    add_xtream.on_click(move |_| {
+        open_account_form(
+            &wiring_x,
+            "xtream",
+            None,
+            Rc::clone(&entries_x),
+            list,
+            mstatus,
+        );
+    });
+    let wiring_s = clone_wiring(wiring);
+    let entries_s = Rc::clone(&entries);
+    add_stalker.on_click(move |_| {
+        open_account_form(
+            &wiring_s,
+            "stalker",
+            None,
+            Rc::clone(&entries_s),
+            list,
+            mstatus,
+        );
+    });
+    bind_manager_edit_buttons(wiring, manager_frame, list, &entries, edit, remove, mstatus);
+}
+
+/// Bind the Playlist Manager's edit/remove actions.
+#[allow(clippy::too_many_arguments)]
+fn bind_manager_edit_buttons(
+    wiring: &Wiring,
+    manager_frame: Frame,
+    list: ListBox,
+    entries: &Rc<RefCell<Vec<serde_json::Value>>>,
+    edit: Button,
+    remove: Button,
+    mstatus: Status,
+) {
+    let entries = Rc::clone(entries);
+    let wiring_e = clone_wiring(wiring);
+    let entries_e = Rc::clone(&entries);
+    edit.on_click(move |_| {
+        let Some(selection) = list.get_selection() else {
+            mstatus.set_label("Choose an entry to edit first.");
+            return;
+        };
+        let index = usize::try_from(selection).unwrap_or(usize::MAX);
+        let Some(entry) = entries_e.borrow().get(index).cloned() else {
+            return;
+        };
+        match &entry {
+            serde_json::Value::String(text) => {
+                let dialog =
+                    TextEntryDialog::builder(&manager_frame, "Playlist location:", "Edit Playlist")
+                        .with_default_value(text)
+                        .build();
+                if dialog.show_modal() != ID_OK {
+                    return;
+                }
+                if let Some(value) = dialog.get_value() {
+                    entries_e.borrow_mut()[index] =
+                        serde_json::Value::String(value.trim().to_string());
+                    manager_refresh(list, &entries_e.borrow());
+                }
+            }
+            serde_json::Value::Object(map) => {
+                let kind = map
+                    .get("type")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("xtream")
+                    .to_string();
+                open_account_form(
+                    &wiring_e,
+                    &kind,
+                    Some((index, entry)),
+                    Rc::clone(&entries_e),
+                    list,
+                    mstatus,
+                );
+            }
+            _ => {}
+        }
+    });
+    let entries_r = Rc::clone(&entries);
+    remove.on_click(move |_| {
+        let Some(selection) = list.get_selection() else {
+            mstatus.set_label("Choose an entry to remove first.");
+            return;
+        };
+        let index = usize::try_from(selection).unwrap_or(usize::MAX);
+        if index < entries_r.borrow().len() {
+            entries_r.borrow_mut().remove(index);
+            manager_refresh(list, &entries_r.borrow());
+        }
+    });
+}
+
+/// File > Playlist Manager: edit the `playlists` config list
+/// (files, URLs, Xtream and Stalker accounts) with OK/Cancel
+/// semantics, as in the Python dialog.
+fn open_playlist_manager(wiring: &Wiring, status: Status, scope_choice: Choice) {
+    let entries: Rc<RefCell<Vec<serde_json::Value>>> = Rc::new(RefCell::new(
+        match wiring.persist.config.borrow().value("playlists") {
+            Some(serde_json::Value::Array(rows)) => rows.clone(),
+            _ => Vec::new(),
+        },
+    ));
+    let manager = Frame::builder()
+        .with_title("Playlist Manager")
+        .with_size(Size::new(680, 520))
+        .build();
+    manager.set_accessibility_label("Playlist Manager");
+    let panel = Panel::builder(&manager).build();
+    let list = ListBox::builder(&panel).build();
+    list.set_accessibility_label("Playlists");
+    manager_refresh(list, &entries.borrow());
+    let add_file = Button::builder(&panel).with_label("Add &File").build();
+    let add_url = Button::builder(&panel).with_label("Add &URL").build();
+    let add_xtream = Button::builder(&panel)
+        .with_label("Add &Xtream Codes")
+        .build();
+    let add_stalker = Button::builder(&panel)
+        .with_label("Add &Stalker Portal")
+        .build();
+    let edit = Button::builder(&panel).with_label("&Edit").build();
+    let remove = Button::builder(&panel).with_label("&Remove").build();
+    let ok = Button::builder(&panel).with_label("&OK").build();
+    let cancel = Button::builder(&panel).with_label("&Cancel").build();
+    let mstatus_label = StaticText::builder(&panel)
+        .with_label("Manager status")
+        .build();
+    let mdetails = TextCtrl::builder(&panel)
+        .with_style(TextCtrlStyle::ReadOnly | TextCtrlStyle::MultiLine)
+        .with_value("Add, edit, or remove playlists and accounts. OK saves and reloads.")
+        .build();
+    mdetails.set_accessibility_label("Manager status");
+    let mstatus = Status {
+        label: mstatus_label,
+        details: mdetails,
+        bar: None,
+    };
+
+    let manager_frame = manager;
+    bind_playlist_manager_buttons(
+        wiring,
+        manager_frame,
+        list,
+        &entries,
+        &PlaylistManagerButtons {
+            add_file,
+            add_url,
+            add_xtream,
+            add_stalker,
+            edit,
+            remove,
+        },
+        mstatus,
+    );
+    let wiring_ok = clone_wiring(wiring);
+    let entries_ok = Rc::clone(&entries);
+    ok.on_click(move |_| {
+        wiring_ok.persist.set_and_save(
+            "playlists",
+            serde_json::Value::Array(entries_ok.borrow().clone()),
+        );
+        fill_scope_choices(&wiring_ok, scope_choice);
+        reload_sources(&wiring_ok);
+        status.set_label("Playlists saved. Reloading...");
+        manager_frame.hide();
+    });
+    cancel.on_click(move |_| manager.hide());
+    manager.show(true);
+}
+
+/// The Xtream / Stalker account form (add or edit). Fields write the
+/// same config dict shape `ProviderAccount::from_config` reads.
+fn open_account_form(
+    wiring: &Wiring,
+    kind: &str,
+    existing: Option<(usize, serde_json::Value)>,
+    entries: Rc<RefCell<Vec<serde_json::Value>>>,
+    manager_list: ListBox,
+    mstatus: Status,
+) {
+    let _ = wiring;
+    let title = if kind == "stalker" {
+        "Stalker Portal"
+    } else {
+        "Xtream Codes"
+    };
+    let form = Frame::builder()
+        .with_title(title)
+        .with_size(Size::new(520, 420))
+        .build();
+    form.set_accessibility_label(title);
+    let panel = Panel::builder(&form).build();
+    let get = |key: &str| -> String {
+        existing
+            .as_ref()
+            .and_then(|(_, value)| value.get(key))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string()
+    };
+    let mut fields: Vec<(String, TextCtrl)> = Vec::new();
+    let specs: Vec<(&str, &str, bool)> = if kind == "stalker" {
+        vec![
+            ("Name", "name", false),
+            ("Portal URL", "base_url", false),
+            ("MAC address", "mac", false),
+        ]
+    } else {
+        vec![
+            ("Name", "name", false),
+            ("Server URL", "base_url", false),
+            ("Username", "username", false),
+            ("Password", "password", true),
+        ]
+    };
+    for (label, key, secret) in &specs {
+        let caption = StaticText::builder(&panel).with_label(label).build();
+        let _ = caption;
+        let builder = TextCtrl::builder(&panel).with_value(&get(key));
+        let field = if *secret {
+            builder.with_style(TextCtrlStyle::Password).build()
+        } else {
+            builder.build()
+        };
+        field.set_accessibility_label(label);
+        fields.push(((*key).to_string(), field));
+    }
+    let ok = Button::builder(&panel).with_label("&OK").build();
+    let cancel = Button::builder(&panel).with_label("&Cancel").build();
+    let form_hide = form;
+    cancel.on_click(move |_| form_hide.hide());
+    let kind_owned = kind.to_string();
+    ok.on_click(move |_| {
+        let mut map = serde_json::Map::new();
+        map.insert("type".to_string(), serde_json::json!(kind_owned));
+        let mut base_url = String::new();
+        let mut user = String::new();
+        for (key, field) in &fields {
+            let value = field.get_value();
+            if key == "base_url" {
+                base_url.clone_from(&value);
+            }
+            if key == "username" || key == "mac" {
+                user.clone_from(&value);
+            }
+            if key == "name" && value.trim().is_empty() {
+                continue;
+            }
+            map.insert(key.clone(), serde_json::json!(value));
+        }
+        let id = existing
+            .as_ref()
+            .and_then(|(_, value)| value.get("id"))
+            .and_then(serde_json::Value::as_str)
+            .map_or_else(
+                || generated_account_id(&kind_owned, &base_url, &user),
+                ToString::to_string,
+            );
+        map.insert("id".to_string(), serde_json::json!(id));
+        let value = serde_json::Value::Object(map);
+        match &existing {
+            Some((index, _)) => {
+                entries.borrow_mut()[*index] = value;
+            }
+            None => entries.borrow_mut().push(value),
+        }
+        manager_refresh(manager_list, &entries.borrow());
+        mstatus.set_label("Account saved in the list. OK in the Playlist Manager writes it.");
+        form.hide();
+    });
+    form.show(true);
+}
+
+/// File > EPG Manager: edit the `epg_urls` config list.
+fn open_epg_manager(wiring: &Wiring, status: Status) {
+    let urls: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(
+        wiring.persist.config.borrow().string_list("epg_urls"),
+    ));
+    let manager = Frame::builder()
+        .with_title("EPG Manager")
+        .with_size(Size::new(640, 440))
+        .build();
+    manager.set_accessibility_label("EPG Manager");
+    let panel = Panel::builder(&manager).build();
+    let list = ListBox::builder(&panel).build();
+    list.set_accessibility_label("EPG sources");
+    list.set_items(&urls.borrow().iter().map(String::as_str).collect::<Vec<_>>());
+    let add_url = Button::builder(&panel).with_label("Add &URL").build();
+    let add_file = Button::builder(&panel).with_label("Add &File").build();
+    let remove = Button::builder(&panel).with_label("&Remove").build();
+    let ok = Button::builder(&panel).with_label("&OK").build();
+    let cancel = Button::builder(&panel).with_label("&Cancel").build();
+    let urls_u = Rc::clone(&urls);
+    let manager_frame = manager;
+    add_url.on_click(move |_| {
+        let dialog =
+            TextEntryDialog::builder(&manager_frame, "EPG URL (XMLTV):", "Add EPG URL").build();
+        if dialog.show_modal() != ID_OK {
+            return;
+        }
+        if let Some(url) = dialog.get_value() {
+            if !url.trim().is_empty() {
+                urls_u.borrow_mut().push(url.trim().to_string());
+                list.set_items(
+                    &urls_u
+                        .borrow()
+                        .iter()
+                        .map(String::as_str)
+                        .collect::<Vec<_>>(),
+                );
+            }
+        }
+    });
+    let urls_f = Rc::clone(&urls);
+    add_file.on_click(move |_| {
+        let dialog = FileDialog::builder(&manager_frame)
+            .with_message("Add EPG file")
+            .with_wildcard("XMLTV (*.xml;*.xml.gz)|*.xml;*.xml.gz|All files (*.*)|*.*")
+            .with_style(FileDialogStyle::Open | FileDialogStyle::FileMustExist)
+            .build();
+        if dialog.show_modal() != ID_OK {
+            return;
+        }
+        if let Some(path) = dialog.get_path() {
+            urls_f.borrow_mut().push(path);
+            list.set_items(
+                &urls_f
+                    .borrow()
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>(),
+            );
+        }
+    });
+    let urls_r = Rc::clone(&urls);
+    remove.on_click(move |_| {
+        if let Some(selection) = list.get_selection() {
+            let index = usize::try_from(selection).unwrap_or(usize::MAX);
+            if index < urls_r.borrow().len() {
+                urls_r.borrow_mut().remove(index);
+                list.set_items(
+                    &urls_r
+                        .borrow()
+                        .iter()
+                        .map(String::as_str)
+                        .collect::<Vec<_>>(),
+                );
+            }
+        }
+    });
+    let wiring_ok = clone_wiring(wiring);
+    ok.on_click(move |_| {
+        wiring_ok
+            .persist
+            .set_and_save("epg_urls", serde_json::json!(urls.borrow().clone()));
+        reload_epg(&wiring_ok);
+        status.set_label("EPG sources saved. Reloading guide...");
+        manager_frame.hide();
+    });
+    cancel.on_click(move |_| manager.hide());
+    manager.show(true);
 }
 
 /// Display text for a category row. The sentinel is never decorated; the
