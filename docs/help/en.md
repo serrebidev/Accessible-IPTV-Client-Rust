@@ -134,6 +134,8 @@ Refresh (F5) on the same menu downloads that playlist again and reloads the chan
 
 Choose OK to keep your changes, or Cancel to forget them. The channels reload after OK.
 
+Playlists from Xtream and Stalker accounts are cached on your disk for six hours, so restarts are fast. If a portal cannot be reached, the cached copy is used instead and the status line says so.
+
 ### Xtream Codes accounts {#xtream-codes}
 
 An Xtream Codes account needs the server address, your user name and your password, which your provider gives you. The name is your own label for the account. Leave "Automatically add XMLTV URL" checked to add the provider's programme guide to the EPG Manager at the same time.
@@ -161,7 +163,7 @@ The Applications key or Shift+F10 on a source opens its menu: Copy URL, Rename (
 
 ### Importing the guide {#import-epg}
 
-File > Import EPG to DB (Ctrl+I) downloads every guide source and loads it into the guide database. It runs in the background, so you can keep watching and browsing, and a message tells you when it has finished. Large guides can take several minutes.
+File > Import EPG to DB (Ctrl+I) asks for an XMLTV guide file on your computer and loads it into the guide database. The sources in the EPG Manager, and the guide each playlist names, load by themselves in the background, and a message tells you when a load has finished. Large guides can take several minutes.
 
 The guide is also refreshed automatically from time to time, silently. Channels are matched to the guide by their guide ID and their names, including the usual country and quality variations in channel names.
 
@@ -176,6 +178,14 @@ File > What's on Now (Ctrl+W) lists every programme on air right now across all 
 - Enter or the Play button plays the channel.
 - Schedule Recording, or the programme's menu, schedules a recording of it.
 - Escape closes the window.
+
+### Continue Watching {#continue-watching}
+
+View > Continue Watching lists programmes you stopped part-way through, newest first. Choose one and Play to pick it up where you left off; positions are kept only when you stopped well into the programme and before its final stretch.
+
+### Reminders {#reminders}
+
+A reminder tells you before a programme starts. Add one from a programme in View EPG or What's on Now. Recordings > Programme Reminders lists your reminders; when one is due the program announces it. Reminders are kept between sessions, up to 500.
 
 ### Channel guide (View EPG) {#channel-epg}
 
@@ -246,10 +256,10 @@ A track you choose is remembered for that channel and comes back next time. See 
 
 Subtitle text appears in the video when the stream provides it. Playback > Load Subtitle File accepts an external subtitle file. Turn on Playback > Speak Subtitles (Shift+S) and the selected voice reads each subtitle of a loaded SRT, ASS, SSA or WebVTT file as it appears, also while the player window is hidden. The current subtitle is also shown as text at the end of the player controls. The built-in player cannot yet read stream-embedded subtitles aloud.
 
-Playback > Read Current Subtitle (C) reads the subtitle on screen, or the last one shown when none is on screen. Playback > Previous Subtitle (Page Up) and Next Subtitle (Page Down) move through the subtitles already shown, so you can hear a line you missed again. They never read ahead of playback, and they work whether Speak Subtitles is on or off. On Windows, Options > Subtitle Speech > Application voice speed adjusts the application voice from -10 to 10 (0 is normal); it does not change playback speed or screen-reader settings.
+Playback > Read Current Subtitle (C) reads the subtitle on screen, or the last one shown when none is on screen. Playback > Previous Subtitle (Page Up) and Next Subtitle (Page Down) move through the subtitles already shown, so you can hear a line you missed again. They never read ahead of playback, and they work whether Speak Subtitles is on or off.
 ### Audio output device {#audio-output-device}
 
-Playback > Audio Output Device (D) chooses the speakers or headphones the player uses, for example to keep TV sound away from your screen reader. System default follows the Windows default device. The choice is remembered.
+In this build the built-in player plays through the system default output device; there is no separate output-device choice yet. Change the default device in your operating system to route the sound elsewhere, for example to keep TV sound away from your screen reader.
 
 ### Controlling the player from the main window {#player-from-main-window}
 
@@ -263,7 +273,7 @@ The Player menu in the main window works on the built-in player without switchin
 
 ## Media player {#media-player}
 
-Options > Media Player to Use chooses what plays your channels: the Built-in Player, or an external player such as VLC, MPC, MPC-BE, MPV, PotPlayer, Kodi or SMPlayer. Custom Player lets you choose any other program by its file.
+Options > Media Player to Use chooses what plays your channels: the Built-in Player, or an external player such as VLC, MPC, MPC-BE, Kodi, Winamp, Foobar2000, MPV, SMPlayer or Totem. Custom Player lets you choose any other program by its file.
 
 Recording, catch-up downloads and casting work the same whichever player you choose. The audio track features and the player keys described in this guide belong to the built-in player.
 
@@ -316,7 +326,7 @@ Recordings > Scheduled Recordings lists every scheduled, running and finished re
 - Delete or Numpad Delete asks for confirmation, then removes the selected recordings. If any selected recordings are still in progress, the program stops them first.
 - Escape closes the window.
 
-Scheduled recordings start by themselves while the program is running, even when it is minimized to the system tray. The window refreshes by itself when you open it and whenever a recording starts, finishes or is cancelled, so the Refresh command is rarely needed.
+Scheduled recordings start by themselves while the program is running, even when it is minimized to the system tray. A scheduled recording on a Stalker portal channel resolves a fresh stream link when its start time arrives; if the portal does not answer, it keeps retrying until the recording's window closes instead of failing at once. The window refreshes by itself when you open it and whenever a recording starts, finishes or is cancelled, so the Refresh command is rarely needed.
 
 When a new recording overlaps another scheduled recording, the program warns you before adding it. Your provider may limit how many streams can run at once.
 
@@ -334,9 +344,11 @@ It never fires while something is still recording or waiting in the schedule. Wh
 
 ## Casting {#casting}
 
-Casting sends a channel to a TV or speaker on your network: Chromecast and other Google Cast devices, AirPlay speakers, DLNA and UPnP renderers, Sonos speakers, Roku players and Kodi.
+Casting sends a channel to a TV or speaker on your network: DLNA and UPnP renderers, Sonos speakers and Roku players. Chromecast and AirPlay are not supported in this build.
 
-File > Cast To searches your network and lists the devices it finds, each followed by its type. Choose a device and Connect. Once connected, playing a channel sends it to the device. Speakers, such as AirPlay and Sonos, play the channel's sound. Choose Cast To again to disconnect.
+File > Cast To searches your network and lists the devices it finds, each followed by its type. Choose a device and Connect. Once connected, playing a channel sends it to the device. Sonos speakers play the channel's sound. Choose Cast To again to disconnect.
+
+Channels whose streams need custom headers play through a small local proxy the program runs for the device, so the renderer can fetch the stream with the right headers.
 
 The Cast button in the built-in player, Player > Cast / Connect (Ctrl+Shift+C) and Ctrl+C in the player do the same.
 
@@ -379,11 +391,9 @@ To quit the program completely, use File > Exit (Ctrl+Q).
 
 On Windows the program can update itself. Help > Check for Updates looks for a new version now, and Options > Auto-check for Updates checks in the background from time to time.
 
-When an update is available, you are told what is new and asked whether to install it. The download is checked before anything is installed. From then on one update window stays on screen for the whole update: it says what is happening at each step, offers Cancel while the download is running, stays up while the program closes and the update is installed, and tells you when the new version has started. Your settings, favorites and recordings are kept.
+When an update is available, you are told a new version exists and asked whether to download it. The program downloads the package, checks it against the published SHA-256 before anything else happens, and then opens the package so you can install it. Your settings, favorites and recordings are kept.
 
-On Linux, install the new package over the old one instead.
-
-Help > What's New lists the changes in every version, newest first. The section headings are always in your language. The notes for the three most recent versions are shown in your language once they have been translated, which can happen a little after a release; until then, and for older versions, they are in English.
+Help > What's New shows the changes in the current version.
 
 ## Troubleshooting {#troubleshooting}
 
