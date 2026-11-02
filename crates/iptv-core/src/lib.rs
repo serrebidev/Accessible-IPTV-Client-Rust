@@ -50,7 +50,7 @@ impl BrowseModel {
         Self {
             channels: Vec::new(),
             malformed: 0,
-            categories: vec![category::Category::All],
+            categories: vec![category::Category::All, category::Category::Favorites],
         }
     }
 
@@ -128,7 +128,8 @@ fn parse_cancellable(text: &str, current: impl Fn() -> bool) -> Option<BrowseMod
         }
         groups.insert(category::group_name(channel).to_owned());
     }
-    let categories = std::iter::once(category::Category::All)
+    let categories = [category::Category::All, category::Category::Favorites]
+        .into_iter()
         .chain(groups.into_iter().map(category::Category::Group))
         .collect();
     current().then_some(BrowseModel {

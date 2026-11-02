@@ -1,0 +1,8 @@
+# case, current playlist, seed playlist, rows toggled in order; final dot preserves empty fields
+empty	categories.m3u	categories.m3u		.
+toggle-order	categories.m3u	categories.m3u	4,1	.
+refresh	favorites-refresh.m3u	categories.m3u	4,1	.
+absent	empty.m3u	categories.m3u	4,1	.
+literal-group	favorites-refresh.m3u	favorites-refresh.m3u	0	.
+duplicate-name-distinct-id	categories.m3u	categories.m3u	1	.
+double-toggle	categories.m3u	categories.m3u	1,1	.

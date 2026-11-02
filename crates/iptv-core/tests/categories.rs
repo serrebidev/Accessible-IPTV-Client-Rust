@@ -39,6 +39,7 @@ fn categories_are_sorted_and_blank_groups_share_uncategorized() {
         model.categories(),
         &[
             Category::All,
+            Category::Favorites,
             Category::Group("All Channels".into()),
             Category::Group("News".into()),
             Category::Group("Uncategorized".into()),

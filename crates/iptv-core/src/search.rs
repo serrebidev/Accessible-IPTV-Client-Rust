@@ -1,5 +1,10 @@
 //! Single-flight, replaceable channel-name searches; no widget dependencies.
-use crate::{category::Category, search_rank, BrowseModel, Channel};
+use crate::{
+    category::Category,
+    favorites::{channel_key, FavoriteSet},
+    search_rank, BrowseModel, Channel,
+};
+use std::collections::HashMap;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     mpsc, Arc,
@@ -10,13 +15,20 @@ pub(crate) fn matching_rows(
     query: &str,
     current: impl Fn() -> bool,
 ) -> Option<Vec<usize>> {
-    matching_category_rows(channels, query, &Category::All, current)
+    matching_category_rows(
+        channels,
+        query,
+        &Category::All,
+        &FavoriteSet::default(),
+        current,
+    )
 }
 
 fn matching_category_rows(
     channels: &[Channel],
     query: &str,
     category: &Category,
+    favorites: &FavoriteSet,
     current: impl Fn() -> bool,
 ) -> Option<Vec<usize>> {
     let query = query.trim().to_lowercase();
@@ -25,7 +37,7 @@ fn matching_category_rows(
         if index % 256 == 0 && !current() {
             return None;
         }
-        if !category.includes(channel) {
+        if !category.includes(channel, favorites) {
             continue;
         }
         if query.is_empty() {
@@ -59,6 +71,7 @@ pub struct SearchResults {
     playlist: Arc<BrowseModel>,
     rows: Vec<usize>,
     positions: Vec<usize>,
+    key_positions: HashMap<String, usize>,
     query: String,
     category: Category,
 }
@@ -70,6 +83,7 @@ impl Default for SearchResults {
             playlist: Arc::new(BrowseModel::empty()),
             rows: Vec::new(),
             positions: Vec::new(),
+            key_positions: HashMap::new(),
             query: String::new(),
             category: Category::All,
         }
@@ -77,6 +91,10 @@ impl Default for SearchResults {
 }
 
 impl SearchResults {
+    pub(crate) fn is_source(&self, playlist: &Arc<BrowseModel>) -> bool {
+        Arc::ptr_eq(&self.playlist, playlist)
+    }
+
     #[must_use]
     pub fn categories(&self) -> &[Category] {
         &self.playlist.categories
@@ -125,13 +143,22 @@ impl SearchResults {
             {
                 return Some(position);
             }
+        } else if let Some(position) = row
+            .and_then(|row| previous.channel(row))
+            .and_then(channel_key)
+            .and_then(|key| self.key_positions.get(&key))
+        {
+            return Some(*position);
         }
         (!self.is_empty()).then_some(0)
     }
 
     #[must_use]
     pub fn status(&self) -> String {
-        let message = if self.playlist.channels().is_empty() {
+        let message = if self.category == Category::Favorites && self.is_empty() {
+            "Favorites is empty. Select a channel in another category and use Toggle favorite."
+                .to_owned()
+        } else if self.playlist.channels().is_empty() {
             "Channel list is empty. Open another playlist.".to_owned()
         } else if self.category != Category::All {
             if self.is_empty() {
@@ -169,6 +196,7 @@ struct Request {
     playlist: Arc<BrowseModel>,
     query: String,
     category: Category,
+    favorites: Arc<FavoriteSet>,
 }
 
 /// One worker serializes searches, skips queued obsolete requests, and checks
@@ -195,13 +223,21 @@ impl Default for SearchWorker {
                     request.playlist.channels(),
                     &request.query,
                     &request.category,
+                    &request.favorites,
                     current,
                 ) else {
                     continue;
                 };
                 let mut positions = vec![usize::MAX; request.playlist.channels().len()];
+                let mut key_positions = HashMap::new();
                 for (row, &index) in rows.iter().enumerate() {
+                    if row % 256 == 0 && !current() {
+                        break;
+                    }
                     positions[index] = row;
+                    if let Some(key) = channel_key(&request.playlist.channels()[index]) {
+                        key_positions.entry(key).or_insert(row);
+                    }
                 }
                 if current()
                     && completed
@@ -210,6 +246,7 @@ impl Default for SearchWorker {
                             playlist: request.playlist,
                             rows,
                             positions,
+                            key_positions,
                             query: request.query,
                             category: request.category,
                         })
@@ -235,12 +272,24 @@ impl SearchWorker {
 
     /// Compose a category projection with the existing ranked name search.
     pub fn submit_category(&self, playlist: Arc<BrowseModel>, query: String, category: Category) {
+        self.submit_favorites(playlist, query, category, Arc::new(FavoriteSet::default()));
+    }
+
+    /// Project a shared immutable favorite snapshot off the calling thread.
+    pub fn submit_favorites(
+        &self,
+        playlist: Arc<BrowseModel>,
+        query: String,
+        category: Category,
+        favorites: Arc<FavoriteSet>,
+    ) {
         let generation = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
         let _ = self.requests.send(Request {
             generation,
             playlist,
             query,
             category,
+            favorites,
         });
     }
 

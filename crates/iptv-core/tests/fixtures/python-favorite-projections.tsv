@@ -1,0 +1,8 @@
+# Python 9aa89e053225ef2c83c4f3659775a00723012ff7; case, ordered source indexes
+empty		.
+toggle-order	1,4	.
+refresh	1,2	.
+absent		.
+literal-group	0	.
+duplicate-name-distinct-id	1	.
+double-toggle		.

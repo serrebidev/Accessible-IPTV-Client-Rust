@@ -28,10 +28,11 @@ The first build downloads/builds wxWidgets through `wxdragon-sys` and can take
 several minutes. The core can be checked separately with `cargo test -p iptv-core`
 without a GUI toolchain. Run the prototype with `cargo run -p iptv-app`.
 Use Alt+O or Tab to **Open playlist**, choose a local `.m3u`/`.m3u8` file,
-then Tab to **Categories**. Use arrows to choose All Channels or a playlist
+then Tab to **Categories**. Use arrows to choose All Channels, Favorites or a playlist
 group, then Tab to **Search channels** to filter within that category. Search ignores
 case and ranks exact names, word starts, then other matches; ties retain
-playlist order. Clear the field to restore the active category. All Channels comes first;
+playlist order. Clear the field to restore the active category. All Channels comes first,
+then Favorites;
 groups follow in case-sensitive lexical order, with source-order rows. Missing,
 empty and whitespace-only groups share **Uncategorized** with explicitly named
 Uncategorized entries. Tab or Enter
@@ -44,13 +45,20 @@ pending load, or use **Cancel loading** (Alt+C). Typing a new search cancels a
 pending load and searches the previous playlist. Cancelling the file chooser
 keeps the current operation intact. Failed loads keep the previous channels;
 use **Open playlist** to retry or choose another file. Empty playlists have zero
-rows and recovery guidance. Tab from Channels to the read-only **Playlist status**
+rows and recovery guidance. Tab from Channels to **Toggle favorite** (Alt+F),
+then the read-only **Playlist status**
 field to review the current state. Loads, results, empty and recovery states use
 live-region announcements without moving keyboard focus. Owner-heard NVDA
 validation remains pending.
+The favorite action operates on the focused channel, announces added/removed state,
+and keeps keyboard focus on the current control. Favorites uses current playlist
+order, including matching namesakes, and stays available with zero rows and explicit
+guidance when empty. Local refresh retains matching stable identities and restores
+selection where possible. Favorites are in memory only for this slice.
 After `cargo build -p iptv-app`, run `powershell -NoProfile -File tools/smoke-foundation.ps1`
 on an interactive Windows desktop to inspect the native accessibility tree.
-This briefly opens the prototype and closes it normally; it does not send keys
+This briefly opens the prototype, inspects Favorites and invokes its empty toggle
+command, then closes it normally; it does not send keys
 or change screen-reader/system settings.
 
 See [the toolkit decision](docs/adr/0003-wxdragon-first-toolkit.md) and
@@ -65,3 +73,5 @@ See [playlist recovery and pinned Python parity evidence](docs/validation/0005-p
 See [the pending owner-heard NVDA acceptance record and session steps](docs/validation/0006-owner-heard-accessibility.md).
 
 See [grouped category evidence and remaining checks](docs/validation/0010-grouped-category-browsing.md).
+
+See [Favorites category and toggle evidence](docs/validation/0012-favorites-category-toggle.md).

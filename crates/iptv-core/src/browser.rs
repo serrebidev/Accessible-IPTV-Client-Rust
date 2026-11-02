@@ -1,6 +1,7 @@
 //! The local browse application seam, shared by the desktop and domain tests.
 use crate::{
     category::Category,
+    favorites::{FavoriteSet, ToggleOutcome},
     loading::{LoadFailure, LoadWorker},
     search::{SearchResults, SearchWorker},
     BrowseModel,
@@ -22,6 +23,7 @@ pub struct BrowserWorker {
     loading: bool,
     searching: bool,
     category: Category,
+    favorites: Arc<FavoriteSet>,
 }
 
 impl BrowserWorker {
@@ -47,8 +49,12 @@ impl BrowserWorker {
     /// A new query supersedes a pending load and searches the last usable source.
     pub fn search(&mut self, query: String) -> bool {
         let cancelled = self.cancel_load();
-        self.searcher
-            .submit_category(Arc::clone(&self.playlist), query, self.category.clone());
+        self.searcher.submit_favorites(
+            Arc::clone(&self.playlist),
+            query,
+            self.category.clone(),
+            Arc::clone(&self.favorites),
+        );
         self.searching = true;
         cancelled
     }
@@ -57,6 +63,27 @@ impl BrowserWorker {
     pub fn select_category(&mut self, category: Category, query: String) -> bool {
         self.category = category;
         self.search(query)
+    }
+
+    /// Toggle one real row from the active playlist, never a retired snapshot.
+    /// Supersede pending projections before publishing the changed favorite set.
+    pub fn toggle_favorite(
+        &mut self,
+        visible: &SearchResults,
+        row: usize,
+        query: String,
+    ) -> Option<ToggleOutcome> {
+        if !visible.is_source(&self.playlist) {
+            return None;
+        }
+        let channel = visible.channel(row)?;
+        let outcome = Arc::make_mut(&mut self.favorites).toggle(channel);
+        // Other categories have unchanged rows: keep their selection, focus and
+        // accessible row cache rather than needlessly publishing the same list.
+        if outcome != ToggleOutcome::Unkeyable && self.category == Category::Favorites {
+            self.search(query);
+        }
+        Some(outcome)
     }
 
     /// Poll from the UI thread; never reads, parses or scans channels here.
@@ -88,8 +115,12 @@ impl BrowserWorker {
         } else {
             Category::All
         };
-        self.searcher
-            .submit_category(Arc::clone(&loaded), query.to_owned(), category);
+        self.searcher.submit_favorites(
+            Arc::clone(&loaded),
+            query.to_owned(),
+            category,
+            Arc::clone(&self.favorites),
+        );
         self.replacement = Some(loaded);
         self.searching = true;
     }
@@ -164,7 +195,7 @@ mod tests {
         assert_eq!(empty.category(), &Category::All);
         assert!(empty.is_empty());
         assert_eq!(empty.restore_row(&selected, Some(1)), None);
-        assert_eq!(empty.categories(), &[Category::All]);
+        assert_eq!(empty.categories(), &[Category::All, Category::Favorites]);
         browser.load(fixture("categories.m3u"));
         assert!(browser.select_category(news, String::new()));
         assert!(results(wait(&mut browser, "")).is_empty());
@@ -233,6 +264,25 @@ mod tests {
         browser.load(fixture("local.m3u"));
         browser.cancel();
         assert!(!browser.is_busy());
+        assert!(browser.poll("").is_none());
+    }
+
+    #[test]
+    fn favorite_toggle_supersedes_a_parsed_replacement_and_queued_projection() {
+        let mut browser = BrowserWorker::default();
+        browser.load(fixture("categories.m3u"));
+        let all = results(wait(&mut browser, ""));
+        browser.toggle_favorite(&all, 1, String::new());
+        browser.select_category(Category::Favorites, String::new());
+        let favorite = results(wait(&mut browser, ""));
+        browser.loading = true;
+        browser.filter_loaded(Arc::new(BrowseModel::empty()), "");
+        browser.toggle_favorite(&favorite, 0, String::new());
+        let removed = results(wait(&mut browser, ""));
+        assert_eq!(removed.category(), &Category::Favorites);
+        assert!(removed.is_empty());
+        browser.select_category(Category::All, String::new());
+        assert_eq!(results(wait(&mut browser, "")).len(), 7);
         assert!(browser.poll("").is_none());
     }
 }
