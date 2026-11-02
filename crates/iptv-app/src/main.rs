@@ -609,6 +609,7 @@ fn bind_browser(frame: Frame, controls: Controls, model: Rc<RefCell<SearchResult
     fill_scope_choices(&wiring, controls.scope_choice);
     bind_completion(&wiring, controls);
     build_menu(frame, &wiring, controls);
+    bind_tray(frame, &wiring, controls.status);
     maybe_auto_check_updates(&wiring);
     bind_actions(frame, &wiring, controls);
     bind_context_menu(frame, &wiring, controls);
@@ -2042,8 +2043,10 @@ fn open_guide_window(wiring: &Wiring, status: Status) {
     status.set_label("User Guide opened.");
 }
 
-/// The tray icon (kept alive on the wiring): tooltip plus a
-/// Show/Exit popup menu.
+/// The tray icon (kept alive on the wiring). Its popup menu is
+/// built fresh per right-click in `bind_tray` (Python builds its
+/// tray menu per popup, because the contents depend on live
+/// player and recording state).
 fn build_tray_icon() -> TaskBarIcon {
     let icon = TaskBarIcon::builder()
         .with_tooltip("Accessible IPTV Client")
@@ -2051,12 +2054,128 @@ fn build_tray_icon() -> TaskBarIcon {
     if let Some(bitmap) = Bitmap::new(16, 16) {
         icon.set_icon(&bitmap, "Accessible IPTV Client");
     }
-    let mut popup = Menu::builder()
-        .append_item(5004, "&Show Accessible IPTV Client", "")
-        .append_item(4004, "E&xit", "")
-        .build();
-    icon.set_popup_menu(&mut popup);
     icon
+}
+
+/// Tray popup menu ids.
+const TRAY_RESTORE: i32 = 5501;
+const TRAY_SHOW_PLAYER: i32 = 5502;
+const TRAY_PLAY_PAUSE: i32 = 5503;
+const TRAY_STOP: i32 = 5504;
+const TRAY_CAST: i32 = 5505;
+const TRAY_STOP_RECORDING: i32 = 5506;
+const TRAY_EXIT: i32 = 5507;
+
+/// Build the tray popup for the current state (Python's
+/// CreatePopupMenu): Restore; a Player Controls submenu whose
+/// items are all disabled when nothing is loaded in the
+/// built-in player; Stop Recording(s) only while a recording
+/// is active; Exit.
+fn build_tray_menu(wiring: &Wiring) -> Menu {
+    let loaded = wiring.player.borrow().current_channel.is_some();
+    let controls = Menu::builder().build();
+    for (id, label) in [
+        (TRAY_SHOW_PLAYER, "Show Player"),
+        (TRAY_PLAY_PAUSE, "Play/Pause"),
+        (TRAY_STOP, "Stop"),
+    ] {
+        controls.append(id, &tr(label), "", ItemKind::Normal);
+        controls.enable_item(id, loaded);
+    }
+    controls.append_separator();
+    controls.append(TRAY_CAST, &tr("Cast / Connect..."), "", ItemKind::Normal);
+    controls.enable_item(TRAY_CAST, loaded);
+    let menu = Menu::builder().build();
+    menu.append(TRAY_RESTORE, &tr("Restore"), "", ItemKind::Normal);
+    menu.append_submenu(controls, &tr("Player Controls"), "");
+    if wiring.recordings.borrow().active_count() > 0 {
+        menu.append(
+            TRAY_STOP_RECORDING,
+            &tr("Stop Recording(s)"),
+            "",
+            ItemKind::Normal,
+        );
+    }
+    menu.append_separator();
+    menu.append(TRAY_EXIT, &tr("Exit"), "", ItemKind::Normal);
+    menu
+}
+
+/// Bind the tray icon's dynamic popup, menu dispatch and
+/// left-click restore (Python: left up and double-click both
+/// restore, for NVDA/JAWS tray navigation).
+fn bind_tray(frame: Frame, wiring: &Wiring, status: Status) {
+    let icon = Rc::clone(&wiring.tray);
+    let popup_wiring = clone_wiring(wiring);
+    let popup_icon = Rc::clone(&icon);
+    icon.on_mouse_right_up(move |_| {
+        let mut menu = build_tray_menu(&popup_wiring);
+        popup_icon.popup_menu(&mut menu);
+    });
+    let menu_wiring = clone_wiring(wiring);
+    icon.on_menu(move |event| {
+        dispatch_tray_menu(&menu_wiring, frame, status, event.get_id());
+    });
+    icon.on_mouse_left_up(move |_| {
+        frame.show(true);
+        frame.raise();
+    });
+    let dbl_frame = frame;
+    icon.on_left_double_click(move |_| {
+        dbl_frame.show(true);
+        dbl_frame.raise();
+    });
+}
+
+/// One tray menu selection.
+fn dispatch_tray_menu(wiring: &Wiring, frame: Frame, status: Status, id: i32) {
+    match id {
+        TRAY_RESTORE => {
+            frame.show(true);
+            frame.raise();
+        }
+        TRAY_SHOW_PLAYER => {
+            let player = wiring.player.borrow();
+            match &player.window {
+                Some(win) => {
+                    win.frame.show(true);
+                    win.frame.raise();
+                }
+                None => {
+                    status.set_label("The built-in player opens when you play a channel.");
+                }
+            }
+        }
+        TRAY_PLAY_PAUSE => toggle_pause_state(&wiring.player, &wiring.persist, status),
+        TRAY_STOP => menu_player_transport(wiring, false),
+        TRAY_CAST => {
+            let player = wiring.player.borrow();
+            if let Some(shared) = &player.shared {
+                show_cast_for(
+                    &shared.cast_ui,
+                    &shared.cast_worker,
+                    &shared.cast_pending,
+                    &shared.timer,
+                    &shared.proxy,
+                    player.current_channel.as_ref(),
+                );
+            }
+        }
+        TRAY_STOP_RECORDING => {
+            let keys = wiring.recordings.borrow().active_keys();
+            let count = keys.len();
+            for key in &keys {
+                wiring.recordings.borrow_mut().stop(key);
+            }
+            if count > 0 {
+                status.set_label(&format!("Stopping {count} recordings."));
+            }
+        }
+        TRAY_EXIT => {
+            frame.close(false);
+        }
+        _ => {}
+    }
 }
 
 /// The main window's menu bar. Labels carry the effective shortcuts
