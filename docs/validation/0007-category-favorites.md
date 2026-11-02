@@ -67,10 +67,12 @@ Manual session reported by the product owner on 2026-11-01:
   Favorites status.
 - PASS: search match, clear-to-category restoration, and no-match status.
 - PASS: available large-list/resizing and presentation checks.
+- PASS: rapid category/search changes did not expose stale results, changed
+  the active category incorrectly, or strand focus.
+- PASS: playlist replacement/recovery announcements and rows remained usable
+  without stale state.
 
 The native MSAA smoke check also passed against an isolated copy of the built
 executable: it found the named Channels list, list role, keyboard focusability,
 zero startup rows, named focusable actions/search, and the read-only empty
-status. It did not populate a playlist or claim NVDA speech. Rapid
-category/search replacement and a dedicated playlist-replacement announcement
-case were not separately recorded and remain follow-up checks.
+status. It did not populate a playlist or claim NVDA speech.
