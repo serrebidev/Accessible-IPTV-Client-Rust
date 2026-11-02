@@ -113,7 +113,7 @@ fn http_get_text(url: &str, user_agent: &str) -> ProviderResult<Vec<u8>> {
         .header("User-Agent", user_agent)
         .call()
         .map_err(|e| e.to_string())?;
-    response.body_mut().read_to_vec().map_err(|e| e.to_string())
+    crate::sources::read_body_unbounded(response.body_mut()).map_err(|e| e.to_string())
 }
 
 fn decode_text(bytes: &[u8]) -> String {
@@ -501,9 +501,7 @@ impl StalkerClient {
             }
             format!("Could not reach the portal: {e}")
         })?;
-        let bytes = response
-            .body_mut()
-            .read_to_vec()
+        let bytes = crate::sources::read_body_unbounded(response.body_mut())
             .map_err(|e| format!("Could not reach the portal: {e}"))?;
         let data: Value = serde_json::from_slice(&bytes)
             .map_err(|_| "Invalid response from portal".to_string())?;

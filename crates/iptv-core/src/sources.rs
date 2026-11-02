@@ -100,6 +100,18 @@ impl SourceFetcher for DefaultFetcher {
     }
 }
 
+/// Reads a whole HTTP body without ureq's default 10 MiB
+/// `read_to_string` / `read_to_vec` cap. Real playlists and
+/// guides run far past it (a 115k-channel playlist is ~28 MB,
+/// its XMLTV ~263 MB) and Python imposes no cap, so the body
+/// streams through the unbounded reader instead.
+pub(crate) fn read_body_unbounded(body: &mut ureq::Body) -> std::io::Result<Vec<u8>> {
+    use std::io::Read as _;
+    let mut bytes = Vec::new();
+    body.as_reader().read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
 fn fetch_http(url: &str, current: &dyn Fn() -> bool) -> Result<String, LoadFailure> {
     if !current() {
         return Err(LoadFailure::Unreadable);
@@ -119,10 +131,8 @@ fn fetch_http(url: &str, current: &dyn Fn() -> bool) -> Result<String, LoadFailu
     if !current() {
         return Err(LoadFailure::Unreadable);
     }
-    response
-        .body_mut()
-        .read_to_string()
-        .map_err(|_| LoadFailure::Unreadable)
+    let bytes = read_body_unbounded(response.body_mut()).map_err(|_| LoadFailure::Unreadable)?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 /// The merged outcome: the combined model plus how many sources failed.
@@ -207,6 +217,48 @@ pub fn scope_indexes(channels: &[Channel], scope: &str) -> Vec<usize> {
 
 #[cfg(test)]
 mod tests {
+
+    /// Serves `body` once over loopback HTTP and returns its URL.
+    fn serve_once(body: Vec<u8>) -> String {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0_u8; 1];
+            while !request.ends_with(b"\r\n\r\n") {
+                if stream.read(&mut byte).unwrap() == 0 {
+                    break;
+                }
+                request.push(byte[0]);
+            }
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(head.as_bytes()).unwrap();
+            stream.write_all(&body).unwrap();
+        });
+        format!("http://127.0.0.1:{port}/list.m3u")
+    }
+
+    #[test]
+    fn http_playlist_over_ureq_default_cap_loads() {
+        // Regression: ureq's read_to_string caps at 10 MiB, which
+        // silently failed real playlists (28 MB for a 115k-channel
+        // provider list). The fetch must take the whole body.
+        let mut body = String::from("#EXTM3U\n");
+        let line = "#EXTINF:-1 tvg-id=\"1\",Channel One\nhttp://x/1\n";
+        while body.len() <= 11 * 1024 * 1024 {
+            body.push_str(line);
+        }
+        let url = serve_once(body.into_bytes());
+        let source = PlaylistSource::new(&url);
+        let text = DefaultFetcher.fetch(&source, &|| true).unwrap();
+        assert!(text.len() > 10 * 1024 * 1024);
+        assert!(text.starts_with("#EXTM3U"));
+    }
     use super::*;
     use crate::parse_m3u;
     use std::collections::BTreeMap;

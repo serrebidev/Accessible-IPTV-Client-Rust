@@ -837,9 +837,7 @@ fn fetch_epg_source(source: &str) -> Result<EpgGuide, String> {
         let mut response = ureq::get(source)
             .call()
             .map_err(|e| format!("{source}: {e}"))?;
-        response
-            .body_mut()
-            .read_to_vec()
+        crate::sources::read_body_unbounded(response.body_mut())
             .map_err(|e| format!("{source}: {e}"))?
     } else {
         std::fs::read(source).map_err(|e| format!("{source}: {e}"))?
@@ -849,6 +847,47 @@ fn fetch_epg_source(source: &str) -> Result<EpgGuide, String> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn http_guide_over_ureq_default_cap_loads() {
+        // Regression pair to the playlist cap: a full XMLTV for a
+        // large provider runs to hundreds of MB, far over ureq's
+        // 10 MiB read_to_vec cap.
+        use std::io::{Read as _, Write as _};
+        let mut body = String::from(
+            "<?xml version=\"1.0\"?><tv><channel id=\"c1\"><display-name>One</display-name></channel>",
+        );
+        body.push_str("<!--");
+        while body.len() <= 11 * 1024 * 1024 {
+            body.push_str("0123456789abcdef");
+        }
+        body.push_str("-->");
+        body.push_str(
+            "<programme channel=\"c1\" start=\"20261101180000 +0000\" stop=\"20261101190000 +0000\"><title>Show</title></programme></tv>",
+        );
+        let bytes = body.into_bytes();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0_u8; 1];
+            while !request.ends_with(b"\r\n\r\n") {
+                if stream.read(&mut byte).unwrap() == 0 {
+                    break;
+                }
+                request.push(byte[0]);
+            }
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                bytes.len()
+            );
+            stream.write_all(head.as_bytes()).unwrap();
+            stream.write_all(&bytes).unwrap();
+        });
+        let guide = fetch_epg_source(&format!("http://127.0.0.1:{port}/guide.xml")).unwrap();
+        assert_eq!(guide.programme_count(), 1);
+    }
     use super::*;
     use crate::Channel;
     use std::collections::BTreeMap;
