@@ -2,6 +2,7 @@
 
 pub mod browser;
 pub mod categories;
+pub mod config;
 pub mod favorites;
 pub mod loading;
 pub mod search;

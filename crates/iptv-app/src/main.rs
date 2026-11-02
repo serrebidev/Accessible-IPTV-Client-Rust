@@ -1,10 +1,11 @@
 use iptv_core::{
     browser::{BrowseEvent, BrowserWorker},
     categories::Category,
-    favorites::Toggle,
+    config::{self, Config},
+    favorites::{FavoriteSet, Toggle},
     search::SearchResults,
 };
-use std::{cell::RefCell, rc::Rc};
+use std::{cell::RefCell, path::PathBuf, rc::Rc};
 use wxdragon::event::EventType;
 use wxdragon::prelude::*;
 use wxdragon::timer::Timer;
@@ -165,14 +166,40 @@ struct Wiring {
     categories: Rc<RefCell<Vec<Category>>>,
     timer: Rc<Timer<Frame>>,
     model: Rc<RefCell<SearchResults>>,
+    persist: Persist,
+}
+
+/// The loaded configuration and the path its saves go to.
+#[derive(Clone)]
+struct Persist {
+    config: Rc<RefCell<Config>>,
+    path: PathBuf,
+}
+
+impl Persist {
+    /// Store the browser's current favorite keys. Best effort, like the
+    /// reference's logged save failures: a failed write never breaks use.
+    fn save_favorites(&self, keys: &[String]) {
+        let mut config = self.config.borrow_mut();
+        config.set_favorites(keys.to_vec());
+        let _ = config.save(&self.path);
+    }
 }
 
 fn bind_browser(frame: Frame, controls: Controls, model: Rc<RefCell<SearchResults>>) {
+    let candidates = config::config_candidates();
+    let loaded = config::load(&candidates, &candidates[0]);
+    let mut browser_worker = BrowserWorker::default();
+    browser_worker.set_favorites(FavoriteSet::from_stored(loaded.config.favorites()));
     let wiring = Wiring {
-        browser: Rc::new(RefCell::new(BrowserWorker::default())),
+        browser: Rc::new(RefCell::new(browser_worker)),
         categories: Rc::new(RefCell::new(vec![Category::All, Category::Favorites])),
         timer: Rc::new(Timer::new(&frame)),
         model,
+        persist: Persist {
+            config: Rc::new(RefCell::new(loaded.config)),
+            path: loaded.path,
+        },
     };
     bind_completion(&wiring, controls);
     bind_actions(frame, &wiring, controls);
@@ -308,6 +335,7 @@ fn bind_toggle(
     let browser = Rc::clone(&wiring.browser);
     let timer = Rc::clone(&wiring.timer);
     let model = Rc::clone(&wiring.model);
+    let persist = wiring.persist.clone();
     toggle_favorite.on_click(move |_| {
         let selected = usize::try_from(list.get_first_selected_item()).ok();
         let focused =
@@ -330,6 +358,8 @@ fn bind_toggle(
             }
             Some(outcome) => {
                 status.set_label(&outcome.announcement);
+                let keys = browser.borrow().favorites().keys().to_vec();
+                persist.save_favorites(&keys);
                 assert!(timer.start(50, false));
             }
             None => status.set_label("No channel selected. Choose a channel in Channels first."),
