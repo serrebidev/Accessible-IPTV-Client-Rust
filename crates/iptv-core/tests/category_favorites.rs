@@ -49,7 +49,7 @@ fn favorite_keys_match_pinned_python_goldens() {
         .lines()
         .filter(|line| !line.starts_with('#'))
     {
-        let (index, expected) = line.split_once('\t').unwrap();
+        let (index, expected) = line.split_once('\t').unwrap_or((line, ""));
         let index: usize = index.parse().unwrap();
         assert_eq!(channel_key(&channels[index]), expected, "golden {index}");
     }
