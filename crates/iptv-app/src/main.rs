@@ -15,6 +15,7 @@ use iptv_core::{
     reminders::{normalize_reminders, Reminder, ReminderStatus},
     search::SearchResults,
     sources::PlaylistSource,
+    vod::{VodCatalog, VodEvent, VodItem, VodKind, VodWorker},
     Channel,
 };
 use std::{cell::RefCell, collections::BTreeMap, path::PathBuf, process::Command, rc::Rc};
@@ -42,6 +43,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .build();
         cancel.set_accessibility_label("Cancel loading");
         let record = record_button(panel);
+        let vod = vod_button(panel);
         let (category_label, category, toggle_favorite) = category_controls(panel);
         let search_label = StaticText::builder(&panel)
             .with_label("&Search channels")
@@ -99,6 +101,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 open,
                 cancel,
                 record,
+                vod,
                 category,
                 toggle_favorite,
                 search,
@@ -169,6 +172,7 @@ struct Controls {
     open: Button,
     cancel: Button,
     record: Button,
+    vod: Button,
     category: ListBox,
     toggle_favorite: Button,
     search: TextCtrl,
@@ -192,6 +196,9 @@ struct Wiring {
     provider_pending: Rc<std::cell::Cell<bool>>,
     pending_resolve: Rc<RefCell<Option<Channel>>>,
     recordings: Rc<RefCell<RecordingEngine>>,
+    vod_worker: Rc<VodWorker>,
+    vod_pending: Rc<std::cell::Cell<bool>>,
+    vod_ui: Rc<RefCell<Option<VodUi>>>,
     dvr: Rc<RefCell<DvrSchedule>>,
     recorded: Rc<std::cell::Cell<bool>>,
     shutdown_attempted: Rc<std::cell::Cell<bool>>,
@@ -299,6 +306,16 @@ impl Persist {
     }
 }
 
+/// The VOD window button for the main window.
+fn vod_button(panel: Panel) -> Button {
+    let vod = Button::builder(&panel).with_label("&VOD").build();
+    vod.set_accessibility_label("Video on demand");
+    vod.set_accessibility_description(
+        "Open the video-on-demand browser for movies and series from your providers and playlists.",
+    );
+    vod
+}
+
 /// The Record toggle button for the main window.
 fn record_button(panel: Panel) -> Button {
     let record = Button::builder(&panel).with_label("&Record").build();
@@ -333,6 +350,9 @@ fn bind_browser(frame: Frame, controls: Controls, model: Rc<RefCell<SearchResult
         provider_pending: Rc::new(std::cell::Cell::new(false)),
         pending_resolve: Rc::new(RefCell::new(None)),
         recordings: Rc::new(RefCell::new(RecordingEngine::new())),
+        vod_worker: Rc::new(VodWorker::new()),
+        vod_pending: Rc::new(std::cell::Cell::new(false)),
+        vod_ui: Rc::new(RefCell::new(None)),
         dvr: Rc::new(RefCell::new(DvrSchedule::load(dvr_path, now_seconds()))),
         recorded: Rc::new(std::cell::Cell::new(false)),
         shutdown_attempted: Rc::new(std::cell::Cell::new(false)),
@@ -360,6 +380,7 @@ fn bind_browser(frame: Frame, controls: Controls, model: Rc<RefCell<SearchResult
     }
     bind_completion(&wiring, controls);
     bind_recording(&wiring, controls);
+    bind_vod(&wiring, controls);
     bind_actions(frame, &wiring, controls);
     let browser = Rc::clone(&wiring.browser);
     let timer = Rc::clone(&wiring.timer);
@@ -393,6 +414,7 @@ fn bind_completion(wiring: &Wiring, controls: Controls) {
         poll_epg(&completed, status);
         poll_providers(&completed, controls);
         poll_recordings(&completed, status);
+        poll_vod(&completed, status);
         if !completed.browser.borrow().is_busy()
             && !completed.epg_pending.get()
             && !completed.provider_pending.get()
@@ -403,6 +425,7 @@ fn bind_completion(wiring: &Wiring, controls: Controls) {
                 .any(|r| r.status == ReminderStatus::Scheduled)
             && completed.recordings.borrow().active_count() == 0
             && completed.dvr.borrow().pending_count() == 0
+            && !completed.vod_pending.get()
         {
             if let Some(timer) = completed_timer.upgrade() {
                 timer.stop();
@@ -416,6 +439,7 @@ fn bind_actions(frame: Frame, wiring: &Wiring, controls: Controls) {
         open,
         cancel,
         record: _,
+        vod: _,
         category,
         toggle_favorite,
         search,
@@ -899,6 +923,257 @@ fn poll_recordings(wiring: &Wiring, status: Status) {
         match recording::shutdown_computer(system, &root) {
             Ok(_) => status.set_label("All recordings finished. Shutting down."),
             Err(error) => status.set_label(&format!("Shutdown failed: {error}")),
+        }
+    }
+}
+
+/// The VOD browser window's handles and view state.
+#[derive(Clone)]
+struct VodUi {
+    frame: Frame,
+    groups: ListBox,
+    items: ListBox,
+    status: Status,
+    view: Rc<RefCell<VodView>>,
+}
+
+#[derive(Default)]
+struct VodView {
+    catalog: VodCatalog,
+    accounts: Vec<ProviderAccount>,
+    showing: Vec<VodItem>,
+    stack: Vec<Vec<VodItem>>,
+}
+
+/// The provider accounts from the configured playlists (the accounts
+/// half of the startup split, recomputed when the VOD window opens).
+fn vod_accounts(persist: &Persist) -> Vec<ProviderAccount> {
+    let value = persist.config.borrow().value("playlists").cloned();
+    let mut accounts = Vec::new();
+    if let Some(serde_json::Value::Array(entries)) = value {
+        for entry in &entries {
+            if let Some(account) = ProviderAccount::from_config(entry) {
+                accounts.push(account);
+            }
+        }
+    }
+    accounts
+}
+
+/// Open (creating on first use) the VOD window and load the catalogue.
+fn bind_vod(wiring: &Wiring, controls: Controls) {
+    let vod = controls.vod;
+    let status = controls.status;
+    let worker = Rc::clone(&wiring.vod_worker);
+    let pending = Rc::clone(&wiring.vod_pending);
+    let ui_slot = Rc::clone(&wiring.vod_ui);
+    let player = Rc::clone(&wiring.player);
+    let persist = wiring.persist.clone();
+    let browser = Rc::clone(&wiring.browser);
+    let timer = Rc::clone(&wiring.timer);
+    vod.on_click(move |_| {
+        let ui = ensure_vod_ui(&ui_slot, &player, &persist, &worker, &pending, &timer);
+        ui.frame.show(true);
+        ui.frame.raise();
+        let accounts = vod_accounts(&persist);
+        ui.view.borrow_mut().accounts.clone_from(&accounts);
+        worker.build(accounts, browser.borrow().all_channels());
+        pending.set(true);
+        assert!(timer.start(50, false));
+        status.set_label("Loading video on demand catalogue...");
+    });
+}
+
+/// Build the VOD window's widgets: (frame, groups, items, play, back,
+/// status).
+fn build_vod_window() -> (Frame, ListBox, ListBox, Button, Button, Status) {
+    let frame = Frame::builder()
+        .with_title("Video on Demand")
+        .with_size(Size::new(720, 520))
+        .build();
+    frame.set_accessibility_label("Video on Demand");
+    let panel = Panel::builder(&frame).build();
+    let groups = ListBox::builder(&panel).build();
+    groups.set_accessibility_label("VOD groups");
+    groups.set_accessibility_description("Choose a movie or series group. Tab moves to Items.");
+    let items = ListBox::builder(&panel).build();
+    items.set_accessibility_label("VOD items");
+    items.set_accessibility_description(
+        "Choose a movie or series. Play / Open plays a movie or opens a series.",
+    );
+    let play = Button::builder(&panel).with_label("&Play / Open").build();
+    play.set_accessibility_label("Play or open selected item");
+    let back = Button::builder(&panel).with_label("&Back").build();
+    back.set_accessibility_label("Back");
+    let status_label = StaticText::builder(&panel).with_label("VOD status").build();
+    let details = TextCtrl::builder(&panel)
+        .with_style(TextCtrlStyle::ReadOnly | TextCtrlStyle::MultiLine)
+        .with_value("No catalogue loaded yet.")
+        .build();
+    details.set_accessibility_label("VOD status");
+    let status = Status {
+        label: status_label,
+        details,
+    };
+    (frame, groups, items, play, back, status)
+}
+
+/// Build the VOD window once and keep it (closing hides it).
+fn ensure_vod_ui(
+    slot: &Rc<RefCell<Option<VodUi>>>,
+    player: &Rc<RefCell<PlayerState>>,
+    persist: &Persist,
+    worker: &Rc<VodWorker>,
+    pending: &Rc<std::cell::Cell<bool>>,
+    timer: &Rc<Timer<Frame>>,
+) -> VodUi {
+    if let Some(ui) = slot.borrow().as_ref() {
+        return ui.clone();
+    }
+    let (frame, groups, items, play, back, status) = build_vod_window();
+    let view = Rc::new(RefCell::new(VodView::default()));
+    let ui = VodUi {
+        frame,
+        groups,
+        items,
+        status,
+        view,
+    };
+    // Group selection shows that group's items.
+    {
+        let view = Rc::clone(&ui.view);
+        let groups_box = groups;
+        let items_box = items;
+        groups.bind_internal(EventType::COMMAND_LISTBOX_SELECTED, move |_| {
+            let Some(selection) = groups_box.get_selection() else {
+                return;
+            };
+            let mut view = view.borrow_mut();
+            let Some(label) = view.catalog.order.get(selection as usize).cloned() else {
+                return;
+            };
+            view.showing = view.catalog.groups.get(&label).cloned().unwrap_or_default();
+            view.stack.clear();
+            show_items(items_box, &view.showing);
+        });
+    }
+    // Play / Open: movies play; series drill in (episodes inline for
+    // M3U folders, fetched for Xtream series).
+    {
+        let view = Rc::clone(&ui.view);
+        let items_box = items;
+        let player = Rc::clone(player);
+        let persist = persist.clone();
+        let worker = Rc::clone(worker);
+        let pending = Rc::clone(pending);
+        let timer = Rc::clone(timer);
+        play.on_click(move |_| {
+            let Some(selection) = items_box.get_selection() else {
+                return;
+            };
+            let item = view.borrow().showing.get(selection as usize).cloned();
+            let Some(item) = item else { return };
+            match item.kind {
+                VodKind::Movie => {
+                    if let Some(channel) = &item.channel {
+                        play_channel(&player, &persist, channel, status);
+                    }
+                }
+                VodKind::Series => {
+                    if !item.episodes.is_empty() {
+                        let mut view = view.borrow_mut();
+                        let previous = std::mem::take(&mut view.showing);
+                        view.stack.push(previous);
+                        view.showing.clone_from(&item.episodes);
+                        show_items(items_box, &view.showing);
+                    } else if let Some(series_id) = &item.series_id {
+                        let account = view
+                            .borrow()
+                            .accounts
+                            .iter()
+                            .find(|a| a.provider_id() == item.provider_id)
+                            .cloned();
+                        if let Some(account) = account {
+                            worker.episodes(account, series_id.clone());
+                            pending.set(true);
+                            assert!(timer.start(50, false));
+                            status.set_label("Loading episodes...");
+                        }
+                    }
+                }
+            }
+        });
+    }
+    // Back: return to the previous item list.
+    {
+        let view = Rc::clone(&ui.view);
+        let items_box = items;
+        back.on_click(move |_| {
+            let mut view = view.borrow_mut();
+            if let Some(previous) = view.stack.pop() {
+                view.showing = previous;
+                show_items(items_box, &view.showing);
+            }
+        });
+    }
+    // Closing the VOD window hides it; the window is reused.
+    {
+        let frame_hide = frame;
+        frame.on_close(move |event| {
+            frame_hide.hide();
+            event.skip(false);
+        });
+    }
+    *slot.borrow_mut() = Some(ui.clone());
+    ui
+}
+
+/// Fill the items list from `VodItem`s and select the first row.
+fn show_items(items_box: ListBox, showing: &[VodItem]) {
+    let names: Vec<String> = showing.iter().map(|i| i.name.clone()).collect();
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    items_box.set_items(&refs);
+    if !refs.is_empty() {
+        items_box.set_selection(0, true);
+    }
+}
+
+/// Collect VOD worker events into the window.
+fn poll_vod(wiring: &Wiring, status: Status) {
+    while let Some(event) = wiring.vod_worker.try_recv() {
+        wiring.vod_pending.set(false);
+        let Some(ui) = wiring.vod_ui.borrow().clone() else {
+            continue;
+        };
+        match event {
+            VodEvent::Catalog(catalog) => {
+                let groups_count = catalog.order.len();
+                let items_count: usize = catalog.groups.values().map(Vec::len).sum();
+                let labels = catalog.order.clone();
+                ui.view.borrow_mut().catalog = catalog;
+                let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+                ui.groups.set_items(&refs);
+                if !refs.is_empty() {
+                    ui.groups.set_selection(0, true);
+                }
+                ui.status.set_label(&format!(
+                    "VOD catalogue ready: {groups_count} groups, {items_count} items."
+                ));
+                status.set_label("VOD catalogue loaded.");
+            }
+            VodEvent::Episodes(Ok(episodes)) => {
+                let count = episodes.len();
+                let mut view = ui.view.borrow_mut();
+                let previous = std::mem::take(&mut view.showing);
+                view.stack.push(previous);
+                view.showing = episodes;
+                show_items(ui.items, &view.showing);
+                ui.status.set_label(&format!("{count} episodes loaded."));
+            }
+            VodEvent::Episodes(Err(error)) => {
+                ui.status
+                    .set_label(&format!("Could not load episodes: {error}"));
+            }
         }
     }
 }

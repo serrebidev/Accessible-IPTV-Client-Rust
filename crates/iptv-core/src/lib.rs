@@ -15,6 +15,7 @@ pub mod recording;
 pub mod reminders;
 pub mod search;
 pub mod sources;
+pub mod vod;
 
 use std::collections::BTreeMap;
 use std::path::Path;
