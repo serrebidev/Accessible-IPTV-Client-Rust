@@ -21,6 +21,7 @@ pub mod proxy;
 pub mod recording;
 pub mod reminders;
 pub mod search;
+pub mod settings_backup;
 pub mod shortcuts;
 pub mod sources;
 pub mod subtitles;

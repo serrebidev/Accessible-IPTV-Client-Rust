@@ -24,3 +24,9 @@ chrono-tz = "0.10"
 serde = { version = "1", features = ["derive"] }
 libloading = "0.8"
 rusqlite = { version = "0.32", features = ["bundled"] }
+aes = "0.8"
+cbc = { version = "0.1", features = ["alloc"] }
+hmac = "0.12"
+pbkdf2 = "0.12"
+base64 = "0.22"
+getrandom = "0.2"
