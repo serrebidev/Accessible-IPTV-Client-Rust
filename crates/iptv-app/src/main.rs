@@ -320,6 +320,7 @@ struct Wiring {
     persist: Persist,
     player: Rc<RefCell<PlayerState>>,
     epg: Rc<RefCell<Option<(EpgGuide, GuideIndexes)>>>,
+    epg_store: Rc<RefCell<Option<iptv_core::epgstore::EpgStore>>>,
     epg_worker: Rc<EpgWorker>,
     epg_pending: Rc<std::cell::Cell<bool>>,
     reminders: Rc<RefCell<Vec<Reminder>>>,
@@ -513,6 +514,7 @@ fn bind_browser(frame: Frame, controls: Controls, model: Rc<RefCell<SearchResult
         },
         player: Rc::new(RefCell::new(PlayerState::default())),
         epg: Rc::new(RefCell::new(None)),
+        epg_store: Rc::new(RefCell::new(None)),
         epg_worker: Rc::new(EpgWorker::new()),
         epg_pending: Rc::new(std::cell::Cell::new(false)),
         reminders: Rc::new(RefCell::new(Vec::new())),
@@ -895,9 +897,10 @@ fn poll_epg(wiring: &Wiring, status: Status) {
             Ok(guide) => {
                 let counts = (guide.channels.len(), guide.programme_count());
                 let indexes = GuideIndexes::build(&guide.channels);
+                let store_note = mirror_guide_to_store(wiring, &guide);
                 *wiring.epg.borrow_mut() = Some((guide, indexes));
                 status.set_label(&format!(
-                    "Guide loaded: {} channels, {} programmes.",
+                    "Guide loaded: {} channels, {} programmes.{store_note}",
                     counts.0, counts.1
                 ));
             }
@@ -1604,6 +1607,7 @@ fn clone_wiring(wiring: &Wiring) -> Wiring {
         model: Rc::clone(&wiring.model),
         player: Rc::clone(&wiring.player),
         epg: Rc::clone(&wiring.epg),
+        epg_store: Rc::clone(&wiring.epg_store),
         epg_worker: Rc::clone(&wiring.epg_worker),
         epg_pending: Rc::clone(&wiring.epg_pending),
         reminders: Rc::clone(&wiring.reminders),
@@ -2698,16 +2702,61 @@ const CTX_CATCHUP: i32 = 6007;
 
 /// All guide programmes for a channel (empty without a guide match).
 fn guide_programmes(wiring: &Wiring, channel: &Channel) -> Vec<Programme> {
-    let guard = wiring.epg.borrow();
-    let Some((guide, indexes)) = guard.as_ref() else {
+    let in_memory = {
+        let guard = wiring.epg.borrow();
+        match guard.as_ref() {
+            Some((guide, indexes)) => {
+                let known: std::collections::HashSet<String> =
+                    guide.channels.iter().map(|c| c.id.to_lowercase()).collect();
+                match match_guide_channel(channel, indexes, Some(&known)) {
+                    Some(id) => guide.programmes.get(&id).cloned().unwrap_or_default(),
+                    None => Vec::new(),
+                }
+            }
+            None => Vec::new(),
+        }
+    };
+    if !in_memory.is_empty() {
+        return in_memory;
+    }
+    store_programmes(wiring, channel)
+}
+
+/// Programmes from the `SQLite` store for a channel (tvg-id
+/// candidates in match order), from an hour ago, capped at 200.
+fn store_programmes(wiring: &Wiring, channel: &Channel) -> Vec<Programme> {
+    let guard = wiring.epg_store.borrow();
+    let Some(store) = guard.as_ref() else {
         return Vec::new();
     };
-    let known: std::collections::HashSet<String> =
-        guide.channels.iter().map(|c| c.id.to_lowercase()).collect();
-    let Some(id) = match_guide_channel(channel, indexes, Some(&known)) else {
-        return Vec::new();
-    };
-    guide.programmes.get(&id).cloned().unwrap_or_default()
+    let now = now_epoch();
+    let mut candidates = iptv_core::epg::expand_tvg_id_candidates(channel.tvg_id.trim());
+    candidates.push(channel.tvg_id.trim().to_string());
+    for candidate in candidates {
+        if let Ok(programmes) = store.programmes_between(&candidate, now - 3600, now + 14 * 86400) {
+            if !programmes.is_empty() {
+                return programmes.into_iter().take(200).collect();
+            }
+        }
+    }
+    Vec::new()
+}
+
+/// Mirror a freshly loaded guide into the `SQLite` store beside
+/// the config; returns a status suffix when the import fails.
+fn mirror_guide_to_store(wiring: &Wiring, guide: &EpgGuide) -> String {
+    let path = iptv_core::config::user_config_dir().join("epg.db");
+    let mut guard = wiring.epg_store.borrow_mut();
+    if guard.is_none() {
+        match iptv_core::epgstore::EpgStore::open(&path) {
+            Ok(store) => *guard = Some(store),
+            Err(error) => return format!(" Guide database unavailable: {error}"),
+        }
+    }
+    match guard.as_mut().map(|store| store.import_guide(guide)) {
+        Some(Ok(_)) | None => String::new(),
+        Some(Err(error)) => format!(" Guide database import failed: {error}"),
+    }
 }
 
 /// The programme airing now on a channel, when the guide has one.
