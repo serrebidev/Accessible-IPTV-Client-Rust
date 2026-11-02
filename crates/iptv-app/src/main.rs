@@ -234,7 +234,10 @@ fn category_controls(panel: Panel) -> (StaticText, TreeCtrl) {
     if let Some(root) = category.add_root("Categories", None, None) {
         category.append_item(&root, "All Channels", None, None);
         category.append_item(&root, "Favorites", None, None);
-        category.expand(&root);
+        // No expand(&root): the root is hidden (TreeCtrlStyle::HideRoot)
+        // and wxWidgets asserts "Can't expand/collapse hidden root
+        // node!" when asked to expand it. Its children are always
+        // visible, so there is nothing to expand.
     }
     (label, category)
 }
@@ -8080,7 +8083,7 @@ fn sync_category_control(
                     None,
                 );
             }
-            control.expand(&root);
+            // See category_controls: never expand the hidden root.
         }
         if *state.borrow() != current {
             *state.borrow_mut() = current;
