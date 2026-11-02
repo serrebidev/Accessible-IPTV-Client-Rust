@@ -43,3 +43,42 @@ with choose/retry guidance. Recovery wording and malformed-input warnings are
 requirements of this slice, not byte-identical Python strings. Worker/controller
 tests cover missing/unreadable/retry, retention, cancellation, and replacement.
 Domain tests and these goldens do not prove desktop announcements or focus.
+
+## Stable favorites fixtures (issue #11, ticket 02)
+
+`favorite-channels.tsv` supplies synthetic loaded-channel fields, including
+provider/stream identity, URL refreshes, credentials in inert URLs, duplicate
+names across groups, missing/whitespace fields, aliases, pipes and backslashes.
+The first column names each case; subsequent columns use Python metadata names.
+Empty values model absent optional strings in Rust's loaded `Channel` type.
+`favorite-stored.tsv` supplies typed stored-value cases: `s:` marks strings;
+nulls, numbers, booleans, maps and lists are invalid entries. Missing, bare-string
+and bytes containers normalize to no keys. A final `.` preserves empty TSV fields.
+
+`python-favorites.tsv` records 27 keys, six normalization results, and 54
+successive toggle/filter outcomes from committed `favorites.py` at Python
+revision `9aa89e053225ef2c83c4f3659775a00723012ff7`. The Rust integration test
+consumes the same inputs and goldens without invoking Python or copying its
+implementation. The oracle runs the committed, GUI-free module itself:
+
+```powershell
+python tools/check-favorites-parity.py <Python-checkout> --update
+python tools/check-favorites-parity.py <Python-checkout>
+cargo test -p iptv-core --test favorites
+```
+
+Rules match `tests/test_favorites.py`'s identity, normalize, filter and toggle
+cases. Plain M3U namesakes share one favorite across groups. Provider keys include
+display name as well as provider type/ID, stream ID and XMLTV ID; renaming a
+channel changes its key in this reference. Fields are omitted when absent, not
+given invented IDs. Group, logo, resolved URL and credential attributes are never
+used. Backslash is escaped before pipe. Keys remain case-sensitive. Stored keys
+are opaque: trim, drop blanks/invalid entries, deduplicate in first-seen order;
+do not parse, unescape, or discard unknown nonblank keys.
+
+Rust accepts typed optional strings at the storage boundary: a future config
+adapter must map invalid entries to `None` and missing/non-list configuration
+to an empty iterator. Persistence and desktop Favorites controls are outside
+this ticket. Filtering scans the supplied playlist in source order and should
+run on a worker for large playlists. This evidence does not prove NVDA speech,
+keyboard traversal or focus preservation after future desktop integration.

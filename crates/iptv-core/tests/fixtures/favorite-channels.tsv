@@ -1,0 +1,28 @@
+case	name	group	url	provider-type	provider-id	stream-id	stream_id	tvg-id	tvg_id	tvg-name	tvg_name	.
+xtream	BBC One HD	UK	http://panel.invalid/live/user/pass/4242.ts	xtream	prov-1	4242		bbc1.uk				.
+refreshed	BBC One HD	News	https://user:newpass@panel.invalid/rotated?token=secret	xtream	prov-1	4242		bbc1.uk				.
+provider-changed	BBC One HD		url	xtream	prov-2	4242		bbc1.uk				.
+stream-changed	BBC One HD		url	xtream	prov-1	4243		bbc1.uk				.
+plain	BBC One	UK	first									.
+namesake	BBC One	News	second									.
+pipe-name	ITV|1		url									.
+split-fields	1		url					ITV				.
+backslash			url	a\	b							.
+pipe-provider			url	a|b								.
+aliases			url				7		guide	Dave	Ignored	.
+no-metadata			https://user:pass@panel.invalid/live?token=secret									.
+trimmed	  News  	  World  	url	 xtream 	 prov-3 	 9 		 news.id 				.
+tvg-name			url							Dave		.
+tvg-id			url					guide				.
+alias-name			url								Dave	.
+alias-id			url						guide			.
+whitespace-primary	   		url					guide		Dave		.
+whitespace-stream	Dave		url			   	7					.
+separator-metadata	A\|B		url	x|y	z\	7|8		id\|x				.
+empty			url									.
+case-sensitive	bbc one	UK	url									.
+provider-only			url	stalker	portal-1							.
+unknown-credentials	News		http://user:pass@panel.invalid/token									.
+unicode	映画 | Café\News		url									.
+rename	BBC One Renamed		url	xtream	prov-1	4242		bbc1.uk				.
+primary-aliases	Dave		url			8	7	primary	alias	Primary TVG	Alias TVG	.
