@@ -2,7 +2,7 @@
 resolver = "2"
 members = [
     "crates/iptv-core",
-    "crates/iptv-app",
+    "crates/iptv-app", "crates/iptv-vlc",
 ]
 
 [workspace.package]
@@ -22,3 +22,5 @@ flate2 = "1"
 chrono = "0.4"
 chrono-tz = "0.10"
 serde = { version = "1", features = ["derive"] }
+libloading = "0.8"
+rusqlite = { version = "0.32", features = ["bundled"] }

@@ -355,6 +355,10 @@ struct PlayerState {
     session: PlaybackSession,
     gate: LaunchGate,
     window: Option<PlayerWindow>,
+    vlc: Option<iptv_vlc::VlcEngine>,
+    vlc_active: bool,
+    vlc_tracks_ready: bool,
+    vlc_track_ids: Vec<i32>,
     shared: Option<PlayerShared>,
     desired_track: Option<String>,
     last_label_cue: Option<usize>,
@@ -371,6 +375,10 @@ impl Default for PlayerState {
             session: PlaybackSession::new(),
             gate: LaunchGate::default(),
             window: None,
+            vlc: None,
+            vlc_active: false,
+            vlc_tracks_ready: false,
+            vlc_track_ids: Vec::new(),
             shared: None,
             desired_track: None,
             last_label_cue: None,
@@ -2168,23 +2176,7 @@ fn bind_menu_actions(frame: Frame, wiring: &Wiring, controls: Controls) {
                     }
                 }
             }
-            PLAY_PAUSE => {
-                let player = wiring.player.borrow();
-                if let Some(win) = &player.window {
-                    if win.media.get_state() == MediaState::Playing {
-                        win.media.pause();
-                    } else {
-                        win.media.play();
-                    }
-                }
-            }
-            STOP => {
-                let mut player = wiring.player.borrow_mut();
-                if let Some(win) = &player.window {
-                    win.media.stop();
-                }
-                player.session.stop();
-            }
+            PLAY_PAUSE | STOP => menu_player_transport(&wiring, id == PLAY_PAUSE),
             VIEW_LIVE => status.set_label("Live TV and catch-up view."),
             VIEW_VOD => open_vod_window(&wiring, status),
             FAVORITE => toggle_selected_favorite(
@@ -2459,15 +2451,45 @@ fn menu_import_settings(wiring: &Wiring, frame: Frame, status: Status) {
     }
 }
 
+/// The Player menu's Play/Pause and Stop items, acting on the
+/// active engine (libVLC when it drives playback, else `MediaCtrl`).
+fn menu_player_transport(wiring: &Wiring, play_pause: bool) {
+    let mut player = wiring.player.borrow_mut();
+    if play_pause {
+        if player.vlc_active {
+            if let Some(engine) = &mut player.vlc {
+                engine.pause();
+            }
+        } else if let Some(win) = &player.window {
+            if win.media.get_state() == MediaState::Playing {
+                win.media.pause();
+            } else {
+                win.media.play();
+            }
+        }
+        return;
+    }
+    if player.vlc_active {
+        if let Some(engine) = &mut player.vlc {
+            engine.stop();
+        }
+        player.vlc_active = false;
+    }
+    if let Some(win) = &player.window {
+        win.media.stop();
+    }
+    player.session.stop();
+}
+
 /// Subtitle Speech > Read current subtitle: announce the cue active
 /// at the player's current position.
 fn menu_read_current_subtitle(wiring: &Wiring, status: Status) {
     let player = wiring.player.borrow();
-    let Some(win) = &player.window else {
+    if player.window.is_none() {
         status.set_label("No subtitle is showing.");
         return;
-    };
-    let position = win.media.tell();
+    }
+    let position = position_length(&player).0;
     match player
         .subtitle_cues
         .iter()
@@ -3202,8 +3224,26 @@ fn play_builtin(
         return;
     };
     if let EngineAction::Load(load) = action {
-        win.media.load_uri(&load.url);
-        win.media.play();
+        state.vlc_active = false;
+        if state.vlc.is_none() {
+            state.vlc = iptv_vlc::VlcEngine::new().ok();
+            if let Some(engine) = &mut state.vlc {
+                engine.set_window_handle(win.media.get_handle() as usize);
+            }
+        }
+        let vlc_started = match &mut state.vlc {
+            Some(engine) => engine.play_url(&load.url, &load.headers).is_ok(),
+            None => false,
+        };
+        let via_vlc = vlc_started;
+        if via_vlc {
+            state.vlc_active = true;
+            state.vlc_tracks_ready = false;
+        }
+        if !via_vlc {
+            win.media.load_uri(&load.url);
+            win.media.play();
+        }
     }
     win.frame
         .set_title(&format!("{} — Player", state.session.announcement()));
@@ -3366,9 +3406,10 @@ fn wire_player_events(
     let tick_player = Rc::clone(player);
     let tick_persist = persist.clone();
     timer.on_tick(move |_| {
-        checkpoint_resume(&tick_player, &tick_persist, media);
-        speak_subtitle_cue(&tick_player, &tick_persist, media, status);
-        update_player_chrome(&tick_player, media);
+        checkpoint_resume(&tick_player, &tick_persist);
+        speak_subtitle_cue(&tick_player, &tick_persist, status);
+        poll_vlc_state(&tick_player, &tick_persist, status);
+        update_player_chrome(&tick_player);
     });
     let _ = timer.start(1000, false);
 
@@ -3441,7 +3482,7 @@ fn wire_player_events(
     let close_player = Rc::clone(player);
     let close_persist = persist.clone();
     frame.on_close(move |event| {
-        checkpoint_resume(&close_player, &close_persist, media);
+        checkpoint_resume(&close_player, &close_persist);
         let mut state = close_player.borrow_mut();
         state.session.stop();
         if let Some(win) = &state.window {
@@ -3460,24 +3501,34 @@ fn bind_player_controls(
     win: &PlayerWindow,
 ) {
     let seek_handle = win.seek;
-    let seek_media = win.media;
+    let seek_player = Rc::clone(player);
     seek_handle.bind_internal(EventType::SLIDER, move |_| {
-        let length = seek_media.length();
+        let length = position_length(&seek_player.borrow()).1;
         if length > 0 {
             let target = i64::from(seek_handle.get_value()) * length / 1000;
-            seek_media.seek(target, SeekMode::FromStart);
+            player_seek_to(&seek_player, target);
         }
     });
     let volume_handle = win.volume;
-    let volume_media = win.media;
+    let volume_player = Rc::clone(player);
     volume_handle.bind_internal(EventType::SLIDER, move |_| {
-        volume_media.set_volume(f64::from(volume_handle.get_value()) / 100.0);
+        player_set_volume(&volume_player, volume_handle.get_value());
     });
     let tracks_handle = win.tracks;
     let tracks_player = Rc::clone(player);
     tracks_handle.bind_internal(EventType::COMMAND_CHOICE_SELECTED, move |_| {
         let label = tracks_handle.get_string_selection().unwrap_or_default();
-        tracks_player.borrow_mut().desired_track = Some(label.clone());
+        let mut state = tracks_player.borrow_mut();
+        state.desired_track = Some(label.clone());
+        if state.vlc_active {
+            if let Some(index) = tracks_handle.get_selection() {
+                if let Some(id) = state.vlc_track_ids.get(index as usize).copied() {
+                    if let Some(engine) = &mut state.vlc {
+                        engine.set_audio_track(id);
+                    }
+                }
+            }
+        }
         status.set_label(&format!("Audio track preference: {label}"));
     });
     let keys_player = Rc::clone(player);
@@ -3493,8 +3544,16 @@ fn bind_player_controls(
 fn toggle_pause_state(player: &Rc<RefCell<PlayerState>>, status: Status) {
     let mut state = player.borrow_mut();
     state.session.toggle_pause();
-    if let Some(win) = &state.window {
-        match state.session.state() {
+    let session_state = state.session.state().clone();
+    if state.vlc_active {
+        if let Some(engine) = &mut state.vlc {
+            match session_state {
+                SessionState::Paused | SessionState::Playing => engine.pause(),
+                _ => {}
+            }
+        }
+    } else if let Some(win) = &state.window {
+        match session_state {
             SessionState::Paused => {
                 win.media.pause();
             }
@@ -3510,11 +3569,15 @@ fn toggle_pause_state(player: &Rc<RefCell<PlayerState>>, status: Status) {
 /// Stop playback and hide the player window (Stop button, the stop
 /// and exit shortcuts).
 fn player_stop(player: &Rc<RefCell<PlayerState>>, persist: &Persist, status: Status) {
-    if let Some(win) = player.borrow().window.clone() {
-        checkpoint_resume(player, persist, win.media);
-    }
+    checkpoint_resume(player, persist);
     let mut state = player.borrow_mut();
     state.session.stop();
+    if state.vlc_active {
+        if let Some(engine) = &mut state.vlc {
+            engine.stop();
+        }
+        state.vlc_active = false;
+    }
     if let Some(win) = &state.window {
         win.media.stop();
         win.frame.show(false);
@@ -3522,15 +3585,162 @@ fn player_stop(player: &Rc<RefCell<PlayerState>>, persist: &Persist, status: Sta
     status.set_label("Stopped.");
 }
 
+/// Seek the active engine (libVLC when it drives playback, else
+/// the `MediaCtrl`).
+fn player_seek_to(player: &Rc<RefCell<PlayerState>>, target_ms: i64) {
+    let mut state = player.borrow_mut();
+    if state.vlc_active {
+        if let Some(engine) = &mut state.vlc {
+            engine.set_time(target_ms);
+        }
+    } else if let Some(win) = &state.window {
+        win.media.seek(target_ms, SeekMode::FromStart);
+    }
+}
+
+/// Set the active engine's volume and mirror it on the slider.
+fn player_set_volume(player: &Rc<RefCell<PlayerState>>, percent: i32) {
+    let mut state = player.borrow_mut();
+    if state.vlc_active {
+        if let Some(engine) = &mut state.vlc {
+            engine.set_volume(percent);
+        }
+    } else if let Some(win) = &state.window {
+        win.media.set_volume(f64::from(percent) / 100.0);
+    }
+    if let Some(win) = &state.window {
+        win.volume.set_value(percent);
+    }
+}
+
+/// Poll the libVLC engine on the 1 s tick: resume seek, one-time
+/// track setup, and end/error transitions into the session
+/// machine (with its reconnect handling).
+fn poll_vlc_state(player: &Rc<RefCell<PlayerState>>, persist: &Persist, status: Status) {
+    let mut setup_tracks = false;
+    {
+        let mut state = player.borrow_mut();
+        if !state.vlc_active {
+            return;
+        }
+        let Some(engine) = &state.vlc else {
+            return;
+        };
+        match engine.state() {
+            iptv_vlc::VlcState::Playing => {
+                if let Some(ms) = state.pending_resume_ms.take() {
+                    if let Some(engine) = &mut state.vlc {
+                        engine.set_time(ms);
+                    }
+                }
+                if !state.vlc_tracks_ready {
+                    state.vlc_tracks_ready = true;
+                    setup_tracks = true;
+                }
+            }
+            iptv_vlc::VlcState::Ended | iptv_vlc::VlcState::Error => {
+                let ended = engine.state() == iptv_vlc::VlcState::Ended;
+                let (position, length) = (engine.time(), engine.length());
+                let near_end = length > 0 && position >= length - 1500;
+                let event = if ended || near_end {
+                    EngineEvent::Ended
+                } else {
+                    EngineEvent::Stalled
+                };
+                let action = state.session.on_event(event);
+                state.vlc_active = false;
+                if let EngineAction::Reconnect(request) = action {
+                    if let Some(engine) = &mut state.vlc {
+                        if engine.play_url(&request.url, &request.headers).is_ok() {
+                            state.vlc_active = true;
+                            state.vlc_tracks_ready = false;
+                        }
+                    }
+                }
+                status.set_label(&state.session.announcement());
+            }
+            _ => {}
+        }
+    }
+    if setup_tracks {
+        apply_vlc_tracks(player, persist);
+    }
+}
+
+/// Fill the player window's audio track choice from libVLC and
+/// apply the recorded preference (explicit choice first, then
+/// the slice-9 keyword engine).
+fn apply_vlc_tracks(player: &Rc<RefCell<PlayerState>>, persist: &Persist) {
+    let tracks = {
+        let state = player.borrow();
+        state
+            .vlc
+            .as_ref()
+            .map(iptv_vlc::VlcEngine::audio_tracks)
+            .unwrap_or_default()
+    };
+    if tracks.is_empty() {
+        return;
+    }
+    let win = {
+        let mut state = player.borrow_mut();
+        state.vlc_track_ids = tracks.iter().map(|(id, _)| *id).collect();
+        state.window.clone()
+    };
+    let Some(win) = win else {
+        return;
+    };
+    win.tracks.clear();
+    for (_, name) in &tracks {
+        win.tracks.append(name);
+    }
+    let (keywords, prefer_ad, desired) = {
+        let config = persist.config.borrow();
+        (
+            iptv_core::audiotracks::preferred_audio_keywords(
+                &config.string_list("preferred_audio_tracks"),
+                config.bool_or("prefer_audio_description", false),
+            ),
+            config.bool_or("prefer_audio_description", false),
+            player.borrow().desired_track.clone(),
+        )
+    };
+    let pairs: Vec<(i64, String)> = tracks
+        .iter()
+        .map(|(id, name)| (i64::from(*id), name.clone()))
+        .collect();
+    let chosen = desired
+        .as_ref()
+        .and_then(|want| {
+            tracks
+                .iter()
+                .find(|(_, name)| name == want)
+                .map(|(id, _)| *id)
+        })
+        .or_else(|| {
+            iptv_core::audiotracks::select_preferred_audio_track(&pairs, &keywords, None, prefer_ad)
+                .map(|id| i32::try_from(id).unwrap_or(-1))
+        });
+    if let Some(id) = chosen {
+        let mut state = player.borrow_mut();
+        if let Some(engine) = &mut state.vlc {
+            engine.set_audio_track(id);
+        }
+        if let Some(position) = state.vlc_track_ids.iter().position(|track| *track == id) {
+            win.tracks
+                .set_selection(u32::try_from(position).unwrap_or(0));
+        }
+    }
+}
+
 /// Refresh the player window's time label, seek position and
 /// subtitle label from the media position (1 s tick).
-fn update_player_chrome(player: &Rc<RefCell<PlayerState>>, media: MediaCtrl) {
+fn update_player_chrome(player: &Rc<RefCell<PlayerState>>) {
     let mut state = player.borrow_mut();
     let Some(win) = state.window.clone() else {
         return;
     };
-    let position = media.tell();
-    let length = media.length();
+    let (position, length) = position_length(&state);
     let text = if length > 0 {
         format!(
             "{} / {}",
@@ -3644,8 +3854,7 @@ fn dispatch_player_key(
         "volume_up" | "volume_down" => {
             let delta = if action == "volume_up" { 10 } else { -10 };
             let value = (win.volume.get_value() + delta).clamp(0, 100);
-            win.volume.set_value(value);
-            win.media.set_volume(f64::from(value) / 100.0);
+            player_set_volume(player, value);
             status.set_label(&format!("Volume {value} percent."));
         }
         "audio_track" => win.tracks.set_focus(),
@@ -3660,7 +3869,7 @@ fn dispatch_player_key(
             });
         }
         "read_subtitle" | "previous_subtitle" | "next_subtitle" => {
-            announce_cue(player, &win, &action, status);
+            announce_cue(player, &action, status);
         }
         "fullscreen" => win.frame.show_full_screen(!win.frame.is_full_screen()),
         "hide" => win.frame.hide(),
@@ -3677,18 +3886,13 @@ fn dispatch_player_key(
 }
 
 /// Announce the current, previous, or next subtitle cue's text.
-fn announce_cue(
-    player: &Rc<RefCell<PlayerState>>,
-    win: &PlayerWindow,
-    action: &str,
-    status: Status,
-) {
+fn announce_cue(player: &Rc<RefCell<PlayerState>>, action: &str, status: Status) {
     let state = player.borrow();
     if state.subtitle_cues.is_empty() {
         status.set_label("No subtitles are loaded.");
         return;
     }
-    let position = win.media.tell();
+    let position = position_length(&state).0;
     let current = active_cue(&state.subtitle_cues, position);
     let index = match action {
         "previous_subtitle" => current.and_then(|i| i.checked_sub(1)).or(current),
@@ -3782,16 +3986,25 @@ fn prompt_subtitle_file(player: &Rc<RefCell<PlayerState>>, frame: Frame, status:
 /// Announce the active subtitle cue when it changes, while the
 /// `speak_subtitles` setting is on (the reference's spoken-subtitle
 /// path, riding the live region).
-fn speak_subtitle_cue(
-    player: &Rc<RefCell<PlayerState>>,
-    persist: &Persist,
-    media: MediaCtrl,
-    status: Status,
-) {
+/// (position, length) in ms from the active engine: libVLC when
+/// it is driving this playback, else the `MediaCtrl`.
+fn position_length(state: &PlayerState) -> (i64, i64) {
+    if state.vlc_active {
+        if let Some(engine) = &state.vlc {
+            return (engine.time(), engine.length());
+        }
+    }
+    match &state.window {
+        Some(win) => (win.media.tell(), win.media.length()),
+        None => (0, 0),
+    }
+}
+
+fn speak_subtitle_cue(player: &Rc<RefCell<PlayerState>>, persist: &Persist, status: Status) {
     if !persist.config.borrow().bool_or("speak_subtitles", false) {
         return;
     }
-    let position = media.tell();
+    let position = position_length(&player.borrow()).0;
     if position <= 0 {
         return;
     }
@@ -3811,7 +4024,7 @@ fn speak_subtitle_cue(
 
 /// Persist the current position for seekable content (Python checkpoint
 /// rules decide whether it is kept).
-fn checkpoint_resume(player: &Rc<RefCell<PlayerState>>, persist: &Persist, media: MediaCtrl) {
+fn checkpoint_resume(player: &Rc<RefCell<PlayerState>>, persist: &Persist) {
     let state = player.borrow();
     if state.session.current().is_none_or(|r| r.live) {
         return;
@@ -3821,9 +4034,8 @@ fn checkpoint_resume(player: &Rc<RefCell<PlayerState>>, persist: &Persist, media
     };
     let key = channel_key(channel);
     let channel = channel.clone();
+    let (position, length) = position_length(&state);
     drop(state);
-    let position = media.tell();
-    let length = media.length();
     if position <= 0 || length <= 0 {
         return;
     }
