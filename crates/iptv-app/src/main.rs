@@ -803,7 +803,7 @@ fn poll_providers(wiring: &Wiring, controls: Controls) {
                         play_channel(&wiring.player, &wiring.persist, &channel, status);
                     }
                     (Some((_id, _)), Err(error)) => status.set_label(&error),
-                    (None, Ok(_)) | (None, Err(_)) => {}
+                    (None, Ok(_) | Err(_)) => {}
                 }
             }
             ProviderEvent::Account(result) => match result {
@@ -1605,6 +1605,7 @@ fn clone_wiring(wiring: &Wiring) -> Wiring {
         provider_worker: Rc::clone(&wiring.provider_worker),
         provider_pending: Rc::clone(&wiring.provider_pending),
         pending_resolve: Rc::clone(&wiring.pending_resolve),
+        pending_dvr_resolves: Rc::clone(&wiring.pending_dvr_resolves),
         recordings: Rc::clone(&wiring.recordings),
         cast_worker: Rc::clone(&wiring.cast_worker),
         cast_pending: Rc::clone(&wiring.cast_pending),
