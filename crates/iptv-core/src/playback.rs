@@ -61,11 +61,18 @@ fn apply_modifier(headers: &mut StreamHeaders, key: &str, value: &str, fill_only
             headers.entries.push((name.to_string(), value.to_string()));
         }
     } else if key == "bearer" || key == "token" {
-        apply_modifier(headers, "authorization", &format!("Bearer {value}"), fill_only);
+        apply_modifier(
+            headers,
+            "authorization",
+            &format!("Bearer {value}"),
+            fill_only,
+        );
     } else if key == "host" || key == "http-host" {
         headers.extra.push(format!("Host: {value}"));
     } else {
-        headers.extra.push(format!("{}: {value}", title_case_header(key)));
+        headers
+            .extra
+            .push(format!("{}: {value}", title_case_header(key)));
     }
 }
 
@@ -82,7 +89,12 @@ pub fn split_stream_modifiers(url: &str) -> (String, StreamHeaders) {
             continue;
         };
         let value = value.trim().replace('+', " ");
-        apply_modifier(&mut headers, key.trim().to_lowercase().as_str(), value.trim(), false);
+        apply_modifier(
+            &mut headers,
+            key.trim().to_lowercase().as_str(),
+            value.trim(),
+            false,
+        );
     }
     (base.trim().to_string(), headers)
 }
@@ -154,7 +166,9 @@ impl PlaybackRequest {
 /// else is treated as a live stream (reconnectable, not resumable).
 fn is_vod_url(url: &str) -> bool {
     let path = url.split(['?', '#']).next().unwrap_or(url).to_lowercase();
-    [".mp4", ".mkv", ".avi", ".mov", ".webm"].iter().any(|ext| path.ends_with(ext))
+    [".mp4", ".mkv", ".avi", ".mov", ".webm"]
+        .iter()
+        .any(|ext| path.ends_with(ext))
         || path.contains("/movie/")
         || path.contains("/series/")
 }
@@ -223,12 +237,7 @@ pub fn detect_from_path(path: &str) -> String {
 /// through one-instance flags, MPV gets its IPC/idle flags, MPC and
 /// everything else take the bare URL.
 #[must_use]
-pub fn external_argv(
-    player_name: &str,
-    exe: &str,
-    url: &str,
-    mpv_ipc_path: &str,
-) -> Vec<String> {
+pub fn external_argv(player_name: &str, exe: &str, url: &str, mpv_ipc_path: &str) -> Vec<String> {
     match player_name {
         "VLC" => vec![
             exe.to_string(),
@@ -365,6 +374,12 @@ pub struct PlaybackSession {
     current: Option<PlaybackRequest>,
     reconnects: u32,
     volume: i32,
+}
+
+impl Default for PlaybackSession {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl PlaybackSession {
@@ -565,18 +580,29 @@ mod tests {
         let headers = StreamHeaders::for_channel(&chan);
         assert_eq!(headers.get("User-Agent"), Some("AttrAgent"));
         let request = PlaybackRequest::for_channel(&chan, None);
-        assert_eq!(request.url, "http://x/y", "pipe tail never reaches the engine");
+        assert_eq!(
+            request.url, "http://x/y",
+            "pipe tail never reaches the engine"
+        );
     }
 
     #[test]
     fn argv_shapes_match_python() {
         assert_eq!(
             external_argv("VLC", "vlc", "http://s", "ipc"),
-            vec!["vlc", "--one-instance", "--one-instance-when-started-from-file", "http://s"]
+            vec![
+                "vlc",
+                "--one-instance",
+                "--one-instance-when-started-from-file",
+                "http://s"
+            ]
         );
         let mpv = external_argv("MPV", "mpv", "http://s", "/tmp/ipc");
         assert!(mpv[1].starts_with("--input-ipc-server=/tmp/ipc"));
-        assert_eq!(external_argv("MPC", "mpc", "http://s", "ipc"), vec!["mpc", "http://s"]);
+        assert_eq!(
+            external_argv("MPC", "mpc", "http://s", "ipc"),
+            vec!["mpc", "http://s"]
+        );
         assert_eq!(detect_from_path(r"C:\players\MpvPortable\mpv.exe"), "MPV");
         assert_eq!(detect_from_path("/usr/bin/mpc-hc"), "MPC");
     }
@@ -603,7 +629,10 @@ mod tests {
                 EngineAction::Reconnect(_)
             ));
         }
-        assert!(matches!(session.on_event(EngineEvent::Stalled), EngineAction::Stop));
+        assert!(matches!(
+            session.on_event(EngineEvent::Stalled),
+            EngineAction::Stop
+        ));
         assert!(matches!(session.state(), SessionState::Failed(_)));
         assert_eq!(session.adjust_volume(5), 100);
         assert_eq!(session.adjust_volume(-250), 0);
@@ -613,7 +642,10 @@ mod tests {
         assert!(!movie.live);
         vod.play(movie);
         vod.on_event(EngineEvent::Started);
-        assert!(matches!(vod.on_event(EngineEvent::Stalled), EngineAction::Stop));
+        assert!(matches!(
+            vod.on_event(EngineEvent::Stalled),
+            EngineAction::Stop
+        ));
     }
 
     #[test]

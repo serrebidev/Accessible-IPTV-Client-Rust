@@ -4,9 +4,9 @@ use iptv_core::{
     config::{self, Config},
     favorites::{channel_key, FavoriteSet, Toggle},
     playback::{
-        candidate_executables, detect_from_path, external_argv, player_choice,
-        resume_checkpoint, resume_position, EngineAction, EngineEvent, LaunchGate,
-        PlaybackRequest, PlaybackSession, PlayerChoice, SessionState,
+        candidate_executables, detect_from_path, external_argv, player_choice, resume_checkpoint,
+        resume_position, EngineAction, EngineEvent, LaunchGate, PlaybackRequest, PlaybackSession,
+        PlayerChoice, SessionState,
     },
     search::SearchResults,
     sources::PlaylistSource,
@@ -519,7 +519,7 @@ fn play_channel(
                 candidates.into_iter().next()
             };
             match exe {
-                Some(exe) => launch_external(player, &name, &exe, request, status),
+                Some(exe) => launch_external(player, &name, &exe, &request, status),
                 None => status.set_label(&format!("Could not locate {name} executable.")),
             }
         }
@@ -528,7 +528,7 @@ fn play_channel(
                 status.set_label("No custom player path is configured.");
             } else {
                 let name = detect_from_path(&path);
-                launch_external(player, &name, &path, request, status);
+                launch_external(player, &name, &path, &request, status);
             }
         }
     }
@@ -538,7 +538,7 @@ fn launch_external(
     player: &Rc<RefCell<PlayerState>>,
     name: &str,
     exe: &str,
-    request: PlaybackRequest,
+    request: &PlaybackRequest,
     status: Status,
 ) {
     let ipc = std::env::temp_dir()
@@ -586,11 +586,7 @@ fn play_builtin(
 /// Build the built-in player window once: video surface, Pause/Resume and
 /// Stop buttons, media events feeding the session, and a 1 s timer that
 /// checkpoints resume positions for seekable content.
-fn ensure_player_window(
-    player: &Rc<RefCell<PlayerState>>,
-    persist: &Persist,
-    status: Status,
-) {
+fn ensure_player_window(player: &Rc<RefCell<PlayerState>>, persist: &Persist, status: Status) {
     if player.borrow().window.is_some() {
         return;
     }
@@ -602,7 +598,9 @@ fn ensure_player_window(
     let panel = Panel::builder(&frame).build();
     let media = MediaCtrl::builder(&panel).build();
     media.set_accessibility_label("Video");
-    let pause = Button::builder(&panel).with_label("&Pause or resume").build();
+    let pause = Button::builder(&panel)
+        .with_label("&Pause or resume")
+        .build();
     pause.set_accessibility_label("Pause or resume");
     let stop = Button::builder(&panel).with_label("&Stop").build();
     stop.set_accessibility_label("Stop");
@@ -614,6 +612,20 @@ fn ensure_player_window(
     sizer.add_sizer(&buttons, 0, SizerFlag::Expand, 0);
     panel.set_sizer(sizer, true);
 
+    wire_player_events(player, persist, status, frame, media, pause, stop);
+    player.borrow_mut().window = Some((frame, media));
+}
+
+/// Timer, buttons, media events and close behavior for the player window.
+fn wire_player_events(
+    player: &Rc<RefCell<PlayerState>>,
+    persist: &Persist,
+    status: Status,
+    frame: Frame,
+    media: MediaCtrl,
+    pause: Button,
+    stop: Button,
+) {
     let timer = Rc::new(Timer::new(&frame));
     let tick_player = Rc::clone(player);
     let tick_persist = persist.clone();
@@ -664,9 +676,9 @@ fn ensure_player_window(
     let stopped_player = Rc::clone(player);
     media.on_stop(move |_| {
         let mut state = stopped_player.borrow_mut();
-        let near_end = state.window.is_some_and(|(_, media)| {
-            media.length() > 0 && media.tell() >= media.length() - 1500
-        });
+        let near_end = state
+            .window
+            .is_some_and(|(_, media)| media.length() > 0 && media.tell() >= media.length() - 1500);
         let event = if near_end {
             EngineEvent::Ended
         } else {
@@ -692,16 +704,11 @@ fn ensure_player_window(
         }
         event.skip(false);
     });
-    player.borrow_mut().window = Some((frame, media));
 }
 
 /// Persist the current position for seekable content (Python checkpoint
 /// rules decide whether it is kept).
-fn checkpoint_resume(
-    player: &Rc<RefCell<PlayerState>>,
-    persist: &Persist,
-    media: MediaCtrl,
-) {
+fn checkpoint_resume(player: &Rc<RefCell<PlayerState>>, persist: &Persist, media: MediaCtrl) {
     let state = player.borrow();
     if state.session.current().is_none_or(|r| r.live) {
         return;
@@ -719,13 +726,7 @@ fn checkpoint_resume(
     }
     let _ = channel;
     let mut entries = persist.resume_entries();
-    resume_checkpoint(
-        &mut entries,
-        &key,
-        position,
-        length,
-        now_ms() / 1000,
-    );
+    resume_checkpoint(&mut entries, &key, position, length, now_ms() / 1000);
     persist.save_resume(&entries);
 }
 
