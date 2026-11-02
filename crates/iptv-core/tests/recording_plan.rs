@@ -227,7 +227,7 @@ fn sanitization_and_collisions_protect_completed_and_part_paths() {
     assert_eq!(sanitize_filename(" A/B:C*?\"<>| D. "), "A B C D");
     assert_eq!(sanitize_filename("..."), "Recording");
     assert_eq!(sanitize_filename("CON"), "CON_");
-    assert_eq!(sanitize_filename("LPT1.txt"), "LPT1.txt_");
+    assert_eq!(sanitize_filename("LPT1.txt"), "LPT1_.txt");
     assert_eq!(sanitize_filename("Émission 東京"), "Émission 東京");
     assert_eq!(sanitize_filename(&"é".repeat(150)).chars().count(), 120);
     let input = channel("Show", "http://example.invalid/live");
@@ -258,6 +258,19 @@ fn sanitization_and_collisions_protect_completed_and_part_paths() {
         .output_path
         .to_string_lossy()
         .ends_with("Show - 2026-11-01 12-34-56 (3).mkv"));
+
+    let reserved = plan(
+        &channel("LPT1.txt", "http://example.invalid/live"),
+        "provider_mkv",
+    );
+    let reserved_name = reserved.output_path.file_name().unwrap().to_string_lossy();
+    assert!(reserved_name.starts_with("LPT1_.txt - "));
+    assert!(reserved
+        .part_path
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .starts_with("LPT1_.txt - "));
 }
 
 #[test]
@@ -378,8 +391,9 @@ fn selected_track_does_not_add_a_second_map_to_provider_mka() {
 #[test]
 fn truncation_keeps_reserved_and_trailing_dot_names_safe() {
     let reserved = format!("CON.{}", "a".repeat(116));
-    assert!(sanitize_filename(&reserved).chars().count() <= 120);
-    assert!(sanitize_filename(&reserved).ends_with('_'));
+    let safe_reserved = sanitize_filename(&reserved);
+    assert!(safe_reserved.chars().count() <= 120);
+    assert!(safe_reserved.starts_with("CON_."));
     let trailing_dot = format!("{}.", "a".repeat(119));
     assert!(!sanitize_filename(&trailing_dot).ends_with('.'));
 }

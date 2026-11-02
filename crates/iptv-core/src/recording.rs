@@ -209,10 +209,11 @@ pub fn sanitize_filename(name: &str) -> String {
         result = "Recording".to_string();
     }
     if windows_reserved(&result) {
+        let stem_end = result.find('.').unwrap_or(result.len());
         if result.chars().count() == 120 {
             result.pop();
         }
-        result.push('_');
+        result.insert(stem_end.min(result.len()), '_');
     }
     result
 }
