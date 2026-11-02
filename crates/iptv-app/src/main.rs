@@ -2,12 +2,15 @@ use iptv_core::{
     browser::{BrowseEvent, BrowserWorker},
     categories::Category,
     config::{self, Config},
+    epg::{local_hhmm, match_guide_channel, EpgGuide, EpgWorker, GuideIndexes},
     favorites::{channel_key, FavoriteSet, Toggle},
     playback::{
         candidate_executables, detect_from_path, external_argv, player_choice, resume_checkpoint,
         resume_position, EngineAction, EngineEvent, LaunchGate, PlaybackRequest, PlaybackSession,
         PlayerChoice, SessionState,
     },
+    providers::{ProviderAccount, ProviderEvent, ProviderWorker},
+    reminders::{normalize_reminders, Reminder, ReminderStatus},
     search::SearchResults,
     sources::PlaylistSource,
     Channel,
@@ -176,6 +179,13 @@ struct Wiring {
     model: Rc<RefCell<SearchResults>>,
     persist: Persist,
     player: Rc<RefCell<PlayerState>>,
+    epg: Rc<RefCell<Option<(EpgGuide, GuideIndexes)>>>,
+    epg_worker: Rc<EpgWorker>,
+    epg_pending: Rc<std::cell::Cell<bool>>,
+    reminders: Rc<RefCell<Vec<Reminder>>>,
+    provider_worker: Rc<ProviderWorker>,
+    provider_pending: Rc<std::cell::Cell<bool>>,
+    pending_resolve: Rc<RefCell<Option<Channel>>>,
 }
 
 /// Built-in player window state, created lazily on first use.
@@ -240,6 +250,25 @@ impl Persist {
         entries
     }
 
+    fn reminders(&self) -> Vec<Reminder> {
+        let rows: Vec<Reminder> = self
+            .config
+            .borrow()
+            .value("programme_reminders")
+            .and_then(|value| serde_json::from_value(value.clone()).ok())
+            .unwrap_or_default();
+        normalize_reminders(rows)
+    }
+
+    fn save_reminders(&self, rows: &[Reminder]) {
+        let mut config = self.config.borrow_mut();
+        config.set_value(
+            "programme_reminders",
+            serde_json::to_value(rows).unwrap_or(serde_json::Value::Null),
+        );
+        let _ = config.save(&self.path);
+    }
+
     fn save_resume(&self, entries: &BTreeMap<String, iptv_core::playback::ResumeEntry>) {
         let map: serde_json::Map<String, serde_json::Value> = entries
             .iter()
@@ -275,12 +304,29 @@ fn bind_browser(frame: Frame, controls: Controls, model: Rc<RefCell<SearchResult
             path: loaded.path,
         },
         player: Rc::new(RefCell::new(PlayerState::default())),
+        epg: Rc::new(RefCell::new(None)),
+        epg_worker: Rc::new(EpgWorker::new()),
+        epg_pending: Rc::new(std::cell::Cell::new(false)),
+        reminders: Rc::new(RefCell::new(Vec::new())),
+        provider_worker: Rc::new(ProviderWorker::new()),
+        provider_pending: Rc::new(std::cell::Cell::new(false)),
+        pending_resolve: Rc::new(RefCell::new(None)),
     };
-    let configured = wiring.persist.config.borrow().string_list("playlists");
-    if !configured.is_empty() {
-        let sources: Vec<PlaylistSource> =
-            configured.into_iter().map(PlaylistSource::new).collect();
+    *wiring.reminders.borrow_mut() = wiring.persist.reminders();
+    let epg_urls = wiring.persist.config.borrow().string_list("epg_urls");
+    if !epg_urls.is_empty() {
+        wiring.epg_worker.load(epg_urls);
+        wiring.epg_pending.set(true);
+        assert!(wiring.timer.start(50, false));
+    }
+    let (sources, accounts) = configured_entries(&wiring);
+    if !sources.is_empty() {
         wiring.browser.borrow_mut().load_sources(sources);
+        assert!(wiring.timer.start(50, false));
+    }
+    if !accounts.is_empty() {
+        wiring.provider_worker.load(accounts);
+        wiring.provider_pending.set(true);
         assert!(wiring.timer.start(50, false));
     }
     bind_completion(&wiring, controls);
@@ -314,7 +360,17 @@ fn bind_completion(wiring: &Wiring, controls: Controls) {
             }
             None => {}
         }
-        if !completed.browser.borrow().is_busy() {
+        poll_epg(&completed, status);
+        poll_providers(&completed, controls);
+        if !completed.browser.borrow().is_busy()
+            && !completed.epg_pending.get()
+            && !completed.provider_pending.get()
+            && !completed
+                .reminders
+                .borrow()
+                .iter()
+                .any(|r| r.status == ReminderStatus::Scheduled)
+        {
             if let Some(timer) = completed_timer.upgrade() {
                 timer.stop();
             }
@@ -450,6 +506,136 @@ fn bind_toggle(
     });
 }
 
+/// The configured `playlists` entries split into plain sources (strings)
+/// and provider accounts (typed dicts), as the Python loader treats them.
+fn configured_entries(wiring: &Wiring) -> (Vec<PlaylistSource>, Vec<ProviderAccount>) {
+    let value = wiring.persist.config.borrow().value("playlists").cloned();
+    let mut sources: Vec<PlaylistSource> = Vec::new();
+    let mut accounts: Vec<ProviderAccount> = Vec::new();
+    match value {
+        Some(serde_json::Value::Array(entries)) => {
+            for entry in &entries {
+                match entry {
+                    serde_json::Value::String(text) => {
+                        sources.push(PlaylistSource::new(text.clone()));
+                    }
+                    other => {
+                        if let Some(account) = ProviderAccount::from_config(other) {
+                            accounts.push(account);
+                        }
+                    }
+                }
+            }
+        }
+        Some(serde_json::Value::String(_)) => {
+            for text in wiring.persist.config.borrow().string_list("playlists") {
+                sources.push(PlaylistSource::new(text));
+            }
+        }
+        _ => {}
+    }
+    (sources, accounts)
+}
+
+/// Drain provider worker events on the poll tick: merged channels, guide
+/// sources, and a finished Stalker link resolution that completes a play.
+fn poll_providers(wiring: &Wiring, controls: Controls) {
+    let status = controls.status;
+    while let Some(event) = wiring.provider_worker.try_recv() {
+        match event {
+            ProviderEvent::Loaded {
+                channels,
+                epg_urls,
+                failures,
+            } => {
+                wiring.provider_pending.set(false);
+                let count = channels.len();
+                if count > 0 {
+                    wiring
+                        .browser
+                        .borrow_mut()
+                        .add_channels(channels, &controls.search.get_value());
+                    status.set_label(&format!("{count} provider channels loaded."));
+                    assert!(wiring.timer.start(50, false));
+                }
+                if !epg_urls.is_empty() {
+                    wiring.epg_worker.load(epg_urls);
+                    wiring.epg_pending.set(true);
+                    assert!(wiring.timer.start(50, false));
+                }
+                for failure in failures {
+                    status.set_label(&failure);
+                }
+            }
+            ProviderEvent::Resolved(result) => {
+                let pending = wiring.pending_resolve.borrow_mut().take();
+                match (pending, result) {
+                    (Some(mut channel), Ok(url)) => {
+                        channel.url = url;
+                        play_channel(&wiring.player, &wiring.persist, &channel, status);
+                    }
+                    (_, Err(error)) => status.set_label(&error),
+                    (None, Ok(_)) => {}
+                }
+            }
+            ProviderEvent::Account(result) => match result {
+                Ok(report) => {
+                    let first = report.lines().next().unwrap_or_default().to_string();
+                    status.set_label(&first);
+                }
+                Err(error) => status.set_label(&error),
+            },
+        }
+    }
+}
+
+/// Drain a finished guide load and fire due reminders; runs on the main
+/// poll tick alongside browse completion.
+fn poll_epg(wiring: &Wiring, status: Status) {
+    if let Some(result) = wiring.epg_worker.try_recv() {
+        wiring.epg_pending.set(false);
+        match result {
+            Ok(guide) => {
+                let counts = (guide.channels.len(), guide.programme_count());
+                let indexes = GuideIndexes::build(&guide.channels);
+                *wiring.epg.borrow_mut() = Some((guide, indexes));
+                status.set_label(&format!(
+                    "Guide loaded: {} channels, {} programmes.",
+                    counts.0, counts.1
+                ));
+            }
+            Err(error) => status.set_label(&format!("Guide failed to load: {error}")),
+        }
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(0));
+    let mut changed = false;
+    let mut fired: Vec<String> = Vec::new();
+    for reminder in wiring.reminders.borrow_mut().iter_mut() {
+        if reminder.is_due(now) {
+            reminder.status = ReminderStatus::Notified;
+            changed = true;
+            fired.push(format!(
+                "Reminder: {} on {} starts at {}.",
+                reminder.title,
+                reminder.channel,
+                local_hhmm(reminder.start)
+            ));
+        } else if reminder.is_expired(now) {
+            reminder.status = ReminderStatus::Expired;
+            changed = true;
+        }
+    }
+    if changed {
+        let rows = wiring.reminders.borrow().clone();
+        wiring.persist.save_reminders(&rows);
+    }
+    if let Some(first) = fired.first() {
+        status.set_label(first);
+    }
+}
+
 /// Enter (item activation) on Channels plays the selected channel through
 /// the configured player: the built-in window, or an external player.
 fn bind_playback(wiring: &Wiring, list: ListCtrl, status: Status) {
@@ -457,6 +643,9 @@ fn bind_playback(wiring: &Wiring, list: ListCtrl, status: Status) {
     let model = Rc::clone(&wiring.model);
     let player = Rc::clone(&wiring.player);
     let persist = wiring.persist.clone();
+    let provider_worker = Rc::clone(&wiring.provider_worker);
+    let pending_resolve = Rc::clone(&wiring.pending_resolve);
+    let timer = Rc::clone(&wiring.timer);
     list.on_item_activated(move |_| {
         let selected = usize::try_from(list.get_first_selected_item()).ok();
         let focused =
@@ -474,7 +663,70 @@ fn bind_playback(wiring: &Wiring, list: ListCtrl, status: Status) {
             status.set_label("No channel selected. Choose a channel in Channels first.");
             return;
         };
+        if channel.url.is_empty()
+            && channel
+                .unknown_attributes
+                .get("provider-type")
+                .map(String::as_str)
+                == Some("stalker")
+        {
+            let Some(key) = channel.unknown_attributes.get("provider-id").cloned() else {
+                status.set_label("This Stalker channel has no provider account configured.");
+                return;
+            };
+            *pending_resolve.borrow_mut() = Some(channel.clone());
+            provider_worker.resolve(key, channel.unknown_attributes.clone());
+            status.set_label("Resolving stream link...");
+            assert!(timer.start(50, false));
+            return;
+        }
         play_channel(&player, &persist, &channel, status);
+    });
+    bind_epg_highlight(wiring, list, status);
+}
+
+/// Moving through Channels announces the highlighted channel's now/next
+/// programme from the loaded guide, when it has one.
+fn bind_epg_highlight(wiring: &Wiring, list: ListCtrl, status: Status) {
+    let browser = Rc::clone(&wiring.browser);
+    let model = Rc::clone(&wiring.model);
+    let epg = Rc::clone(&wiring.epg);
+    list.on_item_selected(move |event| {
+        let Some(row) = usize::try_from(event.get_item_index()).ok() else {
+            return;
+        };
+        let Some(index) = model.borrow().playlist_index(row) else {
+            return;
+        };
+        let Some(channel) = browser.borrow().channel(index) else {
+            return;
+        };
+        let guard = epg.borrow();
+        let Some((guide, indexes)) = guard.as_ref() else {
+            return;
+        };
+        let known: std::collections::HashSet<String> =
+            guide.channels.iter().map(|c| c.id.to_lowercase()).collect();
+        let Some(guide_id) = match_guide_channel(&channel, indexes, Some(&known)) else {
+            status.set_label("No guide information for this channel.");
+            return;
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(0));
+        let (current, next) = guide.now_next(&guide_id, now);
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(p) = current {
+            parts.push(format!("Now: {} until {}.", p.title, local_hhmm(p.stop)));
+        }
+        if let Some(p) = next {
+            parts.push(format!("Next: {} at {}.", p.title, local_hhmm(p.start)));
+        }
+        if parts.is_empty() {
+            status.set_label("No guide information for this channel.");
+        } else {
+            status.set_label(&parts.join(" "));
+        }
     });
 }
 
