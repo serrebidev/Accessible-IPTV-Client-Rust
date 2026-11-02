@@ -5,6 +5,7 @@ ureq.workspace = true
 quick-xml.workspace = true
 flate2.workspace = true
 chrono.workspace = true
+chrono-tz.workspace = true
 serde.workspace = true
 
 [package]
