@@ -2,6 +2,7 @@ use iptv_core::{
     browser::{BrowseEvent, BrowserWorker},
     categories::Category,
     config::{self, Config},
+    dvr::{channel_from_snapshot, DvrAction, DvrSchedule},
     epg::{local_hhmm, match_guide_channel, EpgGuide, EpgWorker, GuideIndexes},
     favorites::{channel_key, FavoriteSet, Toggle},
     playback::{
@@ -10,6 +11,7 @@ use iptv_core::{
         PlayerChoice, SessionState,
     },
     providers::{ProviderAccount, ProviderEvent, ProviderWorker},
+    recording::{self, RecordingEngine},
     reminders::{normalize_reminders, Reminder, ReminderStatus},
     search::SearchResults,
     sources::PlaylistSource,
@@ -39,6 +41,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .with_label("&Cancel loading")
             .build();
         cancel.set_accessibility_label("Cancel loading");
+        let record = record_button(panel);
         let (category_label, category, toggle_favorite) = category_controls(panel);
         let search_label = StaticText::builder(&panel)
             .with_label("&Search channels")
@@ -95,6 +98,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Controls {
                 open,
                 cancel,
+                record,
                 category,
                 toggle_favorite,
                 search,
@@ -164,6 +168,7 @@ impl Status {
 struct Controls {
     open: Button,
     cancel: Button,
+    record: Button,
     category: ListBox,
     toggle_favorite: Button,
     search: TextCtrl,
@@ -186,6 +191,11 @@ struct Wiring {
     provider_worker: Rc<ProviderWorker>,
     provider_pending: Rc<std::cell::Cell<bool>>,
     pending_resolve: Rc<RefCell<Option<Channel>>>,
+    recordings: Rc<RefCell<RecordingEngine>>,
+    dvr: Rc<RefCell<DvrSchedule>>,
+    recorded: Rc<std::cell::Cell<bool>>,
+    shutdown_attempted: Rc<std::cell::Cell<bool>>,
+    last_dvr_tick: Rc<std::cell::Cell<f64>>,
 }
 
 /// Built-in player window state, created lazily on first use.
@@ -289,9 +299,20 @@ impl Persist {
     }
 }
 
+/// The Record toggle button for the main window.
+fn record_button(panel: Panel) -> Button {
+    let record = Button::builder(&panel).with_label("&Record").build();
+    record.set_accessibility_label("Record");
+    record.set_accessibility_description(
+        "Start or stop recording the selected channel to the recordings folder.",
+    );
+    record
+}
+
 fn bind_browser(frame: Frame, controls: Controls, model: Rc<RefCell<SearchResults>>) {
     let candidates = config::config_candidates();
     let loaded = config::load(&candidates, &candidates[0]);
+    let dvr_path = iptv_core::dvr::schedule_path(&loaded.path);
     let mut browser_worker = BrowserWorker::default();
     browser_worker.set_favorites(FavoriteSet::from_stored(loaded.config.favorites()));
     let wiring = Wiring {
@@ -311,8 +332,16 @@ fn bind_browser(frame: Frame, controls: Controls, model: Rc<RefCell<SearchResult
         provider_worker: Rc::new(ProviderWorker::new()),
         provider_pending: Rc::new(std::cell::Cell::new(false)),
         pending_resolve: Rc::new(RefCell::new(None)),
+        recordings: Rc::new(RefCell::new(RecordingEngine::new())),
+        dvr: Rc::new(RefCell::new(DvrSchedule::load(dvr_path, now_seconds()))),
+        recorded: Rc::new(std::cell::Cell::new(false)),
+        shutdown_attempted: Rc::new(std::cell::Cell::new(false)),
+        last_dvr_tick: Rc::new(std::cell::Cell::new(0.0)),
     };
     *wiring.reminders.borrow_mut() = wiring.persist.reminders();
+    if wiring.dvr.borrow().pending_count() > 0 {
+        assert!(wiring.timer.start(50, false));
+    }
     let epg_urls = wiring.persist.config.borrow().string_list("epg_urls");
     if !epg_urls.is_empty() {
         wiring.epg_worker.load(epg_urls);
@@ -330,6 +359,7 @@ fn bind_browser(frame: Frame, controls: Controls, model: Rc<RefCell<SearchResult
         assert!(wiring.timer.start(50, false));
     }
     bind_completion(&wiring, controls);
+    bind_recording(&wiring, controls);
     bind_actions(frame, &wiring, controls);
     let browser = Rc::clone(&wiring.browser);
     let timer = Rc::clone(&wiring.timer);
@@ -362,6 +392,7 @@ fn bind_completion(wiring: &Wiring, controls: Controls) {
         }
         poll_epg(&completed, status);
         poll_providers(&completed, controls);
+        poll_recordings(&completed, status);
         if !completed.browser.borrow().is_busy()
             && !completed.epg_pending.get()
             && !completed.provider_pending.get()
@@ -370,6 +401,8 @@ fn bind_completion(wiring: &Wiring, controls: Controls) {
                 .borrow()
                 .iter()
                 .any(|r| r.status == ReminderStatus::Scheduled)
+            && completed.recordings.borrow().active_count() == 0
+            && completed.dvr.borrow().pending_count() == 0
         {
             if let Some(timer) = completed_timer.upgrade() {
                 timer.stop();
@@ -382,6 +415,7 @@ fn bind_actions(frame: Frame, wiring: &Wiring, controls: Controls) {
     let Controls {
         open,
         cancel,
+        record: _,
         category,
         toggle_favorite,
         search,
@@ -638,6 +672,237 @@ fn poll_epg(wiring: &Wiring, status: Status) {
 
 /// Enter (item activation) on Channels plays the selected channel through
 /// the configured player: the built-in window, or an external player.
+fn bind_recording(wiring: &Wiring, controls: Controls) {
+    let record = controls.record;
+    let list = controls.list;
+    let status = controls.status;
+    let browser = Rc::clone(&wiring.browser);
+    let model = Rc::clone(&wiring.model);
+    let recordings = Rc::clone(&wiring.recordings);
+    let persist = wiring.persist.clone();
+    let timer = Rc::clone(&wiring.timer);
+    record.on_click(move |_| {
+        let Some(channel) = selected_channel(&browser, &model, list) else {
+            status.set_label("No channel selected. Choose a channel in Channels first.");
+            return;
+        };
+        toggle_recording(&recordings, &persist, &channel, status);
+        assert!(timer.start(50, false));
+    });
+}
+
+/// The channel behind the list's current selection, if any.
+fn selected_channel(
+    browser: &Rc<RefCell<BrowserWorker>>,
+    model: &Rc<RefCell<SearchResults>>,
+    list: ListCtrl,
+) -> Option<Channel> {
+    let selected = usize::try_from(list.get_first_selected_item()).ok();
+    let focused =
+        usize::try_from(list.get_next_item(-1, ListNextItemFlag::All, ListItemState::Focused)).ok();
+    let row = pick_row(selected, focused)?;
+    let index = model.borrow().playlist_index(row)?;
+    browser.borrow().channel(index)
+}
+
+/// Start or stop a manual recording of the channel.
+fn toggle_recording(
+    recordings: &Rc<RefCell<RecordingEngine>>,
+    persist: &Persist,
+    channel: &Channel,
+    status: Status,
+) {
+    let key = channel_key(channel);
+    if recordings.borrow().is_recording(&key) {
+        recordings.borrow_mut().stop(&key);
+        status.set_label(&format!("Stopping recording of {}.", channel.name));
+        return;
+    }
+    if channel.url.is_empty() {
+        status.set_label("This channel's stream link must be resolved before recording.");
+        return;
+    }
+    let format = persist
+        .config
+        .borrow()
+        .string_or("recording_format", "provider_mkv");
+    match start_recording(
+        recordings,
+        persist,
+        &key,
+        channel,
+        &format,
+        &channel.name.clone(),
+    ) {
+        Ok(path) => status.set_label(&format!(
+            "Recording {} to {}.",
+            channel.name,
+            path.display()
+        )),
+        Err(error) => status.set_label(&error),
+    }
+}
+
+/// Spawn ffmpeg for one recording; returns the output path.
+fn start_recording(
+    recordings: &Rc<RefCell<RecordingEngine>>,
+    persist: &Persist,
+    key: &str,
+    channel: &Channel,
+    format: &str,
+    display_name: &str,
+) -> Result<PathBuf, String> {
+    let dir = recordings_dir(persist);
+    let stamp = chrono::Local::now().format("%Y-%m-%d %H-%M-%S").to_string();
+    let in_use = recordings.borrow().in_use_paths();
+    let out = recording::unique_output_path(
+        &dir,
+        display_name,
+        recording::format_extension(format),
+        &stamp,
+        &in_use,
+    );
+    let headers = iptv_core::playback::StreamHeaders::for_channel(channel);
+    let (clean_url, _) = iptv_core::playback::split_stream_modifiers(&channel.url);
+    let cmd = recording::ffmpeg_command(
+        "ffmpeg",
+        &clean_url,
+        &out.to_string_lossy(),
+        format,
+        &headers,
+        &recording::FfmpegOptions {
+            show_stats: true,
+            ..recording::FfmpegOptions::default()
+        },
+    );
+    recordings.borrow_mut().start(key, &cmd, out.clone())?;
+    Ok(out)
+}
+
+/// The recordings folder: the configured path, else
+/// ~/Videos/Accessible IPTV Recordings like the reference default.
+fn recordings_dir(persist: &Persist) -> PathBuf {
+    let configured = persist.config.borrow().string_or("recordings_dir", "");
+    if !configured.trim().is_empty() {
+        return PathBuf::from(configured.trim());
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    PathBuf::from(home)
+        .join("Videos")
+        .join("Accessible IPTV Recordings")
+}
+
+/// Start one due DVR job's recording (or fail the job with the reason).
+fn start_dvr_job(wiring: &Wiring, status: Status, job_id: &str, now: f64) {
+    let Some(job) = wiring.dvr.borrow().get(job_id).cloned() else {
+        return;
+    };
+    let channel = channel_from_snapshot(&job.channel);
+    if channel.url.is_empty() {
+        wiring.dvr.borrow_mut().mark_finished(
+            job_id,
+            false,
+            "",
+            "Scheduled recordings from portal channels are not supported yet.",
+            now,
+        );
+        return;
+    }
+    let display = if job.title.is_empty() {
+        channel.name.clone()
+    } else {
+        job.title.clone()
+    };
+    match start_recording(
+        &wiring.recordings,
+        &wiring.persist,
+        &format!("dvr:{job_id}"),
+        &channel,
+        &job.format.clone(),
+        &display,
+    ) {
+        Ok(_) => status.set_label(&format!("Recording {display}.")),
+        Err(error) => {
+            wiring
+                .dvr
+                .borrow_mut()
+                .mark_finished(job_id, false, "", &error, now);
+        }
+    }
+}
+
+/// Per-tick recording housekeeping: collect finishes, run the DVR
+/// state machine (every 10 s, like the reference poll), and apply the
+/// shutdown-after-recordings gate.
+fn poll_recordings(wiring: &Wiring, status: Status) {
+    let now = now_seconds();
+    for finished in wiring.recordings.borrow_mut().poll_finished() {
+        wiring.recorded.set(true);
+        let name = finished
+            .out_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_string();
+        if let Some(job_id) = finished.key.strip_prefix("dvr:") {
+            wiring.dvr.borrow_mut().mark_finished(
+                job_id,
+                finished.success,
+                &finished.out_path.to_string_lossy(),
+                "",
+                now,
+            );
+        }
+        if finished.success {
+            status.set_label(&format!("Recording saved: {name}"));
+        } else {
+            status.set_label(&format!("Recording failed: {name}"));
+        }
+    }
+    if now - wiring.last_dvr_tick.get() >= 10.0 {
+        wiring.last_dvr_tick.set(now);
+        let actions = wiring.dvr.borrow_mut().tick(now);
+        for action in actions {
+            match action {
+                DvrAction::Stop(job_id) => {
+                    wiring
+                        .recordings
+                        .borrow_mut()
+                        .stop(&format!("dvr:{job_id}"));
+                }
+                DvrAction::Start(job_id) => start_dvr_job(wiring, status, &job_id, now),
+            }
+        }
+    }
+    let armed = wiring
+        .persist
+        .config
+        .borrow()
+        .bool_or("shutdown_after_recordings", false);
+    if !wiring.shutdown_attempted.get()
+        && recording::should_shutdown(
+            armed,
+            wiring.recorded.get(),
+            wiring.recordings.borrow().active_count(),
+            wiring.dvr.borrow().pending_count(),
+        )
+    {
+        wiring.shutdown_attempted.set(true);
+        let system = if cfg!(windows) {
+            "windows"
+        } else if cfg!(target_os = "macos") {
+            "darwin"
+        } else {
+            "linux"
+        };
+        let root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
+        match recording::shutdown_computer(system, &root) {
+            Ok(_) => status.set_label("All recordings finished. Shutting down."),
+            Err(error) => status.set_label(&format!("Shutdown failed: {error}")),
+        }
+    }
+}
+
 fn bind_playback(wiring: &Wiring, list: ListCtrl, status: Status) {
     let browser = Rc::clone(&wiring.browser);
     let model = Rc::clone(&wiring.model);
@@ -728,6 +993,13 @@ fn bind_epg_highlight(wiring: &Wiring, list: ListCtrl, status: Status) {
             status.set_label(&parts.join(" "));
         }
     });
+}
+
+#[allow(clippy::cast_precision_loss)] // epoch seconds fit comfortably for schedule math
+fn now_seconds() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0.0, |d| d.as_secs() as f64)
 }
 
 fn now_ms() -> i64 {
