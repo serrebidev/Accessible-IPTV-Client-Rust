@@ -447,6 +447,26 @@ impl RecordingEngine {
 }
 
 /// Whether the computer may shut down now (port of
+/// Minimum free space required before a recording may start.
+pub const MIN_FREE_BYTES: u64 = 500 * 1024 * 1024;
+
+/// Free bytes on the filesystem holding `path`, when the
+/// platform can report it (Unix `df`; `None` elsewhere, which
+/// skips the gate).
+#[must_use]
+pub fn free_space_bytes(path: &std::path::Path) -> Option<u64> {
+    if !cfg!(unix) {
+        return None;
+    }
+    let output = std::process::Command::new("df")
+        .args(["-B1", "--output=avail"])
+        .arg(path)
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    text.lines().nth(1)?.trim().parse().ok()
+}
+
 /// `power.should_shutdown`): the option must be armed, at least one
 /// recording must actually have run, and nothing may be active or
 /// pending.
