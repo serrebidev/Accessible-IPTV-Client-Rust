@@ -876,10 +876,12 @@ enum ProviderJob {
     SetCacheDir(std::path::PathBuf),
     Load(Vec<ProviderAccount>),
     Resolve {
+        request: u64,
         provider_id: String,
         data: BTreeMap<String, String>,
     },
     ResolveCatchup {
+        request: u64,
         provider_id: String,
         data: BTreeMap<String, String>,
         start_text: String,
@@ -897,7 +899,14 @@ pub enum ProviderEvent {
         epg_urls: Vec<String>,
         failures: Vec<String>,
     },
-    Resolved(ProviderResult<String>),
+    /// A resolution finished; `request` correlates the result
+    /// with the caller's dispatch.
+    Resolved {
+        /// The opaque request identifier from dispatch.
+        request: u64,
+        /// The resolved URL or the failure message.
+        result: ProviderResult<String>,
+    },
     Account(ProviderResult<String>),
 }
 
@@ -1108,16 +1117,21 @@ impl ProviderWorker {
                         handle_load(accounts, &mut clients, cache_dir.as_deref())
                     }
                     ProviderJob::SetCacheDir(_) => unreachable!(),
-                    ProviderJob::Resolve { provider_id, data } => {
+                    ProviderJob::Resolve {
+                        request,
+                        provider_id,
+                        data,
+                    } => {
                         let result = match clients.get(&provider_id) {
                             Some((_, Client::Stalker(client))) => {
                                 client.resolve_stream(&data, now_epoch())
                             }
                             _ => Err("No Stalker portal for this channel".to_string()),
                         };
-                        ProviderEvent::Resolved(result)
+                        ProviderEvent::Resolved { request, result }
                     }
                     ProviderJob::ResolveCatchup {
+                        request,
                         provider_id,
                         data,
                         start_text,
@@ -1132,7 +1146,7 @@ impl ProviderWorker {
                             ),
                             _ => Err("No Stalker portal for this channel".to_string()),
                         };
-                        ProviderEvent::Resolved(result)
+                        ProviderEvent::Resolved { request, result }
                     }
                     ProviderJob::Account { provider_id } => {
                         let result = match clients.get(&provider_id) {
@@ -1170,12 +1184,14 @@ impl ProviderWorker {
 
     pub fn resolve_catchup(
         &self,
+        request: u64,
         provider_id: String,
         data: BTreeMap<String, String>,
         start_text: String,
         duration_minutes: i64,
     ) {
         let _ = self.jobs.send(ProviderJob::ResolveCatchup {
+            request,
             provider_id,
             data,
             start_text,
@@ -1183,8 +1199,12 @@ impl ProviderWorker {
         });
     }
 
-    pub fn resolve(&self, provider_id: String, data: BTreeMap<String, String>) {
-        let _ = self.jobs.send(ProviderJob::Resolve { provider_id, data });
+    pub fn resolve(&self, request: u64, provider_id: String, data: BTreeMap<String, String>) {
+        let _ = self.jobs.send(ProviderJob::Resolve {
+            request,
+            provider_id,
+            data,
+        });
     }
 
     pub fn account(&self, provider_id: String) {
@@ -1703,5 +1723,37 @@ mod tests {
         .expect("xtream");
         assert_eq!(xtream.provider_id().as_deref(), Some("prov1"));
         assert!(ProviderAccount::from_config(&serde_json::json!({"type": "m3u"})).is_none());
+    }
+
+    #[test]
+    fn resolution_results_carry_their_request_id() {
+        // Issue #68: with no portal loaded every resolution fails,
+        // but each result must still arrive tagged with the exact
+        // request id it was dispatched with, in dispatch order, so
+        // callers can never consume each other's results.
+        let worker = ProviderWorker::new();
+        let data = std::collections::BTreeMap::new();
+        worker.resolve(41, "missing".to_string(), data.clone());
+        worker.resolve_catchup(
+            42,
+            "missing".to_string(),
+            data.clone(),
+            "2026-01-01 00:00:00".to_string(),
+            30,
+        );
+        worker.resolve(43, "missing".to_string(), data);
+        let mut ids = Vec::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while ids.len() < 3 && std::time::Instant::now() < deadline {
+            match worker.try_recv() {
+                Some(ProviderEvent::Resolved { request, result }) => {
+                    assert!(result.is_err());
+                    ids.push(request);
+                }
+                Some(_) => {}
+                None => std::thread::sleep(std::time::Duration::from_millis(10)),
+            }
+        }
+        assert_eq!(ids, vec![41, 42, 43]);
     }
 }
