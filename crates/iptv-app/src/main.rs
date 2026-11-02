@@ -1,6 +1,7 @@
 use iptv_core::{
     browser::{BrowseEvent, BrowserWorker},
     category::Category,
+    favorites::ToggleOutcome,
     search::SearchResults,
 };
 use std::{cell::RefCell, rc::Rc};
@@ -31,8 +32,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .build();
         let category = Choice::builder(&panel).build();
         category.set_accessibility_label("Categories");
-        category.set_accessibility_description("Choose All Channels or a playlist group with arrow keys. Tab moves to Search channels; Shift+Tab returns to Cancel loading.");
+        category.set_accessibility_description("Choose All Channels, Favorites or a playlist group with arrow keys. Tab moves to Search channels; Shift+Tab returns to Cancel loading.");
         category.append("All Channels");
+        category.append("Favorites");
         category.set_selection(0);
         let search_label = StaticText::builder(&panel)
             .with_label("&Search channels")
@@ -44,25 +46,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         search.set_accessibility_description("Type to filter channel names. Tab or Enter moves to Channels; Shift+Tab returns to Categories.");
         // Keep the label immediately before the list for native MSW accessible naming.
         let label = StaticText::builder(&panel).with_label("Channels").build();
-        let list = ListCtrl::builder(&panel)
-            .with_style(
-                ListCtrlStyle::Report
-                    | ListCtrlStyle::NoHeader
-                    | ListCtrlStyle::SingleSel
-                    | ListCtrlStyle::Virtual,
-            )
-            .build();
-        list.set_accessibility_label("Channels");
-        list.set_accessibility_description("No playlist loaded. Channel list is empty.");
-        list.insert_column(0, "Channels", ListColumnFormat::Left, 640);
-        // ListCtrl does not implement WindowEvents in wxDragon 0.9.24.
-        list.bind_internal(EventType::SIZE, move |event| {
-            let width = list.get_client_size().width;
-            if width > 0 {
-                list.set_column_width(0, width);
-            }
-            event.skip(true);
-        });
+        let list = build_channel_list(panel);
 
         let model = Rc::new(RefCell::new(SearchResults::default()));
         let rows = Rc::clone(&model);
@@ -70,6 +54,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             channel_text(&rows.borrow(), index, column)
         }));
         list.set_item_count(0);
+
+        let favorite = Button::builder(&panel)
+            .with_label("Toggle &favorite")
+            .build();
+        favorite.set_accessibility_label("Toggle favorite");
+        favorite.set_accessibility_description("Add or remove the focused channel from Favorites. Tab moves to Playlist status; Shift+Tab returns to Channels.");
 
         let status_label = StaticText::builder(&panel)
             .with_label("Playlist status")
@@ -88,7 +78,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             frame,
             open,
             cancel,
-            Filters { search, category },
+            Filters {
+                search,
+                category,
+                favorite,
+            },
             list,
             status,
             model,
@@ -102,6 +96,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         layout.add(&search, 0, SizerFlag::Expand | SizerFlag::All, 8);
         layout.add(&label, 0, SizerFlag::All, 8);
         layout.add(&list, 1, SizerFlag::Expand | SizerFlag::All, 8);
+        layout.add(&favorite, 0, SizerFlag::All, 8);
         layout.add(&status_label, 0, SizerFlag::All, 8);
         layout.add(&details, 0, SizerFlag::Expand | SizerFlag::All, 8);
         panel.set_sizer(layout, true);
@@ -114,6 +109,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         frame.centre();
         list.set_focus();
     })
+}
+
+fn build_channel_list(panel: Panel) -> ListCtrl {
+    let list = ListCtrl::builder(&panel)
+        .with_style(
+            ListCtrlStyle::Report
+                | ListCtrlStyle::NoHeader
+                | ListCtrlStyle::SingleSel
+                | ListCtrlStyle::Virtual,
+        )
+        .build();
+    list.set_accessibility_label("Channels");
+    list.set_accessibility_description("No playlist loaded. Channel list is empty.");
+    list.insert_column(0, "Channels", ListColumnFormat::Left, 640);
+    // ListCtrl does not implement WindowEvents in wxDragon 0.9.24.
+    list.bind_internal(EventType::SIZE, move |event| {
+        let width = list.get_client_size().width;
+        if width > 0 {
+            list.set_column_width(0, width);
+        }
+        event.skip(true);
+    });
+    list
 }
 
 #[derive(Clone, Copy)]
@@ -133,6 +151,7 @@ impl Status {
 struct Filters {
     search: TextCtrl,
     category: Choice,
+    favorite: Button,
 }
 
 fn bind_browser(
@@ -144,7 +163,11 @@ fn bind_browser(
     status: Status,
     model: Rc<RefCell<SearchResults>>,
 ) {
-    let Filters { search, category } = filters;
+    let Filters {
+        search,
+        category,
+        favorite: _,
+    } = filters;
     let browser = Rc::new(RefCell::new(BrowserWorker::default()));
     let timer = Rc::new(Timer::new(&frame));
     let completed_timer = Rc::downgrade(&timer);
@@ -154,20 +177,7 @@ fn bind_browser(
         let event = completed_browser.borrow_mut().poll(&search.get_value());
         match event {
             Some(BrowseEvent::Results(results)) => {
-                if results.categories() != completed_model.borrow().categories() {
-                    category.clear();
-                    for entry in results.categories() {
-                        category.append(&category_text(entry));
-                    }
-                }
-                if let Some(index) = results
-                    .categories()
-                    .iter()
-                    .position(|entry| entry == results.category())
-                    .and_then(|index| u32::try_from(index).ok())
-                {
-                    category.set_selection(index);
-                }
+                publish_categories(category, &results, &completed_model.borrow());
                 publish_results(list, status, &completed_model, results);
             }
             Some(BrowseEvent::Recovery(error)) => {
@@ -184,10 +194,15 @@ fn bind_browser(
     });
     let category_browser = Rc::clone(&browser);
     let poll_category = Rc::clone(&timer);
+    let category_model = Rc::clone(&model);
     category.on_selection_changed(move |_| {
-        let selected = category
-            .get_selection()
-            .and_then(|index| model.borrow().categories().get(index as usize).cloned());
+        let selected = category.get_selection().and_then(|index| {
+            category_model
+                .borrow()
+                .categories()
+                .get(index as usize)
+                .cloned()
+        });
         if let Some(selected) = selected {
             category_browser
                 .borrow_mut()
@@ -210,6 +225,15 @@ fn bind_browser(
     // Only an explicit user action moves keyboard focus. A late completion can
     // update item state but never interrupt a new editing session in Search.
     search.on_text_enter(move |_| list.set_focus());
+
+    bind_favorite(
+        filters,
+        list,
+        status,
+        model,
+        Rc::clone(&browser),
+        Rc::clone(&timer),
+    );
 
     let request = Rc::clone(&browser);
     let poll = Rc::clone(&timer);
@@ -243,6 +267,53 @@ fn bind_browser(
         timer.stop();
         event.skip(true);
     });
+}
+
+fn bind_favorite(
+    filters: Filters,
+    list: ListCtrl,
+    status: Status,
+    model: Rc<RefCell<SearchResults>>,
+    browser: Rc<RefCell<BrowserWorker>>,
+    timer: Rc<Timer<Frame>>,
+) {
+    let Filters {
+        search, favorite, ..
+    } = filters;
+    let favorite_browser = browser;
+    let poll_favorite = timer;
+    favorite.on_click(move |_| {
+        let focused =
+            usize::try_from(list.get_next_item(-1, ListNextItemFlag::All, ListItemState::Focused))
+                .ok();
+        let message = toggle_focused(
+            &mut favorite_browser.borrow_mut(),
+            &model.borrow(),
+            focused,
+            search.get_value(),
+        );
+        status.set_label(&message);
+        if favorite_browser.borrow().is_busy() {
+            assert!(poll_favorite.start(50, false));
+        }
+    });
+}
+
+fn publish_categories(category: Choice, results: &SearchResults, previous: &SearchResults) {
+    if results.categories() != previous.categories() {
+        category.clear();
+        for entry in results.categories() {
+            category.append(&category_text(entry));
+        }
+    }
+    if let Some(index) = results
+        .categories()
+        .iter()
+        .position(|entry| entry == results.category())
+        .and_then(|index| u32::try_from(index).ok())
+    {
+        category.set_selection(index);
+    }
 }
 
 fn publish_results(
@@ -308,10 +379,35 @@ fn publish_results(
 
 fn category_text(category: &Category) -> String {
     match category {
-        Category::Group(name) if name == "All Channels" => {
-            "All Channels (playlist group)".to_owned()
+        Category::Group(name) if name == "All Channels" || name == "Favorites" => {
+            format!("{name} (playlist group)")
         }
         _ => category.label().to_owned(),
+    }
+}
+
+// A native button has one command handler for Space, Enter, mnemonic and mouse.
+// This adapter never requests keyboard focus or uses a stream URL as feedback.
+fn toggle_focused(
+    browser: &mut BrowserWorker,
+    model: &SearchResults,
+    focused: Option<usize>,
+    query: String,
+) -> String {
+    let Some(row) = focused else {
+        return "Select a channel first. Favorites unchanged.".to_owned();
+    };
+    match browser.toggle_favorite(model, row, query) {
+        Some(ToggleOutcome::Added) => format!(
+            "{} added to Favorites.",
+            channel_text(model, i64::try_from(row).unwrap_or(-1), 0)
+        ),
+        Some(ToggleOutcome::Removed) => format!(
+            "{} removed from Favorites.",
+            channel_text(model, i64::try_from(row).unwrap_or(-1), 0)
+        ),
+        Some(ToggleOutcome::Unkeyable) => "This entry cannot be added to Favorites.".to_owned(),
+        None => "Select a current channel first. Favorites unchanged.".to_owned(),
     }
 }
 
@@ -341,6 +437,11 @@ mod tests {
     #[test]
     fn category_identity_does_not_depend_on_the_accessible_label() {
         assert_eq!(category_text(&Category::All), "All Channels");
+        assert_eq!(category_text(&Category::Favorites), "Favorites");
+        assert_eq!(
+            category_text(&Category::Group("Favorites".into())),
+            "Favorites (playlist group)"
+        );
         assert_eq!(
             category_text(&Category::Group("All Channels".into())),
             "All Channels (playlist group)"
@@ -349,6 +450,63 @@ mod tests {
             category_text(&Category::Group("News / Local".into())),
             "News / Local"
         );
+    }
+
+    fn wait(browser: &mut BrowserWorker) -> SearchResults {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if let Some(event) = browser.poll("") {
+                return match event {
+                    BrowseEvent::Results(result) => result,
+                    BrowseEvent::Recovery(error) => panic!("{error:?}"),
+                };
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn favorite_action_reports_each_state_once_and_uses_only_real_focused_rows() {
+        let mut browser = BrowserWorker::default();
+        browser.load(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../iptv-core/tests/fixtures/local.m3u"),
+        );
+        let all = wait(&mut browser);
+        assert_eq!(
+            toggle_focused(&mut browser, &all, None, String::new()),
+            "Select a channel first. Favorites unchanged."
+        );
+        assert_eq!(
+            toggle_focused(&mut browser, &all, Some(0), String::new()),
+            "ABC East HD added to Favorites."
+        );
+        browser.select_category(Category::Favorites, String::new());
+        let favorite = wait(&mut browser);
+        assert_eq!(favorite.len(), 1);
+        assert_eq!(channel_text(&favorite, 0, 0), "ABC East HD");
+        assert_eq!(favorite.restore_row(&all, Some(0)), Some(0));
+        assert_eq!(
+            toggle_focused(&mut browser, &favorite, Some(0), String::new()),
+            "ABC East HD removed from Favorites."
+        );
+        let empty = wait(&mut browser);
+        assert_eq!(empty.len(), 0);
+        assert_eq!(channel_text(&empty, 0, 0), "");
+        assert!(empty.status().contains("Favorites is empty"));
+        assert_eq!(empty.restore_row(&favorite, Some(0)), None);
+        assert_eq!(
+            toggle_focused(&mut browser, &empty, Some(0), String::new()),
+            "Select a current channel first. Favorites unchanged."
+        );
+        browser.select_category(Category::All, String::new());
+        let all = wait(&mut browser);
+        assert_eq!(
+            toggle_focused(&mut browser, &all, Some(3), String::new()),
+            "This entry cannot be added to Favorites."
+        );
+        assert!(!browser.is_busy());
     }
 
     #[test]

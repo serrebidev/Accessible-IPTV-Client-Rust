@@ -106,3 +106,22 @@ index within the same immutable playlist snapshot; duplicate names/URLs remain
 separate rows. A successful playlist replacement keeps an existing category
 key or falls back to All Channels, and keeps the existing first-row selection
 policy for a new snapshot. Persistent/favorite identities remain #11/#12.
+
+## Favorites category integration (issue #12)
+
+`favorite-projection-cases.tsv` supplies a current playlist, a seed playlist,
+and rows toggled in order. `python-favorite-projections.tsv` records seven
+observable results through committed `main.py` `_source_for_group` and
+`_favorite_channels`, using the real pinned parser and `favorites.py` above.
+The Rust browse/controller test consumes the same cases and expected indexes.
+`favorites-refresh.m3u` reorders stable IDs, changes inert stream URLs, and
+includes a literal Favorites group. Cases cover empty, reversed toggle order,
+refresh, absent channels, literal-group collision, distinct IDs with the same
+name, and toggling twice. Run `check-favorites-parity.py` to check or regenerate.
+
+Ticket #12 deliberately keeps the typed Favorites sentinel present even when
+empty; Python removes the empty category and uses a dialog. Rust uses zero real
+rows and live-region/status guidance, as required by the published parent spec.
+The literal group displays as `Favorites (playlist group)`. Empty-state wording,
+native controls and focus-free announcements are ticket requirements, not claims
+of byte-identical Python UI behavior. Ticket #13 search interaction stays separate.

@@ -119,7 +119,10 @@ fn pinned_python_category_order_and_source_projections_match() {
                 }
             })
             .collect();
-        assert_eq!(model.categories(), categories);
+        // Ticket #12 keeps the empty Favorites sentinel where Python hides it.
+        let mut expected_categories = categories.clone();
+        expected_categories.insert(1, Category::Favorites);
+        assert_eq!(model.categories(), expected_categories);
         let worker = SearchWorker::default();
         for (category, fields) in categories.into_iter().zip(expected) {
             worker.submit_category(Arc::clone(&model), String::new(), category);
