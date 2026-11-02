@@ -361,10 +361,24 @@ impl DvrSchedule {
     }
 
     /// Return a failed or unavailable resolution to the normal due-job path.
-    /// The next scheduler tick may request another link.
-    pub fn defer_resolution(&mut self, job_id: &str) {
+    /// The next scheduler tick may request another link while the window is
+    /// open; after the window closes the job becomes durably failed.
+    pub fn defer_resolution(&mut self, job_id: &str, now: f64) {
         self.resolving.remove(job_id);
-        self.set_status(job_id, STATUS_SCHEDULED, "");
+        let expired = self
+            .jobs
+            .iter()
+            .find(|job| job.id == job_id)
+            .is_some_and(|job| job.stop_ts > 0.0 && now >= job.stop_ts);
+        if expired {
+            self.set_status(
+                job_id,
+                STATUS_FAILED,
+                "Could not resolve the scheduled recording before its window ended.",
+            );
+        } else {
+            self.set_status(job_id, STATUS_SCHEDULED, "");
+        }
         self.save();
     }
 
@@ -381,6 +395,15 @@ impl DvrSchedule {
             match job.status.as_str() {
                 STATUS_SCHEDULED => {
                     if self.resolving.contains(&id) {
+                        if job.stop_ts > 0.0 && now >= job.stop_ts {
+                            self.resolving.remove(&id);
+                            self.set_status(
+                                &id,
+                                STATUS_FAILED,
+                                "Could not resolve the scheduled recording before its window ended.",
+                            );
+                            changed = true;
+                        }
                         continue;
                     }
                     if job.stop_ts > 0.0 && now >= job.stop_ts {
@@ -601,8 +624,30 @@ mod tests {
         assert!(schedule.tick(160.0).is_empty());
         assert_eq!(schedule.get(&id).expect("job").status, STATUS_SCHEDULED);
 
-        schedule.defer_resolution(&id);
+        schedule.defer_resolution(&id, 160.0);
         assert_eq!(schedule.tick(170.0), vec![DvrAction::Start(id)]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn failed_resolution_retries_before_window_and_fails_after_it() {
+        let dir = std::env::temp_dir().join(format!("iptv-dvr-retry-{}", std::process::id()));
+        let path = dir.join("scheduled_recordings.json");
+        let mut schedule = DvrSchedule::load(path, 0.0);
+        let due = build_job(&spec(&channel(), "Due", 100, 200, 0, 0), 0.0).expect("job");
+        let id = due.id.clone();
+        schedule.add_job(due);
+
+        assert_eq!(schedule.tick(150.0), vec![DvrAction::Start(id.clone())]);
+        schedule.mark_resolving(&id);
+        schedule.defer_resolution(&id, 160.0);
+        assert_eq!(schedule.get(&id).expect("job").status, STATUS_SCHEDULED);
+        assert_eq!(schedule.tick(170.0), vec![DvrAction::Start(id.clone())]);
+        schedule.mark_resolving(&id);
+        schedule.defer_resolution(&id, 200.0);
+        let job = schedule.get(&id).expect("job");
+        assert_eq!(job.status, STATUS_FAILED);
+        assert!(job.message.contains("window ended"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

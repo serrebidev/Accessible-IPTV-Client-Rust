@@ -777,11 +777,12 @@ fn poll_providers(wiring: &Wiring, controls: Controls) {
                                 now_seconds(),
                             );
                         }
-                        Err(error) => {
-                            wiring.dvr.borrow_mut().defer_resolution(&job_id);
-                            status.set_label(&format!(
-                                "Scheduled recording waiting for stream: {error}"
-                            ));
+                        Err(_error) => {
+                            wiring
+                                .dvr
+                                .borrow_mut()
+                                .defer_resolution(&job_id, now_seconds());
+                            status.set_label("Scheduled recording will retry stream resolution.");
                         }
                     }
                     continue;
