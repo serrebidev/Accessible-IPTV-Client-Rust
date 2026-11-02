@@ -43,3 +43,19 @@ with choose/retry guidance. Recovery wording and malformed-input warnings are
 requirements of this slice, not byte-identical Python strings. Worker/controller
 tests cover missing/unreadable/retry, retention, cancellation, and replacement.
 Domain tests and these goldens do not prove desktop announcements or focus.
+
+## Category/Favorites fixtures (issues #10–#13)
+
+`categories.m3u` is synthetic: grouped channels (News, Sport), plain-M3U
+channels with duplicate names, a separator-bearing name (`A|B Network`), a
+credential-bearing provider URL, a provider-identified channel
+(provider-type/provider-id/stream-id attributes), and a nameless channel
+keyed only by tvg-id. No URL is fetched.
+
+`python-favorites.tsv` holds favorite-key goldens produced by the pinned
+Python reference's own `favorites.channel_key` (revision
+`9aa89e053225ef2c83c4f3659775a00723012ff7`, whose `favorites.py` is
+byte-identical to the current Python checkout) over the fixture channels
+plus an escaped-backslash name and an unkeyable entry. The Rust test
+`favorite_keys_match_pinned_python_goldens` compares `channel_key` output
+against every row, including the empty key.

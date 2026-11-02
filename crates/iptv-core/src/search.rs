@@ -10,12 +10,27 @@ pub(crate) fn matching_rows(
     query: &str,
     current: impl Fn() -> bool,
 ) -> Option<Vec<usize>> {
+    let scope: Vec<usize> = (0..channels.len()).collect();
+    matching_scoped(channels, &scope, query, current)
+}
+
+/// Matching within a category scope: only the scoped playlist indexes are
+/// considered, ranking is unchanged, and ties keep playlist source order.
+pub(crate) fn matching_scoped(
+    channels: &[Channel],
+    scope: &[usize],
+    query: &str,
+    current: impl Fn() -> bool,
+) -> Option<Vec<usize>> {
     let query = query.trim().to_lowercase();
     let mut matches = Vec::new();
-    for (index, channel) in channels.iter().enumerate() {
-        if index % 256 == 0 && !current() {
+    for (position, &index) in scope.iter().enumerate() {
+        if position % 256 == 0 && !current() {
             return None;
         }
+        let Some(channel) = channels.get(index) else {
+            continue;
+        };
         if query.is_empty() {
             matches.push(((0, 0), index));
             continue;
@@ -48,6 +63,7 @@ pub struct SearchResults {
     rows: Vec<usize>,
     positions: Vec<usize>,
     query: String,
+    category: crate::categories::Category,
 }
 
 impl Default for SearchResults {
@@ -58,6 +74,7 @@ impl Default for SearchResults {
             rows: Vec::new(),
             positions: Vec::new(),
             query: String::new(),
+            category: crate::categories::Category::All,
         }
     }
 }
@@ -78,6 +95,18 @@ impl SearchResults {
         self.rows
             .get(row)
             .and_then(|&index| self.playlist.channels().get(index))
+    }
+
+    /// The stable playlist identity behind a visible row, for actions such
+    /// as toggling a favorite on the focused channel.
+    #[must_use]
+    pub fn playlist_index(&self, row: usize) -> Option<usize> {
+        self.rows.get(row).copied()
+    }
+
+    #[must_use]
+    pub fn category(&self) -> &crate::categories::Category {
+        &self.category
     }
 
     /// An unchanged row needs no selection/focus cycling or fresh announcement.
@@ -107,15 +136,29 @@ impl SearchResults {
 
     #[must_use]
     pub fn status(&self) -> String {
+        let category = self.category.label();
+        let scoped = self.category != crate::categories::Category::All;
         let message = if self.playlist.channels().is_empty() {
             "Channel list is empty. Open another playlist.".to_owned()
         } else if self.query.trim().is_empty() {
-            format!(
-                "{} channels. Search cleared; showing all channels.",
-                self.len()
-            )
+            if !scoped {
+                format!(
+                    "{} channels. Search cleared; showing all channels.",
+                    self.len()
+                )
+            } else if self.category == crate::categories::Category::Favorites && self.is_empty() {
+                "Favorites is empty. Toggle favorite on a channel to add it here.".to_owned()
+            } else {
+                format!("{} channels in {category}.", self.len())
+            }
         } else if self.is_empty() {
-            "No matching channels. Change or clear Search channels.".to_owned()
+            if scoped {
+                format!("No matching channels in {category}. Change or clear Search channels.")
+            } else {
+                "No matching channels. Change or clear Search channels.".to_owned()
+            }
+        } else if scoped {
+            format!("{} matching channels in {category}.", self.len())
         } else {
             format!("{} matching channels.", self.len())
         };
@@ -130,6 +173,8 @@ impl SearchResults {
 struct Request {
     generation: u64,
     playlist: Arc<BrowseModel>,
+    scope: Vec<usize>,
+    category: crate::categories::Category,
     query: String,
 }
 
@@ -153,9 +198,12 @@ impl Default for SearchWorker {
                     request = newer;
                 }
                 let current = || active.load(Ordering::Relaxed) == request.generation;
-                let Some(rows) =
-                    matching_rows(request.playlist.channels(), &request.query, current)
-                else {
+                let Some(rows) = matching_scoped(
+                    request.playlist.channels(),
+                    &request.scope,
+                    &request.query,
+                    current,
+                ) else {
                     continue;
                 };
                 let mut positions = vec![usize::MAX; request.playlist.channels().len()];
@@ -170,6 +218,7 @@ impl Default for SearchWorker {
                             rows,
                             positions,
                             query: request.query,
+                            category: request.category,
                         })
                         .is_err()
                 {
@@ -188,10 +237,24 @@ impl Default for SearchWorker {
 impl SearchWorker {
     /// Queue a cheap shared playlist snapshot. No channel scanning on the caller.
     pub fn submit(&self, playlist: Arc<BrowseModel>, query: String) {
+        let scope: Vec<usize> = (0..playlist.channels().len()).collect();
+        self.submit_scoped(playlist, scope, crate::categories::Category::All, query);
+    }
+
+    /// Queue a search inside one category scope of the snapshot.
+    pub fn submit_scoped(
+        &self,
+        playlist: Arc<BrowseModel>,
+        scope: Vec<usize>,
+        category: crate::categories::Category,
+        query: String,
+    ) {
         let generation = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
         let _ = self.requests.send(Request {
             generation,
             playlist,
+            scope,
+            category,
             query,
         });
     }
