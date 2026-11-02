@@ -9,6 +9,7 @@ use iptv_core::{
         resume_position, EngineAction, EngineEvent, LaunchGate, PlaybackRequest, PlaybackSession,
         PlayerChoice, SessionState,
     },
+    providers::{ProviderAccount, ProviderEvent, ProviderWorker},
     reminders::{normalize_reminders, Reminder, ReminderStatus},
     search::SearchResults,
     sources::PlaylistSource,
@@ -182,6 +183,9 @@ struct Wiring {
     epg_worker: Rc<EpgWorker>,
     epg_pending: Rc<std::cell::Cell<bool>>,
     reminders: Rc<RefCell<Vec<Reminder>>>,
+    provider_worker: Rc<ProviderWorker>,
+    provider_pending: Rc<std::cell::Cell<bool>>,
+    pending_resolve: Rc<RefCell<Option<Channel>>>,
 }
 
 /// Built-in player window state, created lazily on first use.
@@ -304,6 +308,9 @@ fn bind_browser(frame: Frame, controls: Controls, model: Rc<RefCell<SearchResult
         epg_worker: Rc::new(EpgWorker::new()),
         epg_pending: Rc::new(std::cell::Cell::new(false)),
         reminders: Rc::new(RefCell::new(Vec::new())),
+        provider_worker: Rc::new(ProviderWorker::new()),
+        provider_pending: Rc::new(std::cell::Cell::new(false)),
+        pending_resolve: Rc::new(RefCell::new(None)),
     };
     *wiring.reminders.borrow_mut() = wiring.persist.reminders();
     let epg_urls = wiring.persist.config.borrow().string_list("epg_urls");
@@ -312,11 +319,14 @@ fn bind_browser(frame: Frame, controls: Controls, model: Rc<RefCell<SearchResult
         wiring.epg_pending.set(true);
         assert!(wiring.timer.start(50, false));
     }
-    let configured = wiring.persist.config.borrow().string_list("playlists");
-    if !configured.is_empty() {
-        let sources: Vec<PlaylistSource> =
-            configured.into_iter().map(PlaylistSource::new).collect();
+    let (sources, accounts) = configured_entries(&wiring);
+    if !sources.is_empty() {
         wiring.browser.borrow_mut().load_sources(sources);
+        assert!(wiring.timer.start(50, false));
+    }
+    if !accounts.is_empty() {
+        wiring.provider_worker.load(accounts);
+        wiring.provider_pending.set(true);
         assert!(wiring.timer.start(50, false));
     }
     bind_completion(&wiring, controls);
@@ -351,8 +361,10 @@ fn bind_completion(wiring: &Wiring, controls: Controls) {
             None => {}
         }
         poll_epg(&completed, status);
+        poll_providers(&completed, controls);
         if !completed.browser.borrow().is_busy()
             && !completed.epg_pending.get()
+            && !completed.provider_pending.get()
             && !completed
                 .reminders
                 .borrow()
@@ -494,6 +506,89 @@ fn bind_toggle(
     });
 }
 
+/// The configured `playlists` entries split into plain sources (strings)
+/// and provider accounts (typed dicts), as the Python loader treats them.
+fn configured_entries(wiring: &Wiring) -> (Vec<PlaylistSource>, Vec<ProviderAccount>) {
+    let value = wiring.persist.config.borrow().value("playlists").cloned();
+    let mut sources: Vec<PlaylistSource> = Vec::new();
+    let mut accounts: Vec<ProviderAccount> = Vec::new();
+    match value {
+        Some(serde_json::Value::Array(entries)) => {
+            for entry in &entries {
+                match entry {
+                    serde_json::Value::String(text) => {
+                        sources.push(PlaylistSource::new(text.clone()));
+                    }
+                    other => {
+                        if let Some(account) = ProviderAccount::from_config(other) {
+                            accounts.push(account);
+                        }
+                    }
+                }
+            }
+        }
+        Some(serde_json::Value::String(_)) => {
+            for text in wiring.persist.config.borrow().string_list("playlists") {
+                sources.push(PlaylistSource::new(text));
+            }
+        }
+        _ => {}
+    }
+    (sources, accounts)
+}
+
+/// Drain provider worker events on the poll tick: merged channels, guide
+/// sources, and a finished Stalker link resolution that completes a play.
+fn poll_providers(wiring: &Wiring, controls: Controls) {
+    let status = controls.status;
+    while let Some(event) = wiring.provider_worker.try_recv() {
+        match event {
+            ProviderEvent::Loaded {
+                channels,
+                epg_urls,
+                failures,
+            } => {
+                wiring.provider_pending.set(false);
+                let count = channels.len();
+                if count > 0 {
+                    wiring
+                        .browser
+                        .borrow_mut()
+                        .add_channels(channels, &controls.search.get_value());
+                    status.set_label(&format!("{count} provider channels loaded."));
+                    assert!(wiring.timer.start(50, false));
+                }
+                if !epg_urls.is_empty() {
+                    wiring.epg_worker.load(epg_urls);
+                    wiring.epg_pending.set(true);
+                    assert!(wiring.timer.start(50, false));
+                }
+                for failure in failures {
+                    status.set_label(&failure);
+                }
+            }
+            ProviderEvent::Resolved(result) => {
+                let pending = wiring.pending_resolve.borrow_mut().take();
+                match (pending, result) {
+                    (Some(mut channel), Ok(url)) => {
+                        channel.url = url;
+                        play_channel(&wiring.player, &wiring.persist, &channel, status);
+                    }
+                    (_, Err(error)) => status.set_label(&error),
+                    (None, Ok(_)) => {}
+                }
+            }
+            ProviderEvent::Account(result) => match result {
+                Ok(report) => {
+                    let first = report.lines().next().unwrap_or_default().to_string();
+                    status.set_label(&first);
+                }
+                Err(error) => status.set_label(&error),
+            },
+        }
+    }
+}
+
 /// Drain a finished guide load and fire due reminders; runs on the main
 /// poll tick alongside browse completion.
 fn poll_epg(wiring: &Wiring, status: Status) {
@@ -548,6 +643,9 @@ fn bind_playback(wiring: &Wiring, list: ListCtrl, status: Status) {
     let model = Rc::clone(&wiring.model);
     let player = Rc::clone(&wiring.player);
     let persist = wiring.persist.clone();
+    let provider_worker = Rc::clone(&wiring.provider_worker);
+    let pending_resolve = Rc::clone(&wiring.pending_resolve);
+    let timer = Rc::clone(&wiring.timer);
     list.on_item_activated(move |_| {
         let selected = usize::try_from(list.get_first_selected_item()).ok();
         let focused =
@@ -565,6 +663,23 @@ fn bind_playback(wiring: &Wiring, list: ListCtrl, status: Status) {
             status.set_label("No channel selected. Choose a channel in Channels first.");
             return;
         };
+        if channel.url.is_empty()
+            && channel
+                .unknown_attributes
+                .get("provider-type")
+                .map(String::as_str)
+                == Some("stalker")
+        {
+            let Some(key) = channel.unknown_attributes.get("provider-id").cloned() else {
+                status.set_label("This Stalker channel has no provider account configured.");
+                return;
+            };
+            *pending_resolve.borrow_mut() = Some(channel.clone());
+            provider_worker.resolve(key, channel.unknown_attributes.clone());
+            status.set_label("Resolving stream link...");
+            assert!(timer.start(50, false));
+            return;
+        }
         play_channel(&player, &persist, &channel, status);
     });
     bind_epg_highlight(wiring, list, status);

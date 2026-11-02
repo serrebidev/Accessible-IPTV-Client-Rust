@@ -32,6 +32,8 @@ pub struct BrowserWorker {
     searching: bool,
     category: Category,
     favorites: FavoriteSet,
+    extras: Vec<crate::Channel>,
+    raw: Option<Arc<BrowseModel>>,
 }
 
 impl BrowserWorker {
@@ -166,7 +168,7 @@ impl BrowserWorker {
     pub fn poll(&mut self, query: &str) -> Option<BrowseEvent> {
         if let Some(loaded) = self.loader.try_latest() {
             match loaded.outcome {
-                Ok(loaded) => self.filter_loaded(loaded, query),
+                Ok(loaded) => self.filter_loaded(&loaded, query),
                 Err(error) => {
                     self.loading = false;
                     return Some(BrowseEvent::Recovery(error));
@@ -184,7 +186,28 @@ impl BrowserWorker {
         })
     }
 
-    fn filter_loaded(&mut self, loaded: Arc<BrowseModel>, query: &str) {
+    fn filter_loaded(&mut self, loaded: &Arc<BrowseModel>, query: &str) {
+        self.raw = Some(Arc::clone(loaded));
+        let merged = merged_with_extras(loaded, &self.extras);
+        self.apply_model(merged, query);
+    }
+
+    /// Channels arriving outside the playlist load (provider accounts)
+    /// merge into the browse model without disturbing the active load.
+    pub fn add_channels(&mut self, channels: Vec<crate::Channel>, query: &str) {
+        self.extras.extend(channels);
+        if self.loading {
+            return;
+        }
+        let base = self
+            .raw
+            .clone()
+            .unwrap_or_else(|| Arc::new(BrowseModel::default()));
+        let merged = merged_with_extras(&base, &self.extras);
+        self.apply_model(merged, query);
+    }
+
+    fn apply_model(&mut self, loaded: Arc<BrowseModel>, query: &str) {
         // A group that vanished from the replacement cannot stay active;
         // the sentinels always exist. Favorites survive by stable key.
         if matches!(self.category, Category::Group(_))
@@ -221,6 +244,16 @@ fn announced_name(name: &str) -> &str {
     } else {
         name
     }
+}
+
+/// A browse model with provider channels appended in arrival order.
+fn merged_with_extras(model: &BrowseModel, extras: &[crate::Channel]) -> Arc<BrowseModel> {
+    if extras.is_empty() {
+        return Arc::new(model.clone());
+    }
+    let mut channels = model.channels().to_vec();
+    channels.extend(extras.iter().cloned());
+    Arc::new(BrowseModel::from_parts(channels, model.malformed_entries()))
 }
 
 #[cfg(test)]
@@ -286,7 +319,7 @@ mod tests {
         assert_eq!(results(wait(&mut browser, "")).len(), 4);
         browser.loading = true;
         browser.filter_loaded(
-            Arc::new(BrowseModel::open_local(&fixture("recovery.m3u")).unwrap()),
+            &Arc::new(BrowseModel::open_local(&fixture("recovery.m3u")).unwrap()),
             "cat",
         );
         assert!(browser.cancel_load());
