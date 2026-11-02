@@ -273,7 +273,7 @@ The Player menu in the main window works on the built-in player without switchin
 
 ## Media player {#media-player}
 
-Options > Media Player to Use chooses what plays your channels: the Built-in Player, or an external player such as VLC, MPC, MPC-BE, Kodi, Winamp, Foobar2000, MPV, SMPlayer or Totem. Custom Player lets you choose any other program by its file.
+Options > Media Player to Use chooses what plays your channels: the Built-in Player, or an external player such as VLC, MPC, MPC-BE, MPV, PotPlayer, Kodi or SMPlayer. Custom Player lets you choose any other program by its file.
 
 Recording, catch-up downloads and casting work the same whichever player you choose. The audio track features and the player keys described in this guide belong to the built-in player.
 

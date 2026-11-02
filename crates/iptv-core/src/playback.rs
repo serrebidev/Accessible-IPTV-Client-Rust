@@ -305,44 +305,131 @@ pub fn external_argv(player_name: &str, exe: &str, url: &str, mpv_ipc_path: &str
 /// reference reports them.
 #[must_use]
 pub fn candidate_executables(player_name: &str, windows: bool, macos: bool) -> Vec<String> {
+    // Python external_player.py tables, verbatim: a player with no
+    // entry for the platform yields no candidates (the adapter then
+    // reports it could not be located / is not configured there).
     if windows {
+        return windows_candidates(player_name);
+    }
+    if macos {
+        return macos_candidates(player_name);
+    }
+    linux_candidates(player_name)
+}
+
+fn windows_candidates(player_name: &str) -> Vec<String> {
+    {
         let paths: &[&str] = match player_name {
             "VLC" => &[
                 r"C:\Program Files\VideoLAN\VLC\vlc.exe",
                 r"C:\Program Files (x86)\VideoLAN\VLC\vlc.exe",
             ],
-            "MPV" => &[
-                r"C:\Program Files\mpv\mpv.exe",
-                r"C:\Program Files (x86)\mpv\mpv.exe",
-            ],
             "MPC" => &[
                 r"C:\Program Files\MPC-HC\mpc-hc64.exe",
+                r"C:\Program Files (x86)\K-Lite Codec Pack\MPC-HC64\mpc-hc64.exe",
                 r"C:\Program Files (x86)\MPC-HC\mpc-hc.exe",
             ],
             "MPC-BE" => &[
                 r"C:\Program Files\MPC-BE\mpc-be64.exe",
                 r"C:\Program Files (x86)\MPC-BE\mpc-be.exe",
+                r"C:\Program Files\MPC-BE x64\mpc-be64.exe",
+                r"C:\Program Files\MPC-BE\mpc-be.exe",
             ],
             "Kodi" => &[r"C:\Program Files\Kodi\kodi.exe"],
+            "Winamp" => &[r"C:\Program Files\Winamp\winamp.exe"],
+            "Foobar2000" => &[r"C:\Program Files\foobar2000\foobar2000.exe"],
+            "MPV" => &[
+                r"C:\Program Files\mpv\mpv.exe",
+                r"C:\Program Files (x86)\mpv\mpv.exe",
+            ],
+            "SMPlayer" => &[
+                r"C:\Program Files\SMPlayer\smplayer.exe",
+                r"C:\Program Files (x86)\SMPlayer\smplayer.exe",
+            ],
+            "QuickTime" => &[
+                r"C:\Program Files\QuickTime\QuickTimePlayer.exe",
+                r"C:\Program Files (x86)\QuickTime\QuickTimePlayer.exe",
+            ],
+            "iTunes/Apple Music" => &[
+                r"C:\Program Files\iTunes\iTunes.exe",
+                r"C:\Program Files (x86)\iTunes\iTunes.exe",
+                r"C:\Program Files\Apple\Music\AppleMusic.exe",
+            ],
+            "PotPlayer" => &[
+                r"C:\Program Files\DAUM\PotPlayer\PotPlayerMini64.exe",
+                r"C:\Program Files\DAUM\PotPlayer\PotPlayerMini.exe",
+            ],
+            "KMPlayer" => &[
+                r"C:\Program Files\KMP Media\KMPlayer\KMPlayer64.exe",
+                r"C:\Program Files (x86)\KMP Media\KMPlayer\KMPlayer.exe",
+            ],
+            "AIMP" => &[
+                r"C:\Program Files\AIMP\AIMP.exe",
+                r"C:\Program Files (x86)\AIMP\AIMP.exe",
+            ],
+            "QMPlay2" => &[
+                r"C:\Program Files\QMPlay2\QMPlay2.exe",
+                r"C:\Program Files (x86)\QMPlay2\QMPlay2.exe",
+            ],
+            "GOM Player" => &[
+                r"C:\Program Files\GRETECH\GomPlayer\GOM.exe",
+                r"C:\Program Files (x86)\GRETECH\GomPlayer\GOM.exe",
+            ],
+            "Clementine" => &[r"C:\Program Files\Clementine\clementine.exe"],
+            "Strawberry" => &[r"C:\Program Files\Strawberry\strawberry.exe"],
             _ => &[],
         };
-        return paths.iter().map(ToString::to_string).collect();
+        paths.iter().map(ToString::to_string).collect()
     }
-    if macos {
+}
+
+fn macos_candidates(player_name: &str) -> Vec<String> {
+    {
         let paths: &[&str] = match player_name {
             "VLC" => &["/Applications/VLC.app/Contents/MacOS/VLC"],
-            "MPV" => &["/Applications/mpv.app/Contents/MacOS/mpv"],
+            "QuickTime" => &["/Applications/QuickTime Player.app/Contents/MacOS/QuickTime Player"],
+            "iTunes/Apple Music" => &[
+                "/Applications/Music.app/Contents/MacOS/Music",
+                "/Applications/iTunes.app/Contents/MacOS/iTunes",
+            ],
+            "QMPlay2" => &["/Applications/QMPlay2.app/Contents/MacOS/QMPlay2"],
+            "Audacious" => &["/Applications/Audacious.app/Contents/MacOS/Audacious"],
+            "Fauxdacious" => &["/Applications/Fauxdacious.app/Contents/MacOS/Fauxdacious"],
             _ => &[],
         };
-        return paths.iter().map(ToString::to_string).collect();
+        paths.iter().map(ToString::to_string).collect()
     }
+}
+
+fn linux_candidates(player_name: &str) -> Vec<String> {
     let command = match player_name {
         "VLC" => "vlc",
         "MPV" => "mpv",
         "Kodi" => "kodi",
         "SMPlayer" => "smplayer",
-        "MPC" | "MPC-BE" => "mpc-be",
-        other => return vec![other.to_lowercase().replace(' ', "")],
+        "Totem" => "totem",
+        "PotPlayer" => "potplayer",
+        "KMPlayer" => "kmplayer",
+        "AIMP" => "aimp",
+        "QMPlay2" => "qmplay2",
+        "GOM Player" => "gomplayer",
+        "Audacious" => "audacious",
+        "Fauxdacious" => "fauxdacious",
+        "MPC-BE" => "mpc-be",
+        "Clementine" => "clementine",
+        "Strawberry" => "strawberry",
+        "Amarok" => "amarok",
+        "Rhythmbox" => "rhythmbox",
+        "Pragha" => "pragha",
+        "Lollypop" => "lollypop",
+        "Exaile" => "exaile",
+        "Quod Libet" => "quodlibet",
+        "Gmusicbrowser" => "gmusicbrowser",
+        "Xmms" => "xmms",
+        "Vocal" => "vocal",
+        "Haruna" => "haruna",
+        "Celluloid" => "celluloid",
+        _ => return Vec::new(),
     };
     vec![command.to_string()]
 }
@@ -626,6 +713,34 @@ mod tests {
             request.url, "http://x/y",
             "pipe tail never reaches the engine"
         );
+    }
+
+    #[test]
+    fn candidate_tables_match_python() {
+        // Windows: the full 32-player menu's located paths.
+        assert_eq!(
+            candidate_executables("PotPlayer", true, false)[0],
+            r"C:\Program Files\DAUM\PotPlayer\PotPlayerMini64.exe"
+        );
+        assert_eq!(candidate_executables("MPC", true, false).len(), 3);
+        assert!(candidate_executables("Totem", true, false).is_empty());
+        assert!(candidate_executables("Winamp", true, false)
+            .iter()
+            .any(|p| p.ends_with("winamp.exe")));
+        // macOS: Python locates only six players there.
+        assert_eq!(
+            candidate_executables("QuickTime", false, true)[0],
+            "/Applications/QuickTime Player.app/Contents/MacOS/QuickTime Player"
+        );
+        assert!(candidate_executables("MPV", false, true).is_empty());
+        // Linux: bare commands; unconfigured players yield none.
+        assert_eq!(
+            candidate_executables("Celluloid", false, false),
+            ["celluloid"]
+        );
+        assert_eq!(candidate_executables("MPC-BE", false, false), ["mpc-be"]);
+        assert!(candidate_executables("MPC", false, false).is_empty());
+        assert!(candidate_executables("Winamp", false, false).is_empty());
     }
 
     #[test]
