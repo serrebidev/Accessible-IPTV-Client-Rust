@@ -1,8 +1,10 @@
 //! wx-free domain types and playlist behavior for the Rust port.
 
 pub mod browser;
+pub mod catchup;
 pub mod categories;
 pub mod config;
+pub mod downloads;
 pub mod epg;
 pub mod favorites;
 pub mod loading;

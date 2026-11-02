@@ -878,6 +878,12 @@ enum ProviderJob {
         provider_id: String,
         data: BTreeMap<String, String>,
     },
+    ResolveCatchup {
+        provider_id: String,
+        data: BTreeMap<String, String>,
+        start_text: String,
+        duration_minutes: i64,
+    },
     Account {
         provider_id: String,
     },
@@ -912,6 +918,64 @@ impl Default for ProviderWorker {
     }
 }
 
+/// Run one provider load job against the worker's client table.
+fn handle_load(
+    accounts: Vec<ProviderAccount>,
+    clients: &mut BTreeMap<String, (ProviderAccount, Client)>,
+) -> ProviderEvent {
+    let mut channels = Vec::new();
+    let mut epg_urls = Vec::new();
+    let mut failures = Vec::new();
+    for account in accounts {
+        let now = now_epoch();
+        let key = account.provider_id().unwrap_or_else(|| account.describe());
+        match &account {
+            ProviderAccount::Xtream(cfg) => {
+                let client = XtreamClient::new(cfg.clone());
+                match client.fetch_playlist() {
+                    Ok(text) => {
+                        let mut parsed = crate::parse_m3u(&text);
+                        for channel in &mut parsed {
+                            channel
+                                .unknown_attributes
+                                .insert("provider-type".to_string(), "xtream".to_string());
+                            if let Some(id) = &cfg.provider_id {
+                                channel
+                                    .unknown_attributes
+                                    .insert("provider-id".to_string(), id.clone());
+                            }
+                        }
+                        channels.extend(parsed);
+                        epg_urls.extend(client.epg_urls());
+                    }
+                    Err(e) => {
+                        failures.push(format!("{}: {e}", client.describe()));
+                    }
+                }
+                clients.insert(key, (account, Client::Xtream(client)));
+            }
+            ProviderAccount::Stalker(cfg) => {
+                let client = StalkerClient::new(cfg.clone());
+                match client.fetch_channels(now) {
+                    Ok((found, urls)) => {
+                        channels.extend(found);
+                        epg_urls.extend(urls);
+                    }
+                    Err(e) => {
+                        failures.push(format!("{}: {e}", client.describe()));
+                    }
+                }
+                clients.insert(key, (account, Client::Stalker(client)));
+            }
+        }
+    }
+    ProviderEvent::Loaded {
+        channels,
+        epg_urls,
+        failures,
+    }
+}
+
 impl ProviderWorker {
     #[must_use]
     pub fn new() -> Self {
@@ -921,66 +985,29 @@ impl ProviderWorker {
             let mut clients: BTreeMap<String, (ProviderAccount, Client)> = BTreeMap::new();
             while let Ok(job) = job_receiver.recv() {
                 let event = match job {
-                    ProviderJob::Load(accounts) => {
-                        let mut channels = Vec::new();
-                        let mut epg_urls = Vec::new();
-                        let mut failures = Vec::new();
-                        for account in accounts {
-                            let now = now_epoch();
-                            let key = account.provider_id().unwrap_or_else(|| account.describe());
-                            match &account {
-                                ProviderAccount::Xtream(cfg) => {
-                                    let client = XtreamClient::new(cfg.clone());
-                                    match client.fetch_playlist() {
-                                        Ok(text) => {
-                                            let mut parsed = crate::parse_m3u(&text);
-                                            for channel in &mut parsed {
-                                                channel.unknown_attributes.insert(
-                                                    "provider-type".to_string(),
-                                                    "xtream".to_string(),
-                                                );
-                                                if let Some(id) = &cfg.provider_id {
-                                                    channel.unknown_attributes.insert(
-                                                        "provider-id".to_string(),
-                                                        id.clone(),
-                                                    );
-                                                }
-                                            }
-                                            channels.extend(parsed);
-                                            epg_urls.extend(client.epg_urls());
-                                        }
-                                        Err(e) => {
-                                            failures.push(format!("{}: {e}", client.describe()));
-                                        }
-                                    }
-                                    clients.insert(key, (account, Client::Xtream(client)));
-                                }
-                                ProviderAccount::Stalker(cfg) => {
-                                    let client = StalkerClient::new(cfg.clone());
-                                    match client.fetch_channels(now) {
-                                        Ok((found, urls)) => {
-                                            channels.extend(found);
-                                            epg_urls.extend(urls);
-                                        }
-                                        Err(e) => {
-                                            failures.push(format!("{}: {e}", client.describe()));
-                                        }
-                                    }
-                                    clients.insert(key, (account, Client::Stalker(client)));
-                                }
-                            }
-                        }
-                        ProviderEvent::Loaded {
-                            channels,
-                            epg_urls,
-                            failures,
-                        }
-                    }
+                    ProviderJob::Load(accounts) => handle_load(accounts, &mut clients),
                     ProviderJob::Resolve { provider_id, data } => {
                         let result = match clients.get(&provider_id) {
                             Some((_, Client::Stalker(client))) => {
                                 client.resolve_stream(&data, now_epoch())
                             }
+                            _ => Err("No Stalker portal for this channel".to_string()),
+                        };
+                        ProviderEvent::Resolved(result)
+                    }
+                    ProviderJob::ResolveCatchup {
+                        provider_id,
+                        data,
+                        start_text,
+                        duration_minutes,
+                    } => {
+                        let result = match clients.get(&provider_id) {
+                            Some((_, Client::Stalker(client))) => client.resolve_catchup(
+                                &data,
+                                &start_text,
+                                duration_minutes,
+                                now_epoch(),
+                            ),
                             _ => Err("No Stalker portal for this channel".to_string()),
                         };
                         ProviderEvent::Resolved(result)
@@ -1012,6 +1039,21 @@ impl ProviderWorker {
 
     pub fn load(&self, accounts: Vec<ProviderAccount>) {
         let _ = self.jobs.send(ProviderJob::Load(accounts));
+    }
+
+    pub fn resolve_catchup(
+        &self,
+        provider_id: String,
+        data: BTreeMap<String, String>,
+        start_text: String,
+        duration_minutes: i64,
+    ) {
+        let _ = self.jobs.send(ProviderJob::ResolveCatchup {
+            provider_id,
+            data,
+            start_text,
+            duration_minutes,
+        });
     }
 
     pub fn resolve(&self, provider_id: String, data: BTreeMap<String, String>) {
