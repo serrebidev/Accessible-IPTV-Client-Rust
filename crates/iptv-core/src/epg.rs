@@ -166,6 +166,20 @@ pub fn local_hhmm(epoch: i64) -> String {
     )
 }
 
+/// Local wall-clock `YYYY-MM-DD HH:MM` for an epoch second
+/// (Python's Last Watched column format).
+#[must_use]
+pub fn local_datetime(epoch: i64) -> String {
+    chrono::DateTime::from_timestamp(epoch, 0).map_or_else(
+        || "Unknown time".to_string(),
+        |utc| {
+            utc.with_timezone(&chrono::Local)
+                .format("%Y-%m-%d %H:%M")
+                .to_string()
+        },
+    )
+}
+
 /// Decode guide bytes: gzip when the magic bytes say so, then UTF-8
 /// (lossy, as Python's import tolerates damaged feeds).
 #[must_use]
@@ -933,5 +947,15 @@ mod tests {
         let nums = significant_channel_numbers(&["BBC 2", ""]);
         assert!(nums.contains("2"));
         assert!(!numbers_disagree(&nums, &nums));
+    }
+    #[test]
+    fn local_datetime_formats_like_python() {
+        // 2026-11-02 00:00 UTC renders as a date + HH:MM in local
+        // time; only the shape is asserted (timezone-dependent).
+        let text = local_datetime(1_793_952_000);
+        assert_eq!(text.len(), 16, "{text}");
+        assert_eq!(&text[4..5], "-");
+        assert_eq!(&text[13..14], ":");
+        assert_eq!(local_datetime(i64::MAX), "Unknown time");
     }
 }

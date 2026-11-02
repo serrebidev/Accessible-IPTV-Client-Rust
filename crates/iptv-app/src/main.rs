@@ -7,7 +7,10 @@ use iptv_core::{
     categories::Category,
     config::{self, Config},
     dvr::{channel_from_snapshot, DvrAction, DvrSchedule},
-    epg::{local_hhmm, match_guide_channel, EpgGuide, EpgWorker, GuideIndexes, Programme},
+    epg::{
+        local_datetime, local_hhmm, match_guide_channel, EpgGuide, EpgWorker, GuideIndexes,
+        Programme,
+    },
     favorites::{channel_key, FavoriteSet, Toggle},
     playback::{
         candidate_executables, detect_from_path, external_argv, player_choice, resume_checkpoint,
@@ -470,12 +473,18 @@ impl Persist {
                     value.get("updated").and_then(serde_json::Value::as_i64),
                 );
                 if let (Some(position_ms), Some(length_ms), Some(updated)) = fields {
+                    let title = value
+                        .get("title")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
                     entries.insert(
                         key.clone(),
                         iptv_core::playback::ResumeEntry {
                             position_ms,
                             length_ms,
                             updated,
+                            title,
                         },
                     );
                 }
@@ -513,6 +522,7 @@ impl Persist {
                         "position_ms": entry.position_ms,
                         "length_ms": entry.length_ms,
                         "updated": entry.updated,
+                        "title": entry.title,
                     }),
                 )
             })
@@ -5317,15 +5327,21 @@ fn checkpoint_resume(player: &Rc<RefCell<PlayerState>>, persist: &Persist) {
         return;
     };
     let key = channel_key(channel);
-    let channel = channel.clone();
+    let title = channel.name.clone();
     let (position, length) = position_length(&state);
     drop(state);
     if position <= 0 || length <= 0 {
         return;
     }
-    let _ = channel;
     let mut entries = persist.resume_entries();
-    resume_checkpoint(&mut entries, &key, position, length, now_ms() / 1000);
+    resume_checkpoint(
+        &mut entries,
+        &key,
+        &title,
+        position,
+        length,
+        now_ms() / 1000,
+    );
     persist.save_resume(&entries);
 }
 
@@ -6043,84 +6059,224 @@ fn format_duration_ms(ms: i64) -> String {
 
 /// View > Continue Watching...: saved resume positions with Play
 /// (the player applies the position) and Remove.
+/// One Continue Watching row: a saved position, its fresh
+/// catalogue match when one exists, and the availability state
+/// (Python's fourth column: Not checked until a check runs).
+struct CwRow {
+    key: String,
+    title: String,
+    channel: Option<Channel>,
+    position_ms: i64,
+    length_ms: i64,
+    updated: i64,
+    availability: String,
+}
+
+fn cw_label(row: &CwRow) -> String {
+    let watched = if row.updated > 0 {
+        local_datetime(row.updated)
+    } else {
+        "Unknown time".to_string()
+    };
+    format!(
+        "{} — {} of {} watched — last watched {} — {}",
+        row.title,
+        format_duration_ms(row.position_ms),
+        format_duration_ms(row.length_ms),
+        watched,
+        row.availability
+    )
+}
+
+fn render_cw_rows(rows: &[CwRow], list: ListBox) {
+    let labels: Vec<String> = rows.iter().map(cw_label).collect();
+    list.set_items(&labels.iter().map(String::as_str).collect::<Vec<_>>());
+}
+
 fn open_continue_watching(wiring: &Wiring, status: Status) {
     let entries = wiring.persist.resume_entries();
-    let channels = wiring.browser.borrow().all_channels();
-    let mut rows: Vec<(String, Channel, i64, i64)> = Vec::new();
-    for (key, entry) in &entries {
-        if let Some(channel) = channels.iter().find(|c| channel_key(c) == *key) {
-            rows.push((
-                key.clone(),
-                channel.clone(),
-                entry.position_ms,
-                entry.length_ms,
-            ));
-        }
-    }
-    if rows.is_empty() {
-        status.set_label("Nothing in Continue Watching yet.");
+    if entries.is_empty() {
+        status.set_label("No saved playback positions.");
         return;
     }
+    let channels = wiring.browser.borrow().all_channels();
+    let mut rows: Vec<CwRow> = entries
+        .iter()
+        .map(|(key, entry)| {
+            let channel = channels.iter().find(|c| channel_key(c) == *key).cloned();
+            let title = if !entry.title.is_empty() {
+                entry.title.clone()
+            } else if let Some(channel) = &channel {
+                channel.name.clone()
+            } else {
+                "Previously saved content (title unavailable)".to_string()
+            };
+            CwRow {
+                key: key.clone(),
+                title,
+                channel,
+                position_ms: entry.position_ms,
+                length_ms: entry.length_ms,
+                updated: entry.updated,
+                availability: "Not checked".to_string(),
+            }
+        })
+        .collect();
+    rows.sort_by_key(|row| std::cmp::Reverse(row.updated));
     let (frame, panel, list, dstatus) = list_dialog("Continue Watching", "Programmes to resume");
-    let render = |rows: &[(String, Channel, i64, i64)], list: ListBox| {
-        let labels: Vec<String> = rows
-            .iter()
-            .map(|(_, channel, position, length)| {
-                format!(
-                    "{} — {} of {} watched",
-                    channel.name,
-                    format_duration_ms(*position),
-                    format_duration_ms(*length)
-                )
-            })
-            .collect();
-        list.set_items(&labels.iter().map(String::as_str).collect::<Vec<_>>());
-    };
-    render(&rows, list);
+    render_cw_rows(&rows, list);
+    if !rows.is_empty() {
+        list.set_selection(0, true);
+    }
     dstatus.set_label(&format!("{} programmes to resume.", rows.len()));
-    let play = Button::builder(&panel).with_label("&Play").build();
+    let resume = Button::builder(&panel).with_label("&Resume").build();
+    let check = Button::builder(&panel)
+        .with_label("C&heck Availability")
+        .build();
     let remove = Button::builder(&panel).with_label("&Remove").build();
+    let clear = Button::builder(&panel).with_label("Clear &All").build();
     let close = Button::builder(&panel).with_label("&Close").build();
     let rows = Rc::new(RefCell::new(rows));
+    wire_continue_watching(
+        wiring, frame, list, dstatus, status, &rows, resume, check, remove, clear, close,
+    );
+    frame.show(true);
+}
+
+/// Check Availability for one saved position (Python): show
+/// "Checking saved content…", re-resolve the bookmark identity
+/// against the current catalogue (never probe the stream),
+/// then set the row's availability — Available with the fresh
+/// channel, or Unavailable or ambiguous — speak it via the
+/// dialog status, and keep the selection on the checked row.
+fn cw_check_availability(
+    wiring: &Wiring,
+    rows: &Rc<RefCell<Vec<CwRow>>>,
+    index: usize,
+    list: ListBox,
+    dstatus: Status,
+) {
+    dstatus.set_label("Checking saved content\u{2026}");
+    let fresh = wiring.browser.borrow().all_channels();
+    let mut guard = rows.borrow_mut();
+    let Some(row) = guard.get_mut(index) else {
+        return;
+    };
+    if let Some(channel) = fresh.iter().find(|c| channel_key(c) == row.key).cloned() {
+        if row.title.starts_with("Previously saved content") {
+            row.title.clone_from(&channel.name);
+        }
+        row.channel = Some(channel);
+        row.availability = "Available".to_string();
+    } else {
+        row.channel = None;
+        row.availability = "Unavailable or ambiguous".to_string();
+    }
+    let result = row.availability.clone();
+    drop(guard);
+    render_cw_rows(&rows.borrow(), list);
+    list.set_selection(u32::try_from(index).unwrap_or(0), true);
+    dstatus.set_label(&result);
+}
+
+/// The Continue Watching buttons: Resume, Check Availability
+/// (Python: per selected row, identity re-resolution against
+/// the current catalogue — the stream URL is never probed),
+/// Remove and Clear All (both confirmed, Python's wording).
+#[allow(clippy::too_many_arguments)]
+fn wire_continue_watching(
+    wiring: &Wiring,
+    frame: Frame,
+    list: ListBox,
+    dstatus: Status,
+    status: Status,
+    rows: &Rc<RefCell<Vec<CwRow>>>,
+    resume: Button,
+    check: Button,
+    remove: Button,
+    clear: Button,
+    close: Button,
+) {
+    let selected = |list: ListBox| -> Option<usize> {
+        list.get_selection()
+            .map(|index| usize::try_from(index).unwrap_or(usize::MAX))
+    };
     let wiring_p = clone_wiring(wiring);
-    let rows_p = Rc::clone(&rows);
-    play.on_click(move |_| {
-        let Some(index) = list.get_selection() else {
+    let rows_p = Rc::clone(rows);
+    resume.on_click(move |_| {
+        let Some(index) = selected(list) else {
             return;
         };
-        if let Some((_, channel, _, _)) = rows_p
+        let channel = rows_p
             .borrow()
-            .get(usize::try_from(index).unwrap_or(usize::MAX))
-        {
-            play_channel(&wiring_p.player, &wiring_p.persist, channel, status);
-            frame.hide();
+            .get(index)
+            .and_then(|row| row.channel.clone());
+        match channel {
+            Some(channel) => {
+                play_channel(&wiring_p.player, &wiring_p.persist, &channel, status);
+                frame.hide();
+            }
+            None => dstatus.set_label("Unavailable or ambiguous"),
         }
     });
-    let wiring_r = clone_wiring(wiring);
-    let rows_r = Rc::clone(&rows);
-    remove.on_click(move |_| {
-        let Some(index) = list.get_selection() else {
+    let wiring_c = clone_wiring(wiring);
+    let rows_c = Rc::clone(rows);
+    check.on_click(move |_| {
+        let Some(index) = selected(list) else {
+            dstatus.set_label("Choose a saved position to check first.");
             return;
         };
-        let index = usize::try_from(index).unwrap_or(usize::MAX);
+        cw_check_availability(&wiring_c, &rows_c, index, list, dstatus);
+    });
+    let wiring_r = clone_wiring(wiring);
+    let rows_r = Rc::clone(rows);
+    remove.on_click(move |_| {
+        let Some(index) = selected(list) else {
+            return;
+        };
+        let dialog = MessageDialog::builder(
+            &frame,
+            "Remove this saved playback position?",
+            "Continue Watching",
+        )
+        .with_style(MessageDialogStyle::YesNo)
+        .build();
+        if dialog.show_modal() != ID_YES {
+            return;
+        }
         let removed = {
             let mut guard = rows_r.borrow_mut();
-            if index < guard.len() {
-                Some(guard.remove(index))
-            } else {
-                None
-            }
+            (index < guard.len()).then(|| guard.remove(index))
         };
-        if let Some((key, _, _, _)) = removed {
+        if let Some(row) = removed {
             let mut entries = wiring_r.persist.resume_entries();
-            entries.remove(&key);
+            entries.remove(&row.key);
             wiring_r.persist.save_resume(&entries);
-            render(&rows_r.borrow(), list);
+            render_cw_rows(&rows_r.borrow(), list);
             dstatus.set_label("Removed from Continue Watching.");
         }
     });
+    let wiring_a = clone_wiring(wiring);
+    let rows_a = Rc::clone(rows);
+    clear.on_click(move |_| {
+        let dialog = MessageDialog::builder(
+            &frame,
+            "Remove all saved playback positions?",
+            "Continue Watching",
+        )
+        .with_style(MessageDialogStyle::YesNo)
+        .build();
+        if dialog.show_modal() != ID_YES {
+            return;
+        }
+        rows_a.borrow_mut().clear();
+        wiring_a
+            .persist
+            .save_resume(&std::collections::BTreeMap::new());
+        render_cw_rows(&rows_a.borrow(), list);
+        dstatus.set_label("No saved playback positions.");
+    });
     close.on_click(move |_| frame.hide());
-    frame.show(true);
 }
 
 /// View > Recently Watched...: this session's playback history.

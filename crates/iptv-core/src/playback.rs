@@ -623,6 +623,10 @@ pub struct ResumeEntry {
     pub position_ms: i64,
     pub length_ms: i64,
     pub updated: i64,
+    /// The channel name captured at checkpoint time, so a saved
+    /// position stays identifiable after the channel leaves the
+    /// catalogue (Python keeps the bookmark title in metadata).
+    pub title: String,
 }
 
 const RESUME_MIN_MS: i64 = 30_000;
@@ -634,6 +638,7 @@ const RESUME_MAX_ENTRIES: usize = 200;
 pub fn resume_checkpoint(
     entries: &mut BTreeMap<String, ResumeEntry>,
     key: &str,
+    title: &str,
     position_ms: i64,
     length_ms: i64,
     now: i64,
@@ -651,6 +656,7 @@ pub fn resume_checkpoint(
                 position_ms,
                 length_ms,
                 updated: now,
+                title: title.to_string(),
             },
         );
     }
@@ -808,11 +814,12 @@ mod tests {
     #[test]
     fn resume_checkpoint_rules_match_python() {
         let mut entries = BTreeMap::new();
-        resume_checkpoint(&mut entries, "k", 10_000, 3_600_000, 100);
+        resume_checkpoint(&mut entries, "k", "Show", 10_000, 3_600_000, 100);
         assert!(entries.is_empty(), "under 30s not kept");
-        resume_checkpoint(&mut entries, "k", 900_000, 3_600_000, 100);
+        resume_checkpoint(&mut entries, "k", "Show", 900_000, 3_600_000, 100);
         assert_eq!(resume_position(&entries, "k"), Some(900_000));
-        resume_checkpoint(&mut entries, "k", 3_590_000, 3_600_000, 200);
+        assert_eq!(entries["k"].title, "Show", "title captured at checkpoint");
+        resume_checkpoint(&mut entries, "k", "Show", 3_590_000, 3_600_000, 200);
         assert!(entries.is_empty(), "inside end window removes");
     }
 
