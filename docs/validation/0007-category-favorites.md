@@ -54,12 +54,25 @@ replacement gate.
 - `cargo fmt --all --check`, `cargo clippy --workspace --all-targets`
   (no warnings), and `git diff --check` pass.
 
-## Evidence boundary
+## Owner-heard NVDA/keyboard record
 
-Automated checks do not prove audible acceptance. Still owed, owner-heard
-with NVDA and keyboard only: category navigation in a populated playlist,
-empty Favorites, toggling from the channel list, rapid category/search
-changes, playlist replacement, a large playlist, and system presentation
-settings (large text, contrast, reduced motion). The Windows native smoke
-script's category/Favorites coverage is likewise still owed; this record
-claims domain and adapter-unit evidence only.
+Manual session reported by the product owner on 2026-11-01:
+
+- PASS: initial focus and the accessible Channels list name/role.
+- PASS: empty startup status with no fake selectable channel row.
+- PASS: Tab/Shift+Tab traversal through Open playlist, Category, Search,
+  Channels, Toggle favorite, and Playlist status.
+- PASS: populated category browsing and readable source-order rows.
+- PASS: Favorites add/remove announcements, focus usability, and empty
+  Favorites status.
+- PASS: search match, clear-to-category restoration, and no-match status.
+- PASS: available large-list/resizing and presentation checks.
+- PASS: rapid category/search changes did not expose stale results, changed
+  the active category incorrectly, or strand focus.
+- PASS: playlist replacement/recovery announcements and rows remained usable
+  without stale state.
+
+The native MSAA smoke check also passed against an isolated copy of the built
+executable: it found the named Channels list, list role, keyboard focusability,
+zero startup rows, named focusable actions/search, and the read-only empty
+status. It did not populate a playlist or claim NVDA speech.
