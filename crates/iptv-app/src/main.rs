@@ -224,19 +224,59 @@ fn scope_display_name(location: &str) -> String {
 }
 
 /// The Category list and the Toggle favorite action, in browse order.
-fn category_controls(panel: Panel) -> (StaticText, ListBox, Button) {
+fn category_controls(panel: Panel) -> (StaticText, TreeCtrl, Button) {
     let label = StaticText::builder(&panel).with_label("&Category").build();
-    let category = ListBox::builder(&panel).build();
+    let category = TreeCtrl::builder(&panel)
+        .with_style(TreeCtrlStyle::HideRoot)
+        .build();
     category.set_accessibility_label("Category");
     category.set_accessibility_description("Choose All Channels, Favorites, or a playlist group. Tab moves to Toggle favorite; Shift+Tab returns to Cancel loading.");
-    category.set_items(&["All Channels", "Favorites"]);
-    category.set_selection(0, true);
+    if let Some(root) = category.add_root("Categories", None, None) {
+        category.append_item(&root, "All Channels", None, None);
+        category.append_item(&root, "Favorites", None, None);
+        category.expand(&root);
+    }
     let toggle = Button::builder(&panel)
         .with_label("&Toggle favorite")
         .build();
     toggle.set_accessibility_label("Toggle favorite");
-    toggle.set_accessibility_description("Add or remove the channel selected in Channels from Favorites. The result is announced in Playlist status.");
+    toggle.set_accessibility_description(
+        "Mark or unmark the selected channel as a favorite without moving focus.",
+    );
     (label, category, toggle)
+}
+
+/// The tree item at a top-level position (0-based), walking the
+/// root's children.
+fn tree_item_at(tree: TreeCtrl, index: usize) -> Option<TreeItemId> {
+    let root = tree.get_root_item()?;
+    let (first, mut cookie) = tree.get_first_child(&root)?;
+    if index == 0 {
+        return Some(first);
+    }
+    let mut current = first;
+    for _ in 1..=index {
+        current = tree.get_next_child(&root, &mut cookie)?;
+    }
+    Some(current)
+}
+
+/// The top-level position of a tree item, by item identity.
+fn tree_item_index(tree: TreeCtrl, selected: &TreeItemId) -> Option<usize> {
+    let root = tree.get_root_item()?;
+    let target = u64::from(selected);
+    let (first, mut cookie) = tree.get_first_child(&root)?;
+    if u64::from(&first) == target {
+        return Some(0);
+    }
+    let mut index = 0;
+    loop {
+        index += 1;
+        let next = tree.get_next_child(&root, &mut cookie)?;
+        if u64::from(&next) == target {
+            return Some(index);
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -269,7 +309,7 @@ struct Controls {
     cancel: Button,
     record: Button,
     scope_choice: Choice,
-    category: ListBox,
+    category: TreeCtrl,
     toggle_favorite: Button,
     search: TextCtrl,
     list: ListCtrl,
@@ -653,16 +693,16 @@ fn bind_actions(frame: Frame, wiring: &Wiring, controls: Controls) {
     let category_browser = Rc::clone(&browser);
     let category_timer = Rc::clone(&timer);
     let category_choices = Rc::clone(&categories);
-    category.bind_internal(EventType::COMMAND_LISTBOX_SELECTED, move |event| {
+    category.bind_internal(EventType::TREE_SEL_CHANGED, move |event| {
         let Some(selection) = category.get_selection() else {
             event.skip(true);
             return;
         };
-        let Some(chosen) = category_choices
-            .borrow()
-            .get(usize::try_from(selection).unwrap_or(usize::MAX))
-            .cloned()
-        else {
+        let Some(position) = tree_item_index(category, &selection) else {
+            event.skip(true);
+            return;
+        };
+        let Some(chosen) = category_choices.borrow().get(position).cloned() else {
             event.skip(true);
             return;
         };
@@ -2197,7 +2237,9 @@ fn bind_menu_actions(frame: Frame, wiring: &Wiring, controls: Controls) {
                 status,
             ),
             GO_TO_FAVORITES => {
-                category_box.set_selection(1, true);
+                if let Some(item) = tree_item_at(category_box, 1) {
+                    category_box.select_item(&item);
+                }
                 if wiring
                     .browser
                     .borrow_mut()
@@ -3434,36 +3476,43 @@ fn category_display(category: &Category, favorite_count: usize) -> String {
 /// moving keyboard focus: rebuild rows only when the set changed, and keep
 /// the selection on the active category.
 fn sync_category_control(
-    control: ListBox,
+    control: TreeCtrl,
     state: &RefCell<Vec<Category>>,
     browser: &RefCell<BrowserWorker>,
 ) {
     let browser = browser.borrow();
     let current = browser.categories();
     let favorite_count = browser.favorite_count();
-    if *state.borrow() != current {
-        let labels: Vec<String> = current
-            .iter()
-            .map(|category| category_display(category, favorite_count))
-            .collect();
-        let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
-        control.set_items(&refs);
-        *state.borrow_mut() = current;
-    } else if browser.active_category() == &Category::Favorites {
-        // The count in the Favorites label can change without a set change.
-        let labels: Vec<String> = state
-            .borrow()
-            .iter()
-            .map(|category| category_display(category, favorite_count))
-            .collect();
-        let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
-        control.set_items(&refs);
+    let favorites_active = browser.active_category() == &Category::Favorites;
+    if *state.borrow() != current || favorites_active {
+        // Rebuild the tree rows (the Favorites count can change the
+        // label without a set change, as with the old list).
+        if let Some(root) = control.get_root_item() {
+            control.delete_children(&root);
+            for category in &current {
+                control.append_item(
+                    &root,
+                    &category_display(category, favorite_count),
+                    None,
+                    None,
+                );
+            }
+            control.expand(&root);
+        }
+        if *state.borrow() != current {
+            *state.borrow_mut() = current;
+        }
     }
     let active = browser.active_category().clone();
     if let Some(position) = state.borrow().iter().position(|item| item == &active) {
-        let position = u32::try_from(position).unwrap_or(u32::MAX);
-        if control.get_selection() != Some(position) {
-            control.set_selection(position, true);
+        if let Some(item) = tree_item_at(control, position) {
+            let selected = control.get_selection();
+            let already = selected
+                .as_ref()
+                .is_some_and(|sel| u64::from(sel) == u64::from(&item));
+            if !already {
+                control.select_item(&item);
+            }
         }
     }
 }
