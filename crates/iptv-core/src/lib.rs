@@ -18,8 +18,10 @@ pub mod providers;
 pub mod recording;
 pub mod reminders;
 pub mod search;
+pub mod shortcuts;
 pub mod sources;
 pub mod subtitles;
+pub mod updater;
 pub mod vod;
 
 use std::collections::BTreeMap;
