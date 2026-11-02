@@ -624,4 +624,77 @@ mod tests {
         assert!(!should_shutdown(true, true, 1, 0));
         assert!(!should_shutdown(true, true, 0, 2));
     }
+
+    #[test]
+    fn recording_engine_reports_successful_process_completion() {
+        let dir =
+            std::env::temp_dir().join(format!("iptv-recording-success-{}", std::process::id()));
+        let output = dir.join("success.ts");
+        let command = test_process_command(0);
+        let mut engine = RecordingEngine::new();
+        engine
+            .start("channel", &command, output.clone())
+            .expect("start");
+
+        let finished = wait_for_finished(&mut engine);
+        assert_eq!(finished.len(), 1);
+        assert_eq!(finished[0].key, "channel");
+        assert_eq!(finished[0].out_path, output);
+        assert!(finished[0].success);
+        assert_eq!(engine.active_count(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recording_engine_reports_failed_process_completion() {
+        let dir =
+            std::env::temp_dir().join(format!("iptv-recording-failure-{}", std::process::id()));
+        let output = dir.join("failure.ts");
+        let command = test_process_command(7);
+        let mut engine = RecordingEngine::new();
+        engine
+            .start("channel", &command, output.clone())
+            .expect("start");
+
+        let finished = wait_for_finished(&mut engine);
+        assert_eq!(finished.len(), 1);
+        assert_eq!(finished[0].key, "channel");
+        assert_eq!(finished[0].out_path, output);
+        assert!(!finished[0].success);
+        assert_eq!(engine.active_count(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn wait_for_finished(engine: &mut RecordingEngine) -> Vec<RecordingFinished> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let finished = engine.poll_finished();
+            if !finished.is_empty() {
+                return finished;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "recording process timed out"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    #[cfg(windows)]
+    fn test_process_command(exit_code: u8) -> Vec<String> {
+        vec![
+            "cmd.exe".to_string(),
+            "/C".to_string(),
+            format!("exit {exit_code}"),
+        ]
+    }
+
+    #[cfg(not(windows))]
+    fn test_process_command(exit_code: u8) -> Vec<String> {
+        vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            format!("exit {exit_code}"),
+        ]
+    }
 }

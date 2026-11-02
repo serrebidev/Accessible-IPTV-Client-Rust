@@ -20,6 +20,10 @@ _Avoid_: demo, spike
 The evidence required before Rust can replace Python as the shipping product: feature parity, regression coverage, build and release checks, and owner-heard accessibility acceptance.
 _Avoid_: launch date, migration complete
 
+**Replacement readiness**:
+Candidate approval for Rust after current owner-heard accessibility, installed-libVLC playback, live ffmpeg recording, and packaging/updater VM evidence pass. Physical-renderer evidence remains a separately reported risk; a maintainer may record an explicit dated waiver with owner notification. Readiness does not switch the shipping product or authorize a release.
+_Avoid_: replacement complete, Python retired
+
 **Owner-heard validation**:
 Hands-on validation by the blind product owner using NVDA and keyboard interaction; automated accessibility evidence does not substitute for it.
 _Avoid_: accessibility test, screen-reader automation

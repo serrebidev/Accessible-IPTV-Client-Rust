@@ -1054,6 +1054,7 @@ fn handle_dvr_resolve(
                 state.in_flight = false;
                 state.next_try = now + 10.0;
             }
+            wiring.dvr.borrow_mut().defer_resolution(job_id, now);
             status.set_label("The portal did not answer; the scheduled recording will retry.");
         } else {
             wiring.dvr_resolve.borrow_mut().remove(job_id);
@@ -1081,6 +1082,10 @@ fn handle_dvr_resolve(
     }
     let mut channel = channel_from_snapshot(&job.channel);
     channel.url = url;
+    if !wiring.dvr.borrow_mut().resolution_succeeded(job_id) {
+        wiring.dvr_resolve.borrow_mut().remove(job_id);
+        return;
+    }
     record_dvr_channel(wiring, status, &job, &channel, now);
 }
 fn poll_providers(wiring: &Wiring, controls: Controls) {
@@ -1455,6 +1460,41 @@ fn poll_recordings(wiring: &Wiring, status: Status) {
         let actions = wiring.dvr.borrow_mut().tick(now);
         for action in actions {
             match action {
+                DvrAction::Resolve {
+                    job_id,
+                    provider_id,
+                    data,
+                } => {
+                    if provider_id.is_empty() {
+                        wiring.dvr.borrow_mut().mark_finished(
+                            &job_id,
+                            false,
+                            "",
+                            "Scheduled recording has no provider account.",
+                            now,
+                        );
+                        continue;
+                    }
+                    if wiring.dvr_resolve.borrow().contains_key(&job_id) {
+                        continue;
+                    }
+                    wiring.dvr.borrow_mut().mark_resolving(&job_id);
+                    let request = dispatch_resolve(
+                        wiring,
+                        PendingResolve::Dvr(job_id.clone()),
+                        provider_id,
+                        data,
+                    );
+                    wiring.dvr_resolve.borrow_mut().insert(
+                        job_id,
+                        DvrResolve {
+                            request,
+                            in_flight: true,
+                            next_try: now + 10.0,
+                        },
+                    );
+                    status.set_label("Resolving scheduled recording stream...");
+                }
                 DvrAction::Stop(job_id) => {
                     wiring
                         .recordings

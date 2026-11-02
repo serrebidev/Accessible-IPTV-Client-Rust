@@ -2,6 +2,7 @@
 //! `scheduled_recordings.json` (the same version-1 file shape), padding,
 //! the tick state machine, restart re-arming, and daily/weekly repeats.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use chrono::TimeZone as _;
@@ -217,6 +218,12 @@ pub fn build_job(spec: &NewJob<'_>, now: f64) -> Result<DvrJob, String> {
 /// What the scheduler wants the caller to do after a tick.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DvrAction {
+    /// Resolve a temporary provider stream before starting this job.
+    Resolve {
+        job_id: String,
+        provider_id: String,
+        data: std::collections::BTreeMap<String, String>,
+    },
     /// Start recording this job now.
     Start(String),
     /// Stop the recording for this job.
@@ -228,6 +235,7 @@ pub enum DvrAction {
 pub struct DvrSchedule {
     jobs: Vec<DvrJob>,
     stopping_since: std::collections::BTreeMap<String, f64>,
+    resolving: BTreeSet<String>,
     path: PathBuf,
 }
 
@@ -239,6 +247,7 @@ impl DvrSchedule {
         let mut schedule = Self {
             jobs: Vec::new(),
             stopping_since: std::collections::BTreeMap::new(),
+            resolving: BTreeSet::new(),
             path,
         };
         let Ok(text) = std::fs::read_to_string(&schedule.path) else {
@@ -341,6 +350,7 @@ impl DvrSchedule {
         if DONE_STATUSES.contains(&job.status.as_str()) {
             return false;
         }
+        self.resolving.remove(job_id);
         job.status = STATUS_CANCELED.to_string();
         job.message = "Canceled by user.".to_string();
         self.save();
@@ -358,7 +368,63 @@ impl DvrSchedule {
 
     /// Record that a job's recording has started.
     pub fn mark_recording(&mut self, job_id: &str) {
+        self.resolving.remove(job_id);
         self.set_status(job_id, STATUS_RECORDING, "");
+        self.save();
+    }
+
+    /// Apply a successful asynchronous provider resolution to a still-pending
+    /// job. Returns false for canceled, expired, or otherwise stale results.
+    pub fn resolution_succeeded(&mut self, job_id: &str) -> bool {
+        let active = self.resolving.contains(job_id)
+            && self
+                .jobs
+                .iter()
+                .any(|job| job.id == job_id && job.status == STATUS_SCHEDULED);
+        if !active {
+            return false;
+        }
+        self.resolving.remove(job_id);
+        self.set_status(job_id, STATUS_RECORDING, "");
+        self.save();
+        true
+    }
+
+    /// Keep a due job scheduled while an asynchronous provider link is being
+    /// resolved. The transient ownership never enters the persisted store.
+    pub fn mark_resolving(&mut self, job_id: &str) {
+        self.resolving.insert(job_id.to_string());
+        self.set_status(job_id, STATUS_SCHEDULED, "");
+        self.save();
+    }
+
+    /// Return a failed or unavailable resolution to the normal due-job path.
+    /// The next scheduler tick may request another link while the window is
+    /// open; after the window closes the job becomes durably failed.
+    pub fn defer_resolution(&mut self, job_id: &str, now: f64) {
+        let active = self.resolving.contains(job_id)
+            && self
+                .jobs
+                .iter()
+                .any(|job| job.id == job_id && job.status == STATUS_SCHEDULED);
+        if !active {
+            return;
+        }
+        self.resolving.remove(job_id);
+        let expired = self
+            .jobs
+            .iter()
+            .find(|job| job.id == job_id)
+            .is_some_and(|job| job.stop_ts > 0.0 && now >= job.stop_ts);
+        if expired {
+            self.set_status(
+                job_id,
+                STATUS_FAILED,
+                "Could not resolve the scheduled recording before its window ended.",
+            );
+        } else {
+            self.set_status(job_id, STATUS_SCHEDULED, "");
+        }
         self.save();
     }
 
@@ -374,13 +440,33 @@ impl DvrSchedule {
             };
             match job.status.as_str() {
                 STATUS_SCHEDULED => {
+                    if self.resolving.contains(&id) {
+                        if job.stop_ts > 0.0 && now >= job.stop_ts {
+                            self.resolving.remove(&id);
+                            self.set_status(
+                                &id,
+                                STATUS_FAILED,
+                                "Could not resolve the scheduled recording before its window ended.",
+                            );
+                            changed = true;
+                        }
+                        continue;
+                    }
                     if job.stop_ts > 0.0 && now >= job.stop_ts {
                         self.set_status(&id, STATUS_MISSED, "Scheduled recording was missed.");
                         changed = true;
                     } else if now >= job.start_ts {
-                        self.set_status(&id, STATUS_RECORDING, "");
-                        changed = true;
-                        actions.push(DvrAction::Start(id));
+                        if let Some((provider_id, data)) = stalker_resolution_request(&job) {
+                            actions.push(DvrAction::Resolve {
+                                job_id: id,
+                                provider_id,
+                                data,
+                            });
+                        } else {
+                            self.set_status(&id, STATUS_RECORDING, "");
+                            changed = true;
+                            actions.push(DvrAction::Start(id));
+                        }
                     }
                 }
                 STATUS_RECORDING => {
@@ -417,6 +503,7 @@ impl DvrSchedule {
         now: f64,
     ) {
         self.stopping_since.remove(job_id);
+        self.resolving.remove(job_id);
         let Some(job) = self.jobs.iter_mut().find(|j| j.id == job_id) else {
             return;
         };
@@ -496,6 +583,27 @@ impl DvrSchedule {
     }
 }
 
+fn stalker_resolution_request(
+    job: &DvrJob,
+) -> Option<(String, std::collections::BTreeMap<String, String>)> {
+    let channel = channel_from_snapshot(&job.channel);
+    if !channel.url.is_empty()
+        || channel
+            .unknown_attributes
+            .get("provider-type")
+            .map(String::as_str)
+            != Some("stalker")
+    {
+        return None;
+    }
+    let provider_id = channel
+        .unknown_attributes
+        .get("provider-id")
+        .cloned()
+        .unwrap_or_default();
+    Some((provider_id, channel.unknown_attributes))
+}
+
 /// The schedule store path: beside the loaded config file, which is
 /// the reference's user config dir (`scheduled_recordings.json`).
 #[must_use]
@@ -520,6 +628,21 @@ mod tests {
             tvg_logo: String::new(),
             unknown_attributes: std::collections::BTreeMap::new(),
         }
+    }
+
+    fn stalker_channel() -> Channel {
+        let mut channel = channel();
+        channel.url.clear();
+        channel
+            .unknown_attributes
+            .insert("provider-type".to_string(), "stalker".to_string());
+        channel
+            .unknown_attributes
+            .insert("provider-id".to_string(), "portal-1".to_string());
+        channel
+            .unknown_attributes
+            .insert("cmd".to_string(), "ffmpeg http://portal/live".to_string());
+        channel
     }
 
     fn spec<'a>(
@@ -574,6 +697,106 @@ mod tests {
         assert_eq!(stop_actions, vec![DvrAction::Stop(due_id.clone())]);
         schedule.mark_finished(&due_id, true, "/tmp/x.mkv", "", 260.0);
         assert_eq!(schedule.get(&due_id).expect("due").status, STATUS_COMPLETED);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn due_stalker_job_emits_resolution_before_recording() {
+        let dir = std::env::temp_dir().join(format!("iptv-dvr-stalker-{}", std::process::id()));
+        let path = dir.join("scheduled_recordings.json");
+        let mut schedule = DvrSchedule::load(path, 0.0);
+        let channel = stalker_channel();
+        let job = build_job(&spec(&channel, "Due", 100, 200, 0, 0), 0.0).expect("job");
+        let id = job.id.clone();
+        schedule.add_job(job);
+
+        let actions = schedule.tick(150.0);
+        assert_eq!(
+            actions,
+            vec![DvrAction::Resolve {
+                job_id: id.clone(),
+                provider_id: "portal-1".to_string(),
+                data: channel.unknown_attributes.clone(),
+            }]
+        );
+        assert_eq!(schedule.get(&id).expect("job").status, STATUS_SCHEDULED);
+        schedule.mark_resolving(&id);
+        assert!(schedule.resolution_succeeded(&id));
+        assert_eq!(schedule.get(&id).expect("job").status, STATUS_RECORDING);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolving_due_job_is_not_started_again_until_resolution_finishes() {
+        let dir = std::env::temp_dir().join(format!("iptv-dvr-resolve-{}", std::process::id()));
+        let path = dir.join("scheduled_recordings.json");
+        let mut schedule = DvrSchedule::load(path, 0.0);
+        let due = build_job(&spec(&channel(), "Due", 100, 200, 0, 0), 0.0).expect("job");
+        let id = due.id.clone();
+        schedule.add_job(due);
+
+        assert_eq!(schedule.tick(150.0), vec![DvrAction::Start(id.clone())]);
+        schedule.mark_resolving(&id);
+        assert!(schedule.tick(160.0).is_empty());
+        assert_eq!(schedule.get(&id).expect("job").status, STATUS_SCHEDULED);
+
+        schedule.defer_resolution(&id, 160.0);
+        assert_eq!(schedule.tick(170.0), vec![DvrAction::Start(id)]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn failed_resolution_retries_before_window_and_fails_after_it() {
+        let dir = std::env::temp_dir().join(format!("iptv-dvr-retry-{}", std::process::id()));
+        let path = dir.join("scheduled_recordings.json");
+        let mut schedule = DvrSchedule::load(path, 0.0);
+        let due = build_job(&spec(&channel(), "Due", 100, 200, 0, 0), 0.0).expect("job");
+        let id = due.id.clone();
+        schedule.add_job(due);
+
+        assert_eq!(schedule.tick(150.0), vec![DvrAction::Start(id.clone())]);
+        schedule.mark_resolving(&id);
+        schedule.defer_resolution(&id, 160.0);
+        assert_eq!(schedule.get(&id).expect("job").status, STATUS_SCHEDULED);
+        assert_eq!(schedule.tick(170.0), vec![DvrAction::Start(id.clone())]);
+        schedule.mark_resolving(&id);
+        schedule.defer_resolution(&id, 200.0);
+        let job = schedule.get(&id).expect("job");
+        assert_eq!(job.status, STATUS_FAILED);
+        assert!(job.message.contains("window ended"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn late_resolution_failure_cannot_resurrect_a_canceled_job() {
+        let dir = std::env::temp_dir().join(format!("iptv-dvr-cancel-{}", std::process::id()));
+        let path = dir.join("scheduled_recordings.json");
+        let mut schedule = DvrSchedule::load(path, 0.0);
+        let due = build_job(&spec(&channel(), "Due", 100, 200, 0, 0), 0.0).expect("job");
+        let id = due.id.clone();
+        schedule.add_job(due);
+        assert_eq!(schedule.tick(150.0), vec![DvrAction::Start(id.clone())]);
+        schedule.mark_resolving(&id);
+        assert!(schedule.cancel_job(&id));
+        schedule.defer_resolution(&id, 160.0);
+        assert_eq!(schedule.get(&id).expect("job").status, STATUS_CANCELED);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn late_resolution_success_cannot_resurrect_a_canceled_job() {
+        let dir =
+            std::env::temp_dir().join(format!("iptv-dvr-cancel-success-{}", std::process::id()));
+        let path = dir.join("scheduled_recordings.json");
+        let mut schedule = DvrSchedule::load(path, 0.0);
+        let due = build_job(&spec(&stalker_channel(), "Due", 100, 200, 0, 0), 0.0).expect("job");
+        let id = due.id.clone();
+        schedule.add_job(due);
+        assert_eq!(schedule.tick(150.0).len(), 1);
+        schedule.mark_resolving(&id);
+        assert!(schedule.cancel_job(&id));
+        assert!(!schedule.resolution_succeeded(&id));
+        assert_eq!(schedule.get(&id).expect("job").status, STATUS_CANCELED);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
