@@ -10,6 +10,8 @@ pub mod downloads;
 pub mod dvr;
 pub mod epg;
 pub mod favorites;
+pub mod guide;
+pub mod i18n;
 pub mod loading;
 pub mod playback;
 pub mod providers;
