@@ -97,6 +97,15 @@ impl BrowserWorker {
         &self.favorites
     }
 
+    /// Every loaded channel (playlist plus provider extras), for
+    /// catalogue builders that scan the whole browse state.
+    #[must_use]
+    pub fn all_channels(&self) -> Vec<crate::Channel> {
+        let mut out: Vec<crate::Channel> = self.playlist.channels().to_vec();
+        out.extend(self.extras.iter().cloned());
+        out
+    }
+
     /// The channel at a playlist index in the current projection's source.
     #[must_use]
     pub fn channel(&self, playlist_index: usize) -> Option<crate::Channel> {
