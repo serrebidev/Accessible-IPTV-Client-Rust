@@ -374,6 +374,11 @@ struct PlayerState {
     vlc_track_ids: Vec<i32>,
     shared: Option<PlayerShared>,
     desired_track: Option<String>,
+    track_menu_ids: Vec<i32>,
+    sleep_deadline: Option<i64>,
+    sleep_fade_secs: i64,
+    sleep_fading: bool,
+    sleep_start_volume: i32,
     last_label_cue: Option<usize>,
     current_channel: Option<Channel>,
     pending_resume_ms: Option<i64>,
@@ -394,6 +399,11 @@ impl Default for PlayerState {
             vlc_track_ids: Vec::new(),
             shared: None,
             desired_track: None,
+            track_menu_ids: Vec::new(),
+            sleep_deadline: None,
+            sleep_fade_secs: 5,
+            sleep_fading: false,
+            sleep_start_volume: 100,
             last_label_cue: None,
             current_channel: None,
             pending_resume_ms: None,
@@ -4213,7 +4223,370 @@ fn ensure_player_window(player: &Rc<RefCell<PlayerState>>, persist: &Persist, st
         },
     );
     bind_player_controls(player, persist, status, &win);
+    build_playback_menu(player, persist, status, &win);
     player.borrow_mut().window = Some(win);
+}
+
+/// Player Playback-menu ids.
+const PM_PLAY_PAUSE: i32 = 5301;
+const PM_STOP: i32 = 5302;
+const PM_SLEEP: i32 = 5303;
+const PM_RECORD: i32 = 5304;
+const PM_NO_TRACKS: i32 = 5305;
+const PM_LOAD_SUBS: i32 = 5320;
+const PM_SPEAK_SUBS: i32 = 5321;
+const PM_READ_SUB: i32 = 5322;
+const PM_PREV_SUB: i32 = 5323;
+const PM_NEXT_SUB: i32 = 5324;
+const PM_CAST: i32 = 5330;
+const PM_FULLSCREEN: i32 = 5331;
+const PM_WHATS_PLAYING: i32 = 5332;
+const PM_HIDE: i32 = 5333;
+const PM_EXIT: i32 = 5334;
+const PM_TRACK_BASE: i32 = 5340;
+
+/// Build the player window's Playback menu (Python's order and
+/// items). Dynamic pieces: the Audio Track submenu fills when
+/// libVLC publishes tracks (`apply_vlc_tracks`), and the Speak
+/// Subtitles check mirrors the setting.
+fn build_playback_menu(
+    player: &Rc<RefCell<PlayerState>>,
+    persist: &Persist,
+    status: Status,
+    win: &PlayerWindow,
+) {
+    let config = serde_json::Value::Object(persist.config.borrow().raw().clone());
+    let keys = iptv_core::shortcuts::effective(&config, "player")
+        .into_iter()
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let mut menu = Menu::builder().build();
+    menu_add(
+        &menu,
+        PM_PLAY_PAUSE,
+        &menu_label(&keys, "&Play/Pause", "play_pause"),
+        "",
+        ItemKind::Normal,
+    );
+    menu_add(&menu, PM_STOP, "&Stop", "", ItemKind::Normal);
+    menu_add(&menu, PM_SLEEP, "Sleep &Timer...", "", ItemKind::Normal);
+    menu_add(&menu, PM_RECORD, "&Record", "", ItemKind::Normal);
+    menu.append_separator();
+    let mut audio_menu = Menu::builder().build();
+    menu_add(
+        &audio_menu,
+        PM_NO_TRACKS,
+        "No audio tracks available",
+        "",
+        ItemKind::Normal,
+    );
+    audio_menu.enable_item(PM_NO_TRACKS, false);
+    menu.append_submenu(audio_menu, "Audio Trac&k", "");
+    menu_add(
+        &menu,
+        PM_LOAD_SUBS,
+        "Load Subtitle &File...",
+        "",
+        ItemKind::Normal,
+    );
+    menu_add(
+        &menu,
+        PM_SPEAK_SUBS,
+        "Spea&k Subtitles",
+        "",
+        ItemKind::Check,
+    );
+    let speak = persist.config.borrow().bool_or("speak_subtitles", false);
+    menu.check_item(PM_SPEAK_SUBS, speak);
+    menu_add(
+        &menu,
+        PM_READ_SUB,
+        "Read &Current Subtitle",
+        "",
+        ItemKind::Normal,
+    );
+    menu_add(
+        &menu,
+        PM_PREV_SUB,
+        "&Previous Subtitle",
+        "",
+        ItemKind::Normal,
+    );
+    menu_add(&menu, PM_NEXT_SUB, "&Next Subtitle", "", ItemKind::Normal);
+    menu.append_separator();
+    menu_add(&menu, PM_CAST, "&Cast...", "", ItemKind::Normal);
+    menu_add(
+        &menu,
+        PM_FULLSCREEN,
+        "Toggle &Full Screen",
+        "",
+        ItemKind::Normal,
+    );
+    menu_add(
+        &menu,
+        PM_WHATS_PLAYING,
+        "What Is &Playing",
+        "",
+        ItemKind::Normal,
+    );
+    menu.append_separator();
+    menu_add(&menu, PM_HIDE, "&Hide Window", "", ItemKind::Normal);
+    menu_add(&menu, PM_EXIT, "E&xit Player", "", ItemKind::Normal);
+    let bar = MenuBar::builder().append(menu, "&Playback").build();
+    win.frame.set_menu_bar(bar);
+    let menu_player = Rc::clone(player);
+    let menu_persist = persist.clone();
+    win.frame.on_menu(move |event| {
+        dispatch_player_menu(&menu_player, &menu_persist, status, event.get_id());
+    });
+}
+
+/// One Playback-menu selection. The menu mirrors the buttons and
+/// the player shortcuts; every arm reuses their helpers.
+fn dispatch_player_menu(
+    player: &Rc<RefCell<PlayerState>>,
+    persist: &Persist,
+    status: Status,
+    id: i32,
+) {
+    if (PM_TRACK_BASE..PM_TRACK_BASE + 40).contains(&id) {
+        let index = u32::try_from(id - PM_TRACK_BASE).unwrap_or(0);
+        if let Some(win) = player.borrow().window.clone() {
+            win.tracks.set_selection(index);
+        }
+        choose_audio_track(player, index, status);
+        return;
+    }
+    let win = player.borrow().window.clone();
+    let Some(win) = win else {
+        return;
+    };
+    match id {
+        PM_PLAY_PAUSE => toggle_pause_state(player, status),
+        PM_STOP | PM_EXIT => player_stop(player, persist, status),
+        PM_SLEEP => prompt_sleep_timer(player, win.frame, persist, status),
+        PM_RECORD => {
+            let state = player.borrow();
+            if let (Some(shared), Some(channel)) = (&state.shared, &state.current_channel) {
+                toggle_recording(&shared.recordings, persist, channel, status);
+                assert!(shared.timer.start(50, false));
+            }
+        }
+        PM_LOAD_SUBS => prompt_subtitle_file(player, win.frame, status),
+        PM_SPEAK_SUBS => {
+            let next = !persist.config.borrow().bool_or("speak_subtitles", false);
+            persist.set_and_save("speak_subtitles", serde_json::json!(next));
+            if let Some(menu) = playback_menu(player) {
+                menu.check_item(PM_SPEAK_SUBS, next);
+            }
+            status.set_label(if next {
+                "Subtitle speech on."
+            } else {
+                "Subtitle speech off."
+            });
+        }
+        PM_READ_SUB => announce_cue(player, "read_subtitle", status),
+        PM_PREV_SUB => announce_cue(player, "previous_subtitle", status),
+        PM_NEXT_SUB => announce_cue(player, "next_subtitle", status),
+        PM_CAST => {
+            let state = player.borrow();
+            if let Some(shared) = &state.shared {
+                show_cast_for(
+                    &shared.cast_ui,
+                    &shared.cast_worker,
+                    &shared.cast_pending,
+                    &shared.timer,
+                    &shared.proxy,
+                    state.current_channel.as_ref(),
+                );
+            }
+        }
+        PM_FULLSCREEN => win.frame.show_full_screen(!win.frame.is_full_screen()),
+        PM_WHATS_PLAYING => {
+            let state = player.borrow();
+            match &state.current_channel {
+                Some(channel) => status.set_label(&format!("Now playing: {}", channel.name)),
+                None => status.set_label("Nothing is playing."),
+            }
+        }
+        PM_HIDE => win.frame.hide(),
+        _ => {}
+    }
+}
+
+/// The player frame's Playback menu, as a borrowed handle (wx
+/// menus are owning wrappers; the frame's menu bar owns the
+/// real one after set_menu_bar).
+fn playback_menu(player: &Rc<RefCell<PlayerState>>) -> Option<Menu> {
+    let state = player.borrow();
+    let win = state.window.as_ref()?;
+    win.frame.get_menu_bar()?.get_menu(0)
+}
+
+/// The Audio Track submenu (Playback menu position 5, after
+/// Play/Pause, Stop, Sleep Timer, Record and a separator).
+fn audio_track_menu(player: &Rc<RefCell<PlayerState>>) -> Option<Menu> {
+    playback_menu(player)?
+        .find_item_by_position(5)?
+        .get_sub_menu()
+}
+
+/// Select an audio track by Choice index (the Choice and the
+/// Audio Track menu share this).
+fn choose_audio_track(player: &Rc<RefCell<PlayerState>>, index: u32, status: Status) {
+    let mut state = player.borrow_mut();
+    let label = state
+        .window
+        .as_ref()
+        .and_then(|win| win.tracks.get_string_selection())
+        .unwrap_or_default();
+    state.desired_track = Some(label.clone());
+    if state.vlc_active {
+        if let Some(id) = state.vlc_track_ids.get(index as usize).copied() {
+            if let Some(engine) = &mut state.vlc {
+                engine.set_audio_track(id);
+            }
+        }
+    }
+    status.set_label(&format!("Audio track preference: {label}"));
+}
+
+/// Python's Sleep Timer prompts: minutes (0-1440, 0 cancels),
+/// then the fade-out seconds (0-min(300, minutes*60), default
+/// from the sleep_fade_seconds setting, 5).
+fn prompt_sleep_timer(
+    player: &Rc<RefCell<PlayerState>>,
+    frame: Frame,
+    persist: &Persist,
+    status: Status,
+) {
+    let current = {
+        let state = player.borrow();
+        state
+            .sleep_deadline
+            .map(|deadline| ((deadline - now_epoch()).max(0) + 59) / 60)
+    };
+    let dialog = TextEntryDialog::builder(
+        &frame,
+        "Stop built-in playback after 1-1440 minutes; enter 0 to cancel the timer.",
+        "Sleep Timer",
+    )
+    .with_default_value(&current.map(|m| m.to_string()).unwrap_or_default())
+    .build();
+    if dialog.show_modal() != ID_OK {
+        return;
+    }
+    let text = dialog.get_value().unwrap_or_default();
+    let Ok(minutes) = text.trim().parse::<i64>() else {
+        status.set_label("Enter a whole number of minutes between 0 and 1440.");
+        return;
+    };
+    if !(0..=1440).contains(&minutes) {
+        status.set_label("Enter a whole number of minutes between 0 and 1440.");
+        return;
+    }
+    if minutes == 0 {
+        cancel_sleep_timer(player);
+        status.set_label("Sleep timer cancelled.");
+        return;
+    }
+    let saved_fade = persist
+        .config
+        .borrow()
+        .value("sleep_fade_seconds")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(5);
+    let fade_cap = (minutes * 60).min(300);
+    let fade_dialog = TextEntryDialog::builder(
+        &frame,
+        "Fade-out duration before stopping (seconds); 0 disables fading.",
+        "Sleep Timer",
+    )
+    .with_default_value(&saved_fade.clamp(0, fade_cap).to_string())
+    .build();
+    if fade_dialog.show_modal() != ID_OK {
+        return;
+    }
+    let fade_text = fade_dialog.get_value().unwrap_or_default();
+    let Ok(fade) = fade_text.trim().parse::<i64>() else {
+        status.set_label("Enter a whole number of fade-out seconds.");
+        return;
+    };
+    if !(0..=fade_cap).contains(&fade) {
+        status.set_label(&format!("Enter fade-out seconds between 0 and {fade_cap}."));
+        return;
+    }
+    persist.set_and_save("sleep_fade_seconds", serde_json::json!(fade));
+    let mut state = player.borrow_mut();
+    state.sleep_deadline = Some(now_epoch() + minutes * 60);
+    state.sleep_fade_secs = fade;
+    state.sleep_fading = false;
+    status.set_label(&format!(
+        "Sleep timer set: playback stops in {minutes} minutes."
+    ));
+}
+
+/// Clear the sleep timer, restoring the pre-fade volume if a
+/// fade was in progress.
+fn cancel_sleep_timer(player: &Rc<RefCell<PlayerState>>) {
+    let restore = {
+        let mut state = player.borrow_mut();
+        let restore = state.sleep_fading.then_some(state.sleep_start_volume);
+        state.sleep_deadline = None;
+        state.sleep_fading = false;
+        restore
+    };
+    if let Some(volume) = restore {
+        player_set_volume(player, volume);
+    }
+}
+
+/// The 1-second sleep-timer driver (Python's countdown): the
+/// fade announcement fires once when the fade window opens, the
+/// volume ramps linearly to zero, and the deadline stops
+/// playback (restoring the pre-fade volume for the next play).
+fn drive_sleep_timer(player: &Rc<RefCell<PlayerState>>, persist: &Persist, status: Status) {
+    let now = now_epoch();
+    let (deadline, fade, fading) = {
+        let state = player.borrow();
+        (
+            state.sleep_deadline,
+            state.sleep_fade_secs,
+            state.sleep_fading,
+        )
+    };
+    let Some(deadline) = deadline else {
+        return;
+    };
+    if now >= deadline {
+        let start_volume = player.borrow().sleep_start_volume;
+        {
+            let mut state = player.borrow_mut();
+            state.sleep_deadline = None;
+            state.sleep_fading = false;
+        }
+        player_stop(player, persist, status);
+        player_set_volume(player, start_volume);
+        return;
+    }
+    if fade > 0 && now >= deadline - fade {
+        if !fading {
+            let start_volume = player
+                .borrow()
+                .window
+                .as_ref()
+                .map_or(100, |win| win.volume.get_value());
+            let mut state = player.borrow_mut();
+            state.sleep_fading = true;
+            state.sleep_start_volume = start_volume;
+            // Priority 2 in Python; the announcement-level gate
+            // arrives with issue #102.
+            status.set_label("Playback volume is fading before the sleep timer stops it.");
+        }
+        let (start, _) = (player.borrow().sleep_start_volume, ());
+        let remaining = deadline - now;
+        let level = (i64::from(start) * remaining / fade).clamp(0, i64::from(start));
+        player_set_volume(player, i32::try_from(level).unwrap_or(0));
+    }
 }
 
 /// The player window's buttons.
@@ -4244,6 +4617,7 @@ fn wire_player_events(
         checkpoint_resume(&tick_player, &tick_persist);
         speak_subtitle_cue(&tick_player, &tick_persist, status);
         poll_vlc_state(&tick_player, &tick_persist, status);
+        drive_sleep_timer(&tick_player, &tick_persist, status);
         update_player_chrome(&tick_player);
     });
     let _ = timer.start(1000, false);
@@ -4353,19 +4727,9 @@ fn bind_player_controls(
     let tracks_handle = win.tracks;
     let tracks_player = Rc::clone(player);
     tracks_handle.bind_internal(EventType::COMMAND_CHOICE_SELECTED, move |_| {
-        let label = tracks_handle.get_string_selection().unwrap_or_default();
-        let mut state = tracks_player.borrow_mut();
-        state.desired_track = Some(label.clone());
-        if state.vlc_active {
-            if let Some(index) = tracks_handle.get_selection() {
-                if let Some(id) = state.vlc_track_ids.get(index as usize).copied() {
-                    if let Some(engine) = &mut state.vlc {
-                        engine.set_audio_track(id);
-                    }
-                }
-            }
+        if let Some(index) = tracks_handle.get_selection() {
+            choose_audio_track(&tracks_player, index, status);
         }
-        status.set_label(&format!("Audio track preference: {label}"));
     });
     let keys_player = Rc::clone(player);
     let keys_persist = persist.clone();
@@ -4565,6 +4929,22 @@ fn apply_vlc_tracks(player: &Rc<RefCell<PlayerState>>, persist: &Persist) {
         if let Some(position) = state.vlc_track_ids.iter().position(|track| *track == id) {
             win.tracks
                 .set_selection(u32::try_from(position).unwrap_or(0));
+        }
+    }
+    if let Some(menu) = audio_track_menu(player) {
+        let mut state = player.borrow_mut();
+        for old in state.track_menu_ids.drain(..) {
+            menu.delete(old);
+        }
+        menu.delete(PM_NO_TRACKS);
+        for (index, (_, name)) in tracks.iter().enumerate() {
+            let id = PM_TRACK_BASE + i32::try_from(index).unwrap_or(0);
+            menu_add(&menu, id, name, "", ItemKind::Radio);
+            state.track_menu_ids.push(id);
+        }
+        let selected = win.tracks.get_selection().unwrap_or(0);
+        if let Some(id) = state.track_menu_ids.get(selected as usize) {
+            menu.check_item(*id, true);
         }
     }
 }
