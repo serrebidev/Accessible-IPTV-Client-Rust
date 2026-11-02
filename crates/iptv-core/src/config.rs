@@ -309,6 +309,17 @@ impl Config {
         &self.values
     }
 
+    /// Set an arbitrary key (used by features that own a config section,
+    /// such as resume positions). Normalization never removes unknown keys.
+    pub fn set_value(&mut self, key: &str, value: Value) {
+        self.values.insert(key.to_string(), value);
+    }
+
+    #[must_use]
+    pub fn value(&self, key: &str) -> Option<&Value> {
+        self.values.get(key)
+    }
+
     /// Pretty JSON exactly as a save would write it.
     #[must_use]
     pub fn to_json_string(&self) -> String {

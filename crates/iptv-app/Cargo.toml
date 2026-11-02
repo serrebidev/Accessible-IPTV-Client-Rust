@@ -6,8 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+serde_json.workspace = true
 iptv-core.workspace = true
-wxdragon.workspace = true
+wxdragon = { workspace = true, features = ["media-ctrl"] }
 live-region.workspace = true
 
 [lints.rust]
