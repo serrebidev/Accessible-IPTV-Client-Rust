@@ -2166,11 +2166,16 @@ fn bind_tray(frame: Frame, wiring: &Wiring, status: Status) {
         frame.show(true);
         frame.raise();
     });
-    let dbl_frame = frame;
-    icon.on_left_double_click(move |_| {
-        dbl_frame.show(true);
-        dbl_frame.raise();
-    });
+    // wxdragon has no double-click event for the macOS tray
+    // icon; left-up restore above covers that platform.
+    #[cfg(not(target_os = "macos"))]
+    {
+        let dbl_frame = frame;
+        icon.on_left_double_click(move |_| {
+            dbl_frame.show(true);
+            dbl_frame.raise();
+        });
+    }
 }
 
 /// One tray menu selection.
