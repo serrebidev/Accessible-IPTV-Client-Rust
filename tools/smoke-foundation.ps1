@@ -48,7 +48,7 @@ public class FoundationAccessible {
         while (child != IntPtr.Zero) {
             var classBuffer = new System.Text.StringBuilder(128);
             GetClassName(child, classBuffer, classBuffer.Capacity);
-            if (classBuffer.ToString() == className) {
+            if (className == "*" || classBuffer.ToString() == className) {
                 try {
                     if (Read(child).Name == name) return child;
                 } catch { }
@@ -102,6 +102,8 @@ try {
     foreach ($controlSpec in @(
         @{ Class = 'Button'; Name = 'Open playlist' },
         @{ Class = 'Button'; Name = 'Cancel loading' },
+        @{ Class = '*'; Name = 'Category' },
+        @{ Class = 'Button'; Name = 'Toggle favorite' },
         @{ Class = 'Edit'; Name = 'Search channels' }
     )) {
         $controlHandle = [FoundationAccessible]::FindDescendant(
@@ -112,6 +114,9 @@ try {
         $control = [FoundationAccessible]::Read($controlHandle)
         if (-not ($control.State -band 0x100000)) {
             throw "Missing or non-focusable control: $($controlSpec.Name)"
+        }
+        if ($controlSpec.Name -eq 'Category' -and $control.Role -ne 0x21) {
+            throw "Unexpected Category role: $($control.Role)"
         }
     }
     $statusHandle = [FoundationAccessible]::FindDescendant(

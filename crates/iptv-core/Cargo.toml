@@ -1,3 +1,6 @@
+[dependencies]
+serde_json.workspace = true
+
 [package]
 name = "iptv-core"
 version = "0.1.0"
