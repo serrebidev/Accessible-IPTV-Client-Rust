@@ -8,6 +8,12 @@ chrono.workspace = true
 chrono-tz.workspace = true
 rusqlite.workspace = true
 serde.workspace = true
+aes.workspace = true
+cbc.workspace = true
+hmac.workspace = true
+pbkdf2.workspace = true
+base64.workspace = true
+getrandom.workspace = true
 
 [package]
 name = "iptv-core"
