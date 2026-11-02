@@ -1,6 +1,6 @@
 # Validation 0034: replacement-readiness evidence ledger
 
-Issue: #84. Current revision: `2be90e3` on
+Issue: #84. Current revision: `8d97048` on
 `integration/stalker-dvr-resolution`.
 
 This ledger closes the documentation and deterministic implementation work for
@@ -23,11 +23,18 @@ the replacement-gate pack. It is an evidence summary, not a release approval.
 ## Readiness recommendation
 
 **Not replacement-ready yet.** The automated and deterministic gates are green,
-but the owner-heard NVDA session, installed-libVLC playback, live ffmpeg
-recording, and physical-renderer evidence are not complete for this revision.
-The packaging VM procedure is defined but its artifact run is also still open.
+but the four critical gates — owner-heard NVDA acceptance, installed-libVLC
+playback, live ffmpeg recording, and packaging/updater VM evidence — are not
+complete for this revision. Physical-renderer evidence is a separately reported
+risk and is not a critical readiness gate.
 
-This recommendation does not claim that explicitly unported Python features are
+If a critical environment gate cannot run, a maintainer may record an explicit,
+dated waiver with rationale, named risk, expiration/retest date, and owner
+notification. A waiver is not a pass and does not switch the shipping product.
+
+Readiness is candidate approval only. It does not switch the shipping product,
+retire Python, authorize a release, or publish an installer. This
+recommendation does not claim that explicitly unported Python features are
 complete. Chromecast, AirPlay/RAOP, Sonos native control, Yamaha side-channel
 control, the Python installer flow, DVR statistics/storage-reserve/live-buffer
 relay/series-link surfaces, and release publication remain outside this pack.
