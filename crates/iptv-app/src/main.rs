@@ -344,6 +344,10 @@ struct Wiring {
     last_dvr_tick: Rc<std::cell::Cell<f64>>,
     previous_channel: Rc<RefCell<Option<Channel>>>,
     scope_ids: Rc<RefCell<Vec<Option<String>>>>,
+    download_worker: Rc<iptv_core::downloads::DownloadWorker>,
+    downloads: Rc<RefCell<Vec<DownloadRow>>>,
+    downloads_active: Rc<std::cell::Cell<bool>>,
+    account_text: Rc<RefCell<Option<TextCtrl>>>,
 }
 
 /// Built-in player window state, created lazily on first use.
@@ -355,6 +359,7 @@ struct PlayerState {
     pending_resume_ms: Option<i64>,
     subtitle_cues: Vec<Cue>,
     last_spoken_cue: Option<usize>,
+    history: Vec<Channel>,
 }
 
 impl Default for PlayerState {
@@ -367,6 +372,7 @@ impl Default for PlayerState {
             pending_resume_ms: None,
             subtitle_cues: Vec::new(),
             last_spoken_cue: None,
+            history: Vec::new(),
         }
     }
 }
@@ -517,6 +523,10 @@ fn bind_browser(frame: Frame, controls: Controls, model: Rc<RefCell<SearchResult
         last_dvr_tick: Rc::new(std::cell::Cell::new(0.0)),
         previous_channel: Rc::new(RefCell::new(None)),
         scope_ids: Rc::new(RefCell::new(vec![None])),
+        download_worker: Rc::new(iptv_core::downloads::DownloadWorker::default()),
+        downloads: Rc::new(RefCell::new(Vec::new())),
+        downloads_active: Rc::new(std::cell::Cell::new(false)),
+        account_text: Rc::new(RefCell::new(None)),
     };
     *wiring.reminders.borrow_mut() = wiring.persist.reminders();
     if wiring.dvr.borrow().pending_count() > 0 {
@@ -576,6 +586,7 @@ fn bind_completion(wiring: &Wiring, controls: Controls) {
         poll_vod(&completed, status);
         poll_cast(&completed, status);
         poll_updates(&completed, status);
+        poll_downloads(&completed, status);
         if !completed.browser.borrow().is_busy()
             && !completed.epg_pending.get()
             && !completed.provider_pending.get()
@@ -588,6 +599,7 @@ fn bind_completion(wiring: &Wiring, controls: Controls) {
             && completed.dvr.borrow().pending_count() == 0
             && !completed.vod_pending.get()
             && !completed.cast_pending.get()
+            && !completed.downloads_active.get()
             && !completed.update_pending.get()
         {
             if let Some(timer) = completed_timer.upgrade() {
@@ -837,6 +849,9 @@ fn poll_providers(wiring: &Wiring, controls: Controls) {
                 Ok(report) => {
                     let first = report.lines().next().unwrap_or_default().to_string();
                     status.set_label(&first);
+                    if let Some(text) = wiring.account_text.borrow().as_ref() {
+                        text.set_value(&report);
+                    }
                 }
                 Err(error) => status.set_label(&error),
             },
@@ -1612,6 +1627,10 @@ fn clone_wiring(wiring: &Wiring) -> Wiring {
         last_dvr_tick: Rc::clone(&wiring.last_dvr_tick),
         previous_channel: Rc::clone(&wiring.previous_channel),
         scope_ids: Rc::clone(&wiring.scope_ids),
+        download_worker: Rc::clone(&wiring.download_worker),
+        downloads: Rc::clone(&wiring.downloads),
+        downloads_active: Rc::clone(&wiring.downloads_active),
+        account_text: Rc::clone(&wiring.account_text),
     }
 }
 
@@ -1795,8 +1814,6 @@ fn build_file_menu(keys: &std::collections::BTreeMap<String, String>) -> Menu {
         "Close the application",
         ItemKind::Normal,
     );
-    file_menu.enable_item(WHATS_ON_NOW, false);
-    file_menu.enable_item(ACCOUNT_INFO, false);
 
     file_menu
 }
@@ -1860,7 +1877,6 @@ fn build_view_menu(keys: &std::collections::BTreeMap<String, String>) -> Menu {
         "",
         ItemKind::Normal,
     );
-    view_menu.enable_item(CONTINUE_WATCHING, false);
     menu_add(
         &view_menu,
         FAVORITE,
@@ -1889,7 +1905,6 @@ fn build_view_menu(keys: &std::collections::BTreeMap<String, String>) -> Menu {
         "",
         ItemKind::Normal,
     );
-    view_menu.enable_item(RECENT_CHANNELS, false);
     menu_add(
         &view_menu,
         CHANNEL_NUMBER,
@@ -1905,7 +1920,6 @@ fn build_view_menu(keys: &std::collections::BTreeMap<String, String>) -> Menu {
         "",
         ItemKind::Normal,
     );
-    view_menu.enable_item(SHOW_DOWNLOADS, false);
 
     view_menu
 }
@@ -2101,6 +2115,22 @@ fn build_help_menu() -> Menu {
     help_menu
 }
 
+/// Menu items that simply open a manager or list dialog.
+/// Returns true when the id was one of them.
+fn menu_dialog_action(id: i32, wiring: &Wiring, status: Status, scope_choice: Choice) -> bool {
+    match id {
+        PLAYLIST_MANAGER => open_playlist_manager(wiring, status, scope_choice),
+        EPG_MANAGER => open_epg_manager(wiring, status),
+        WHATS_ON_NOW => open_whats_on_now(wiring, status),
+        ACCOUNT_INFO => open_account_info(wiring, status),
+        CONTINUE_WATCHING => open_continue_watching(wiring, status),
+        RECENT_CHANNELS => open_recent_channels(wiring, status),
+        SHOW_DOWNLOADS => open_downloads_window(wiring, status),
+        _ => return false,
+    }
+    true
+}
+
 /// Dispatch for the parity menu tree.
 fn bind_menu_actions(frame: Frame, wiring: &Wiring, controls: Controls) {
     bind_menu_option_actions(frame, wiring, controls);
@@ -2113,10 +2143,11 @@ fn bind_menu_actions(frame: Frame, wiring: &Wiring, controls: Controls) {
     frame.on_menu(move |event| {
         let id = event.get_id();
         let persist = &wiring.persist;
+        if menu_dialog_action(id, &wiring, status, scope_choice) {
+            return;
+        }
         match id {
             4004 => frame.close(false),
-            PLAYLIST_MANAGER => open_playlist_manager(&wiring, status, scope_choice),
-            EPG_MANAGER => open_epg_manager(&wiring, status),
             5002 => open_guide_window(&wiring, status),
             5003 => {
                 start_update_check(&wiring);
@@ -2130,9 +2161,7 @@ fn bind_menu_actions(frame: Frame, wiring: &Wiring, controls: Controls) {
             WHAT_IS_PLAYING => {
                 let player = wiring.player.borrow();
                 match &player.current_channel {
-                    Some(channel) => {
-                        status.set_label(&format!("Now playing: {}", channel.name));
-                    }
+                    Some(channel) => status.set_label(&format!("Now playing: {}", channel.name)),
                     None => status.set_label("Nothing is playing."),
                 }
             }
@@ -2813,6 +2842,11 @@ fn play_catchup(wiring: &Wiring, channel: &Channel, status: Status) {
         status.set_label("No current programme to catch up.");
         return;
     };
+    play_catchup_for(wiring, channel, &programme, status);
+}
+
+/// Resolve and play one programme's catch-up stream.
+fn play_catchup_for(wiring: &Wiring, channel: &Channel, programme: &Programme, status: Status) {
     let now = now_epoch();
     match iptv_core::catchup::resolve_show_url(channel, programme.start, programme.stop, now) {
         Ok(
@@ -2921,6 +2955,18 @@ fn open_channel_epg(wiring: &Wiring, channel: &Channel, main_status: Status) {
             add_dvr_job(&wiring_s, &channel_s, programme, status);
         }
     });
+    let all_reminders_button = Button::builder(&panel).with_label("Remin&ders...").build();
+    let all_scheduled_button = Button::builder(&panel)
+        .with_label("S&cheduled Recordings...")
+        .build();
+    let catchup_button = Button::builder(&panel).with_label("Cat&ch-up...").build();
+    let wiring_rem = clone_wiring(wiring);
+    all_reminders_button.on_click(move |_| open_reminders_dialog(&wiring_rem, status));
+    let wiring_sch = clone_wiring(wiring);
+    all_scheduled_button.on_click(move |_| open_scheduled_dialog(&wiring_sch, status));
+    let wiring_cat = clone_wiring(wiring);
+    let channel_cat = channel.clone();
+    catchup_button.on_click(move |_| open_catchup_dialog(&wiring_cat, &channel_cat, status));
     let frame_hide = frame;
     close_button.on_click(move |_| frame_hide.hide());
     frame.show(true);
@@ -3069,6 +3115,13 @@ fn play_channel(
     channel: &Channel,
     status: Status,
 ) {
+    {
+        let mut state = player.borrow_mut();
+        if state.history.first().map(|c| &c.url) != Some(&channel.url) {
+            state.history.insert(0, channel.clone());
+            state.history.truncate(50);
+        }
+    }
     let key = channel_key(channel);
     let entries = persist.resume_entries();
     let probe = PlaybackRequest::for_channel(channel, None);
@@ -3884,6 +3937,539 @@ fn open_epg_manager(wiring: &Wiring, status: Status) {
     });
     cancel.on_click(move |_| manager.hide());
     manager.show(true);
+}
+
+/// One download tracked by the adapter (worker events arrive in
+/// start order; the first unfinished row is the active one).
+struct DownloadRow {
+    name: String,
+    destination: String,
+    progress: String,
+    done: bool,
+}
+
+/// Build a simple list dialog shell: frame, panel, list, status.
+fn list_dialog(title: &str, list_label: &str) -> (Frame, Panel, ListBox, Status) {
+    let frame = Frame::builder()
+        .with_title(title)
+        .with_size(Size::new(680, 520))
+        .build();
+    frame.set_accessibility_label(title);
+    let panel = Panel::builder(&frame).build();
+    let list = ListBox::builder(&panel).build();
+    list.set_accessibility_label(list_label);
+    let status_label = StaticText::builder(&panel)
+        .with_label("Dialog status")
+        .build();
+    let details = TextCtrl::builder(&panel)
+        .with_style(TextCtrlStyle::ReadOnly | TextCtrlStyle::MultiLine)
+        .with_value("No items yet.")
+        .build();
+    details.set_accessibility_label("Dialog status");
+    let status = Status {
+        label: status_label,
+        details,
+        bar: None,
+    };
+    (frame, panel, list, status)
+}
+
+/// File > What's on Now: every channel's current programme; Play
+/// starts the chosen channel.
+fn open_whats_on_now(wiring: &Wiring, status: Status) {
+    let mut rows: Vec<(Channel, Programme)> = Vec::new();
+    for channel in wiring.browser.borrow().all_channels() {
+        if let Some(programme) = current_programme(wiring, &channel) {
+            rows.push((channel, programme));
+        }
+    }
+    if rows.is_empty() {
+        status.set_label("No guide information is loaded yet.");
+        return;
+    }
+    let (frame, panel, list, dstatus) = list_dialog("What's on Now", "Programmes on now");
+    let labels: Vec<String> = rows
+        .iter()
+        .map(|(channel, p)| {
+            format!(
+                "{} — {} ({}-{})",
+                channel.name,
+                p.title,
+                local_hhmm(p.start),
+                local_hhmm(p.stop)
+            )
+        })
+        .collect();
+    list.set_items(&labels.iter().map(String::as_str).collect::<Vec<_>>());
+    list.set_selection(0, true);
+    dstatus.set_label(&format!("{} programmes on now.", rows.len()));
+    let play = Button::builder(&panel).with_label("&Play").build();
+    let close = Button::builder(&panel).with_label("&Close").build();
+    let rows = Rc::new(RefCell::new(rows));
+    let wiring_p = clone_wiring(wiring);
+    play.on_click(move |_| {
+        let Some(index) = list.get_selection() else {
+            return;
+        };
+        if let Some((channel, _)) = rows
+            .borrow()
+            .get(usize::try_from(index).unwrap_or(usize::MAX))
+        {
+            play_channel(&wiring_p.player, &wiring_p.persist, channel, status);
+            frame.hide();
+        }
+    });
+    close.on_click(move |_| frame.hide());
+    frame.show(true);
+}
+
+/// Format a millisecond duration as M:SS or H:MM:SS.
+fn format_duration_ms(ms: i64) -> String {
+    let seconds = ms.max(0) / 1000;
+    let (h, m, s) = (seconds / 3600, (seconds % 3600) / 60, seconds % 60);
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m}:{s:02}")
+    }
+}
+
+/// View > Continue Watching...: saved resume positions with Play
+/// (the player applies the position) and Remove.
+fn open_continue_watching(wiring: &Wiring, status: Status) {
+    let entries = wiring.persist.resume_entries();
+    let channels = wiring.browser.borrow().all_channels();
+    let mut rows: Vec<(String, Channel, i64, i64)> = Vec::new();
+    for (key, entry) in &entries {
+        if let Some(channel) = channels.iter().find(|c| channel_key(c) == *key) {
+            rows.push((
+                key.clone(),
+                channel.clone(),
+                entry.position_ms,
+                entry.length_ms,
+            ));
+        }
+    }
+    if rows.is_empty() {
+        status.set_label("Nothing in Continue Watching yet.");
+        return;
+    }
+    let (frame, panel, list, dstatus) = list_dialog("Continue Watching", "Programmes to resume");
+    let render = |rows: &[(String, Channel, i64, i64)], list: ListBox| {
+        let labels: Vec<String> = rows
+            .iter()
+            .map(|(_, channel, position, length)| {
+                format!(
+                    "{} — {} of {} watched",
+                    channel.name,
+                    format_duration_ms(*position),
+                    format_duration_ms(*length)
+                )
+            })
+            .collect();
+        list.set_items(&labels.iter().map(String::as_str).collect::<Vec<_>>());
+    };
+    render(&rows, list);
+    dstatus.set_label(&format!("{} programmes to resume.", rows.len()));
+    let play = Button::builder(&panel).with_label("&Play").build();
+    let remove = Button::builder(&panel).with_label("&Remove").build();
+    let close = Button::builder(&panel).with_label("&Close").build();
+    let rows = Rc::new(RefCell::new(rows));
+    let wiring_p = clone_wiring(wiring);
+    let rows_p = Rc::clone(&rows);
+    play.on_click(move |_| {
+        let Some(index) = list.get_selection() else {
+            return;
+        };
+        if let Some((_, channel, _, _)) = rows_p
+            .borrow()
+            .get(usize::try_from(index).unwrap_or(usize::MAX))
+        {
+            play_channel(&wiring_p.player, &wiring_p.persist, channel, status);
+            frame.hide();
+        }
+    });
+    let wiring_r = clone_wiring(wiring);
+    let rows_r = Rc::clone(&rows);
+    remove.on_click(move |_| {
+        let Some(index) = list.get_selection() else {
+            return;
+        };
+        let index = usize::try_from(index).unwrap_or(usize::MAX);
+        let removed = {
+            let mut guard = rows_r.borrow_mut();
+            if index < guard.len() {
+                Some(guard.remove(index))
+            } else {
+                None
+            }
+        };
+        if let Some((key, _, _, _)) = removed {
+            let mut entries = wiring_r.persist.resume_entries();
+            entries.remove(&key);
+            wiring_r.persist.save_resume(&entries);
+            render(&rows_r.borrow(), list);
+            dstatus.set_label("Removed from Continue Watching.");
+        }
+    });
+    close.on_click(move |_| frame.hide());
+    frame.show(true);
+}
+
+/// View > Recently Watched...: this session's playback history.
+fn open_recent_channels(wiring: &Wiring, status: Status) {
+    let history = wiring.player.borrow().history.clone();
+    if history.is_empty() {
+        status.set_label("No channels watched yet this session.");
+        return;
+    }
+    let (frame, panel, list, dstatus) =
+        list_dialog("Recently Watched", "Recently watched channels");
+    let labels: Vec<String> = history.iter().map(|c| c.name.clone()).collect();
+    list.set_items(&labels.iter().map(String::as_str).collect::<Vec<_>>());
+    list.set_selection(0, true);
+    dstatus.set_label(&format!("{} recently watched channels.", history.len()));
+    let play = Button::builder(&panel).with_label("&Play").build();
+    let close = Button::builder(&panel).with_label("&Close").build();
+    let history = Rc::new(RefCell::new(history));
+    let wiring_p = clone_wiring(wiring);
+    play.on_click(move |_| {
+        let Some(index) = list.get_selection() else {
+            return;
+        };
+        if let Some(channel) = history
+            .borrow()
+            .get(usize::try_from(index).unwrap_or(usize::MAX))
+        {
+            play_channel(&wiring_p.player, &wiring_p.persist, channel, status);
+            frame.hide();
+        }
+    });
+    close.on_click(move |_| frame.hide());
+    frame.show(true);
+}
+
+/// The Reminders dialog: stored reminders with Delete.
+fn open_reminders_dialog(wiring: &Wiring, main_status: Status) {
+    let (frame, panel, list, dstatus) = list_dialog("Reminders", "Reminders");
+    let render = |wiring: &Wiring, list: ListBox, dstatus: Status| {
+        let rows = wiring.reminders.borrow();
+        let labels: Vec<String> = rows
+            .iter()
+            .map(|r| {
+                format!(
+                    "{} {} — {} ({} min before)",
+                    local_hhmm(r.start),
+                    r.title,
+                    r.channel,
+                    r.lead
+                )
+            })
+            .collect();
+        list.set_items(&labels.iter().map(String::as_str).collect::<Vec<_>>());
+        dstatus.set_label(&format!("{} reminders.", rows.len()));
+    };
+    render(wiring, list, dstatus);
+    if wiring.reminders.borrow().is_empty() {
+        main_status.set_label("No reminders set.");
+    }
+    let delete = Button::builder(&panel).with_label("&Delete").build();
+    let close = Button::builder(&panel).with_label("&Close").build();
+    let wiring_d = clone_wiring(wiring);
+    delete.on_click(move |_| {
+        let Some(index) = list.get_selection() else {
+            dstatus.set_label("Choose a reminder to delete first.");
+            return;
+        };
+        let index = usize::try_from(index).unwrap_or(usize::MAX);
+        let mut rows = wiring_d.reminders.borrow_mut();
+        if index < rows.len() {
+            rows.remove(index);
+            let saved = rows.clone();
+            drop(rows);
+            wiring_d.persist.save_reminders(&saved);
+            render(&wiring_d, list, dstatus);
+        }
+    });
+    close.on_click(move |_| frame.hide());
+    frame.show(true);
+}
+
+/// The Scheduled Recordings dialog: DVR jobs with Cancel.
+fn open_scheduled_dialog(wiring: &Wiring, main_status: Status) {
+    let (frame, panel, list, dstatus) = list_dialog("Scheduled Recordings", "Scheduled recordings");
+    let render = |wiring: &Wiring, list: ListBox, dstatus: Status| {
+        let dvr = wiring.dvr.borrow();
+        let labels: Vec<String> = dvr
+            .jobs()
+            .iter()
+            .map(|job| {
+                format!(
+                    "{} {} — {} [{}]",
+                    job.start_at, job.title, job.channel_name, job.status
+                )
+            })
+            .collect();
+        list.set_items(&labels.iter().map(String::as_str).collect::<Vec<_>>());
+        dstatus.set_label(&format!("{} scheduled recordings.", dvr.jobs().len()));
+    };
+    render(wiring, list, dstatus);
+    if wiring.dvr.borrow().jobs().is_empty() {
+        main_status.set_label("No scheduled recordings.");
+    }
+    let cancel_job = Button::builder(&panel)
+        .with_label("&Cancel Recording")
+        .build();
+    let close = Button::builder(&panel).with_label("&Close").build();
+    let wiring_c = clone_wiring(wiring);
+    cancel_job.on_click(move |_| {
+        let Some(index) = list.get_selection() else {
+            dstatus.set_label("Choose a recording to cancel first.");
+            return;
+        };
+        let index = usize::try_from(index).unwrap_or(usize::MAX);
+        let id = wiring_c
+            .dvr
+            .borrow()
+            .jobs()
+            .get(index)
+            .map(|job| job.id.clone());
+        if let Some(id) = id {
+            let mut dvr = wiring_c.dvr.borrow_mut();
+            if dvr.cancel_job(&id) {
+                dvr.save();
+                drop(dvr);
+                render(&wiring_c, list, dstatus);
+            }
+        }
+    });
+    close.on_click(move |_| frame.hide());
+    frame.show(true);
+}
+
+/// The Catch-up dialog for one channel: past programmes with Play
+/// and Download.
+fn open_catchup_dialog(wiring: &Wiring, channel: &Channel, main_status: Status) {
+    if !iptv_core::catchup::channel_has_catchup(channel) {
+        main_status.set_label("This channel does not provide catch-up streaming.");
+        return;
+    }
+    let now = now_epoch();
+    let programmes: Vec<Programme> = guide_programmes(wiring, channel)
+        .into_iter()
+        .filter(|p| {
+            p.stop <= now && iptv_core::catchup::within_catchup_window(channel, p.start, now)
+        })
+        .collect();
+    if programmes.is_empty() {
+        main_status.set_label("No catch-up programmes available for this channel.");
+        return;
+    }
+    let (frame, panel, list, dstatus) = list_dialog(
+        &format!("Catch-up — {}", channel.name),
+        "Catch-up programmes",
+    );
+    let labels: Vec<String> = programmes
+        .iter()
+        .map(|p| format!("{}-{} {}", local_hhmm(p.start), local_hhmm(p.stop), p.title))
+        .collect();
+    list.set_items(&labels.iter().map(String::as_str).collect::<Vec<_>>());
+    list.set_selection(0, true);
+    dstatus.set_label(&format!("{} catch-up programmes.", programmes.len()));
+    let play = Button::builder(&panel).with_label("&Play").build();
+    let download = Button::builder(&panel).with_label("&Download").build();
+    let close = Button::builder(&panel).with_label("&Close").build();
+    let programmes = Rc::new(RefCell::new(programmes));
+    let wiring_p = clone_wiring(wiring);
+    let programmes_p = Rc::clone(&programmes);
+    let channel_p = channel.clone();
+    play.on_click(move |_| {
+        let Some(index) = list.get_selection() else {
+            return;
+        };
+        if let Some(programme) = programmes_p
+            .borrow()
+            .get(usize::try_from(index).unwrap_or(usize::MAX))
+        {
+            play_catchup_for(&wiring_p, &channel_p, programme, main_status);
+        }
+    });
+    let wiring_d = clone_wiring(wiring);
+    let programmes_d = Rc::clone(&programmes);
+    let channel_d = channel.clone();
+    download.on_click(move |_| {
+        let Some(index) = list.get_selection() else {
+            return;
+        };
+        let Some(programme) = programmes_d
+            .borrow()
+            .get(usize::try_from(index).unwrap_or(usize::MAX))
+            .cloned()
+        else {
+            return;
+        };
+        start_catchup_download(&wiring_d, &channel_d, &programme, dstatus);
+    });
+    close.on_click(move |_| frame.hide());
+    frame.show(true);
+}
+
+/// Resolve a catch-up programme URL and queue its download.
+fn start_catchup_download(
+    wiring: &Wiring,
+    channel: &Channel,
+    programme: &Programme,
+    status: Status,
+) {
+    let now = now_epoch();
+    let resolved =
+        match iptv_core::catchup::resolve_show_url(channel, programme.start, programme.stop, now) {
+            Ok(
+                iptv_core::catchup::ShowResolution::Catchup(url)
+                | iptv_core::catchup::ShowResolution::Live(url),
+            ) => Some(url),
+            Ok(_) => None,
+            Err(error) => {
+                status.set_label(&error);
+                return;
+            }
+        };
+    let Some(url) = resolved else {
+        status.set_label("Catch-up downloads from portal channels are not supported yet.");
+        return;
+    };
+    let dir = recordings_dir(&wiring.persist);
+    let _ = std::fs::create_dir_all(&dir);
+    let name = iptv_core::recording::sanitize_filename(&programme.title);
+    let destination = dir.join(format!("{name}.ts"));
+    wiring
+        .download_worker
+        .start(iptv_core::downloads::DownloadRequest {
+            url,
+            headers: iptv_core::downloads::channel_headers(channel),
+            destination: destination.clone(),
+        });
+    wiring.downloads.borrow_mut().push(DownloadRow {
+        name: programme.title.clone(),
+        destination: destination.display().to_string(),
+        progress: "Starting...".to_string(),
+        done: false,
+    });
+    wiring.downloads_active.set(true);
+    assert!(wiring.timer.start(50, false));
+    status.set_label(&format!("Downloading {}...", programme.title));
+}
+
+/// View > Show Downloads: tracked downloads with progress.
+fn open_downloads_window(wiring: &Wiring, status: Status) {
+    let rows = wiring.downloads.borrow();
+    if rows.is_empty() {
+        status.set_label("No downloads yet. Downloads start from a channel's Catch-up dialog.");
+        return;
+    }
+    let (frame, panel, list, dstatus) = list_dialog("Downloads", "Downloads");
+    let labels: Vec<String> = rows
+        .iter()
+        .map(|row| format!("{} — {} — {}", row.name, row.progress, row.destination))
+        .collect();
+    list.set_items(&labels.iter().map(String::as_str).collect::<Vec<_>>());
+    dstatus.set_label(&format!("{} downloads.", rows.len()));
+    drop(rows);
+    let cancel = Button::builder(&panel)
+        .with_label("&Cancel Download")
+        .build();
+    let close = Button::builder(&panel).with_label("&Close").build();
+    let wiring_c = clone_wiring(wiring);
+    cancel.on_click(move |_| {
+        wiring_c.download_worker.cancel();
+        dstatus.set_label("Cancelling the active download...");
+    });
+    close.on_click(move |_| frame.hide());
+    frame.show(true);
+}
+
+/// File > Account Info: pick an account and fetch its info report
+/// from the provider; the report lands in the dialog's text.
+fn open_account_info(wiring: &Wiring, status: Status) {
+    let (_, accounts) = configured_entries(wiring);
+    if accounts.is_empty() {
+        status.set_label("No provider accounts are configured.");
+        return;
+    }
+    let (frame, panel, list, dstatus) = list_dialog("Account Info", "Accounts");
+    let labels: Vec<String> = accounts.iter().map(ProviderAccount::describe).collect();
+    list.set_items(&labels.iter().map(String::as_str).collect::<Vec<_>>());
+    list.set_selection(0, true);
+    let fetch = Button::builder(&panel).with_label("&Fetch Info").build();
+    let close = Button::builder(&panel).with_label("&Close").build();
+    let text_slot = Rc::clone(&wiring.account_text);
+    let accounts = Rc::new(RefCell::new(accounts));
+    let wiring_f = clone_wiring(wiring);
+    fetch.on_click(move |_| {
+        let Some(index) = list.get_selection() else {
+            return;
+        };
+        let id = accounts
+            .borrow()
+            .get(usize::try_from(index).unwrap_or(usize::MAX))
+            .and_then(ProviderAccount::provider_id);
+        let Some(id) = id else {
+            dstatus.set_label("This account has no provider id.");
+            return;
+        };
+        *text_slot.borrow_mut() = Some(dstatus.details);
+        wiring_f.provider_worker.account(id);
+        wiring_f.provider_pending.set(true);
+        assert!(wiring_f.timer.start(50, false));
+        dstatus.set_label("Fetching account info...");
+    });
+    close.on_click(move |_| frame.hide());
+    frame.show(true);
+}
+
+/// Drain download events into the tracked rows and announce
+/// completions on the main status line.
+fn poll_downloads(wiring: &Wiring, status: Status) {
+    while let Some(event) = wiring.download_worker.try_recv() {
+        let mut rows = wiring.downloads.borrow_mut();
+        let Some(row) = rows.iter_mut().find(|row| !row.done) else {
+            continue;
+        };
+        match event {
+            iptv_core::downloads::DownloadEvent::Progress { written, total } => {
+                row.progress = match total {
+                    Some(total) if total > 0 => {
+                        format!("{}% of {}", written * 100 / total, format_bytes(total))
+                    }
+                    _ => format!("{} downloaded", format_bytes(written)),
+                };
+            }
+            iptv_core::downloads::DownloadEvent::Finished(Ok(bytes)) => {
+                row.progress = format!("Done ({})", format_bytes(bytes));
+                row.done = true;
+                let name = row.name.clone();
+                drop(rows);
+                status.set_label(&format!("Download finished: {name}"));
+            }
+            iptv_core::downloads::DownloadEvent::Finished(Err(error)) => {
+                row.progress = format!("Failed: {error}");
+                row.done = true;
+            }
+        }
+    }
+    let active = wiring.downloads.borrow().iter().any(|row| !row.done);
+    wiring.downloads_active.set(active);
+}
+
+/// Human-readable byte counts for download progress.
+fn format_bytes(bytes: u64) -> String {
+    if bytes >= 1_000_000 {
+        format!("{} MB", bytes / 1_000_000)
+    } else if bytes >= 1_000 {
+        format!("{} KB", bytes / 1_000)
+    } else {
+        format!("{bytes} B")
+    }
 }
 
 /// Display text for a category row. The sentinel is never decorated; the
