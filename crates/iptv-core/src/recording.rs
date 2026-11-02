@@ -127,7 +127,8 @@ pub const DEFAULT_UPSTREAM_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win
 /// ffmpeg input options from the channel headers (port of
 /// `_header_input_args`): dedicated `-user_agent`/`-referer`, everything
 /// else folded into one CRLF `-headers` blob.
-fn header_input_args(headers: &StreamHeaders) -> Vec<String> {
+#[must_use]
+pub fn header_input_args(headers: &StreamHeaders) -> Vec<String> {
     let mut args: Vec<String> = Vec::new();
     let mut extra_lines: Vec<String> = Vec::new();
     let mut entries: Vec<(String, String)> = headers.entries.clone();

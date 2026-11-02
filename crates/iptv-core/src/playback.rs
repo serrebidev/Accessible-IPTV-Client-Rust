@@ -187,6 +187,9 @@ pub struct PlaybackRequest {
     pub headers: StreamHeaders,
     pub resume_ms: Option<i64>,
     pub live: bool,
+    /// Skip the live-buffer intercept (buffer view URLs and
+    /// buffer-internal replays must not re-intercept).
+    pub buffer_bypass: bool,
 }
 
 impl PlaybackRequest {
@@ -200,6 +203,7 @@ impl PlaybackRequest {
             headers: StreamHeaders::for_channel(channel),
             resume_ms,
             live,
+            buffer_bypass: false,
         }
     }
 }

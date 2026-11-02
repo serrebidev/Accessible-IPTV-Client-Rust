@@ -1,3 +1,5 @@
+mod buffer;
+
 use iptv_core::guide::Guide;
 use iptv_core::i18n::I18n;
 use iptv_core::updater::{UpdateEvent, UpdateWorker};
@@ -386,6 +388,7 @@ struct Wiring {
     downloads: Rc<RefCell<Vec<DownloadRow>>>,
     downloads_active: Rc<std::cell::Cell<bool>>,
     account_text: Rc<RefCell<Option<TextCtrl>>>,
+    buffers: Rc<RefCell<buffer::BufferRegistry>>,
 }
 
 /// Built-in player window state, created lazily on first use.
@@ -591,8 +594,10 @@ fn bind_browser(frame: Frame, controls: Controls, model: Rc<RefCell<SearchResult
         downloads: Rc::new(RefCell::new(Vec::new())),
         downloads_active: Rc::new(std::cell::Cell::new(false)),
         account_text: Rc::new(RefCell::new(None)),
+        buffers: Rc::new(RefCell::new(buffer::BufferRegistry::default())),
     };
     wiring.player.borrow_mut().shared = Some(PlayerShared {
+        buffers: Rc::clone(&wiring.buffers),
         recordings: Rc::clone(&wiring.recordings),
         cast_ui: Rc::clone(&wiring.cast_ui),
         proxy: Rc::clone(&wiring.proxy),
@@ -613,12 +618,20 @@ fn bind_browser(frame: Frame, controls: Controls, model: Rc<RefCell<SearchResult
     maybe_auto_check_updates(&wiring);
     bind_actions(frame, &wiring, controls);
     bind_context_menu(frame, &wiring, controls);
-    let browser = Rc::clone(&wiring.browser);
-    let timer = Rc::clone(&wiring.timer);
     wiring
         .provider_worker
         .set_cache_dir(iptv_core::config::user_config_dir().join("provider-cache"));
+    bind_main_close(frame, &wiring);
+}
+
+/// The main window's close behavior: minimize-to-tray hides
+/// instead of closing; a real close cancels browsing, closes
+/// every live buffer session and stops the tick timer.
+fn bind_main_close(frame: Frame, wiring: &Wiring) {
+    let browser = Rc::clone(&wiring.browser);
+    let timer = Rc::clone(&wiring.timer);
     let close_persist = wiring.persist.clone();
+    let close_buffers = Rc::clone(&wiring.buffers);
     frame.bind_internal(EventType::CLOSE_WINDOW, move |event| {
         if close_persist
             .config
@@ -630,6 +643,7 @@ fn bind_browser(frame: Frame, controls: Controls, model: Rc<RefCell<SearchResult
             return;
         }
         browser.borrow_mut().cancel();
+        close_buffers.borrow_mut().close_all();
         timer.stop();
         event.skip(true);
     });
@@ -1225,6 +1239,7 @@ fn selected_channel(
 /// Start or stop a manual recording of the channel.
 fn toggle_recording(
     recordings: &Rc<RefCell<RecordingEngine>>,
+    buffers: &Rc<RefCell<buffer::BufferRegistry>>,
     persist: &Persist,
     channel: &Channel,
     status: Status,
@@ -1232,6 +1247,7 @@ fn toggle_recording(
     let key = channel_key(channel);
     if recordings.borrow().is_recording(&key) {
         recordings.borrow_mut().stop(&key);
+        release_recording_lease(buffers, &key);
         status.set_label(&format!("Stopping recording of {}.", channel.name));
         return;
     }
@@ -1245,6 +1261,7 @@ fn toggle_recording(
         .string_or("recording_format", "provider_mkv");
     match start_recording(
         recordings,
+        buffers,
         persist,
         &key,
         channel,
@@ -1263,6 +1280,7 @@ fn toggle_recording(
 /// Spawn ffmpeg for one recording; returns the output path.
 fn start_recording(
     recordings: &Rc<RefCell<RecordingEngine>>,
+    buffers: &Rc<RefCell<buffer::BufferRegistry>>,
     persist: &Persist,
     key: &str,
     channel: &Channel,
@@ -1297,18 +1315,43 @@ fn start_recording(
     );
     let headers = iptv_core::playback::StreamHeaders::for_channel(channel);
     let (clean_url, _) = iptv_core::playback::split_stream_modifiers(&channel.url);
+    // A live buffer session for this source feeds the
+    // recording through a protected view instead of a second
+    // provider connection (Python's recording_input).
+    let mut input_url = clean_url.clone();
+    let mut input_headers = headers.clone();
+    if let Some(session) = buffers.borrow_mut().find(&channel.url, &headers) {
+        if let Ok(lease) = session.acquire() {
+            match session.cursor(0.0, true) {
+                Ok((view_url, _)) => {
+                    input_url = view_url;
+                    input_headers = iptv_core::playback::StreamHeaders::default();
+                    buffers
+                        .borrow_mut()
+                        .recording_leases
+                        .insert(key.to_string(), (session, lease));
+                }
+                Err(_) => {
+                    session.release(lease);
+                }
+            }
+        }
+    }
     let cmd = recording::ffmpeg_command(
         "ffmpeg",
-        &clean_url,
+        &input_url,
         &out.to_string_lossy(),
         format,
-        &headers,
+        &input_headers,
         &recording::FfmpegOptions {
             show_stats: true,
             ..recording::FfmpegOptions::default()
         },
     );
-    recordings.borrow_mut().start(key, &cmd, out.clone())?;
+    if let Err(error) = recordings.borrow_mut().start(key, &cmd, out.clone()) {
+        release_recording_lease(buffers, key);
+        return Err(error);
+    }
     Ok(out)
 }
 
@@ -1393,6 +1436,7 @@ fn record_dvr_channel(
     };
     match start_recording(
         &wiring.recordings,
+        &wiring.buffers,
         &wiring.persist,
         &format!("dvr:{}", job.id),
         channel,
@@ -1415,6 +1459,7 @@ fn record_dvr_channel(
 fn poll_recordings(wiring: &Wiring, status: Status) {
     let now = now_seconds();
     for finished in wiring.recordings.borrow_mut().poll_finished() {
+        release_recording_lease(&wiring.buffers, &finished.key);
         wiring.recorded.set(true);
         let name = finished
             .out_path
@@ -2026,6 +2071,7 @@ fn clone_wiring(wiring: &Wiring) -> Wiring {
         downloads: Rc::clone(&wiring.downloads),
         downloads_active: Rc::clone(&wiring.downloads_active),
         account_text: Rc::clone(&wiring.account_text),
+        buffers: Rc::clone(&wiring.buffers),
     }
 }
 
@@ -3008,7 +3054,13 @@ fn menu_recordings_action(
     match id {
         REC_START => {
             if let Some(channel) = selected_channel(&wiring.browser, &wiring.model, list) {
-                toggle_recording(&wiring.recordings, &wiring.persist, &channel, status);
+                toggle_recording(
+                    &wiring.recordings,
+                    &wiring.buffers,
+                    &wiring.persist,
+                    &channel,
+                    status,
+                );
             } else {
                 status.set_label("Select a channel to record first.");
             }
@@ -3018,6 +3070,7 @@ fn menu_recordings_action(
                 let key = channel_key(&channel);
                 if wiring.recordings.borrow().is_recording(&key) {
                     wiring.recordings.borrow_mut().stop(&key);
+                    release_recording_lease(&wiring.buffers, &key);
                     status.set_label(&format!("Stopping recording of {}.", channel.name));
                 } else {
                     status.set_label("That channel is not recording.");
@@ -3034,6 +3087,7 @@ fn menu_recordings_action(
                 let count = keys.len();
                 for key in &keys {
                     wiring.recordings.borrow_mut().stop(key);
+                    release_recording_lease(&wiring.buffers, key);
                 }
                 status.set_label(&format!("Stopping {count} recordings."));
             }
@@ -3909,6 +3963,7 @@ fn bind_context_menu(frame: Frame, wiring: &Wiring, controls: Controls) {
             CTX_RECORD => {
                 toggle_recording(
                     &wiring_menu.recordings,
+                    &wiring_menu.buffers,
                     &wiring_menu.persist,
                     &channel,
                     status,
@@ -4294,6 +4349,9 @@ fn play_builtin(
     request: PlaybackRequest,
     status: Status,
 ) {
+    if !request.buffer_bypass && buffer_intercept(player, persist, channel, &request, status) {
+        return;
+    }
     ensure_player_window(player, persist, status);
     let mut state = player.borrow_mut();
     state.current_channel = Some(channel.clone());
@@ -4357,6 +4415,7 @@ struct PlayerWindow {
 /// cast), installed when the browser wiring is built.
 #[derive(Clone)]
 struct PlayerShared {
+    buffers: Rc<RefCell<buffer::BufferRegistry>>,
     recordings: Rc<RefCell<RecordingEngine>>,
     cast_ui: Rc<RefCell<Option<CastUi>>>,
     proxy: Rc<RefCell<Option<iptv_core::proxy::ProxyServer>>>,
@@ -4479,12 +4538,46 @@ const PM_READ_SUB: i32 = 5322;
 const PM_PREV_SUB: i32 = 5323;
 const PM_NEXT_SUB: i32 = 5324;
 const PM_AUDIO_DEVICE: i32 = 5325;
+const PM_LIVE_BUFFER: i32 = 5326;
+const PM_REWIND: i32 = 5327;
+const PM_RETURN_LIVE: i32 = 5328;
 const PM_CAST: i32 = 5330;
 const PM_FULLSCREEN: i32 = 5331;
 const PM_WHATS_PLAYING: i32 = 5332;
 const PM_HIDE: i32 = 5333;
 const PM_EXIT: i32 = 5334;
 const PM_TRACK_BASE: i32 = 5340;
+
+/// The Playback menu's transport block: Play/Pause (label
+/// carries the effective shortcut), Stop, Sleep Timer, the
+/// live-buffer items and Record.
+fn playback_transport_items(menu: &Menu, keys: &std::collections::BTreeMap<String, String>) {
+    menu_add(
+        menu,
+        PM_PLAY_PAUSE,
+        &menu_label(keys, "&Play/Pause", "play_pause"),
+        "",
+        ItemKind::Normal,
+    );
+    menu_add(menu, PM_STOP, "&Stop", "", ItemKind::Normal);
+    menu_add(menu, PM_SLEEP, "Sleep &Timer...", "", ItemKind::Normal);
+    menu_add(
+        menu,
+        PM_LIVE_BUFFER,
+        "Local Live &Buffer...",
+        "",
+        ItemKind::Normal,
+    );
+    menu_add(menu, PM_REWIND, "Re&wind Live TV...", "", ItemKind::Normal);
+    menu_add(
+        menu,
+        PM_RETURN_LIVE,
+        "Return to &Live",
+        "",
+        ItemKind::Normal,
+    );
+    menu_add(menu, PM_RECORD, "&Record", "", ItemKind::Normal);
+}
 
 /// Build the player window's Playback menu (Python's order and
 /// items). Dynamic pieces: the Audio Track submenu fills when
@@ -4501,16 +4594,7 @@ fn build_playback_menu(
         .into_iter()
         .collect::<std::collections::BTreeMap<_, _>>();
     let menu = Menu::builder().build();
-    menu_add(
-        &menu,
-        PM_PLAY_PAUSE,
-        &menu_label(&keys, "&Play/Pause", "play_pause"),
-        "",
-        ItemKind::Normal,
-    );
-    menu_add(&menu, PM_STOP, "&Stop", "", ItemKind::Normal);
-    menu_add(&menu, PM_SLEEP, "Sleep &Timer...", "", ItemKind::Normal);
-    menu_add(&menu, PM_RECORD, "&Record", "", ItemKind::Normal);
+    playback_transport_items(&menu, &keys);
     menu.append_separator();
     let audio_menu = Menu::builder().build();
     menu_add(
@@ -4613,10 +4697,19 @@ fn dispatch_player_menu(
         PM_PLAY_PAUSE => toggle_pause_state(player, persist, status),
         PM_STOP | PM_EXIT => player_stop(player, persist, status),
         PM_SLEEP => prompt_sleep_timer(player, win.frame, persist, status),
+        PM_LIVE_BUFFER => prompt_live_buffer_config(player, win.frame, persist, status),
+        PM_REWIND => prompt_rewind(player, win.frame, persist, status),
+        PM_RETURN_LIVE => return_to_live(player, win.frame, persist, status),
         PM_RECORD => {
             let state = player.borrow();
             if let (Some(shared), Some(channel)) = (&state.shared, &state.current_channel) {
-                toggle_recording(&shared.recordings, persist, channel, status);
+                toggle_recording(
+                    &shared.recordings,
+                    &shared.buffers,
+                    persist,
+                    channel,
+                    status,
+                );
                 assert!(shared.timer.start(50, false));
             }
         }
@@ -4681,7 +4774,7 @@ fn playback_menu(player: &Rc<RefCell<PlayerState>>) -> Option<Menu> {
 /// Play/Pause, Stop, Sleep Timer, Record and a separator).
 fn audio_track_menu(player: &Rc<RefCell<PlayerState>>) -> Option<Menu> {
     playback_menu(player)?
-        .find_item_by_position(5)?
+        .find_item_by_position(8)?
         .get_sub_menu()
 }
 
@@ -4960,6 +5053,19 @@ struct PlayerButtons {
     subs: Button,
 }
 
+/// One player-window tick (1 s): buffer delivery and poll,
+/// resume checkpointing, subtitle speech, engine state,
+/// the sleep timer and the window chrome.
+fn player_tick(player: &Rc<RefCell<PlayerState>>, persist: &Persist, status: Status) {
+    deliver_buffer_pending(player, persist, status);
+    poll_buffer(player, persist, status);
+    checkpoint_resume(player, persist);
+    speak_subtitle_cue(player, persist, status);
+    poll_vlc_state(player, persist, status);
+    drive_sleep_timer(player, persist, status);
+    update_player_chrome(player);
+}
+
 /// Timer, buttons, media events, keys and close behavior for the
 /// player window.
 fn wire_player_events(
@@ -4975,11 +5081,7 @@ fn wire_player_events(
     let tick_player = Rc::clone(player);
     let tick_persist = persist.clone();
     timer.on_tick(move |_| {
-        checkpoint_resume(&tick_player, &tick_persist);
-        speak_subtitle_cue(&tick_player, &tick_persist, status);
-        poll_vlc_state(&tick_player, &tick_persist, status);
-        drive_sleep_timer(&tick_player, &tick_persist, status);
-        update_player_chrome(&tick_player);
+        player_tick(&tick_player, &tick_persist, status);
     });
     let _ = timer.start(1000, false);
 
@@ -5001,7 +5103,13 @@ fn wire_player_events(
         let (Some(shared), Some(channel)) = (&state.shared, &state.current_channel) else {
             return;
         };
-        toggle_recording(&shared.recordings, &record_persist, channel, status);
+        toggle_recording(
+            &shared.recordings,
+            &shared.buffers,
+            &record_persist,
+            channel,
+            status,
+        );
         assert!(shared.timer.start(50, false));
     });
     let cast_player = Rc::clone(player);
@@ -5129,11 +5237,603 @@ fn toggle_pause_state(player: &Rc<RefCell<PlayerState>>, persist: &Persist, stat
         }
     }
     player_status(status, persist, &state.session.announcement(), 3);
+    drop(state);
+    buffer_resume_check(player, persist, status);
+}
+
+/// The live-buffer registry shared with the player, if the
+/// shared wiring has been built.
+fn buffers_of(player: &Rc<RefCell<PlayerState>>) -> Option<Rc<RefCell<buffer::BufferRegistry>>> {
+    player
+        .borrow()
+        .shared
+        .as_ref()
+        .map(|shared| Rc::clone(&shared.buffers))
+}
+
+/// Stop the engines without hiding the window or announcing
+/// (a buffer transition is about to replace the stream).
+fn stop_engines_keep_window(player: &Rc<RefCell<PlayerState>>) {
+    let mut state = player.borrow_mut();
+    state.session.stop();
+    if state.vlc_active {
+        if let Some(engine) = &mut state.vlc {
+            engine.stop();
+        }
+        state.vlc_active = false;
+    }
+    if let Some(win) = &state.window {
+        win.media.stop();
+    }
+}
+
+/// The live-buffer intercept at the head of `play_builtin`
+/// (Python's `_intercept_live_buffer`): returns true when the
+/// request was taken over — either replayed through an
+/// existing session's view or handed to a background start.
+fn buffer_intercept(
+    player: &Rc<RefCell<PlayerState>>,
+    persist: &Persist,
+    channel: &Channel,
+    request: &PlaybackRequest,
+    status: Status,
+) -> bool {
+    let Some(buffers) = buffers_of(player) else {
+        return false;
+    };
+    if buffers.borrow().owns_view(&request.url) {
+        return false;
+    }
+    let settings = iptv_core::timeshift::BufferSettings::from_config(&persist.config.borrow());
+    let wants = iptv_core::timeshift::wants_buffer(
+        &settings,
+        iptv_core::timeshift::EngageContext {
+            builtin_player: true,
+            // The Rust cast model keeps no persistent
+            // connection state to consult (recorded in
+            // validation 0045).
+            casting: false,
+            live_stream: request.live,
+            channel_is_movie: false,
+        },
+    );
+    if !wants {
+        buffers.borrow_mut().release_current();
+        return false;
+    }
+    if let Some(session) = buffers.borrow_mut().find(&channel.url, &request.headers) {
+        if let Ok(lease) = session.acquire() {
+            match session.cursor(0.0, false) {
+                Ok((url, position)) => {
+                    buffers.borrow_mut().current = Some(buffer::BufferCurrent {
+                        session,
+                        lease,
+                        url: url.clone(),
+                        channel: channel.clone(),
+                        position,
+                        last_clock_ms: None,
+                    });
+                    let mut replay = request.clone();
+                    replay.url = url;
+                    replay.buffer_bypass = true;
+                    replay.resume_ms = None;
+                    play_builtin(player, persist, channel, replay, status);
+                    return true;
+                }
+                Err(_) => {
+                    session.release(lease);
+                }
+            }
+        }
+    }
+    // New session: stop the current stream and prepare the
+    // buffer in the background; the player tick delivers it.
+    buffers.borrow_mut().release_current();
+    stop_engines_keep_window(player);
+    player_status(status, persist, "Buffering...", 3);
+    let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
+    buffers.borrow_mut().pending = Some(std::sync::Arc::clone(&slot));
+    let url = channel.url.clone();
+    let headers = request.headers.clone();
+    let channel = channel.clone();
+    let cap = persist
+        .config
+        .borrow()
+        .value("internal_player_variant_max_mbps")
+        .and_then(serde_json::Value::as_f64)
+        .filter(|value| *value > 0.0);
+    std::thread::spawn(move || {
+        let outcome = start_buffer_session(settings, &url, &headers, cap, channel);
+        if let Ok(mut guard) = slot.lock() {
+            *guard = Some(outcome);
+        }
+    });
+    true
+}
+
+/// The background half of a buffer start (worker thread):
+/// create the session, start ingest, wait for history, open
+/// the live view.
+fn start_buffer_session(
+    settings: iptv_core::timeshift::BufferSettings,
+    url: &str,
+    headers: &iptv_core::playback::StreamHeaders,
+    cap: Option<f64>,
+    channel: Channel,
+) -> buffer::BufferOutcome {
+    let key = buffer::source_key(url, headers);
+    let Ok(session) = buffer::BufferSession::new(&settings) else {
+        return buffer::BufferOutcome::Failed;
+    };
+    let Ok(lease) = session.acquire() else {
+        return buffer::BufferOutcome::Failed;
+    };
+    if session.start_ingest(url, headers, cap).is_err()
+        || session
+            .wait_ready(std::time::Duration::from_secs(30))
+            .is_err()
+    {
+        session.release(lease);
+        return buffer::BufferOutcome::Failed;
+    }
+    if let Ok((view_url, position)) = session.cursor(0.0, false) {
+        return buffer::BufferOutcome::Ready {
+            session,
+            key,
+            lease,
+            url: view_url,
+            position,
+            channel,
+        };
+    }
+    session.release(lease);
+    buffer::BufferOutcome::Failed
+}
+
+/// Deliver a finished background buffer start on the player
+/// tick: take over playback if the user is still on that
+/// channel, otherwise release the lease and let the session
+/// close.
+fn deliver_buffer_pending(player: &Rc<RefCell<PlayerState>>, persist: &Persist, status: Status) {
+    let Some(buffers) = buffers_of(player) else {
+        return;
+    };
+    let slot = buffers.borrow().pending.clone();
+    let Some(slot) = slot else {
+        return;
+    };
+    let outcome = slot.lock().ok().and_then(|mut guard| guard.take());
+    let Some(outcome) = outcome else {
+        return;
+    };
+    buffers.borrow_mut().pending = None;
+    match outcome {
+        buffer::BufferOutcome::Failed => {
+            let frame = player.borrow().window.as_ref().map(|win| win.frame);
+            if let Some(frame) = frame {
+                let _ = MessageDialog::builder(
+                    &frame,
+                    "The local live buffer could not start. No extra provider connection was opened. Disable the buffer to retry direct playback.",
+                    "Local Live Buffer",
+                )
+                .with_style(MessageDialogStyle::OK)
+                .build()
+                .show_modal();
+            }
+            status.set_label("The local live buffer could not start.");
+        }
+        buffer::BufferOutcome::Ready {
+            session,
+            key,
+            lease,
+            url,
+            position,
+            channel,
+        } => {
+            let still_wanted = {
+                let state = player.borrow();
+                state
+                    .current_channel
+                    .as_ref()
+                    .is_none_or(|current| current.url == channel.url)
+            };
+            buffers
+                .borrow_mut()
+                .sessions
+                .insert(key, std::sync::Arc::clone(&session));
+            if !still_wanted {
+                session.release(lease);
+                return;
+            }
+            buffers.borrow_mut().release_current();
+            buffers.borrow_mut().current = Some(buffer::BufferCurrent {
+                session,
+                lease,
+                url: url.clone(),
+                channel: channel.clone(),
+                position,
+                last_clock_ms: None,
+            });
+            let mut replay = PlaybackRequest::for_channel(&channel, None);
+            replay.url = url;
+            replay.buffer_bypass = true;
+            play_builtin(player, persist, &channel, replay, status);
+        }
+    }
+}
+
+/// Playback clock for buffer bookkeeping: (position ms,
+/// playing or paused, ended).
+fn buffer_clock(state: &PlayerState) -> (i64, bool, bool) {
+    if state.vlc_active {
+        if let Some(engine) = &state.vlc {
+            let state = engine.state();
+            return (
+                engine.time(),
+                matches!(
+                    state,
+                    iptv_vlc::VlcState::Playing | iptv_vlc::VlcState::Paused
+                ),
+                state == iptv_vlc::VlcState::Ended,
+            );
+        }
+    }
+    match &state.window {
+        Some(win) => {
+            let media_state = win.media.get_state();
+            (
+                win.media.tell(),
+                matches!(media_state, MediaState::Playing | MediaState::Paused),
+                media_state == MediaState::Stopped,
+            )
+        }
+        None => (0, false, false),
+    }
+}
+
+/// Per-tick buffer housekeeping (Python's `_poll_live_buffer`
+/// plus its position tracker): advance the tracked position
+/// while the clock runs, jump forward when the tracked
+/// position falls out of the retained window, and stop with
+/// Python's messages when the buffer fails or input ends.
+/// What one buffer poll decided to do.
+enum BufferPollAct {
+    None,
+    Failed,
+    Expired,
+    Ended,
+}
+
+#[allow(clippy::cast_precision_loss)] // ms deltas to f64 seconds, as Python's /1000
+fn poll_buffer(player: &Rc<RefCell<PlayerState>>, persist: &Persist, status: Status) {
+    let Some(buffers) = buffers_of(player) else {
+        return;
+    };
+    let act = {
+        let mut registry = buffers.borrow_mut();
+        let Some(current) = registry.current.as_mut() else {
+            return;
+        };
+        if current.session.window_error().is_some() {
+            BufferPollAct::Failed
+        } else {
+            let (clock_ms, live_clock, ended) = buffer_clock(&player.borrow());
+            if live_clock && clock_ms >= 0 {
+                if let Some(before) = current.last_clock_ms {
+                    if clock_ms >= before {
+                        current.position += (clock_ms - before) as f64 / 1000.0;
+                    }
+                }
+                current.last_clock_ms = Some(clock_ms);
+            }
+            let span = current.session.retained_span();
+            let expired = span.is_some_and(|(first, _)| current.position < first);
+            let paused = {
+                let state = player.borrow();
+                state.session.state() == &SessionState::Paused
+            };
+            if expired && !paused {
+                BufferPollAct::Expired
+            } else if current.session.process_exited() && ended {
+                BufferPollAct::Ended
+            } else {
+                BufferPollAct::None
+            }
+        }
+    };
+    match act {
+        BufferPollAct::Failed => {
+            player_stop(player, persist, status);
+            player_status(
+                status,
+                persist,
+                "The local buffer stopped because its storage or input failed.",
+                1,
+            );
+        }
+        BufferPollAct::Expired => {
+            if let Some((first, last)) = buffers
+                .borrow()
+                .current
+                .as_ref()
+                .and_then(|current| current.session.retained_span())
+            {
+                jump_live_buffer(player, persist, status, last - first);
+                player_status(
+                    status,
+                    persist,
+                    "The old buffered position expired; playback moved to the retained window.",
+                    1,
+                );
+            }
+        }
+        BufferPollAct::Ended => {
+            player_stop(player, persist, status);
+            player_status(
+                status,
+                persist,
+                "Live input ended; retained history is still available.",
+                1,
+            );
+        }
+        BufferPollAct::None => {}
+    }
+}
+
+/// Jump the buffered view `behind` seconds behind live
+/// (0 = live edge). Returns false when there is no current
+/// buffer or the position is not retained.
+fn jump_live_buffer(
+    player: &Rc<RefCell<PlayerState>>,
+    persist: &Persist,
+    status: Status,
+    behind: f64,
+) -> bool {
+    let Some(buffers) = buffers_of(player) else {
+        return false;
+    };
+    let jumped = {
+        let mut registry = buffers.borrow_mut();
+        let Some(current) = registry.current.as_mut() else {
+            return false;
+        };
+        match current.session.cursor(behind, false) {
+            Ok((url, position)) => {
+                current.url.clone_from(&url);
+                current.position = position;
+                current.last_clock_ms = None;
+                Some((current.channel.clone(), url))
+            }
+            Err(_) => None,
+        }
+    };
+    let Some((channel, url)) = jumped else {
+        return false;
+    };
+    let mut replay = PlaybackRequest::for_channel(&channel, None);
+    replay.url = url;
+    replay.buffer_bypass = true;
+    play_builtin(player, persist, &channel, replay, status);
+    true
+}
+
+/// Resume-after-pause expiry (Python's `_resume_live_buffer`
+/// position check), run when playback resumes.
+fn buffer_resume_check(player: &Rc<RefCell<PlayerState>>, persist: &Persist, status: Status) {
+    let Some(buffers) = buffers_of(player) else {
+        return;
+    };
+    let expired = {
+        let registry = buffers.borrow();
+        let Some(current) = registry.current.as_ref() else {
+            return;
+        };
+        current
+            .session
+            .retained_span()
+            .is_some_and(|(first, _)| current.position < first)
+    };
+    if expired {
+        if let Some((first, last)) = buffers
+            .borrow()
+            .current
+            .as_ref()
+            .and_then(|current| current.session.retained_span())
+        {
+            jump_live_buffer(player, persist, status, last - first);
+            player_status(
+                status,
+                persist,
+                "The paused position expired. Playback resumed at the oldest retained picture.",
+                1,
+            );
+        }
+    }
+}
+
+/// Playback > Local Live Buffer...: Python's two prompts
+/// (minutes, then MiB), the recording-lease refusal when
+/// disabling, persistence of the three config keys, and a
+/// relaunch of the live channel being watched.
+fn prompt_live_buffer_config(
+    player: &Rc<RefCell<PlayerState>>,
+    frame: Frame,
+    persist: &Persist,
+    status: Status,
+) {
+    let mut settings = iptv_core::timeshift::BufferSettings::from_config(&persist.config.borrow());
+    let dialog = TextEntryDialog::builder(
+        &frame,
+        "Keep up to this many minutes of live TV (1\u{2013}30); 0 disables the local buffer.",
+        "Local Live Buffer",
+    )
+    .with_default_value(&settings.dialog_minutes().to_string())
+    .build();
+    if dialog.show_modal() != ID_OK {
+        return;
+    }
+    let text = dialog.get_value().unwrap_or_default();
+    let Ok(minutes) = text.trim().parse::<i64>() else {
+        status.set_label(&format!("\"{text}\" is not a whole number of minutes."));
+        return;
+    };
+    if !(0..=30).contains(&minutes) {
+        status.set_label("Minutes must be between 0 and 30.");
+        return;
+    }
+    if minutes == 0 {
+        let feeding = buffers_of(player)
+            .and_then(|buffers| {
+                buffers
+                    .borrow()
+                    .current
+                    .as_ref()
+                    .map(|current| current.session.lease_count())
+            })
+            .is_some_and(|count| count > 1);
+        if feeding {
+            let _ = MessageDialog::builder(
+                &frame,
+                "The local buffer is still feeding a recording. Stop the recording before disabling it.",
+                "Local Live Buffer",
+            )
+            .with_style(MessageDialogStyle::OK)
+            .build()
+            .show_modal();
+            return;
+        }
+        settings.apply_dialog_choice(0, settings.mib);
+    } else {
+        let dialog = TextEntryDialog::builder(
+            &frame,
+            "Maximum local buffer size per session (MiB). Old data is removed when either limit is reached.",
+            "Local Live Buffer",
+        )
+        .with_default_value(&settings.mib.to_string())
+        .build();
+        if dialog.show_modal() != ID_OK {
+            return;
+        }
+        let text = dialog.get_value().unwrap_or_default();
+        let Ok(mib) = text.trim().parse::<i64>() else {
+            status.set_label(&format!("\"{text}\" is not a whole number of MiB."));
+            return;
+        };
+        if !(64..=4096).contains(&mib) {
+            status.set_label("Buffer size must be between 64 and 4096 MiB.");
+            return;
+        }
+        settings.apply_dialog_choice(minutes, mib);
+    }
+    persist.set_and_save("live_buffer_enabled", serde_json::json!(settings.enabled));
+    persist.set_and_save("live_buffer_seconds", serde_json::json!(settings.seconds));
+    persist.set_and_save("live_buffer_mib", serde_json::json!(settings.mib));
+    status.set_label(if settings.enabled {
+        "Local live buffer settings saved."
+    } else {
+        "Local live buffer disabled."
+    });
+    // Python relaunches the live channel being watched so the
+    // new setting applies immediately.
+    let live_channel = {
+        let state = player.borrow();
+        state
+            .current_channel
+            .clone()
+            .filter(|_| state.session.state() != &SessionState::Idle)
+    };
+    if let Some(channel) = live_channel {
+        if let Some(buffers) = buffers_of(player) {
+            buffers.borrow_mut().release_current();
+        }
+        let request = PlaybackRequest::for_channel(&channel, None);
+        if request.live {
+            play_builtin(player, persist, &channel, request, status);
+        }
+    }
+}
+
+/// Playback > Rewind Live TV...: Python's seconds prompt over
+/// the retained span; without a buffer it falls back to
+/// Return to Live, like Python's `_seek_live_buffer`.
+#[allow(clippy::cast_precision_loss)] // whole seconds to f64, as Python
+fn prompt_rewind(
+    player: &Rc<RefCell<PlayerState>>,
+    frame: Frame,
+    persist: &Persist,
+    status: Status,
+) {
+    let range = buffers_of(player).and_then(|buffers| {
+        buffers
+            .borrow()
+            .current
+            .as_ref()
+            .and_then(|current| current.session.rewind_range())
+    });
+    let Some(max_seconds) = range else {
+        return_to_live(player, frame, persist, status);
+        return;
+    };
+    let dialog = TextEntryDialog::builder(
+        &frame,
+        "Seconds behind the latest buffered picture; 0 returns to live.",
+        "Rewind Live TV",
+    )
+    .with_default_value("0")
+    .build();
+    if dialog.show_modal() != ID_OK {
+        return;
+    }
+    let text = dialog.get_value().unwrap_or_default();
+    let Ok(seconds) = text.trim().parse::<i64>() else {
+        status.set_label(&format!("\"{text}\" is not a whole number of seconds."));
+        return;
+    };
+    let seconds = seconds.clamp(0, max_seconds.max(0));
+    jump_live_buffer(player, persist, status, seconds as f64);
+}
+
+/// Playback > Return to Live: jump to the live edge; with no
+/// current buffer, relaunch the last buffered channel (which
+/// re-buffers), else Python's information box.
+fn return_to_live(
+    player: &Rc<RefCell<PlayerState>>,
+    frame: Frame,
+    persist: &Persist,
+    status: Status,
+) {
+    if jump_live_buffer(player, persist, status, 0.0) {
+        return;
+    }
+    let last = buffers_of(player).and_then(|buffers| buffers.borrow().last.clone());
+    if let Some((channel, _view)) = last {
+        let request = PlaybackRequest::for_channel(&channel, None);
+        play_builtin(player, persist, &channel, request, status);
+        return;
+    }
+    let _ = MessageDialog::builder(
+        &frame,
+        "No local live history is available.",
+        "Local Live Buffer",
+    )
+    .with_style(MessageDialogStyle::OK)
+    .build()
+    .show_modal();
+}
+
+/// Release a recording's buffer lease, if it held one.
+fn release_recording_lease(buffers: &Rc<RefCell<buffer::BufferRegistry>>, key: &str) {
+    if let Some((session, lease)) = buffers.borrow_mut().recording_leases.remove(key) {
+        session.release(lease);
+    }
 }
 
 /// Stop playback and hide the player window (Stop button, the stop
 /// and exit shortcuts).
 fn player_stop(player: &Rc<RefCell<PlayerState>>, persist: &Persist, status: Status) {
+    if let Some(buffers) = buffers_of(player) {
+        buffers.borrow_mut().release_current();
+    }
     checkpoint_resume(player, persist);
     let mut state = player.borrow_mut();
     state.session.stop();
@@ -5416,7 +6116,13 @@ fn dispatch_player_key(
         "record" => {
             let state = player.borrow();
             if let (Some(shared), Some(channel)) = (&state.shared, &state.current_channel) {
-                toggle_recording(&shared.recordings, persist, channel, status);
+                toggle_recording(
+                    &shared.recordings,
+                    &shared.buffers,
+                    persist,
+                    channel,
+                    status,
+                );
                 assert!(shared.timer.start(50, false));
             }
         }
@@ -7092,7 +7798,13 @@ fn dispatch_main_hotkey(
         }
         Some("record") => {
             if let Some(channel) = selected_channel(&wiring.browser, &wiring.model, controls.list) {
-                toggle_recording(&wiring.recordings, &wiring.persist, &channel, status);
+                toggle_recording(
+                    &wiring.recordings,
+                    &wiring.buffers,
+                    &wiring.persist,
+                    &channel,
+                    status,
+                );
             } else {
                 status.set_label("Select a channel to record first.");
             }
