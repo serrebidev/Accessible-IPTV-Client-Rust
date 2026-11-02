@@ -1,3 +1,5 @@
+use iptv_core::guide::Guide;
+use iptv_core::i18n::I18n;
 use iptv_core::{
     browser::{BrowseEvent, BrowserWorker},
     cast::{CastDevice, CastEvent, CastWorker},
@@ -40,6 +42,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let record = record_button(panel);
         let vod = vod_button(panel);
         let cast = cast_button(panel);
+        let guide_button = guide_ui_button(panel);
         let (category_label, category, toggle_favorite) = category_controls(panel);
         let search_label = StaticText::builder(&panel)
             .with_label("&Search channels")
@@ -99,6 +102,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 record,
                 vod,
                 cast,
+                guide_button,
                 category,
                 toggle_favorite,
                 search,
@@ -171,6 +175,7 @@ struct Controls {
     record: Button,
     vod: Button,
     cast: Button,
+    guide_button: Button,
     category: ListBox,
     toggle_favorite: Button,
     search: TextCtrl,
@@ -197,6 +202,8 @@ struct Wiring {
     cast_worker: Rc<CastWorker>,
     cast_pending: Rc<std::cell::Cell<bool>>,
     cast_ui: Rc<RefCell<Option<CastUi>>>,
+    guide_ui: Rc<RefCell<Option<GuideUi>>>,
+    i18n: Rc<I18n>,
     vod_worker: Rc<VodWorker>,
     vod_pending: Rc<std::cell::Cell<bool>>,
     vod_ui: Rc<RefCell<Option<VodUi>>>,
@@ -344,6 +351,14 @@ fn open_cancel_buttons(panel: Panel) -> (Button, Button) {
     (open, cancel)
 }
 
+/// The User Guide button for the main window.
+fn guide_ui_button(panel: Panel) -> Button {
+    let button = Button::builder(&panel).with_label("User &Guide").build();
+    button.set_accessibility_label("User Guide");
+    button.set_accessibility_description("Open the offline User Guide.");
+    button
+}
+
 /// The Record toggle button for the main window.
 fn record_button(panel: Panel) -> Button {
     let record = Button::builder(&panel).with_label("&Record").build();
@@ -358,6 +373,11 @@ fn bind_browser(frame: Frame, controls: Controls, model: Rc<RefCell<SearchResult
     let candidates = config::config_candidates();
     let loaded = config::load(&candidates, &candidates[0]);
     let dvr_path = iptv_core::dvr::schedule_path(&loaded.path);
+    let i18n = {
+        let mut i18n = I18n::default();
+        i18n.init_from_config(&iptv_core::i18n::locale_dir(), loaded.config.raw());
+        Rc::new(i18n)
+    };
     let mut browser_worker = BrowserWorker::default();
     browser_worker.set_favorites(FavoriteSet::from_stored(loaded.config.favorites()));
     let wiring = Wiring {
@@ -381,6 +401,8 @@ fn bind_browser(frame: Frame, controls: Controls, model: Rc<RefCell<SearchResult
         cast_worker: Rc::new(CastWorker::new()),
         cast_pending: Rc::new(std::cell::Cell::new(false)),
         cast_ui: Rc::new(RefCell::new(None)),
+        guide_ui: Rc::new(RefCell::new(None)),
+        i18n,
         vod_worker: Rc::new(VodWorker::new()),
         vod_pending: Rc::new(std::cell::Cell::new(false)),
         vod_ui: Rc::new(RefCell::new(None)),
@@ -413,6 +435,7 @@ fn bind_browser(frame: Frame, controls: Controls, model: Rc<RefCell<SearchResult
     bind_recording(&wiring, controls);
     bind_vod(&wiring, controls);
     bind_cast(&wiring, controls);
+    bind_guide(&wiring, controls);
     bind_actions(frame, &wiring, controls);
     let browser = Rc::clone(&wiring.browser);
     let timer = Rc::clone(&wiring.timer);
@@ -475,6 +498,7 @@ fn bind_actions(frame: Frame, wiring: &Wiring, controls: Controls) {
         record: _,
         vod: _,
         cast: _,
+        guide_button: _,
         category,
         toggle_favorite,
         search,
@@ -1407,6 +1431,161 @@ fn poll_cast(wiring: &Wiring, status: Status) {
             }
         }
     }
+}
+
+/// The guide window's handles and state.
+#[derive(Clone)]
+struct GuideUi {
+    frame: Frame,
+    toc: ListBox,
+    body: TextCtrl,
+    status: Status,
+    guide: Rc<RefCell<Guide>>,
+}
+
+/// Open (creating on first use) the User Guide window at the start of
+/// the manual, in the resolved language.
+fn bind_guide(wiring: &Wiring, controls: Controls) {
+    let button = controls.guide_button;
+    let status = controls.status;
+    let ui_slot = Rc::clone(&wiring.guide_ui);
+    let i18n = Rc::clone(&wiring.i18n);
+    button.on_click(move |_| {
+        let ui = ensure_guide_ui(&ui_slot);
+        let language = i18n.resolved_language();
+        let (guide, section) = iptv_core::guide::open_topic(Some(&language), None, None);
+        show_guide(&ui, guide);
+        if let Some(section) = section {
+            move_caret(&ui, &section);
+        }
+        ui.frame.show(true);
+        ui.frame.raise();
+        status.set_label("User Guide opened.");
+    });
+}
+
+/// Build the guide window once and keep it (closing hides it).
+fn ensure_guide_ui(slot: &Rc<RefCell<Option<GuideUi>>>) -> GuideUi {
+    if let Some(ui) = slot.borrow().as_ref() {
+        return ui.clone();
+    }
+    let frame = Frame::builder()
+        .with_title("User Guide")
+        .with_size(Size::new(760, 560))
+        .build();
+    frame.set_accessibility_label("User Guide");
+    let panel = Panel::builder(&frame).build();
+    let toc = ListBox::builder(&panel).build();
+    toc.set_accessibility_label("Table of contents");
+    toc.set_accessibility_description("Choose a section to read it in the guide text.");
+    let body = TextCtrl::builder(&panel)
+        .with_style(TextCtrlStyle::ReadOnly | TextCtrlStyle::MultiLine)
+        .build();
+    body.set_accessibility_label("Guide text");
+    let find_label = StaticText::builder(&panel).with_label("Find").build();
+    let _ = find_label;
+    let find_box = TextCtrl::builder(&panel).build();
+    find_box.set_accessibility_label("Find in guide");
+    let find_button = Button::builder(&panel).with_label("Fin&d").build();
+    find_button.set_accessibility_label("Find");
+    let status_label = StaticText::builder(&panel)
+        .with_label("Guide status")
+        .build();
+    let details = TextCtrl::builder(&panel)
+        .with_style(TextCtrlStyle::ReadOnly | TextCtrlStyle::MultiLine)
+        .with_value("The guide has not been opened yet.")
+        .build();
+    details.set_accessibility_label("Guide status");
+    let status = Status {
+        label: status_label,
+        details,
+    };
+    let guide = Rc::new(RefCell::new(iptv_core::guide::load_guide(None, None)));
+    let ui = GuideUi {
+        frame,
+        toc,
+        body,
+        status,
+        guide,
+    };
+    {
+        let guide = Rc::clone(&ui.guide);
+        toc.bind_internal(EventType::COMMAND_LISTBOX_SELECTED, move |event| {
+            event.skip(true);
+            let Some(selection) = toc.get_selection() else {
+                return;
+            };
+            let guide = guide.borrow();
+            if let Some(section) = guide.sections.get(selection as usize) {
+                body.set_insertion_point(i64::try_from(section.start).unwrap_or(0));
+                body.set_selection(
+                    i64::try_from(section.start).unwrap_or(0),
+                    i64::try_from(section.start).unwrap_or(0),
+                );
+                body.set_focus();
+            }
+        });
+    }
+    {
+        let guide = Rc::clone(&ui.guide);
+        find_button.on_click(move |_| {
+            let query = find_box.get_value();
+            if query.trim().is_empty() {
+                status.set_label("Type something to find first.");
+                return;
+            }
+            let guide = guide.borrow();
+            let haystack = guide.text.to_lowercase();
+            let needle = query.to_lowercase();
+            match haystack.find(&needle) {
+                Some(byte_index) => {
+                    let char_index = haystack[..byte_index].chars().count();
+                    body.set_insertion_point(i64::try_from(char_index).unwrap_or(0));
+                    body.set_focus();
+                    status.set_label(&format!("Found \"{query}\"."));
+                }
+                None => {
+                    status.set_label(&format!("Cannot find \"{query}\"."));
+                }
+            }
+        });
+    }
+    {
+        let frame_hide = frame;
+        frame.on_close(move |event| {
+            frame_hide.hide();
+            event.skip(false);
+        });
+    }
+    *slot.borrow_mut() = Some(ui.clone());
+    ui
+}
+
+/// Put a guide into the window: text, contents, spoken status.
+fn show_guide(ui: &GuideUi, guide: Guide) {
+    let titles: Vec<String> = guide
+        .sections
+        .iter()
+        .map(|section| section.title.clone())
+        .collect();
+    ui.body.change_value(&guide.text);
+    let refs: Vec<&str> = titles.iter().map(String::as_str).collect();
+    ui.toc.set_items(&refs);
+    if !refs.is_empty() {
+        ui.toc.set_selection(0, true);
+    }
+    ui.status.set_label(&format!(
+        "User Guide ({}). {} sections. Choose a section, or use Find.",
+        guide.language,
+        guide.sections.len()
+    ));
+    *ui.guide.borrow_mut() = guide;
+}
+
+/// Move the guide text caret to a section.
+fn move_caret(ui: &GuideUi, section: &iptv_core::guide::Section) {
+    ui.body
+        .set_insertion_point(i64::try_from(section.start).unwrap_or(0));
 }
 
 fn bind_playback(wiring: &Wiring, list: ListCtrl, status: Status) {
