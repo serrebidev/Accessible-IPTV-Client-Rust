@@ -381,15 +381,36 @@ pub fn upnp_didl(media_url: &str, title: &str, mime: &str, upnp_class: &str) -> 
 /// # Errors
 ///
 /// Returns the transport failure text.
+/// Whether a device is a Sonos speaker (its DIDL differs: an
+/// audio item class, no video).
+#[must_use]
+pub fn is_sonos(device: &CastDevice) -> bool {
+    device.manufacturer.to_ascii_lowercase().contains("sonos")
+        || device.name.to_ascii_lowercase().contains("sonos")
+}
+
+/// Send a stream to a `UPnP` `AVTransport` renderer.
+///
+/// # Errors
+/// Returns the SOAP failure text when the device refuses.
 pub fn upnp_play(
     control_url: &str,
     media_url: &str,
     title: &str,
     mime: &str,
 ) -> Result<(), String> {
-    let escaped = xml_escape(media_url);
     let didl = upnp_didl(media_url, title, mime, "object.item.videoItem");
-    let didl_escaped = xml_escape(&didl);
+    upnp_play_with_didl(control_url, media_url, &didl)
+}
+
+/// `SetAVTransportURI` + Play with a caller-built DIDL document
+/// (Sonos uses its own shape).
+///
+/// # Errors
+/// Returns the SOAP failure text when the device refuses.
+pub fn upnp_play_with_didl(control_url: &str, media_url: &str, didl: &str) -> Result<(), String> {
+    let escaped = xml_escape(media_url);
+    let didl_escaped = xml_escape(didl);
     let uri_args = format!(
         "<u:SetAVTransportURI xmlns:u=\"urn:schemas-upnp-org:service:AVTransport:1\"><InstanceID>0</InstanceID><CurrentURI>{escaped}</CurrentURI><CurrentURIMetaData>{didl_escaped}</CurrentURIMetaData></u:SetAVTransportURI>"
     );
@@ -853,8 +874,13 @@ impl CastWorker {
                         let result = match device.kind {
                             CastKind::Upnp => {
                                 let mime = guess_mime(&url);
-                                upnp_play(&device.control_url, &url, &title, &mime)
-                                    .map(|()| device.name.clone())
+                                let played = if is_sonos(&device) {
+                                    let didl = sonos_didl(&title, &url, &mime);
+                                    upnp_play_with_didl(&device.control_url, &url, &didl)
+                                } else {
+                                    upnp_play(&device.control_url, &url, &title, &mime)
+                                };
+                                played.map(|()| device.name.clone())
                             }
                             CastKind::Roku => {
                                 let mime = roku_mime(&url);
@@ -907,6 +933,26 @@ pub type HeaderPairs = BTreeMap<String, String>;
 
 #[cfg(test)]
 mod tests {
+    use super::{is_sonos, CastDevice, CastKind};
+
+    #[test]
+    fn sonos_detection_uses_manufacturer_or_name() {
+        let sonos = CastDevice {
+            name: "Living Room".into(),
+            control_url: String::new(),
+            manufacturer: "Sonos, Inc.".into(),
+            sink_mimes: Vec::new(),
+            kind: CastKind::Upnp,
+        };
+        assert!(is_sonos(&sonos));
+        let tv = CastDevice {
+            name: "TV".into(),
+            manufacturer: "Samsung".into(),
+            ..sonos.clone()
+        };
+        assert!(!is_sonos(&tv));
+    }
+
     use super::*;
 
     #[test]

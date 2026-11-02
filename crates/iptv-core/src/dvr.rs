@@ -18,7 +18,7 @@ pub const STATUS_FAILED: &str = "failed";
 pub const STATUS_MISSED: &str = "missed";
 pub const STATUS_CANCELED: &str = "canceled";
 
-const DONE_STATUSES: &[&str] = &[
+pub const DONE_STATUSES: &[&str] = &[
     STATUS_COMPLETED,
     STATUS_FAILED,
     STATUS_MISSED,

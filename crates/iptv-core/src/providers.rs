@@ -8,7 +8,6 @@
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde_json::Value;
 
@@ -27,9 +26,6 @@ const PORTAL_FILENAMES: &[&str] = &[
 ];
 
 type ProviderResult<T> = Result<T, String>;
-
-/// Opaque identity for one asynchronous provider request.
-pub type ProviderRequestId = u64;
 
 // ---------------------------------------------------------------------------
 // URL helpers
@@ -877,14 +873,15 @@ impl ProviderAccount {
 }
 
 enum ProviderJob {
+    SetCacheDir(std::path::PathBuf),
     Load(Vec<ProviderAccount>),
     Resolve {
-        request_id: ProviderRequestId,
+        request: u64,
         provider_id: String,
         data: BTreeMap<String, String>,
     },
     ResolveCatchup {
-        request_id: ProviderRequestId,
+        request: u64,
         provider_id: String,
         data: BTreeMap<String, String>,
         start_text: String,
@@ -902,8 +899,12 @@ pub enum ProviderEvent {
         epg_urls: Vec<String>,
         failures: Vec<String>,
     },
+    /// A resolution finished; `request` correlates the result
+    /// with the caller's dispatch.
     Resolved {
-        request_id: ProviderRequestId,
+        /// The opaque request identifier from dispatch.
+        request: u64,
+        /// The resolved URL or the failure message.
         result: ProviderResult<String>,
     },
     Account(ProviderResult<String>),
@@ -919,7 +920,6 @@ enum Client {
 pub struct ProviderWorker {
     jobs: std::sync::mpsc::Sender<ProviderJob>,
     events: std::sync::Mutex<std::sync::mpsc::Receiver<ProviderEvent>>,
-    next_request_id: AtomicU64,
 }
 
 impl Default for ProviderWorker {
@@ -929,9 +929,14 @@ impl Default for ProviderWorker {
 }
 
 /// Run one provider load job against the worker's client table.
+/// Cached provider data stays fresh for six hours; a stale copy
+/// still serves when a fetch fails.
+const CACHE_TTL: std::time::Duration = std::time::Duration::from_hours(6);
+
 fn handle_load(
     accounts: Vec<ProviderAccount>,
     clients: &mut BTreeMap<String, (ProviderAccount, Client)>,
+    cache_dir: Option<&std::path::Path>,
 ) -> ProviderEvent {
     let mut channels = Vec::new();
     let mut epg_urls = Vec::new();
@@ -942,39 +947,18 @@ fn handle_load(
         match &account {
             ProviderAccount::Xtream(cfg) => {
                 let client = XtreamClient::new(cfg.clone());
-                match client.fetch_playlist() {
-                    Ok(text) => {
-                        let mut parsed = crate::parse_m3u(&text);
-                        for channel in &mut parsed {
-                            channel
-                                .unknown_attributes
-                                .insert("provider-type".to_string(), "xtream".to_string());
-                            if let Some(id) = &cfg.provider_id {
-                                channel
-                                    .unknown_attributes
-                                    .insert("provider-id".to_string(), id.clone());
-                            }
-                        }
-                        channels.extend(parsed);
-                        epg_urls.extend(client.epg_urls());
-                    }
-                    Err(e) => {
-                        failures.push(format!("{}: {e}", client.describe()));
-                    }
-                }
+                let (found, urls, fails) = load_xtream_account(&client, cfg, cache_dir);
+                channels.extend(found);
+                epg_urls.extend(urls);
+                failures.extend(fails);
                 clients.insert(key, (account, Client::Xtream(client)));
             }
             ProviderAccount::Stalker(cfg) => {
                 let client = StalkerClient::new(cfg.clone());
-                match client.fetch_channels(now) {
-                    Ok((found, urls)) => {
-                        channels.extend(found);
-                        epg_urls.extend(urls);
-                    }
-                    Err(e) => {
-                        failures.push(format!("{}: {e}", client.describe()));
-                    }
-                }
+                let (found, urls, fails) = load_stalker_account(&client, cfg, cache_dir, now);
+                channels.extend(found);
+                epg_urls.extend(urls);
+                failures.extend(fails);
                 clients.insert(key, (account, Client::Stalker(client)));
             }
         }
@@ -986,6 +970,135 @@ fn handle_load(
     }
 }
 
+/// Tag parsed channels with their provider identity.
+fn tag_xtream_channels(parsed: &mut [Channel], cfg: &XtreamConfig) {
+    for channel in parsed {
+        channel
+            .unknown_attributes
+            .insert("provider-type".to_string(), "xtream".to_string());
+        if let Some(id) = &cfg.provider_id {
+            channel
+                .unknown_attributes
+                .insert("provider-id".to_string(), id.clone());
+        }
+    }
+}
+
+/// One Xtream account's playlist: fresh cache first, then the
+/// server (writing the cache), then the stale cache on failure.
+fn load_xtream_account(
+    client: &XtreamClient,
+    cfg: &XtreamConfig,
+    cache_dir: Option<&std::path::Path>,
+) -> (Vec<Channel>, Vec<String>, Vec<String>) {
+    let cache_file = cache_dir.map(|dir| {
+        crate::cache::file_for(
+            dir,
+            &crate::cache::cache_key(&["xtream", &cfg.base_url, &cfg.username]),
+        )
+    });
+    let fresh = cache_file
+        .as_ref()
+        .and_then(|path| crate::cache::read(path, Some(CACHE_TTL), std::time::SystemTime::now()));
+    let fetched = match fresh {
+        Some(text) => Ok(text),
+        None => client.fetch_playlist().inspect(|text| {
+            if let Some(path) = &cache_file {
+                let _ = crate::cache::write(path, text);
+            }
+        }),
+    };
+    match fetched {
+        Ok(text) => {
+            let mut parsed = crate::parse_m3u(&text);
+            tag_xtream_channels(&mut parsed, cfg);
+            (parsed, client.epg_urls(), Vec::new())
+        }
+        Err(error) => {
+            let stale = cache_file
+                .as_ref()
+                .and_then(|path| crate::cache::read(path, None, std::time::SystemTime::now()));
+            match stale {
+                Some(text) => {
+                    let mut parsed = crate::parse_m3u(&text);
+                    tag_xtream_channels(&mut parsed, cfg);
+                    (
+                        parsed,
+                        client.epg_urls(),
+                        vec![format!(
+                            "{}: {error}; using the cached playlist",
+                            client.describe()
+                        )],
+                    )
+                }
+                None => (
+                    Vec::new(),
+                    Vec::new(),
+                    vec![format!("{}: {error}", client.describe())],
+                ),
+            }
+        }
+    }
+}
+
+/// One Stalker account's channel list, with the same cache
+/// policy as the Xtream path (channels serialized as JSON).
+fn load_stalker_account(
+    client: &StalkerClient,
+    cfg: &StalkerConfig,
+    cache_dir: Option<&std::path::Path>,
+    now: i64,
+) -> (Vec<Channel>, Vec<String>, Vec<String>) {
+    let cache_file = cache_dir.map(|dir| {
+        crate::cache::file_for(
+            dir,
+            &crate::cache::cache_key(&["stalker", &cfg.base_url, &cfg.mac]),
+        )
+    });
+    let read_cache = |fresh_only: bool| -> Option<(Vec<Channel>, Vec<String>)> {
+        let path = cache_file.as_ref()?;
+        let text = crate::cache::read(
+            path,
+            fresh_only.then_some(CACHE_TTL),
+            std::time::SystemTime::now(),
+        )?;
+        let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+        let found: Vec<Channel> = serde_json::from_value(value.get("channels")?.clone()).ok()?;
+        let urls: Vec<String> = serde_json::from_value(value.get("epg_urls")?.clone()).ok()?;
+        Some((found, urls))
+    };
+    if let Some((found, urls)) = read_cache(true) {
+        return (found, urls, Vec::new());
+    }
+    match client.fetch_channels(now) {
+        Ok((found, urls)) => {
+            if let Some(path) = &cache_file {
+                let payload = serde_json::json!({
+                    "channels": found,
+                    "epg_urls": urls,
+                });
+                let _ = crate::cache::write(path, &payload.to_string());
+            }
+            (found, urls, Vec::new())
+        }
+        Err(error) => match read_cache(false) {
+            Some((found, urls)) => (
+                found,
+                urls,
+                vec![format!(
+                    "{}: {error}; using the cached channel list",
+                    client.describe()
+                )],
+            ),
+            None => (
+                Vec::new(),
+                Vec::new(),
+                vec![format!("{}: {error}", client.describe())],
+            ),
+        },
+    }
+}
+
 impl ProviderWorker {
     #[must_use]
     pub fn new() -> Self {
@@ -993,11 +1106,19 @@ impl ProviderWorker {
         let (event_sender, event_receiver) = std::sync::mpsc::channel::<ProviderEvent>();
         std::thread::spawn(move || {
             let mut clients: BTreeMap<String, (ProviderAccount, Client)> = BTreeMap::new();
+            let mut cache_dir: Option<std::path::PathBuf> = None;
             while let Ok(job) = job_receiver.recv() {
+                if let ProviderJob::SetCacheDir(dir) = job {
+                    cache_dir = Some(dir);
+                    continue;
+                }
                 let event = match job {
-                    ProviderJob::Load(accounts) => handle_load(accounts, &mut clients),
+                    ProviderJob::Load(accounts) => {
+                        handle_load(accounts, &mut clients, cache_dir.as_deref())
+                    }
+                    ProviderJob::SetCacheDir(_) => unreachable!(),
                     ProviderJob::Resolve {
-                        request_id,
+                        request,
                         provider_id,
                         data,
                     } => {
@@ -1007,10 +1128,10 @@ impl ProviderWorker {
                             }
                             _ => Err("No Stalker portal for this channel".to_string()),
                         };
-                        ProviderEvent::Resolved { request_id, result }
+                        ProviderEvent::Resolved { request, result }
                     }
                     ProviderJob::ResolveCatchup {
-                        request_id,
+                        request,
                         provider_id,
                         data,
                         start_text,
@@ -1025,7 +1146,7 @@ impl ProviderWorker {
                             ),
                             _ => Err("No Stalker portal for this channel".to_string()),
                         };
-                        ProviderEvent::Resolved { request_id, result }
+                        ProviderEvent::Resolved { request, result }
                     }
                     ProviderJob::Account { provider_id } => {
                         let result = match clients.get(&provider_id) {
@@ -1049,8 +1170,12 @@ impl ProviderWorker {
         Self {
             jobs: job_sender,
             events: std::sync::Mutex::new(event_receiver),
-            next_request_id: AtomicU64::new(1),
         }
+    }
+
+    /// Set the directory provider playlists are cached in.
+    pub fn set_cache_dir(&self, dir: std::path::PathBuf) {
+        let _ = self.jobs.send(ProviderJob::SetCacheDir(dir));
     }
 
     pub fn load(&self, accounts: Vec<ProviderAccount>) {
@@ -1059,34 +1184,27 @@ impl ProviderWorker {
 
     pub fn resolve_catchup(
         &self,
+        request: u64,
         provider_id: String,
         data: BTreeMap<String, String>,
         start_text: String,
         duration_minutes: i64,
-    ) -> ProviderRequestId {
-        let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
+    ) {
         let _ = self.jobs.send(ProviderJob::ResolveCatchup {
-            request_id,
+            request,
             provider_id,
             data,
             start_text,
             duration_minutes,
         });
-        request_id
     }
 
-    pub fn resolve(
-        &self,
-        provider_id: String,
-        data: BTreeMap<String, String>,
-    ) -> ProviderRequestId {
-        let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
+    pub fn resolve(&self, request: u64, provider_id: String, data: BTreeMap<String, String>) {
         let _ = self.jobs.send(ProviderJob::Resolve {
-            request_id,
+            request,
             provider_id,
             data,
         });
-        request_id
     }
 
     pub fn account(&self, provider_id: String) {
@@ -1608,13 +1726,34 @@ mod tests {
     }
 
     #[test]
-    fn asynchronous_resolution_requests_have_distinct_ids() {
+    fn resolution_results_carry_their_request_id() {
+        // Issue #68: with no portal loaded every resolution fails,
+        // but each result must still arrive tagged with the exact
+        // request id it was dispatched with, in dispatch order, so
+        // callers can never consume each other's results.
         let worker = ProviderWorker::new();
-        let first = worker.resolve("missing-a".to_string(), BTreeMap::new());
-        let second = worker.resolve("missing-b".to_string(), BTreeMap::new());
-
-        assert_ne!(first, second);
-        assert!(first > 0);
-        assert!(second > first);
+        let data = std::collections::BTreeMap::new();
+        worker.resolve(41, "missing".to_string(), data.clone());
+        worker.resolve_catchup(
+            42,
+            "missing".to_string(),
+            data.clone(),
+            "2026-01-01 00:00:00".to_string(),
+            30,
+        );
+        worker.resolve(43, "missing".to_string(), data);
+        let mut ids = Vec::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while ids.len() < 3 && std::time::Instant::now() < deadline {
+            match worker.try_recv() {
+                Some(ProviderEvent::Resolved { request, result }) => {
+                    assert!(result.is_err());
+                    ids.push(request);
+                }
+                Some(_) => {}
+                None => std::thread::sleep(std::time::Duration::from_millis(10)),
+            }
+        }
+        assert_eq!(ids, vec![41, 42, 43]);
     }
 }

@@ -14,7 +14,7 @@ use iptv_core::{
         resume_position, EngineAction, EngineEvent, LaunchGate, PlaybackRequest, PlaybackSession,
         PlayerChoice, SessionState,
     },
-    providers::{ProviderAccount, ProviderEvent, ProviderRequestId, ProviderWorker},
+    providers::{ProviderAccount, ProviderEvent, ProviderWorker},
     recording::{self, RecordingEngine},
     reminders::{normalize_reminders, Reminder, ReminderStatus},
     search::SearchResults,
@@ -281,8 +281,25 @@ struct Status {
     bar: Option<Frame>,
 }
 
+/// The UI translator, installed once the configuration (and its
+/// language) is loaded. `tr` is the gettext choke point for menu
+/// labels and status announcements; untranslated strings pass
+/// through unchanged.
+static TRANSLATOR: std::sync::OnceLock<I18n> = std::sync::OnceLock::new();
+
+fn set_translator(i18n: &I18n) {
+    let _ = TRANSLATOR.set(i18n.clone());
+}
+
+fn tr(text: &str) -> String {
+    TRANSLATOR
+        .get()
+        .map_or_else(|| text.to_string(), |i18n| i18n.gettext(text))
+}
+
 impl Status {
     fn set_label(self, message: &str) {
+        let message = &tr(message);
         self.details.change_value(message);
         if let Some(frame) = self.bar {
             frame.set_status_text(message, 0);
@@ -326,15 +343,18 @@ struct Wiring {
     reminders: Rc<RefCell<Vec<Reminder>>>,
     provider_worker: Rc<ProviderWorker>,
     provider_pending: Rc<std::cell::Cell<bool>>,
-    pending_resolve: Rc<RefCell<Option<(ProviderRequestId, Channel)>>>,
-    pending_dvr_resolves: Rc<RefCell<BTreeMap<ProviderRequestId, String>>>,
+    resolve_seq: Rc<std::cell::Cell<u64>>,
+    pending_resolves: Rc<RefCell<std::collections::HashMap<u64, PendingResolve>>>,
+    dvr_resolve: Rc<RefCell<std::collections::HashMap<String, DvrResolve>>>,
     recordings: Rc<RefCell<RecordingEngine>>,
     cast_worker: Rc<CastWorker>,
     cast_pending: Rc<std::cell::Cell<bool>>,
     cast_ui: Rc<RefCell<Option<CastUi>>>,
+    proxy: Rc<RefCell<Option<iptv_core::proxy::ProxyServer>>>,
     guide_ui: Rc<RefCell<Option<GuideUi>>>,
     update_worker: Rc<UpdateWorker>,
     update_pending: Rc<std::cell::Cell<bool>>,
+    pending_update: Rc<RefCell<Option<iptv_core::updater::UpdateManifest>>>,
     tray: Rc<TaskBarIcon>,
     i18n: Rc<I18n>,
     vod_worker: Rc<VodWorker>,
@@ -521,15 +541,18 @@ fn bind_browser(frame: Frame, controls: Controls, model: Rc<RefCell<SearchResult
         reminders: Rc::new(RefCell::new(Vec::new())),
         provider_worker: Rc::new(ProviderWorker::new()),
         provider_pending: Rc::new(std::cell::Cell::new(false)),
-        pending_resolve: Rc::new(RefCell::new(None)),
-        pending_dvr_resolves: Rc::new(RefCell::new(BTreeMap::new())),
+        resolve_seq: Rc::new(std::cell::Cell::new(0)),
+        pending_resolves: Rc::new(RefCell::new(std::collections::HashMap::new())),
+        dvr_resolve: Rc::new(RefCell::new(std::collections::HashMap::new())),
         recordings: Rc::new(RefCell::new(RecordingEngine::new())),
         cast_worker: Rc::new(CastWorker::new()),
         cast_pending: Rc::new(std::cell::Cell::new(false)),
         cast_ui: Rc::new(RefCell::new(None)),
+        proxy: Rc::new(RefCell::new(None)),
         guide_ui: Rc::new(RefCell::new(None)),
         update_worker: Rc::new(UpdateWorker::new()),
         update_pending: Rc::new(std::cell::Cell::new(false)),
+        pending_update: Rc::new(RefCell::new(None)),
         tray: Rc::new(build_tray_icon()),
         i18n,
         vod_worker: Rc::new(VodWorker::new()),
@@ -549,6 +572,7 @@ fn bind_browser(frame: Frame, controls: Controls, model: Rc<RefCell<SearchResult
     wiring.player.borrow_mut().shared = Some(PlayerShared {
         recordings: Rc::clone(&wiring.recordings),
         cast_ui: Rc::clone(&wiring.cast_ui),
+        proxy: Rc::clone(&wiring.proxy),
         cast_worker: Rc::clone(&wiring.cast_worker),
         cast_pending: Rc::clone(&wiring.cast_pending),
         timer: Rc::clone(&wiring.timer),
@@ -568,6 +592,9 @@ fn bind_browser(frame: Frame, controls: Controls, model: Rc<RefCell<SearchResult
     bind_context_menu(frame, &wiring, controls);
     let browser = Rc::clone(&wiring.browser);
     let timer = Rc::clone(&wiring.timer);
+    wiring
+        .provider_worker
+        .set_cache_dir(iptv_core::config::user_config_dir().join("provider-cache"));
     let close_persist = wiring.persist.clone();
     frame.bind_internal(EventType::CLOSE_WINDOW, move |event| {
         if close_persist
@@ -837,6 +864,182 @@ fn configured_entries(wiring: &Wiring) -> (Vec<PlaylistSource>, Vec<ProviderAcco
 
 /// Drain provider worker events on the poll tick: merged channels, guide
 /// sources, and a finished Stalker link resolution that completes a play.
+/// What one in-flight provider resolution is for. Results are
+/// correlated by request id (issue #68): a result only ever
+/// reaches the entry that dispatched it, and unknown or late
+/// results are dropped.
+enum PendingResolve {
+    Play(Channel),
+    Dvr(String),
+    Download {
+        channel: Channel,
+        programme: Programme,
+    },
+}
+
+/// Retry bookkeeping for one Stalker DVR job awaiting a link.
+struct DvrResolve {
+    request: u64,
+    in_flight: bool,
+    next_try: f64,
+}
+
+/// Dispatch a live-link resolution with a fresh correlation id.
+fn dispatch_resolve(
+    wiring: &Wiring,
+    pending: PendingResolve,
+    provider_id: String,
+    data: std::collections::BTreeMap<String, String>,
+) -> u64 {
+    let request = wiring.resolve_seq.get() + 1;
+    wiring.resolve_seq.set(request);
+    wiring
+        .pending_resolves
+        .borrow_mut()
+        .insert(request, pending);
+    wiring.provider_worker.resolve(request, provider_id, data);
+    assert!(wiring.timer.start(50, false));
+    request
+}
+
+/// Dispatch a catch-up resolution with a fresh correlation id.
+fn dispatch_resolve_catchup(
+    wiring: &Wiring,
+    pending: PendingResolve,
+    provider_id: String,
+    data: std::collections::BTreeMap<String, String>,
+    start_text: String,
+    duration_minutes: i64,
+) -> u64 {
+    let request = wiring.resolve_seq.get() + 1;
+    wiring.resolve_seq.set(request);
+    wiring
+        .pending_resolves
+        .borrow_mut()
+        .insert(request, pending);
+    wiring.provider_worker.resolve_catchup(
+        request,
+        provider_id,
+        data,
+        start_text,
+        duration_minutes,
+    );
+    assert!(wiring.timer.start(50, false));
+    request
+}
+
+/// Retry due Stalker DVR resolutions on the DVR tick: at most
+/// one in-flight request per job, only while the padded window
+/// is open; an expired window fails the job durably.
+fn retry_dvr_resolves(wiring: &Wiring, now: f64) {
+    let due: Vec<String> = wiring
+        .dvr_resolve
+        .borrow()
+        .iter()
+        .filter(|(_, state)| !state.in_flight && state.next_try <= now)
+        .map(|(id, _)| id.clone())
+        .collect();
+    for job_id in due {
+        let job = wiring.dvr.borrow().get(&job_id).cloned();
+        let Some(job) = job else {
+            wiring.dvr_resolve.borrow_mut().remove(&job_id);
+            continue;
+        };
+        if iptv_core::dvr::DONE_STATUSES.contains(&job.status.as_str())
+            || job.status == iptv_core::dvr::STATUS_CANCELED
+        {
+            wiring.dvr_resolve.borrow_mut().remove(&job_id);
+            continue;
+        }
+        if job.stop_ts > 0.0 && now >= job.stop_ts {
+            wiring.dvr_resolve.borrow_mut().remove(&job_id);
+            wiring.dvr.borrow_mut().mark_finished(
+                &job_id,
+                false,
+                "",
+                "Could not resolve the stream link in time.",
+                now,
+            );
+            continue;
+        }
+        let channel = channel_from_snapshot(&job.channel);
+        let Some(key) = channel.unknown_attributes.get("provider-id").cloned() else {
+            wiring.dvr_resolve.borrow_mut().remove(&job_id);
+            continue;
+        };
+        let request = dispatch_resolve(
+            wiring,
+            PendingResolve::Dvr(job_id.clone()),
+            key,
+            channel.unknown_attributes.clone(),
+        );
+        if let Some(state) = wiring.dvr_resolve.borrow_mut().get_mut(&job_id) {
+            state.request = request;
+            state.in_flight = true;
+        }
+    }
+}
+
+/// A Stalker resolve for a scheduled recording finished: record
+/// with the resolved URL, or fail the job with the error.
+fn handle_dvr_resolve(
+    wiring: &Wiring,
+    status: Status,
+    job_id: &str,
+    result: Result<String, String>,
+) {
+    let now = now_seconds();
+    let Some(job) = wiring.dvr.borrow().get(job_id).cloned() else {
+        wiring.dvr_resolve.borrow_mut().remove(job_id);
+        return;
+    };
+    if iptv_core::dvr::DONE_STATUSES.contains(&job.status.as_str())
+        || job.status == iptv_core::dvr::STATUS_CANCELED
+    {
+        wiring.dvr_resolve.borrow_mut().remove(job_id);
+        return;
+    }
+    let Ok(url) = result else {
+        let window_open = job.stop_ts <= 0.0 || now < job.stop_ts;
+        if window_open {
+            if let Some(state) = wiring.dvr_resolve.borrow_mut().get_mut(job_id) {
+                state.in_flight = false;
+                state.next_try = now + 10.0;
+            }
+            wiring.dvr.borrow_mut().defer_resolution(job_id, now);
+            status.set_label("The portal did not answer; the scheduled recording will retry.");
+        } else {
+            wiring.dvr_resolve.borrow_mut().remove(job_id);
+            wiring.dvr.borrow_mut().mark_finished(
+                job_id,
+                false,
+                "",
+                "Could not resolve the stream link in time.",
+                now,
+            );
+            status.set_label("Scheduled recording failed: the stream link could not be resolved.");
+        }
+        return;
+    };
+    wiring.dvr_resolve.borrow_mut().remove(job_id);
+    if job.stop_ts > 0.0 && now >= job.stop_ts {
+        wiring.dvr.borrow_mut().mark_finished(
+            job_id,
+            false,
+            "",
+            "The recording window closed before the stream link was ready.",
+            now,
+        );
+        return;
+    }
+    let mut channel = channel_from_snapshot(&job.channel);
+    channel.url = url;
+    if !wiring.dvr.borrow_mut().resolution_succeeded(job_id) {
+        wiring.dvr_resolve.borrow_mut().remove(job_id);
+        return;
+    }
+    record_dvr_channel(wiring, status, &job, &channel, now);
+}
 fn poll_providers(wiring: &Wiring, controls: Controls) {
     let status = controls.status;
     while let Some(event) = wiring.provider_worker.try_recv() {
@@ -865,55 +1068,26 @@ fn poll_providers(wiring: &Wiring, controls: Controls) {
                     status.set_label(&failure);
                 }
             }
-            ProviderEvent::Resolved { request_id, result } => {
-                let dvr_job = wiring.pending_dvr_resolves.borrow_mut().remove(&request_id);
-                if let Some(job_id) = dvr_job {
-                    match result {
+            ProviderEvent::Resolved { request, result } => {
+                let pending = wiring.pending_resolves.borrow_mut().remove(&request);
+                match pending {
+                    Some(PendingResolve::Play(mut channel)) => match result {
                         Ok(url) => {
-                            let Some(job) = wiring.dvr.borrow().get(&job_id).cloned() else {
-                                continue;
-                            };
-                            let mut channel = channel_from_snapshot(&job.channel);
                             channel.url = url;
-                            if !wiring.dvr.borrow_mut().resolution_succeeded(&job_id) {
-                                continue;
-                            }
-                            start_dvr_recording(
-                                wiring,
-                                status,
-                                &job_id,
-                                &job,
-                                &channel,
-                                now_seconds(),
-                            );
+                            play_channel(&wiring.player, &wiring.persist, &channel, status);
                         }
-                        Err(_error) => {
-                            wiring
-                                .dvr
-                                .borrow_mut()
-                                .defer_resolution(&job_id, now_seconds());
-                            status.set_label("Scheduled recording will retry stream resolution.");
+                        Err(error) => status.set_label(&error),
+                    },
+                    Some(PendingResolve::Dvr(job_id)) => {
+                        handle_dvr_resolve(wiring, status, &job_id, result);
+                    }
+                    Some(PendingResolve::Download { channel, programme }) => match result {
+                        Ok(url) => {
+                            begin_catchup_download(wiring, &channel, &programme, url, status);
                         }
-                    }
-                    continue;
-                }
-
-                let pending = wiring
-                    .pending_resolve
-                    .borrow()
-                    .as_ref()
-                    .filter(|(pending_id, _)| *pending_id == request_id)
-                    .cloned();
-                if pending.is_some() {
-                    let _ = wiring.pending_resolve.borrow_mut().take();
-                }
-                match (pending, result) {
-                    (Some((_, mut channel)), Ok(url)) => {
-                        channel.url = url;
-                        play_channel(&wiring.player, &wiring.persist, &channel, status);
-                    }
-                    (Some((_id, _)), Err(error)) => status.set_label(&error),
-                    (None, Ok(_) | Err(_)) => {}
+                        Err(error) => status.set_label(&error),
+                    },
+                    None => {}
                 }
             }
             ProviderEvent::Account(result) => match result {
@@ -1061,6 +1235,14 @@ fn start_recording(
     display_name: &str,
 ) -> Result<PathBuf, String> {
     let dir = recordings_dir(persist);
+    if let Some(free) = recording::free_space_bytes(&dir) {
+        if free < recording::MIN_FREE_BYTES {
+            return Err(format!(
+                "Not enough free space to record ({} MB free).",
+                free / (1024 * 1024)
+            ));
+        }
+    }
     let stamp = chrono::Local::now().format("%Y-%m-%d %H-%M-%S").to_string();
     let in_use = recordings.borrow().in_use_paths();
     let out = recording::unique_output_path(
@@ -1107,22 +1289,56 @@ fn start_dvr_job(wiring: &Wiring, status: Status, job_id: &str, now: f64) {
     };
     let channel = channel_from_snapshot(&job.channel);
     if channel.url.is_empty() {
-        wiring.dvr.borrow_mut().mark_finished(
-            job_id,
-            false,
-            "",
-            "Scheduled recordings from portal channels are not supported yet.",
-            now,
-        );
+        let is_stalker = channel
+            .unknown_attributes
+            .get("provider-type")
+            .map(String::as_str)
+            == Some("stalker");
+        let key = channel.unknown_attributes.get("provider-id").cloned();
+        match (is_stalker, key) {
+            (true, Some(key)) => {
+                if wiring.dvr_resolve.borrow().contains_key(job_id) {
+                    return;
+                }
+                let request = dispatch_resolve(
+                    wiring,
+                    PendingResolve::Dvr(job_id.to_string()),
+                    key,
+                    channel.unknown_attributes.clone(),
+                );
+                wiring.dvr_resolve.borrow_mut().insert(
+                    job_id.to_string(),
+                    DvrResolve {
+                        request,
+                        in_flight: true,
+                        next_try: now + 10.0,
+                    },
+                );
+                status.set_label(&format!(
+                    "Resolving the stream link for the scheduled recording of {}.",
+                    channel.name
+                ));
+            }
+            _ => {
+                wiring.dvr.borrow_mut().mark_finished(
+                    job_id,
+                    false,
+                    "",
+                    "This channel has no stream link to record.",
+                    now,
+                );
+            }
+        }
         return;
     }
-    start_dvr_recording(wiring, status, job_id, &job, &channel, now);
+    record_dvr_channel(wiring, status, &job, &channel, now);
 }
 
-fn start_dvr_recording(
+/// Start the ffmpeg side of a DVR job once its channel has a
+/// playable URL (directly, or after a Stalker resolve).
+fn record_dvr_channel(
     wiring: &Wiring,
     status: Status,
-    job_id: &str,
     job: &iptv_core::dvr::DvrJob,
     channel: &Channel,
     now: f64,
@@ -1135,7 +1351,7 @@ fn start_dvr_recording(
     match start_recording(
         &wiring.recordings,
         &wiring.persist,
-        &format!("dvr:{job_id}"),
+        &format!("dvr:{}", job.id),
         channel,
         &job.format.clone(),
         &display,
@@ -1145,7 +1361,7 @@ fn start_dvr_recording(
             wiring
                 .dvr
                 .borrow_mut()
-                .mark_finished(job_id, false, "", &error, now);
+                .mark_finished(&job.id, false, "", &error, now);
         }
     }
 }
@@ -1173,7 +1389,12 @@ fn poll_recordings(wiring: &Wiring, status: Status) {
             );
         }
         if finished.success {
-            status.set_label(&format!("Recording saved: {name}"));
+            let size = std::fs::metadata(&finished.out_path).map_or(0, |m| m.len());
+            status.set_label(&format!(
+                "Recording saved: {name} ({}.{} MB)",
+                size / 1_000_000,
+                (size % 1_000_000) / 100_000
+            ));
         } else {
             status.set_label(&format!("Recording failed: {name}"));
         }
@@ -1198,12 +1419,24 @@ fn poll_recordings(wiring: &Wiring, status: Status) {
                         );
                         continue;
                     }
+                    if wiring.dvr_resolve.borrow().contains_key(&job_id) {
+                        continue;
+                    }
                     wiring.dvr.borrow_mut().mark_resolving(&job_id);
-                    let request_id = wiring.provider_worker.resolve(provider_id, data);
-                    wiring
-                        .pending_dvr_resolves
-                        .borrow_mut()
-                        .insert(request_id, job_id);
+                    let request = dispatch_resolve(
+                        wiring,
+                        PendingResolve::Dvr(job_id.clone()),
+                        provider_id,
+                        data,
+                    );
+                    wiring.dvr_resolve.borrow_mut().insert(
+                        job_id,
+                        DvrResolve {
+                            request,
+                            in_flight: true,
+                            next_try: now + 10.0,
+                        },
+                    );
                     status.set_label("Resolving scheduled recording stream...");
                 }
                 DvrAction::Stop(job_id) => {
@@ -1215,6 +1448,7 @@ fn poll_recordings(wiring: &Wiring, status: Status) {
                 DvrAction::Start(job_id) => start_dvr_job(wiring, status, &job_id, now),
             }
         }
+        retry_dvr_resolves(wiring, now);
     }
     let armed = wiring
         .persist
@@ -1509,8 +1743,85 @@ fn open_cast_window(wiring: &Wiring, list: ListCtrl) {
         &wiring.cast_worker,
         &wiring.cast_pending,
         &wiring.timer,
+        &wiring.proxy,
         channel.as_ref(),
     );
+}
+
+/// The cast window's Play / Stop / Refresh bindings.
+#[allow(clippy::too_many_arguments)]
+fn bind_cast_buttons(
+    play: Button,
+    stop: Button,
+    refresh: Button,
+    devices: ListBox,
+    view: &Rc<RefCell<CastView>>,
+    worker: &Rc<CastWorker>,
+    pending: &Rc<std::cell::Cell<bool>>,
+    timer: &Rc<Timer<Frame>>,
+    proxy: &Rc<RefCell<Option<iptv_core::proxy::ProxyServer>>>,
+    status: Status,
+) {
+    {
+        let view = Rc::clone(view);
+        let worker = Rc::clone(worker);
+        let pending = Rc::clone(pending);
+        let timer = Rc::clone(timer);
+        let proxy = Rc::clone(proxy);
+        play.on_click(move |_| {
+            let Some(selection) = devices.get_selection() else {
+                return;
+            };
+            let view = view.borrow();
+            let (Some(device), Some(channel)) =
+                (view.devices.get(selection as usize), view.channel.as_ref())
+            else {
+                return;
+            };
+            let (clean_url, _) = iptv_core::playback::split_stream_modifiers(&channel.url);
+            let headers = iptv_core::downloads::channel_headers(channel);
+            let play_url = if headers.is_empty() {
+                clean_url
+            } else {
+                let mut slot = proxy.borrow_mut();
+                if slot.is_none() {
+                    *slot = iptv_core::proxy::ProxyServer::start().ok();
+                }
+                match slot.as_ref() {
+                    Some(server) => server.url_for(&clean_url, &headers),
+                    None => clean_url,
+                }
+            };
+            worker.play(device.clone(), play_url, channel.name.clone());
+            pending.set(true);
+            assert!(timer.start(50, false));
+            status.set_label(&format!("Casting {} to {}...", channel.name, device.name));
+        });
+    }
+    {
+        let view = Rc::clone(view);
+        let worker = Rc::clone(worker);
+        stop.on_click(move |_| {
+            let Some(selection) = devices.get_selection() else {
+                return;
+            };
+            if let Some(device) = view.borrow().devices.get(selection as usize).cloned() {
+                worker.stop(device);
+                status.set_label("Stopping the cast...");
+            }
+        });
+    }
+    {
+        let worker = Rc::clone(worker);
+        let pending = Rc::clone(pending);
+        let timer = Rc::clone(timer);
+        refresh.on_click(move |_| {
+            worker.discover();
+            pending.set(true);
+            assert!(timer.start(50, false));
+            status.set_label("Looking for cast devices...");
+        });
+    }
 }
 
 fn ensure_cast_ui(
@@ -1518,6 +1829,7 @@ fn ensure_cast_ui(
     worker: &Rc<CastWorker>,
     pending: &Rc<std::cell::Cell<bool>>,
     timer: &Rc<Timer<Frame>>,
+    proxy: &Rc<RefCell<Option<iptv_core::proxy::ProxyServer>>>,
 ) -> CastUi {
     if let Some(ui) = slot.borrow().as_ref() {
         return ui.clone();
@@ -1559,54 +1871,9 @@ fn ensure_cast_ui(
         status,
         view,
     };
-    {
-        let view = Rc::clone(&ui.view);
-        let devices_box = devices;
-        let worker = Rc::clone(worker);
-        let pending = Rc::clone(pending);
-        let timer = Rc::clone(timer);
-        play.on_click(move |_| {
-            let Some(selection) = devices_box.get_selection() else {
-                return;
-            };
-            let view = view.borrow();
-            let (Some(device), Some(channel)) =
-                (view.devices.get(selection as usize), view.channel.as_ref())
-            else {
-                return;
-            };
-            let (clean_url, _) = iptv_core::playback::split_stream_modifiers(&channel.url);
-            worker.play(device.clone(), clean_url, channel.name.clone());
-            pending.set(true);
-            assert!(timer.start(50, false));
-            status.set_label(&format!("Casting {} to {}...", channel.name, device.name));
-        });
-    }
-    {
-        let view = Rc::clone(&ui.view);
-        let devices_box = devices;
-        let worker = Rc::clone(worker);
-        stop.on_click(move |_| {
-            let Some(selection) = devices_box.get_selection() else {
-                return;
-            };
-            if let Some(device) = view.borrow().devices.get(selection as usize).cloned() {
-                worker.stop(device);
-                status.set_label("Stopping the cast...");
-            }
-        });
-    }
-    {
-        let worker = Rc::clone(worker);
-        let pending = Rc::clone(pending);
-        let timer = Rc::clone(timer);
-        refresh.on_click(move |_| {
-            worker.discover();
-            pending.set(true);
-            assert!(timer.start(50, false));
-            status.set_label("Looking for cast devices...");
-        });
-    }
+    bind_cast_buttons(
+        play, stop, refresh, devices, &ui.view, worker, pending, timer, proxy, status,
+    );
     {
         let frame_hide = frame;
         frame.on_close(move |event| {
@@ -1689,15 +1956,18 @@ fn clone_wiring(wiring: &Wiring) -> Wiring {
         reminders: Rc::clone(&wiring.reminders),
         provider_worker: Rc::clone(&wiring.provider_worker),
         provider_pending: Rc::clone(&wiring.provider_pending),
-        pending_resolve: Rc::clone(&wiring.pending_resolve),
-        pending_dvr_resolves: Rc::clone(&wiring.pending_dvr_resolves),
+        resolve_seq: Rc::clone(&wiring.resolve_seq),
+        pending_resolves: Rc::clone(&wiring.pending_resolves),
+        dvr_resolve: Rc::clone(&wiring.dvr_resolve),
         recordings: Rc::clone(&wiring.recordings),
         cast_worker: Rc::clone(&wiring.cast_worker),
         cast_pending: Rc::clone(&wiring.cast_pending),
         cast_ui: Rc::clone(&wiring.cast_ui),
+        proxy: Rc::clone(&wiring.proxy),
         guide_ui: Rc::clone(&wiring.guide_ui),
         update_worker: Rc::clone(&wiring.update_worker),
         update_pending: Rc::clone(&wiring.update_pending),
+        pending_update: Rc::clone(&wiring.pending_update),
         tray: Rc::clone(&wiring.tray),
         i18n: Rc::clone(&wiring.i18n),
         vod_worker: Rc::clone(&wiring.vod_worker),
@@ -1806,7 +2076,7 @@ const PLAYER_LABELS: [&str; 10] = [
 
 /// Append one item to a menu under construction.
 fn menu_add(menu: &Menu, id: i32, label: &str, help: &str, kind: ItemKind) {
-    menu.append(id, label, help, kind);
+    menu.append(id, &tr(label), &tr(help), kind);
 }
 
 /// Build the full Python-parity menu tree (File, Player, View,
@@ -1822,6 +2092,7 @@ fn menu_label(keys: &std::collections::BTreeMap<String, String>, text: &str, nam
 }
 
 fn build_menu(frame: Frame, wiring: &Wiring, controls: Controls) {
+    set_translator(&wiring.i18n);
     let config = wiring.persist.config.borrow();
     let raw = serde_json::Value::Object(config.raw().clone());
     let keys = iptv_core::shortcuts::effective(&raw, "main");
@@ -2228,10 +2499,7 @@ fn bind_menu_actions(frame: Frame, wiring: &Wiring, controls: Controls) {
         match id {
             4004 => frame.close(false),
             5002 => open_guide_window(&wiring, status),
-            5003 => {
-                start_update_check(&wiring);
-                status.set_label("Checking for updates...");
-            }
+            5003 => open_update_prompt(&wiring, frame, status),
             5004 => {
                 frame.show(true);
                 frame.raise();
@@ -2625,10 +2893,11 @@ fn poll_updates(wiring: &Wiring, status: Status) {
             UpdateEvent::Checked { manifest, newer } => {
                 if newer {
                     status.set_label(&format!(
-                        "Version {} is available. You have {}.",
+                        "Version {} is available. You have {}. Choose Check for Updates in the Help menu to download and install it.",
                         manifest.version,
                         env!("CARGO_PKG_VERSION")
                     ));
+                    *wiring.pending_update.borrow_mut() = Some(manifest);
                 } else {
                     status.set_label(&format!(
                         "Accessible IPTV Client is up to date ({}).",
@@ -2636,11 +2905,57 @@ fn poll_updates(wiring: &Wiring, status: Status) {
                     ));
                 }
             }
+            UpdateEvent::Downloaded { path } => {
+                status.set_label(&format!(
+                    "Update downloaded and verified: {}. Opening it now.",
+                    path.display()
+                ));
+                open_downloaded_package(&path);
+            }
             UpdateEvent::Failed(error) => {
-                status.set_label(&format!("Update check failed: {error}"));
+                status.set_label(&format!("Update failed: {error}"));
             }
         }
     }
+}
+
+/// Ask whether to download the pending update, then queue it.
+fn open_update_prompt(wiring: &Wiring, frame: Frame, status: Status) {
+    let Some(manifest) = wiring.pending_update.borrow().clone() else {
+        start_update_check(wiring);
+        status.set_label("Checking for updates...");
+        return;
+    };
+    let dialog = MessageDialog::builder(
+        &frame,
+        &format!(
+            "Version {} is available. Download and open it now?",
+            manifest.version
+        ),
+        "Update Accessible IPTV Client",
+    )
+    .with_style(MessageDialogStyle::YesNo)
+    .build();
+    if dialog.show_modal() != ID_YES {
+        status.set_label("Update postponed.");
+        return;
+    }
+    let dest = iptv_core::config::user_config_dir().join("updates");
+    wiring.update_worker.download(&manifest, dest);
+    wiring.update_pending.set(true);
+    assert!(wiring.timer.start(50, false));
+    status.set_label(&format!("Downloading version {}...", manifest.version));
+}
+
+/// Open a downloaded package with the platform's handler.
+fn open_downloaded_package(path: &std::path::Path) {
+    #[cfg(target_os = "windows")]
+    let program = "explorer";
+    #[cfg(target_os = "macos")]
+    let program = "open";
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let program = "xdg-open";
+    let _ = std::process::Command::new(program).arg(path).spawn();
 }
 
 /// Build the guide window once and keep it (closing hides it).
@@ -3009,15 +3324,15 @@ fn play_catchup_for(wiring: &Wiring, channel: &Channel, programme: &Programme, s
                 status.set_label("This Stalker channel has no provider account configured.");
                 return;
             };
-            let request_id = wiring.provider_worker.resolve_catchup(
+            dispatch_resolve_catchup(
+                wiring,
+                PendingResolve::Play(channel.clone()),
                 key,
                 channel.unknown_attributes.clone(),
                 start_text,
                 duration_minutes,
             );
-            *wiring.pending_resolve.borrow_mut() = Some((request_id, channel.clone()));
             status.set_label("Resolving catch-up link...");
-            assert!(wiring.timer.start(50, false));
         }
         Err(error) => status.set_label(&error),
     }
@@ -3155,12 +3470,13 @@ fn activate_channel(wiring: &Wiring, list: ListCtrl, status: Status) {
             status.set_label("This Stalker channel has no provider account configured.");
             return;
         };
-        let request_id = wiring
-            .provider_worker
-            .resolve(key, channel.unknown_attributes.clone());
-        *wiring.pending_resolve.borrow_mut() = Some((request_id, channel.clone()));
+        dispatch_resolve(
+            wiring,
+            PendingResolve::Play(channel.clone()),
+            key,
+            channel.unknown_attributes.clone(),
+        );
         status.set_label("Resolving stream link...");
-        assert!(wiring.timer.start(50, false));
         return;
     }
     if let Some(current) = wiring.player.borrow().current_channel.clone() {
@@ -3401,6 +3717,7 @@ struct PlayerWindow {
 struct PlayerShared {
     recordings: Rc<RefCell<RecordingEngine>>,
     cast_ui: Rc<RefCell<Option<CastUi>>>,
+    proxy: Rc<RefCell<Option<iptv_core::proxy::ProxyServer>>>,
     cast_worker: Rc<CastWorker>,
     cast_pending: Rc<std::cell::Cell<bool>>,
     timer: Rc<Timer<Frame>>,
@@ -3570,6 +3887,7 @@ fn wire_player_events(
             &shared.cast_worker,
             &shared.cast_pending,
             &shared.timer,
+            &shared.proxy,
             state.current_channel.as_ref(),
         );
     });
@@ -3973,6 +4291,7 @@ fn dispatch_player_key(
                     &shared.cast_worker,
                     &shared.cast_pending,
                     &shared.timer,
+                    &shared.proxy,
                     state.current_channel.as_ref(),
                 );
             }
@@ -4046,9 +4365,10 @@ fn show_cast_for(
     worker: &Rc<CastWorker>,
     pending: &Rc<std::cell::Cell<bool>>,
     timer: &Rc<Timer<Frame>>,
+    proxy: &Rc<RefCell<Option<iptv_core::proxy::ProxyServer>>>,
     channel: Option<&Channel>,
 ) {
-    let ui = ensure_cast_ui(ui_slot, worker, pending, timer);
+    let ui = ensure_cast_ui(ui_slot, worker, pending, timer, proxy);
     ui.frame.show(true);
     ui.frame.raise();
     ui.view.borrow_mut().channel = channel.cloned();
@@ -4671,14 +4991,15 @@ struct DownloadRow {
 
 /// Build a simple list dialog shell: frame, panel, list, status.
 fn list_dialog(title: &str, list_label: &str) -> (Frame, Panel, ListBox, Status) {
+    let title = tr(title);
     let frame = Frame::builder()
-        .with_title(title)
+        .with_title(&title)
         .with_size(Size::new(680, 520))
         .build();
-    frame.set_accessibility_label(title);
+    frame.set_accessibility_label(&title);
     let panel = Panel::builder(&frame).build();
     let list = ListBox::builder(&panel).build();
-    list.set_accessibility_label(list_label);
+    list.set_accessibility_label(&tr(list_label));
     let status_label = StaticText::builder(&panel)
         .with_label("Dialog status")
         .build();
@@ -4960,6 +5281,10 @@ fn open_scheduled_dialog(wiring: &Wiring, main_status: Status) {
             if dvr.cancel_job(&id) {
                 dvr.save();
                 drop(dvr);
+                wiring_c.dvr_resolve.borrow_mut().remove(&id);
+                wiring_c.pending_resolves.borrow_mut().retain(
+                    |_, pending| !matches!(pending, PendingResolve::Dvr(job) if job == &id),
+                );
                 render(&wiring_c, list, dstatus);
             }
         }
@@ -5043,22 +5368,61 @@ fn start_catchup_download(
     status: Status,
 ) {
     let now = now_epoch();
-    let resolved =
-        match iptv_core::catchup::resolve_show_url(channel, programme.start, programme.stop, now) {
-            Ok(
-                iptv_core::catchup::ShowResolution::Catchup(url)
-                | iptv_core::catchup::ShowResolution::Live(url),
-            ) => Some(url),
-            Ok(_) => None,
-            Err(error) => {
-                status.set_label(&error);
+    match iptv_core::catchup::resolve_show_url(channel, programme.start, programme.stop, now) {
+        Ok(
+            iptv_core::catchup::ShowResolution::Catchup(url)
+            | iptv_core::catchup::ShowResolution::Live(url),
+        ) => begin_catchup_download(wiring, channel, programme, url, status),
+        Ok(iptv_core::catchup::ShowResolution::StalkerLive) => {
+            let Some(key) = channel.unknown_attributes.get("provider-id").cloned() else {
+                status.set_label("This Stalker channel has no provider account configured.");
                 return;
-            }
-        };
-    let Some(url) = resolved else {
-        status.set_label("Catch-up downloads from portal channels are not supported yet.");
-        return;
-    };
+            };
+            dispatch_resolve(
+                wiring,
+                PendingResolve::Download {
+                    channel: channel.clone(),
+                    programme: programme.clone(),
+                },
+                key,
+                channel.unknown_attributes.clone(),
+            );
+            status.set_label("Resolving the download link...");
+        }
+        Ok(iptv_core::catchup::ShowResolution::StalkerCatchup {
+            start_text,
+            duration_minutes,
+        }) => {
+            let Some(key) = channel.unknown_attributes.get("provider-id").cloned() else {
+                status.set_label("This Stalker channel has no provider account configured.");
+                return;
+            };
+            dispatch_resolve_catchup(
+                wiring,
+                PendingResolve::Download {
+                    channel: channel.clone(),
+                    programme: programme.clone(),
+                },
+                key,
+                channel.unknown_attributes.clone(),
+                start_text,
+                duration_minutes,
+            );
+            status.set_label("Resolving the download link...");
+        }
+        Err(error) => status.set_label(&error),
+    }
+}
+
+/// Start a catch-up download once its URL is known (directly, or
+/// after a portal resolution).
+fn begin_catchup_download(
+    wiring: &Wiring,
+    channel: &Channel,
+    programme: &Programme,
+    url: String,
+    status: Status,
+) {
     let dir = recordings_dir(&wiring.persist);
     let _ = std::fs::create_dir_all(&dir);
     let name = iptv_core::recording::sanitize_filename(&programme.title);

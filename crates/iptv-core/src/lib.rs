@@ -2,6 +2,7 @@
 
 pub mod audiotracks;
 pub mod browser;
+pub mod cache;
 pub mod cast;
 pub mod catchup;
 pub mod categories;
@@ -16,6 +17,7 @@ pub mod i18n;
 pub mod loading;
 pub mod playback;
 pub mod providers;
+pub mod proxy;
 pub mod recording;
 pub mod reminders;
 pub mod search;
@@ -29,7 +31,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 /// A channel as it appears in a playlist.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Channel {
     pub name: String,
     pub group: String,
