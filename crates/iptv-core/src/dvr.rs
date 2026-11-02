@@ -364,6 +364,14 @@ impl DvrSchedule {
     /// The next scheduler tick may request another link while the window is
     /// open; after the window closes the job becomes durably failed.
     pub fn defer_resolution(&mut self, job_id: &str, now: f64) {
+        let active = self.resolving.contains(job_id)
+            && self
+                .jobs
+                .iter()
+                .any(|job| job.id == job_id && job.status == STATUS_SCHEDULED);
+        if !active {
+            return;
+        }
         self.resolving.remove(job_id);
         let expired = self
             .jobs
@@ -648,6 +656,22 @@ mod tests {
         let job = schedule.get(&id).expect("job");
         assert_eq!(job.status, STATUS_FAILED);
         assert!(job.message.contains("window ended"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn late_resolution_failure_cannot_resurrect_a_canceled_job() {
+        let dir = std::env::temp_dir().join(format!("iptv-dvr-cancel-{}", std::process::id()));
+        let path = dir.join("scheduled_recordings.json");
+        let mut schedule = DvrSchedule::load(path, 0.0);
+        let due = build_job(&spec(&channel(), "Due", 100, 200, 0, 0), 0.0).expect("job");
+        let id = due.id.clone();
+        schedule.add_job(due);
+        assert_eq!(schedule.tick(150.0), vec![DvrAction::Start(id.clone())]);
+        schedule.mark_resolving(&id);
+        assert!(schedule.cancel_job(&id));
+        schedule.defer_resolution(&id, 160.0);
+        assert_eq!(schedule.get(&id).expect("job").status, STATUS_CANCELED);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
