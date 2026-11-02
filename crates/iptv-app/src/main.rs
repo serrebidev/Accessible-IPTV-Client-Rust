@@ -142,6 +142,10 @@ impl Status {
         self.details.change_value(message);
         live_region::announce_with_priority(self.label, message, live_region::Priority::Medium);
     }
+
+    fn set_silent(self, message: &str) {
+        self.details.change_value(message);
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -443,7 +447,9 @@ fn publish_results(
     if count > 0 {
         list.refresh_items(0, count - 1);
     }
-    status.set_label(&message);
+    // Search/category completions update visible status without repeating a
+    // live announcement already made for the deliberate action.
+    status.set_silent(&message);
     list.set_accessibility_description(&message);
     std::thread::spawn(move || drop(previous));
 }
