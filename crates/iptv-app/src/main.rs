@@ -2098,16 +2098,16 @@ pub const RECENT_CHANNELS: i32 = 5127;
 pub const CHANNEL_NUMBER: i32 = 5128;
 pub const SHOW_DOWNLOADS: i32 = 5129;
 pub const PLAYER_RADIO_BASE: i32 = 5131;
-pub const CUSTOM_PLAYER: i32 = 5141;
-pub const PREFERRED_AUDIO: i32 = 5142;
-pub const LANGUAGE_BASE: i32 = 5150;
-pub const MINIMIZE_TO_TRAY: i32 = 5171;
-pub const SHOW_PLAYER_ON_ENTER: i32 = 5172;
-pub const SHOW_STREAM_URL: i32 = 5173;
-pub const AUTO_CHECK_UPDATES: i32 = 5174;
-pub const EXPORT_SETTINGS: i32 = 5175;
-pub const IMPORT_SETTINGS: i32 = 5176;
-pub const ANNOUNCE_BASE: i32 = 5180;
+pub const CUSTOM_PLAYER: i32 = 5163;
+pub const PREFERRED_AUDIO: i32 = 5164;
+pub const LANGUAGE_BASE: i32 = 5170;
+pub const MINIMIZE_TO_TRAY: i32 = 5195;
+pub const SHOW_PLAYER_ON_ENTER: i32 = 5196;
+pub const SHOW_STREAM_URL: i32 = 5197;
+pub const AUTO_CHECK_UPDATES: i32 = 5198;
+pub const EXPORT_SETTINGS: i32 = 5199;
+pub const IMPORT_SETTINGS: i32 = 5200;
+pub const ANNOUNCE_BASE: i32 = 5165;
 pub const SPEAK_SUBTITLES: i32 = 5185;
 pub const READ_CURRENT_SUBTITLE: i32 = 5186;
 pub const KEYBOARD_SHORTCUTS: i32 = 5190;
@@ -2132,7 +2132,7 @@ pub const REC_SET_FOLDER: i32 = 5222;
 pub const REC_SHUTDOWN_AFTER: i32 = 5223;
 
 /// The "Media Player to Use" radio labels, in Python's order.
-const PLAYER_LABELS: [&str; 10] = [
+const PLAYER_LABELS: [&str; 32] = [
     "Built-in Player",
     "VLC",
     "MPC",
@@ -2143,6 +2143,28 @@ const PLAYER_LABELS: [&str; 10] = [
     "MPV",
     "SMPlayer",
     "Totem",
+    "QuickTime",
+    "iTunes/Apple Music",
+    "PotPlayer",
+    "KMPlayer",
+    "AIMP",
+    "QMPlay2",
+    "GOM Player",
+    "Audacious",
+    "Fauxdacious",
+    "Clementine",
+    "Strawberry",
+    "Amarok",
+    "Rhythmbox",
+    "Pragha",
+    "Lollypop",
+    "Exaile",
+    "Quod Libet",
+    "Gmusicbrowser",
+    "Xmms",
+    "Vocal",
+    "Haruna",
+    "Celluloid",
 ];
 
 /// Append one item to a menu under construction.
@@ -2967,7 +2989,7 @@ fn menu_recordings_action(
 /// announcement level). Returns true when the id was a radio.
 fn menu_radio_action(id: i32, wiring: &Wiring, status: Status) -> bool {
     let persist = &wiring.persist;
-    if (PLAYER_RADIO_BASE..PLAYER_RADIO_BASE + 10).contains(&id) {
+    if (PLAYER_RADIO_BASE..PLAYER_RADIO_BASE + 32).contains(&id) {
         let index = usize::try_from(id - PLAYER_RADIO_BASE).unwrap_or(0);
         if let Some(name) = PLAYER_LABELS.get(index) {
             persist.set_and_save("media_player", serde_json::json!(name));

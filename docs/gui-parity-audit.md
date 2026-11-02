@@ -160,3 +160,15 @@ those open, and all of them are covered. Second, on Linux the
 Python app presents its menu through a Menu button because
 menu bars are unreliable there; the Rust app uses a standard
 menu bar on every platform, which exposes the same commands.
+
+## Correction — 2026-11-01 (post-v0.2.0, validation 0035)
+
+The G2 verification recorded the Media Player radio list as ten
+labels; the Python list has 32 (PLAYER_KEYS, main.py). Fixed in
+validation 0035 with Python's executable tables ported verbatim.
+The full Python audit also surfaced player features absent from
+the Rust port — Sleep Timer, Audio Output Device, Local Live
+Buffer/Rewind — plus the What's on Now filter, Continue Watching
+availability check and the settings-backup password; those are
+tracked as follow-up issues. Everything else in the verification
+update above stands.
