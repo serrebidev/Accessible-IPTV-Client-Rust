@@ -43,3 +43,28 @@ with choose/retry guidance. Recovery wording and malformed-input warnings are
 requirements of this slice, not byte-identical Python strings. Worker/controller
 tests cover missing/unreadable/retry, retention, cancellation, and replacement.
 Domain tests and these goldens do not prove desktop announcements or focus.
+
+## Grouped categories (issue #10)
+
+`categories.m3u` adds out-of-order groups, missing/whitespace-only metadata,
+explicit Uncategorized, duplicate channel names with distinct tvg-id values,
+and a literal All Channels group. The same pinned Python revision above is
+used by `python-categories.tsv`. The oracle extracts the real grouping fallback
+from `main.py`, the `sorted(scoped_groups)` expression in `_refresh_group_ui`,
+and `_source_for_group`; scoped group keys distinguish a literal group from
+the All Channels sentinel. No user config, UI modules or network are loaded.
+The parser trims group values; missing, empty and whitespace-only groups join
+Uncategorized. All Channels is first, then case-sensitive lexical group order;
+category projections retain source order. Nonempty searches retain existing
+Python name ranking within the selected category. All five fixtures now cover
+30 searches as well as fields, load outcomes and category projections.
+
+Rust uses a typed All sentinel and displays a literal All Channels group as
+`All Channels (playlist group)`. This avoids the ambiguous unscoped string-key
+path in Python while matching its scope-aware group projection. Categories
+are flat in this local seam: Python tree hierarchy/provider branches and
+Favorites are outside this ticket. Selection identity is the existing source
+index within the same immutable playlist snapshot; duplicate names/URLs remain
+separate rows. A successful playlist replacement keeps an existing category
+key or falls back to All Channels, and keeps the existing first-row selection
+policy for a new snapshot. Persistent/favorite identities remain #11/#12.

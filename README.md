@@ -14,6 +14,7 @@ For the standard LLVM installation, use this PowerShell session setup:
 
 ```powershell
 $env:LIBCLANG_PATH = 'C:\Program Files\LLVM\bin'
+$env:PATH = 'C:\Program Files\CMake\bin;C:\Program Files\LLVM\bin;' + $env:PATH
 cmake --version
 rustc --version
 cargo fmt --all -- --check
@@ -27,9 +28,13 @@ The first build downloads/builds wxWidgets through `wxdragon-sys` and can take
 several minutes. The core can be checked separately with `cargo test -p iptv-core`
 without a GUI toolchain. Run the prototype with `cargo run -p iptv-app`.
 Use Alt+O or Tab to **Open playlist**, choose a local `.m3u`/`.m3u8` file,
-then Tab to **Search channels** to filter names as you type. Search ignores
+then Tab to **Categories**. Use arrows to choose All Channels or a playlist
+group, then Tab to **Search channels** to filter within that category. Search ignores
 case and ranks exact names, word starts, then other matches; ties retain
-playlist order. Clear the field to restore the full playlist. Tab or Enter
+playlist order. Clear the field to restore the active category. All Channels comes first;
+groups follow in case-sensitive lexical order, with source-order rows. Missing,
+empty and whitespace-only groups share **Uncategorized** with explicitly named
+Uncategorized entries. Tab or Enter
 moves to **Channels**; Shift+Tab returns from Channels to search. Browse with
 the arrow keys, Home and End. Results preserve the selected channel while it
 remains present; otherwise the first result is selected. Search completion
@@ -58,3 +63,5 @@ See [incremental search evidence and remaining checks](docs/validation/0004-incr
 See [playlist recovery and pinned Python parity evidence](docs/validation/0005-playlist-recovery.md).
 
 See [the pending owner-heard NVDA acceptance record and session steps](docs/validation/0006-owner-heard-accessibility.md).
+
+See [grouped category evidence and remaining checks](docs/validation/0010-grouped-category-browsing.md).

@@ -1,5 +1,6 @@
 use iptv_core::{
     browser::{BrowseEvent, BrowserWorker},
+    category::Category,
     search::SearchResults,
 };
 use std::{cell::RefCell, rc::Rc};
@@ -25,6 +26,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .with_label("&Cancel loading")
             .build();
         cancel.set_accessibility_label("Cancel loading");
+        let category_label = StaticText::builder(&panel)
+            .with_label("&Categories")
+            .build();
+        let category = Choice::builder(&panel).build();
+        category.set_accessibility_label("Categories");
+        category.set_accessibility_description("Choose All Channels or a playlist group with arrow keys. Tab moves to Search channels; Shift+Tab returns to Cancel loading.");
+        category.append("All Channels");
+        category.set_selection(0);
         let search_label = StaticText::builder(&panel)
             .with_label("&Search channels")
             .build();
@@ -32,7 +41,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .with_style(TextCtrlStyle::ProcessEnter)
             .build();
         search.set_accessibility_label("Search channels");
-        search.set_accessibility_description("Type to filter channel names. Tab or Enter moves to Channels; Shift+Tab returns to Cancel loading.");
+        search.set_accessibility_description("Type to filter channel names. Tab or Enter moves to Channels; Shift+Tab returns to Categories.");
         // Keep the label immediately before the list for native MSW accessible naming.
         let label = StaticText::builder(&panel).with_label("Channels").build();
         let list = ListCtrl::builder(&panel)
@@ -75,10 +84,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             label: status_label,
             details,
         };
-        bind_browser(frame, open, cancel, search, list, status, model);
+        bind_browser(
+            frame,
+            open,
+            cancel,
+            Filters { search, category },
+            list,
+            status,
+            model,
+        );
         let layout = BoxSizer::builder(Orientation::Vertical).build();
         layout.add(&open, 0, SizerFlag::All, 8);
         layout.add(&cancel, 0, SizerFlag::All, 8);
+        layout.add(&category_label, 0, SizerFlag::All, 8);
+        layout.add(&category, 0, SizerFlag::Expand | SizerFlag::All, 8);
         layout.add(&search_label, 0, SizerFlag::All, 8);
         layout.add(&search, 0, SizerFlag::Expand | SizerFlag::All, 8);
         layout.add(&label, 0, SizerFlag::All, 8);
@@ -110,23 +129,47 @@ impl Status {
     }
 }
 
+#[derive(Clone, Copy)]
+struct Filters {
+    search: TextCtrl,
+    category: Choice,
+}
+
 fn bind_browser(
     frame: Frame,
     open: Button,
     cancel: Button,
-    search: TextCtrl,
+    filters: Filters,
     list: ListCtrl,
     status: Status,
     model: Rc<RefCell<SearchResults>>,
 ) {
+    let Filters { search, category } = filters;
     let browser = Rc::new(RefCell::new(BrowserWorker::default()));
     let timer = Rc::new(Timer::new(&frame));
     let completed_timer = Rc::downgrade(&timer);
     let completed_browser = Rc::clone(&browser);
+    let completed_model = Rc::clone(&model);
     timer.on_tick(move |_| {
         let event = completed_browser.borrow_mut().poll(&search.get_value());
         match event {
-            Some(BrowseEvent::Results(results)) => publish_results(list, status, &model, results),
+            Some(BrowseEvent::Results(results)) => {
+                if results.categories() != completed_model.borrow().categories() {
+                    category.clear();
+                    for entry in results.categories() {
+                        category.append(&category_text(entry));
+                    }
+                }
+                if let Some(index) = results
+                    .categories()
+                    .iter()
+                    .position(|entry| entry == results.category())
+                    .and_then(|index| u32::try_from(index).ok())
+                {
+                    category.set_selection(index);
+                }
+                publish_results(list, status, &completed_model, results);
+            }
             Some(BrowseEvent::Recovery(error)) => {
                 status.set_label(error.message());
                 list.set_accessibility_description(error.message());
@@ -137,6 +180,20 @@ fn bind_browser(
             if let Some(timer) = completed_timer.upgrade() {
                 timer.stop();
             }
+        }
+    });
+    let category_browser = Rc::clone(&browser);
+    let poll_category = Rc::clone(&timer);
+    category.on_selection_changed(move |_| {
+        let selected = category
+            .get_selection()
+            .and_then(|index| model.borrow().categories().get(index as usize).cloned());
+        if let Some(selected) = selected {
+            category_browser
+                .borrow_mut()
+                .select_category(selected, search.get_value());
+            status.details.change_value("Updating category channels...");
+            assert!(poll_category.start(50, false));
         }
     });
     let search_browser = Rc::clone(&browser);
@@ -249,6 +306,15 @@ fn publish_results(
     std::thread::spawn(move || drop(previous));
 }
 
+fn category_text(category: &Category) -> String {
+    match category {
+        Category::Group(name) if name == "All Channels" => {
+            "All Channels (playlist group)".to_owned()
+        }
+        _ => category.label().to_owned(),
+    }
+}
+
 fn channel_text(model: &SearchResults, index: i64, column: i32) -> String {
     if column != 0 {
         return String::new();
@@ -273,11 +339,54 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
+    fn category_identity_does_not_depend_on_the_accessible_label() {
+        assert_eq!(category_text(&Category::All), "All Channels");
+        assert_eq!(
+            category_text(&Category::Group("All Channels".into())),
+            "All Channels (playlist group)"
+        );
+        assert_eq!(
+            category_text(&Category::Group("News / Local".into())),
+            "News / Local"
+        );
+    }
+
+    #[test]
     fn empty_list_has_no_placeholder_or_stale_accessible_rows() {
         let model = SearchResults::default();
         for index in [-1, 0, 1, i64::MAX] {
             assert_eq!(channel_text(&model, index, 0), "");
             assert_eq!(channel_text(&model, index, 1), "");
+        }
+    }
+
+    #[test]
+    fn category_projection_exposes_real_accessible_rows_and_empty_status() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../iptv-core/tests/fixtures/categories.m3u");
+        let source = Arc::new(BrowseModel::open_local(&path).unwrap());
+        let worker = SearchWorker::default();
+        for (query, count) in [("", 2), ("absent", 0)] {
+            worker.submit_category(
+                Arc::clone(&source),
+                query.to_owned(),
+                Category::Group("News".into()),
+            );
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let result = loop {
+                if let Some(result) = worker.try_latest() {
+                    break result;
+                }
+                assert!(std::time::Instant::now() < deadline);
+                std::thread::yield_now();
+            };
+            assert_eq!(result.len(), count);
+            assert_eq!(
+                channel_text(&result, 0, 0),
+                if count == 0 { "" } else { "Same" }
+            );
+            assert_eq!(channel_text(&result, 2, 0), "");
+            assert!(result.status().contains("category News"));
         }
     }
 
