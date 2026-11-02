@@ -5,7 +5,9 @@ pub mod categories;
 pub mod config;
 pub mod favorites;
 pub mod loading;
+pub mod playback;
 pub mod search;
+pub mod sources;
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -50,6 +52,17 @@ impl BrowseModel {
     #[must_use]
     pub const fn malformed_entries(&self) -> usize {
         self.malformed
+    }
+
+    pub(crate) fn from_parts(channels: Vec<Channel>, malformed: usize) -> Self {
+        Self {
+            channels,
+            malformed,
+        }
+    }
+
+    pub(crate) fn into_parts(self) -> (Vec<Channel>, usize) {
+        (self.channels, self.malformed)
     }
 
     #[must_use]
