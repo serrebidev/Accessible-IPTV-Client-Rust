@@ -22,6 +22,21 @@ pub(crate) fn matching_scoped(
     query: &str,
     current: impl Fn() -> bool,
 ) -> Option<Vec<usize>> {
+    matching_scoped_indexed(channels, scope, query, current, None)
+}
+
+/// [`matching_scoped`] with the navigation index's precomputed
+/// lowercase names (audit B19): a repeat search over a large
+/// catalogue must not re-lowercase every name on every keystroke.
+/// The index is only ever passed alongside the catalogue it was
+/// built from, so position `i` of `names` is channel `i`'s name.
+pub(crate) fn matching_scoped_indexed(
+    channels: &[Channel],
+    scope: &[usize],
+    query: &str,
+    current: impl Fn() -> bool,
+    names: Option<&[String]>,
+) -> Option<Vec<usize>> {
     let query = query.trim().to_lowercase();
     let mut matches = Vec::new();
     for (position, &index) in scope.iter().enumerate() {
@@ -35,9 +50,15 @@ pub(crate) fn matching_scoped(
             matches.push(((0, 0), index));
             continue;
         }
-        let name = channel.name.to_lowercase();
+        let lowered;
+        let name: &str = if let Some(precomputed) = names.and_then(|all| all.get(index)) {
+            precomputed
+        } else {
+            lowered = channel.name.to_lowercase();
+            &lowered
+        };
         if name.contains(&query) {
-            let rank = search_rank(&name, &query);
+            let rank = search_rank(name, &query);
             matches.push((rank, index));
         }
     }
@@ -190,6 +211,9 @@ struct Request {
     scope: Vec<usize>,
     category: crate::categories::Category,
     query: String,
+    /// The navigation index built from this request's playlist, when
+    /// one is installed (B19); positions line up with the playlist.
+    nav_index: Option<Arc<crate::navindex::NavIndex>>,
 }
 
 /// One worker serializes searches, skips queued obsolete requests, and checks
@@ -212,11 +236,15 @@ impl Default for SearchWorker {
                     request = newer;
                 }
                 let current = || active.load(Ordering::Relaxed) == request.generation;
-                let Some(rows) = matching_scoped(
+                let Some(rows) = matching_scoped_indexed(
                     request.playlist.channels(),
                     &request.scope,
                     &request.query,
                     current,
+                    request
+                        .nav_index
+                        .as_ref()
+                        .map(|index| index.normalized_names()),
                 ) else {
                     continue;
                 };
@@ -252,16 +280,24 @@ impl SearchWorker {
     /// Queue a cheap shared playlist snapshot. No channel scanning on the caller.
     pub fn submit(&self, playlist: Arc<BrowseModel>, query: String) {
         let scope: Vec<usize> = (0..playlist.channels().len()).collect();
-        self.submit_scoped(playlist, scope, crate::categories::Category::All, query);
+        self.submit_scoped(
+            playlist,
+            scope,
+            crate::categories::Category::All,
+            query,
+            None,
+        );
     }
 
     /// Queue a search inside one category scope of the snapshot.
+    /// `nav_index` must have been built from `playlist` (B19).
     pub fn submit_scoped(
         &self,
         playlist: Arc<BrowseModel>,
         scope: Vec<usize>,
         category: crate::categories::Category,
         query: String,
+        nav_index: Option<Arc<crate::navindex::NavIndex>>,
     ) {
         let generation = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
         let _ = self.requests.send(Request {
@@ -270,6 +306,7 @@ impl SearchWorker {
             scope,
             category,
             query,
+            nav_index,
         });
     }
 

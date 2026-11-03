@@ -10,8 +10,8 @@ use iptv_core::{
     config::{self, Config},
     dvr::{channel_from_snapshot, DvrAction, DvrSchedule},
     epg::{
-        airing_index, build_row_guide, epg_info_message, epg_row_label, epg_time_range,
-        hash_epg_sources, local_datetime, local_hhmm, match_guide_channel, merged_epg_sources,
+        airing_index, epg_info_message, epg_row_label, epg_time_range, hash_epg_sources,
+        local_datetime, local_hhmm, match_guide_channel, merged_epg_sources,
         should_auto_import_epg, should_run_epg_search, EpgGuide, EpgWorker, GuideIndexes, NowNext,
         Programme, SEARCH_EPG_RESULT_LIMIT,
     },
@@ -453,6 +453,11 @@ struct Wiring {
     player: Rc<RefCell<PlayerState>>,
     epg: Rc<RefCell<Option<(EpgGuide, GuideIndexes)>>>,
     epg_suffixes: Rc<EpgSuffixes>,
+    /// Guide matches for the current playlist (audit E12 match
+    /// cache): keyed by the model's playlist pointer, cleared
+    /// whenever a guide load lands, so the per-minute suffix
+    /// refresh never re-matches the catalogue.
+    epg_match_cache: Rc<RefCell<Option<(usize, iptv_core::epg::GuideMatchCache)>>>,
     epg_store: Rc<RefCell<Option<iptv_core::epgstore::EpgStore>>>,
     epg_worker: Rc<EpgWorker>,
     epg_pending: Rc<std::cell::Cell<bool>>,
@@ -926,6 +931,7 @@ fn bind_browser(
         player: Rc::new(RefCell::new(PlayerState::default())),
         epg: Rc::new(RefCell::new(None)),
         epg_suffixes: suffixes,
+        epg_match_cache: Rc::new(RefCell::new(None)),
         // The saved guide database is reopened for reading at
         // startup (audit E02): schedules, What's on Now and the
         // information panel answer from it before — and without —
@@ -1100,6 +1106,7 @@ fn bind_main_close(frame: Frame, wiring: &Wiring) {
         }
         close_buffers.borrow_mut().close_all();
         close_player.borrow_mut().app_voice.close();
+        release_engine_off_thread(&close_player);
         timer.stop();
         event.skip(true);
     });
@@ -1808,6 +1815,8 @@ fn poll_epg(wiring: &Wiring, status: Status) {
                 };
                 // The store changed under the cached indexes.
                 *wiring.epg_store_indexes.borrow_mut() = None;
+                // The guide changed under the match cache (E12).
+                *wiring.epg_match_cache.borrow_mut() = None;
                 wiring.epg_suffixes.borrow_mut().0 = 0;
                 // Python records the import stamp and the hash of
                 // the sources actually imported, so the next
@@ -2378,12 +2387,13 @@ fn probe_audio_labels(url: &str, headers: &iptv_core::playback::StreamHeaders) -
             .unwrap_or_default();
         let _ = sender.send(report);
     });
-    // Shorter than Python's 20 s: this runs on the UI thread at
-    // record start, and a stream that has not described itself
-    // in 6 s is not worth freezing the interface for; ffmpeg's
-    // own rw_timeout bounds the abandoned probe thread.
+    // Python's 20 s budget (audit R10): ffmpeg's own rw_timeout
+    // (10 s) bounds a stalled probe thread, and the wait only runs
+    // when a remembered audio preference exists with no heard
+    // witness — the case where cutting the probe short silently
+    // recorded the wrong track.
     receiver
-        .recv_timeout(std::time::Duration::from_secs(6))
+        .recv_timeout(std::time::Duration::from_secs(20))
         .map(|report| parse_audio_stream_labels(&report))
         .unwrap_or_default()
 }
@@ -3597,6 +3607,7 @@ fn clone_wiring(wiring: &Wiring) -> Wiring {
         player: Rc::clone(&wiring.player),
         epg: Rc::clone(&wiring.epg),
         epg_suffixes: Rc::clone(&wiring.epg_suffixes),
+        epg_match_cache: Rc::clone(&wiring.epg_match_cache),
         epg_store: Rc::clone(&wiring.epg_store),
         epg_worker: Rc::clone(&wiring.epg_worker),
         epg_pending: Rc::clone(&wiring.epg_pending),
@@ -4891,6 +4902,40 @@ fn menu_dialog_action(id: i32, wiring: &Wiring, status: Status, scope_choice: Ch
     true
 }
 
+/// The User Guide topic a menu item belongs to, for
+/// highlight-driven F1 routing (audit S10). Items without a
+/// dedicated section return None and leave the current topic
+/// alone.
+fn menu_item_topic(id: i32) -> Option<&'static str> {
+    Some(match id {
+        PLAYLIST_MANAGER => "playlist-manager",
+        EPG_MANAGER => "epg-manager",
+        IMPORT_EPG => "import-epg",
+        WHATS_ON_NOW => "whats-on-now",
+        CONTINUE_WATCHING => "continue-watching",
+        VIEW_VOD => "video-on-demand",
+        FAVORITE | GO_TO_FAVORITES | CTX_FAVORITE => "favorites",
+        ACCOUNT_INFO => "account-info",
+        CAST_TO | CAST_CONNECT => "casting",
+        SHOW_PLAYER | PLAY_PAUSE | STOP => "built-in-player",
+        PREFERRED_AUDIO => "preferred-audio-track",
+        KEYBOARD_SHORTCUTS => "keyboard-shortcuts",
+        WHATS_NEW => "updates",
+        REC_START | REC_STOP | REC_STOP_ALL | REC_STORAGE | REC_MIN_FREE | REC_SET_FOLDER
+        | REC_OPEN_FOLDER | CTX_RECORD => "recordings",
+        REC_REMINDERS | CTX_REMINDER => "reminders",
+        REC_SCHEDULED | CTX_SCHEDULE => "scheduled-recordings",
+        REC_PADDING => "schedule-padding",
+        SPEAK_SUBTITLES | READ_CURRENT_SUBTITLE | READ_PREVIOUS_SUBTITLE | REVIEW_SUBTITLES => {
+            "subtitle-speech"
+        }
+        CTX_PLAY => "channel-list",
+        CTX_EPG => "channel-epg",
+        CTX_CATCHUP => "catch-up",
+        _ => return None,
+    })
+}
+
 /// Dispatch for the parity menu tree.
 fn bind_menu_actions(frame: Frame, wiring: &Wiring, controls: Controls) {
     bind_menu_option_actions(frame, wiring, controls);
@@ -4899,6 +4944,17 @@ fn bind_menu_actions(frame: Frame, wiring: &Wiring, controls: Controls) {
     let search = controls.search;
     let category_box = controls.category;
     let scope_choice = controls.scope_choice;
+    // Menu browsing also aims help (audit S10): wxdragon exposes
+    // MENU_HIGHLIGHT, so the highlighted item's topic becomes the
+    // current help topic while a menu is open. The User Guide
+    // command (F1) then opens at the item the user is actually
+    // on, instead of falling back to the last focused control.
+    let highlight_topic = Rc::clone(&wiring.help_focus_topic);
+    frame.on_menu_highlighted(move |event| {
+        if let Some(topic) = event.get_menu_id().and_then(menu_item_topic) {
+            *highlight_topic.borrow_mut() = topic;
+        }
+    });
     let wiring = clone_wiring(wiring);
     frame.on_menu(move |event| {
         let id = event.get_id();
@@ -5871,6 +5927,9 @@ fn move_caret(ui: &GuideUi, section: &iptv_core::guide::Section) {
 }
 
 /// Context menu command ids on the Channels list (G3).
+const DVR_CTX_REFRESH: i32 = 6051;
+const DVR_CTX_CANCEL: i32 = 6052;
+const DVR_CTX_DELETE: i32 = 6053;
 const CTX_PLAY: i32 = 6001;
 const CTX_FAVORITE: i32 = 6002;
 const CTX_RECORD: i32 = 6003;
@@ -6497,7 +6556,9 @@ fn bind_epg_highlight(
         // exists.
         let text = match guide_now_next(&wiring, &channel) {
             Some(entry) => epg_info_message(entry.current.as_ref(), entry.next.as_ref()),
-            None => "No description available for this programme.".to_owned(),
+            // No guide match at all: Python's description cache
+            // leaves the panel empty (audit E10, exact behavior).
+            None => String::new(),
         };
         episode_description.set_value(&text);
     });
@@ -6817,6 +6878,29 @@ fn spawn_vlc_ops() -> std::sync::mpsc::Sender<VlcOp> {
         }
     });
     sender
+}
+
+/// Hand the engine's final release to a detached thread at exit
+/// (audit P18 residual): libvlc's player/instance release can
+/// block, and Python tears its player down in a worker, so the
+/// last engine handles must not drop on the UI thread while the
+/// app closes. Taking the sender hangs the ops channel up: the
+/// worker drains its queued ops, drops its own engine clones on
+/// its thread, and exits; the state's clone drops on the cleanup
+/// thread. Any clone still queued inside an op drops with that
+/// op on the worker thread.
+fn release_engine_off_thread(player: &Rc<RefCell<PlayerState>>) {
+    let (vlc, ops) = {
+        let mut state = player.borrow_mut();
+        (state.vlc.take(), state.vlc_ops.take())
+    };
+    if vlc.is_none() && ops.is_none() {
+        return;
+    }
+    std::thread::spawn(move || {
+        drop(ops);
+        drop(vlc);
+    });
 }
 
 /// Queue a load on the ops worker; the result lands in the
@@ -12363,6 +12447,30 @@ fn render_scheduled_jobs(wiring: &Wiring, list: ListCtrl, dstatus: Status) {
     ));
 }
 
+/// Cancel the first selected scheduled job (the Cancel Recording
+/// button and the context menu share this; audit R19). Cancelling
+/// also stops the capture: a canceled job leaves the Recording
+/// state, so the scheduler will never emit its Stop action
+/// (issue #130).
+fn cancel_first_selected_job(wiring: &Wiring, list: ListCtrl, dstatus: Status) {
+    let Some(id) = selected_job_ids(wiring, list).into_iter().next() else {
+        dstatus.set_label("Choose a recording to cancel first.");
+        return;
+    };
+    let mut dvr = wiring.dvr.borrow_mut();
+    if dvr.cancel_job(&id) {
+        dvr.save();
+        drop(dvr);
+        wiring.recordings.borrow_mut().stop(&format!("dvr:{id}"));
+        wiring.dvr_resolve.borrow_mut().remove(&id);
+        wiring
+            .pending_resolves
+            .borrow_mut()
+            .retain(|_, pending| !matches!(pending, PendingResolve::Dvr(job) if job == &id));
+        render_scheduled_jobs(wiring, list, dstatus);
+    }
+}
+
 /// Delete every selected finished job (the Delete button and
 /// the Delete key share this; audit R19).
 fn delete_selected_finished_jobs(wiring: &Wiring, list: ListCtrl, dstatus: Status) {
@@ -12439,26 +12547,7 @@ fn open_scheduled_dialog(wiring: &Wiring, main_status: Status) {
     let close = Button::builder(&panel).with_label("&Close").build();
     let wiring_c = clone_wiring(wiring);
     cancel_job.on_click(move |_| {
-        let Some(id) = selected_job_ids(&wiring_c, list).into_iter().next() else {
-            dstatus.set_label("Choose a recording to cancel first.");
-            return;
-        };
-        let mut dvr = wiring_c.dvr.borrow_mut();
-        if dvr.cancel_job(&id) {
-            dvr.save();
-            drop(dvr);
-            // Stop the capture too: a canceled job leaves the
-            // Recording state, so the scheduler will never
-            // emit its Stop action — an in-flight or running
-            // capture must be halted here (issue #130).
-            wiring_c.recordings.borrow_mut().stop(&format!("dvr:{id}"));
-            wiring_c.dvr_resolve.borrow_mut().remove(&id);
-            wiring_c
-                .pending_resolves
-                .borrow_mut()
-                .retain(|_, pending| !matches!(pending, PendingResolve::Dvr(job) if job == &id));
-            render(&wiring_c, list, dstatus);
-        }
+        cancel_first_selected_job(&wiring_c, list, dstatus);
     });
     let wiring_x = clone_wiring(wiring);
     resolve_conflict.on_click(move |_| {
@@ -12503,6 +12592,27 @@ fn open_scheduled_dialog(wiring: &Wiring, main_status: Status) {
             return;
         }
         event.skip(true);
+    });
+    // The right-click / Apps-key menu (Python's Scheduled
+    // Recordings context menu, audit R19): Refresh always; Cancel
+    // and Delete once the list has rows. Selections arrive as menu
+    // events on the dialog frame.
+    list.bind_internal(EventType::CONTEXT_MENU, move |_| {
+        let mut menu = Menu::builder().build();
+        menu.append(DVR_CTX_REFRESH, &tr("Refresh"), "", ItemKind::Normal);
+        if list.get_item_count() > 0 {
+            menu.append_separator();
+            menu.append(DVR_CTX_CANCEL, &tr("Cancel"), "", ItemKind::Normal);
+            menu.append(DVR_CTX_DELETE, &tr("Delete\tDel"), "", ItemKind::Normal);
+        }
+        list.popup_menu(&mut menu, None);
+    });
+    let wiring_m = clone_wiring(wiring);
+    frame.on_menu(move |event| match event.get_id() {
+        DVR_CTX_REFRESH => render_scheduled_jobs(&wiring_m, list, dstatus),
+        DVR_CTX_CANCEL => cancel_first_selected_job(&wiring_m, list, dstatus),
+        DVR_CTX_DELETE => delete_selected_finished_jobs(&wiring_m, list, dstatus),
+        _ => {}
     });
     close.on_click(move |_| frame.hide());
     frame.show(true);
@@ -13729,6 +13839,31 @@ fn channel_text(
 /// indexes are the ones built with the guide — nothing is
 /// rebuilt per channel. The store alone can drive the rebuild
 /// after a restart (audit E02).
+/// The row guide for the current playlist+guide, through the
+/// match cache (audit E12): the first build for a playlist
+/// matches every channel once; later refreshes only assemble
+/// suffixes from the fresh bulk snapshot.
+fn cached_row_guide(
+    wiring: &Wiring,
+    channels: &[Channel],
+    indexes: &GuideIndexes,
+    bulk: &std::collections::HashMap<String, NowNext>,
+) -> (
+    std::collections::HashMap<usize, String>,
+    std::collections::HashMap<usize, String>,
+) {
+    let ptr = wiring.model.borrow().playlist_ptr();
+    let mut slot = wiring.epg_match_cache.borrow_mut();
+    if !matches!(slot.as_ref(), Some((key, _)) if *key == ptr) {
+        *slot = Some((
+            ptr,
+            iptv_core::epg::GuideMatchCache::build(channels, indexes),
+        ));
+    }
+    let cache = &slot.as_ref().expect("match cache just set").1;
+    iptv_core::epg::row_guide_from_matches(cache.matches(), bulk)
+}
+
 fn refresh_epg_suffixes(wiring: &Wiring) {
     let now = now_epoch();
     let playlist_ptr = wiring.model.borrow().playlist_ptr();
@@ -13738,7 +13873,7 @@ fn refresh_epg_suffixes(wiring: &Wiring) {
         if let Some((guide, indexes)) = wiring.epg.borrow().as_ref() {
             let bulk = guide.bulk_now_next(now);
             browser.with_all_channels(|channels| {
-                suffixes = build_row_guide(channels, indexes, &bulk).0;
+                suffixes = cached_row_guide(wiring, channels, indexes, &bulk).0;
             });
         } else if let Some(indexes) = store_indexes(wiring) {
             if let Some(bulk) = wiring
@@ -13752,7 +13887,7 @@ fn refresh_epg_suffixes(wiring: &Wiring) {
                     .map(|(channel, entry)| (channel.id, entry))
                     .collect();
                 browser.with_all_channels(|channels| {
-                    suffixes = build_row_guide(channels, &indexes, &bulk).0;
+                    suffixes = cached_row_guide(wiring, channels, &indexes, &bulk).0;
                 });
             }
         }

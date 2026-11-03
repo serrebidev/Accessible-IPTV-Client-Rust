@@ -913,23 +913,53 @@ pub fn now_playing_key(channel: &Channel) -> String {
     }
 }
 
-/// Suffix and on-air description maps for a whole catalogue,
-/// built from one bulk now/next snapshot (audit E12): the guide
-/// indexes are consulted once per channel against the snapshot,
-/// never rebuilt per channel. Keys are playlist indexes.
+/// Playlist-position → guide-id matches, computed once for a
+/// playlist+guide pair (port of Python's program-match cache,
+/// invalidated when either side is replaced). Matching a channel
+/// is the expensive part of a row-guide build — tvg candidates,
+/// word-number expansion, canonical name buckets — so a refresh
+/// must never redo it per channel per tick (audit E12).
+#[derive(Debug)]
+pub struct GuideMatchCache {
+    matches: Vec<Option<String>>,
+}
+
+impl GuideMatchCache {
+    /// Match every channel once against the guide indexes.
+    #[must_use]
+    pub fn build(channels: &[Channel], indexes: &GuideIndexes) -> Self {
+        let matches = channels
+            .iter()
+            .map(|channel| match_guide_channel(channel, indexes, Some(&indexes.known_ids)))
+            .collect();
+        Self { matches }
+    }
+
+    /// The guide id matched to a playlist position, if any.
+    #[must_use]
+    pub fn get(&self, position: usize) -> Option<&str> {
+        self.matches.get(position).and_then(|id| id.as_deref())
+    }
+
+    /// Every match by playlist position.
+    #[must_use]
+    pub fn matches(&self) -> &[Option<String>] {
+        &self.matches
+    }
+}
+
+/// Suffix and on-air description maps from precomputed matches
+/// and one bulk now/next snapshot: the steady-state refresh —
+/// one hash lookup per matched channel, no matching work at all.
 #[must_use]
-pub fn build_row_guide<S: std::hash::BuildHasher>(
-    channels: &[Channel],
-    indexes: &GuideIndexes,
+pub fn row_guide_from_matches<S: std::hash::BuildHasher>(
+    matches: &[Option<String>],
     bulk: &HashMap<String, NowNext, S>,
 ) -> (HashMap<usize, String>, HashMap<usize, String>) {
     let mut suffixes = HashMap::new();
     let mut descriptions = HashMap::new();
-    for (index, channel) in channels.iter().enumerate() {
-        let Some(guide_id) = match_guide_channel(channel, indexes, Some(&indexes.known_ids)) else {
-            continue;
-        };
-        let Some(entry) = bulk.get(&guide_id) else {
+    for (index, guide_id) in matches.iter().enumerate() {
+        let Some(entry) = guide_id.as_ref().and_then(|id| bulk.get(id)) else {
             continue;
         };
         let suffix = programme_suffix(entry.current.as_ref(), entry.next.as_ref());
@@ -944,6 +974,22 @@ pub fn build_row_guide<S: std::hash::BuildHasher>(
         }
     }
     (suffixes, descriptions)
+}
+
+/// Suffix and on-air description maps for a whole catalogue,
+/// built from one bulk now/next snapshot (audit E12): the guide
+/// indexes are consulted once per channel against the snapshot,
+/// never rebuilt per channel. Keys are playlist indexes. This is
+/// the uncached form; recurring refreshes should go through
+/// [`GuideMatchCache`] + [`row_guide_from_matches`].
+#[must_use]
+pub fn build_row_guide<S: std::hash::BuildHasher>(
+    channels: &[Channel],
+    indexes: &GuideIndexes,
+    bulk: &HashMap<String, NowNext, S>,
+) -> (HashMap<usize, String>, HashMap<usize, String>) {
+    let cache = GuideMatchCache::build(channels, indexes);
+    row_guide_from_matches(cache.matches(), bulk)
 }
 
 /// The index of the programme airing at `now` in a start-sorted
@@ -1964,6 +2010,13 @@ mod tests {
         assert!(suffixes[&0].contains("Next: Quiz"), "{suffixes:?}");
         assert_eq!(descriptions[&0], "Evening news");
         assert!(!suffixes.contains_key(&1));
+        // The match-cache path (the recurring refresh) must agree
+        // exactly with the uncached build.
+        let cache = GuideMatchCache::build(&channels, &indexes);
+        assert_eq!(cache.get(0), Some("bbc2.uk"));
+        assert_eq!(cache.get(1), None);
+        let cached = row_guide_from_matches(cache.matches(), &bulk);
+        assert_eq!(cached, (suffixes, descriptions));
     }
 
     #[test]
