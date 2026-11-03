@@ -50,6 +50,11 @@ pub struct DvrJob {
     pub pre_padding_minutes: i64,
     pub post_padding_minutes: i64,
     pub created_at: String,
+    /// The recording actually began after the programme's own
+    /// start (padding already consumed): a successful finish
+    /// carries the missed-beginning warning (issue #130).
+    #[serde(default)]
+    pub started_late: bool,
     pub recording_id: Option<String>,
     pub output_path: String,
     pub message: String,
@@ -64,6 +69,21 @@ fn iso_from_ts(ts: f64) -> String {
         .single()
         .map(|dt| dt.format("%Y-%m-%dT%H:%M:%S+00:00").to_string())
         .unwrap_or_default()
+}
+
+/// The programme's own start: the padded record start plus the
+/// pre-padding that leads it.
+#[allow(clippy::cast_precision_loss)] // schedule times are whole seconds
+fn programme_start_ts(job: &DvrJob) -> f64 {
+    job.start_ts + f64::from(i32::try_from(job.pre_padding_minutes).unwrap_or(0)) * 60.0
+}
+
+/// Flag a job whose recording begins after the programme itself
+/// started: the beginning is gone, and the finish must say so.
+fn note_started(job: &mut DvrJob, now: f64) {
+    if now > programme_start_ts(job) {
+        job.started_late = true;
+    }
 }
 
 fn hex_id(seed: &str) -> String {
@@ -204,6 +224,7 @@ pub fn build_job(spec: &NewJob<'_>, now: f64) -> Result<DvrJob, String> {
         pre_padding_minutes: pre,
         post_padding_minutes: post,
         created_at: iso_from_ts(now),
+        started_late: false,
         recording_id: None,
         output_path: String::new(),
         message: String::new(),
@@ -367,15 +388,18 @@ impl DvrSchedule {
     }
 
     /// Record that a job's recording has started.
-    pub fn mark_recording(&mut self, job_id: &str) {
+    pub fn mark_recording(&mut self, job_id: &str, now: f64) {
         self.resolving.remove(job_id);
         self.set_status(job_id, STATUS_RECORDING, "");
+        if let Some(job) = self.jobs.iter_mut().find(|j| j.id == job_id) {
+            note_started(job, now);
+        }
         self.save();
     }
 
     /// Apply a successful asynchronous provider resolution to a still-pending
     /// job. Returns false for canceled, expired, or otherwise stale results.
-    pub fn resolution_succeeded(&mut self, job_id: &str) -> bool {
+    pub fn resolution_succeeded(&mut self, job_id: &str, now: f64) -> bool {
         let active = self.resolving.contains(job_id)
             && self
                 .jobs
@@ -386,6 +410,9 @@ impl DvrSchedule {
         }
         self.resolving.remove(job_id);
         self.set_status(job_id, STATUS_RECORDING, "");
+        if let Some(job) = self.jobs.iter_mut().find(|j| j.id == job_id) {
+            note_started(job, now);
+        }
         self.save();
         true
     }
@@ -464,6 +491,9 @@ impl DvrSchedule {
                             });
                         } else {
                             self.set_status(&id, STATUS_RECORDING, "");
+                            if let Some(job) = self.jobs.iter_mut().find(|j| j.id == id) {
+                                note_started(job, now);
+                            }
                             changed = true;
                             actions.push(DvrAction::Start(id));
                         }
@@ -520,7 +550,16 @@ impl DvrSchedule {
             } else {
                 STATUS_FAILED.to_string()
             };
-            job.message = message.to_string();
+            job.message = if success && job.started_late {
+                let warning = "Started late; the beginning of the programme was missed.";
+                if message.is_empty() {
+                    warning.to_string()
+                } else {
+                    format!("{message} {warning}")
+                }
+            } else {
+                message.to_string()
+            };
         }
         let snapshot = self.jobs.iter().find(|j| j.id == job_id).cloned();
         if let Some(job) = snapshot {
@@ -575,6 +614,7 @@ impl DvrSchedule {
             next.stop_ts - f64::from(i32::try_from(next.post_padding_minutes).unwrap_or(0)) * 60.0,
         );
         next.status = STATUS_SCHEDULED.to_string();
+        next.started_late = false;
         next.recording_id = None;
         next.output_path = String::new();
         next.message = String::new();
@@ -721,7 +761,7 @@ mod tests {
         );
         assert_eq!(schedule.get(&id).expect("job").status, STATUS_SCHEDULED);
         schedule.mark_resolving(&id);
-        assert!(schedule.resolution_succeeded(&id));
+        assert!(schedule.resolution_succeeded(&id, 150.0));
         assert_eq!(schedule.get(&id).expect("job").status, STATUS_RECORDING);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -795,8 +835,82 @@ mod tests {
         assert_eq!(schedule.tick(150.0).len(), 1);
         schedule.mark_resolving(&id);
         assert!(schedule.cancel_job(&id));
-        assert!(!schedule.resolution_succeeded(&id));
+        assert!(!schedule.resolution_succeeded(&id, 150.0));
         assert_eq!(schedule.get(&id).expect("job").status, STATUS_CANCELED);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn late_start_completes_with_a_persistent_missed_beginning_warning() {
+        let dir = std::env::temp_dir().join(format!("iptv-dvr-late-{}", std::process::id()));
+        let path = dir.join("scheduled_recordings.json");
+        let mut schedule = DvrSchedule::load(path, 0.0);
+        let chan = channel();
+        // Programme 1000-2000 with two minutes of pre-padding:
+        // the padded start is 880.
+        let late = build_job(&spec(&chan, "Late", 1000, 2000, 2, 5), 0.0).expect("j");
+        let late_id = late.id.clone();
+        schedule.add_job(late);
+        // First tick lands after the programme itself began.
+        assert_eq!(schedule.tick(1001.0).len(), 1);
+        let job = schedule.get(&late_id).expect("job");
+        assert_eq!(job.status, STATUS_RECORDING);
+        assert!(job.started_late);
+        // It still stops at the saved stop time (2300, padding in).
+        assert_eq!(
+            schedule.tick(2300.0),
+            vec![DvrAction::Stop(late_id.clone())]
+        );
+        schedule.mark_finished(&late_id, true, "/tmp/out.mkv", "", 2301.0);
+        let job = schedule.get(&late_id).expect("job");
+        assert_eq!(job.status, STATUS_COMPLETED);
+        assert_eq!(
+            job.message,
+            "Started late; the beginning of the programme was missed."
+        );
+        // The warning is persisted, not just in memory.
+        let reloaded = DvrSchedule::load(dir.join("scheduled_recordings.json"), 0.0);
+        assert!(reloaded
+            .get(&late_id)
+            .expect("job")
+            .message
+            .contains("beginning of the programme was missed"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn start_inside_padding_is_not_late() {
+        let dir = std::env::temp_dir().join(format!("iptv-dvr-pad-{}", std::process::id()));
+        let path = dir.join("scheduled_recordings.json");
+        let mut schedule = DvrSchedule::load(path, 0.0);
+        let chan = channel();
+        let job = build_job(&spec(&chan, "Padded", 1000, 2000, 2, 5), 0.0).expect("j");
+        let id = job.id.clone();
+        schedule.add_job(job);
+        assert_eq!(schedule.tick(900.0).len(), 1); // padded start 880, programme 1000
+        assert!(!schedule.get(&id).expect("job").started_late);
+        schedule.mark_finished(&id, true, "/tmp/out.mkv", "", 2301.0);
+        assert_eq!(schedule.get(&id).expect("job").message, "");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn finish_after_cancel_keeps_canceled_and_the_users_reason() {
+        let dir = std::env::temp_dir().join(format!("iptv-dvr-cfin-{}", std::process::id()));
+        let path = dir.join("scheduled_recordings.json");
+        let mut schedule = DvrSchedule::load(path, 0.0);
+        let chan = channel();
+        let job = build_job(&spec(&chan, "Show", 100, 200, 0, 0), 0.0).expect("j");
+        let id = job.id.clone();
+        schedule.add_job(job);
+        assert_eq!(schedule.tick(150.0).len(), 1);
+        assert!(schedule.cancel_job(&id));
+        // The capture that was starting when the cancel landed
+        // ends now: the job stays Canceled with the user's reason.
+        schedule.mark_finished(&id, true, "/tmp/out.mkv", "", 160.0);
+        let job = schedule.get(&id).expect("job");
+        assert_eq!(job.status, STATUS_CANCELED);
+        assert_eq!(job.message, "Canceled by user.");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
