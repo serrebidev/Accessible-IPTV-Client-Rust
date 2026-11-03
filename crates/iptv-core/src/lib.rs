@@ -1,6 +1,7 @@
 //! wx-free domain types and playlist behavior for the Rust port.
 
 pub mod audiotracks;
+pub mod bookmarks;
 pub mod browser;
 pub mod cache;
 pub mod cast;

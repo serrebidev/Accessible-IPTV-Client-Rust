@@ -3,6 +3,7 @@ mod buffer;
 use iptv_core::guide::Guide;
 use iptv_core::i18n::I18n;
 use iptv_core::{
+    bookmarks::Bookmarks,
     browser::{BrowseEvent, BrowserWorker},
     cast::{CastDevice, CastEvent, CastWorker},
     categories::Category,
@@ -14,11 +15,10 @@ use iptv_core::{
         should_auto_import_epg, should_run_epg_search, EpgGuide, EpgWorker, GuideIndexes, NowNext,
         Programme, SEARCH_EPG_RESULT_LIMIT,
     },
-    favorites::{channel_key, FavoriteSet, Toggle},
+    favorites::{channel_key, remember_recent, FavoriteSet, Toggle},
     playback::{
-        candidate_executables, detect_from_path, external_argv, player_choice, resume_checkpoint,
-        resume_position, EngineAction, EngineEvent, LaunchGate, PlaybackRequest, PlaybackSession,
-        PlayerChoice, SessionState,
+        candidate_executables, detect_from_path, external_argv, player_choice, EngineAction,
+        EngineEvent, LaunchGate, PlaybackRequest, PlaybackSession, PlayerChoice, SessionState,
     },
     providers::{
         account_form_error, merge_account_fields, random_mag_mac, sanitize_mac, ProviderAccount,
@@ -29,7 +29,7 @@ use iptv_core::{
     search::SearchResults,
     sources::PlaylistSource,
     speech::{CueRoute, CueSpeech, DevicePolicy, SpeechBackend},
-    subtitles::{active as active_cue, load_cues, Cue},
+    subtitles::{active as active_cue, load_cues, started as started_cue, Cue, ReviewCursor},
     vod::{VodCatalog, VodEvent, VodItem, VodKind, VodWorker},
     Channel,
 };
@@ -448,7 +448,6 @@ struct Wiring {
     recorded: Rc<std::cell::Cell<bool>>,
     shutdown_attempted: Rc<std::cell::Cell<bool>>,
     last_dvr_tick: Rc<std::cell::Cell<f64>>,
-    previous_channel: Rc<RefCell<Option<Channel>>>,
     scope_ids: Rc<RefCell<Vec<Option<String>>>>,
     download_worker: Rc<iptv_core::downloads::DownloadWorker>,
     downloads: Rc<RefCell<Vec<DownloadRow>>>,
@@ -466,11 +465,29 @@ enum ActiveEngine {
     Vlc,
 }
 
+/// The in-flight VLC worker load's result slot (P18):
+/// (session generation, was-a-retry, reply).
+type VlcLoadReply = std::sync::Arc<std::sync::Mutex<Option<Result<(), String>>>>;
+
+/// A subtitle file load's result slot (P09): (generation,
+/// parsed cues or the load error).
+type PendingSubtitles = std::sync::Arc<std::sync::Mutex<Option<(u64, Result<Vec<Cue>, String>)>>>;
+
+// The player state is a flat bag of session flags by design —
+// one struct the poll loop and the menu/key dispatchers share.
+// Splitting it into sub-structs would churn every call site.
+#[allow(clippy::struct_excessive_bools)]
 struct PlayerState {
     session: PlaybackSession,
     gate: LaunchGate,
     window: Option<PlayerWindow>,
     vlc: Option<iptv_vlc::VlcEngine>,
+    /// The VLC transport worker's channel (P18): loads and
+    /// stops are serialized there, off the UI thread.
+    vlc_ops: Option<std::sync::mpsc::Sender<VlcOp>>,
+    /// The in-flight worker load's result slot: (session
+    /// generation, was-a-retry, reply).
+    vlc_load_reply: Option<(u64, bool, VlcLoadReply)>,
     vlc_active: bool,
     vlc_tracks_ready: bool,
     vlc_track_ids: Vec<i32>,
@@ -491,9 +508,57 @@ struct PlayerState {
     pending_reconnect: Option<(u64, i64, PlaybackRequest)>,
     /// Which engine the current request was loaded into.
     engine: ActiveEngine,
+    /// The cache plan for this player lifetime (P01): reset on
+    /// each new channel choice, grown by recovery restarts.
+    cache_plan: iptv_core::playback::CachePlan,
+    /// Whether the current channel is a Dispatcharr stream
+    /// (its cache never grows, P01).
+    dispatcharr: bool,
+    /// The frozen-stream watchdog (P03) and the monotonic
+    /// instant the current load started (its grace anchor).
+    watchdog: iptv_core::playback::FreezeWatchdog,
+    play_started_ms: i64,
+    /// Preference-application attempts for late-published audio
+    /// tracks, in 500 ms units (P07).
+    track_attempts: u32,
+    /// The pending reconnect is an expected-TS rollover (P04):
+    /// no cache growth, quick-start cache on the reload.
+    reconnect_rollover: bool,
+    /// The Subtitles submenu's dynamic item ids and the SPU ids
+    /// they map to (P08), plus the currently selected SPU
+    /// (-2 = unknown, -1 = Off) and the sidecar file's track.
+    spu_menu_ids: Vec<i32>,
+    spu_ids: Vec<i32>,
+    selected_spu: i32,
+    file_subtitle_track: Option<i32>,
+    /// Subtitle file loads run on a worker (P09): the
+    /// generation guards delivery, the slot carries the result.
+    subtitle_generation: u64,
+    pending_subtitles: Option<PendingSubtitles>,
+    /// Per-channel audio memory supplied for the current
+    /// channel (P06): its key, remembered name and slot.
+    audio_key: String,
+    supply_audio_name: Option<String>,
+    supply_audio_index: Option<i64>,
     subtitle_cues: Vec<Cue>,
     last_spoken_cue: Option<usize>,
-    history: Vec<Channel>,
+    /// Subtitle review state (P11): the cursor bounded by
+    /// shown history, the sampled active/latest-shown indexes,
+    /// and the cues actually delivered, newest last (the
+    /// manager's recent list, capped at 50).
+    review: ReviewCursor,
+    active_cue_index: Option<usize>,
+    last_shown_cue: Option<usize>,
+    shown_cues: std::collections::VecDeque<Cue>,
+    /// Resume-seek protection (P16) for the adopted saved
+    /// position, and the last checkpoint's monotonic time
+    /// (non-forced checkpoints are throttled to 30 s).
+    resume_guard: Option<iptv_core::playback::ResumeGuard>,
+    last_checkpoint_ms: i64,
+    /// Whether the current live channel has been recorded in
+    /// the persisted recent-channels MRU (P17) — recorded
+    /// once, on confirmed start.
+    history_recorded: bool,
     /// The application voice (Windows SAPI) and the cue routing
     /// state for subtitle speech (issues #131/#132).
     app_voice: iptv_sapi::AppVoice,
@@ -507,6 +572,8 @@ impl Default for PlayerState {
             gate: LaunchGate::default(),
             window: None,
             vlc: None,
+            vlc_ops: None,
+            vlc_load_reply: None,
             vlc_active: false,
             vlc_tracks_ready: false,
             vlc_error: None,
@@ -523,9 +590,36 @@ impl Default for PlayerState {
             pending_resume_ms: None,
             pending_reconnect: None,
             engine: ActiveEngine::Fallback,
+            cache_plan: iptv_core::playback::CachePlan::new(
+                &iptv_core::config::InternalPlayerSettings {
+                    buffer_seconds: 25.0,
+                    max_buffer_seconds: 30.0,
+                    variant_max_mbps: 0.0,
+                },
+            ),
+            dispatcharr: false,
+            watchdog: iptv_core::playback::FreezeWatchdog::new(false, true),
+            play_started_ms: 0,
+            track_attempts: 0,
+            reconnect_rollover: false,
+            spu_menu_ids: Vec::new(),
+            spu_ids: Vec::new(),
+            selected_spu: -2,
+            file_subtitle_track: None,
+            subtitle_generation: 0,
+            pending_subtitles: None,
+            audio_key: String::new(),
+            supply_audio_name: None,
+            supply_audio_index: None,
             subtitle_cues: Vec::new(),
             last_spoken_cue: None,
-            history: Vec::new(),
+            review: ReviewCursor::default(),
+            active_cue_index: None,
+            last_shown_cue: None,
+            shown_cues: std::collections::VecDeque::new(),
+            resume_guard: None,
+            last_checkpoint_ms: 0,
+            history_recorded: false,
             app_voice: iptv_sapi::AppVoice::new(""),
             cue_speech: CueSpeech::new(SpeechBackend::ScreenReader, false),
         }
@@ -555,35 +649,39 @@ impl Persist {
         let _ = config.save(&self.path);
     }
 
-    fn resume_entries(&self) -> BTreeMap<String, iptv_core::playback::ResumeEntry> {
-        let mut entries = BTreeMap::new();
-        if let Some(serde_json::Value::Object(map)) = self.config.borrow().value("resume_positions")
-        {
-            for (key, value) in map {
-                let fields = (
-                    value.get("position_ms").and_then(serde_json::Value::as_i64),
-                    value.get("length_ms").and_then(serde_json::Value::as_i64),
-                    value.get("updated").and_then(serde_json::Value::as_i64),
-                );
-                if let (Some(position_ms), Some(length_ms), Some(updated)) = fields {
-                    let title = value
-                        .get("title")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or_default()
-                        .to_string();
-                    entries.insert(
-                        key.clone(),
-                        iptv_core::playback::ResumeEntry {
-                            position_ms,
-                            length_ms,
-                            updated,
-                            title,
-                        },
-                    );
-                }
-            }
-        }
-        entries
+    /// The Python `playback_bookmarks` store (P21), normalized
+    /// on read exactly as Python's `normalize` does, so records
+    /// imported from the Python client are consumed unchanged.
+    fn resume_entries(&self) -> Bookmarks {
+        let config = self.config.borrow();
+        iptv_core::bookmarks::normalize(config.value("playback_bookmarks"))
+    }
+
+    /// The persisted recent-channels keys (P17): stable
+    /// channel keys only, newest first, capped at 20.
+    fn recent_keys(&self) -> Vec<String> {
+        let config = self.config.borrow();
+        let keys: Vec<String> = match config.value("recent_channels") {
+            Some(serde_json::Value::Array(items)) => items
+                .iter()
+                .filter_map(|item| item.as_str().map(str::to_string))
+                .collect(),
+            _ => Vec::new(),
+        };
+        let mut keys = iptv_core::favorites::normalize_keys(keys);
+        keys.truncate(iptv_core::favorites::MAX_RECENT_CHANNELS);
+        keys
+    }
+
+    fn save_recent_keys(&self, keys: &[String]) {
+        self.set_and_save(
+            "recent_channels",
+            serde_json::Value::Array(
+                keys.iter()
+                    .map(|key| serde_json::Value::String(key.clone()))
+                    .collect(),
+            ),
+        );
     }
 
     fn reminders(&self) -> Vec<Reminder> {
@@ -605,23 +703,82 @@ impl Persist {
         let _ = config.save(&self.path);
     }
 
-    fn save_resume(&self, entries: &BTreeMap<String, iptv_core::playback::ResumeEntry>) {
-        let map: serde_json::Map<String, serde_json::Value> = entries
-            .iter()
-            .map(|(key, entry)| {
-                (
-                    key.clone(),
-                    serde_json::json!({
-                        "position_ms": entry.position_ms,
-                        "length_ms": entry.length_ms,
-                        "updated": entry.updated,
-                        "title": entry.title,
-                    }),
-                )
-            })
+    /// The per-channel audio-track memory (P06): remembered
+    /// track names and slots by audio memory key.
+    fn audio_memory(&self) -> (BTreeMap<String, String>, BTreeMap<String, i64>) {
+        let read = |key: &str| -> BTreeMap<String, serde_json::Value> {
+            match self.config.borrow().value(key) {
+                Some(serde_json::Value::Object(map)) => {
+                    map.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+                }
+                _ => BTreeMap::new(),
+            }
+        };
+        let names = read("channel_audio_tracks")
+            .into_iter()
+            .filter_map(|(k, v)| v.as_str().map(|s| (k, s.to_string())))
             .collect();
+        let indices = read("channel_audio_track_indices")
+            .into_iter()
+            .filter_map(|(k, v)| v.as_i64().map(|n| (k, n)))
+            .collect();
+        (names, indices)
+    }
+
+    /// Persist one manual audio choice (P06): the channel's
+    /// name/slot memory and the global last track, in one save.
+    fn save_audio_choice(&self, key: &str, name: &str, index: i64) {
+        let (mut names, mut indices) = self.audio_memory();
+        iptv_core::audiotracks::remember_channel_track(&mut names, &mut indices, key, name, index);
         let mut config = self.config.borrow_mut();
-        config.set_value("resume_positions", serde_json::Value::Object(map));
+        config.set_value(
+            "channel_audio_tracks",
+            serde_json::to_value(names).unwrap_or(serde_json::Value::Null),
+        );
+        config.set_value(
+            "channel_audio_track_indices",
+            serde_json::to_value(indices).unwrap_or(serde_json::Value::Null),
+        );
+        config.set_value("last_audio_track", serde_json::json!(name));
+        let _ = config.save(&self.path);
+    }
+
+    /// Write the bookmark store in Python's record shape
+    /// (P21): `{position_ms, length_ms, updated}` plus a
+    /// `metadata` object with the cleaned title and locator
+    /// when either survives, newest first.
+    fn save_resume(&self, entries: &Bookmarks) {
+        let mut rows: Vec<(&String, &iptv_core::bookmarks::Bookmark)> = entries.iter().collect();
+        rows.sort_by(|a, b| b.1.updated.cmp(&a.1.updated).then_with(|| a.0.cmp(b.0)));
+        let mut map = serde_json::Map::new();
+        for (key, entry) in rows {
+            let mut record = serde_json::json!({
+                "position_ms": entry.position_ms,
+                "length_ms": entry.length_ms,
+                "updated": entry.updated,
+            });
+            let mut metadata = serde_json::Map::new();
+            if !entry.title.is_empty() {
+                metadata.insert("title".to_string(), serde_json::json!(entry.title));
+            }
+            if let Some(locator) = &entry.locator {
+                let mut loc = serde_json::json!({
+                    "source": locator.source,
+                    "type": locator.kind,
+                    "id": locator.id,
+                });
+                if let Some(series) = &locator.series {
+                    loc["series"] = serde_json::json!(series);
+                }
+                metadata.insert("locator".to_string(), loc);
+            }
+            if !metadata.is_empty() {
+                record["metadata"] = serde_json::Value::Object(metadata);
+            }
+            map.insert(key.clone(), record);
+        }
+        let mut config = self.config.borrow_mut();
+        config.set_value("playback_bookmarks", serde_json::Value::Object(map));
         let _ = config.save(&self.path);
     }
 }
@@ -701,7 +858,6 @@ fn bind_browser(
         recorded: Rc::new(std::cell::Cell::new(false)),
         shutdown_attempted: Rc::new(std::cell::Cell::new(false)),
         last_dvr_tick: Rc::new(std::cell::Cell::new(0.0)),
-        previous_channel: Rc::new(RefCell::new(None)),
         scope_ids: Rc::new(RefCell::new(vec![None])),
         download_worker: Rc::new(iptv_core::downloads::DownloadWorker::default()),
         downloads: Rc::new(RefCell::new(Vec::new())),
@@ -2765,7 +2921,6 @@ fn clone_wiring(wiring: &Wiring) -> Wiring {
         recorded: Rc::clone(&wiring.recorded),
         shutdown_attempted: Rc::clone(&wiring.shutdown_attempted),
         last_dvr_tick: Rc::clone(&wiring.last_dvr_tick),
-        previous_channel: Rc::clone(&wiring.previous_channel),
         scope_ids: Rc::clone(&wiring.scope_ids),
         download_worker: Rc::clone(&wiring.download_worker),
         downloads: Rc::clone(&wiring.downloads),
@@ -3359,48 +3514,35 @@ fn build_recordings_menu(config: &Config) -> Menu {
     menu
 }
 
-/// Options > Subtitle Speech > Read previous subtitle.
+/// Options > Subtitle Speech > Read previous subtitle: the
+/// player review cursor's previous step (P11), through the
+/// shared speech route.
 fn menu_read_previous_subtitle(wiring: &Wiring, status: Status) {
-    let player = wiring.player.borrow();
-    if player.window.is_none() {
-        status.set_label("No subtitle is showing.");
-        return;
-    }
-    let position = position_length(&player).0;
-    let text = player
-        .subtitle_cues
-        .iter()
-        .rev()
-        .find(|cue| cue.end <= position)
-        .map(|cue| cue.text.clone());
-    drop(player);
-    match text {
-        Some(text) => speak_cue_text(&wiring.player, &wiring.persist, status, &text),
-        None => status.set_label("No previous subtitle."),
-    }
+    review_subtitle(&wiring.player, &wiring.persist, status, -1);
 }
 
 /// Options > Subtitle Speech > Review recent subtitles...
+/// (P11): the last 20 cues actually shown, newest first and
+/// numbered — never the file's unplayed tail.
 fn open_review_subtitles(wiring: &Wiring, status: Status) {
     let recent: Vec<String> = {
         let player = wiring.player.borrow();
-        if player.window.is_none() {
-            status.set_label("No subtitles are loaded.");
-            return;
-        }
-        let cues = &player.subtitle_cues;
-        let start = cues.len().saturating_sub(20);
-        cues[start..].iter().map(|c| c.text.clone()).collect()
+        player
+            .shown_cues
+            .iter()
+            .rev()
+            .take(20)
+            .enumerate()
+            .map(|(index, cue)| format!("{}. {}", index + 1, cue.text))
+            .collect()
     };
     if recent.is_empty() {
-        status.set_label("No subtitles are loaded.");
+        status.set_label("No recent subtitles.");
         return;
     }
     let (frame, _panel, list, dstatus) = list_dialog("Recent Subtitles", "Recent subtitles");
     list.set_items(&recent.iter().map(String::as_str).collect::<Vec<_>>());
-    if !recent.is_empty() {
-        list.set_selection(u32::try_from(recent.len() - 1).unwrap_or(0), true);
-    }
+    list.set_selection(0, true);
     dstatus.set_label(&format!("{} recent subtitles.", recent.len()));
     frame.show(true);
 }
@@ -4094,12 +4236,16 @@ fn bind_menu_actions(frame: Frame, wiring: &Wiring, controls: Controls) {
                 assert!(wiring.timer.start(50, false));
             }
             PREVIOUS_CHANNEL => {
-                let previous = wiring.previous_channel.borrow().clone();
-                match previous {
+                // The second entry of the persisted MRU
+                // (P17): playing it promotes it to the front,
+                // so repeated Previous toggles A/B.
+                let recent = resolved_recent(&wiring);
+                match recent.get(1) {
                     Some(channel) => {
+                        let channel = channel.clone();
                         play_channel(&wiring.player, persist, &channel, status);
                     }
-                    None => status.set_label("No previous channel yet."),
+                    None => status.set_label("No previous channel is available."),
                 }
             }
             CHANNEL_NUMBER => menu_go_to_channel_number(&wiring, frame, list, status),
@@ -4675,16 +4821,16 @@ fn menu_player_transport(wiring: &Wiring, play_pause: bool) {
         }
         return;
     }
-    if player.vlc_active {
-        if let Some(engine) = &mut player.vlc {
-            engine.stop();
-        }
-        player.vlc_active = false;
-    }
+    let stop_vlc = player.vlc_active;
+    player.vlc_active = false;
     if let Some(win) = &player.window {
         win.media.stop();
     }
     player.session.stop();
+    drop(player);
+    if stop_vlc {
+        queue_vlc_stop(&wiring.player);
+    }
 }
 
 /// Subtitle Speech > Read current subtitle: announce the cue active
@@ -5344,11 +5490,6 @@ fn activate_channel(wiring: &Wiring, list: ListCtrl, status: Status) {
         status.set_label("Resolving stream link...");
         return;
     }
-    if let Some(current) = wiring.player.borrow().current_channel.clone() {
-        if current.url != channel.url {
-            *wiring.previous_channel.borrow_mut() = Some(current);
-        }
-    }
     play_channel(&wiring.player, &wiring.persist, &channel, status);
 }
 
@@ -5413,10 +5554,83 @@ fn now_seconds() -> f64 {
         .map_or(0.0, |d| d.as_secs() as f64)
 }
 
+/// Monotonic milliseconds since process start (P20): launch
+/// debounce, session recovery deadlines and the sleep timer
+/// measure *elapsed* time, so a wall-clock correction must not
+/// move them. Wall-clock needs (EPG, DVR, stored timestamps)
+/// use `now_epoch` / `now_seconds` instead.
 fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let start = START.get_or_init(std::time::Instant::now);
+    i64::try_from(start.elapsed().as_millis()).unwrap_or(i64::MAX)
+}
+
+/// The answer to the resume choice (P15).
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ResumeChoice {
+    Resume,
+    Beginning,
+    Cancel,
+}
+
+/// Python's `choose_resume` (P15): "Resume playback from
+/// H:MM:SS?" with Resume, Play from Beginning — the default,
+/// as Python's `NO_DEFAULT` makes it — and Cancel.
+fn choose_resume(player: &Rc<RefCell<PlayerState>>, position_ms: i64) -> ResumeChoice {
+    let parent = player
+        .borrow()
+        .window
+        .as_ref()
+        .map_or_else(|| Frame::builder().build(), |win| win.frame);
+    let total_secs = position_ms / 1000;
+    let message = format!(
+        "Resume playback from {}:{:02}:{:02}?",
+        total_secs / 3600,
+        (total_secs % 3600) / 60,
+        total_secs % 60
+    );
+    let dialog = Dialog::builder(&parent, "Resume").build();
+    dialog.set_accessibility_label("Resume");
+    let panel = Panel::builder(&dialog).build();
+    let label = StaticText::builder(&panel).with_label(&message).build();
+    label.set_accessibility_label(&message);
+    let chosen = Rc::new(std::cell::Cell::new(ResumeChoice::Cancel));
+    let resume = Button::builder(&panel).with_label("&Resume").build();
+    resume.set_accessibility_label("Resume");
+    let beginning = Button::builder(&panel)
+        .with_label("Play from &Beginning")
+        .build();
+    beginning.set_accessibility_label("Play from Beginning");
+    let cancel = Button::builder(&panel).with_label("&Cancel").build();
+    cancel.set_accessibility_label("Cancel");
+    let sizer = BoxSizer::builder(Orientation::Vertical).build();
+    sizer.add(&label, 0, SizerFlag::All, 8);
+    let buttons = BoxSizer::builder(Orientation::Horizontal).build();
+    buttons.add(&resume, 0, SizerFlag::All, 4);
+    buttons.add(&beginning, 0, SizerFlag::All, 4);
+    buttons.add(&cancel, 0, SizerFlag::All, 4);
+    sizer.add_sizer(&buttons, 0, SizerFlag::Expand, 0);
+    panel.set_sizer(sizer, true);
+    for (button, choice) in [
+        (resume, ResumeChoice::Resume),
+        (beginning, ResumeChoice::Beginning),
+        (cancel, ResumeChoice::Cancel),
+    ] {
+        let chosen_b = Rc::clone(&chosen);
+        let dialog_b = dialog;
+        button.on_click(move |_| {
+            chosen_b.set(choice);
+            dialog_b.end_modal(ID_OK);
+        });
+    }
+    // "Play from Beginning" is the default button (Python's
+    // NO_DEFAULT), so it takes the focus.
+    beginning.set_focus();
+    if dialog.show_modal() == ID_OK {
+        chosen.get()
+    } else {
+        ResumeChoice::Cancel
+    }
 }
 
 fn play_channel(
@@ -5425,21 +5639,38 @@ fn play_channel(
     channel: &Channel,
     status: Status,
 ) {
-    {
-        let mut state = player.borrow_mut();
-        if state.history.first().map(|c| &c.url) != Some(&channel.url) {
-            state.history.insert(0, channel.clone());
-            state.history.truncate(50);
+    let probe = PlaybackRequest::for_channel(channel, None);
+    let mut resume = None;
+    if !probe.live {
+        // Python's prepare_vod_resume: the outgoing stream's
+        // checkpoint is force-saved before the lookup, and a
+        // saved position is offered, never silently applied
+        // (P15). Cancel aborts the launch entirely — the
+        // current stream keeps playing, the bookmark is
+        // untouched.
+        checkpoint_resume(player, persist, status, true);
+        let before = persist.resume_entries();
+        let (entries, key) = iptv_core::bookmarks::lookup(&before, channel);
+        if let Some(entry) = entries.get(&key) {
+            let position = entry.position_ms;
+            match choose_resume(player, position) {
+                ResumeChoice::Resume => {
+                    resume = Some(position);
+                    if entries != before {
+                        persist.save_resume(&entries);
+                    }
+                }
+                ResumeChoice::Beginning => {
+                    let mut entries = entries;
+                    entries.remove(&key);
+                    persist.save_resume(&entries);
+                }
+                ResumeChoice::Cancel => return,
+            }
+        } else if entries != before {
+            persist.save_resume(&entries);
         }
     }
-    let key = channel_key(channel);
-    let entries = persist.resume_entries();
-    let probe = PlaybackRequest::for_channel(channel, None);
-    let resume = if probe.live {
-        None
-    } else {
-        resume_position(&entries, &key)
-    };
     let request = PlaybackRequest::for_channel(channel, resume);
     let (media_player, custom_path) = {
         let config = persist.config.borrow();
@@ -5461,7 +5692,11 @@ fn play_channel(
                 candidates.into_iter().next()
             };
             match exe {
-                Some(exe) => launch_external(player, &name, &exe, &request, status),
+                Some(exe) => {
+                    if launch_external(player, &name, &exe, &request, status) && request.live {
+                        record_recent(persist, channel);
+                    }
+                }
                 None => status.set_label(&format!("Could not locate {name} executable.")),
             }
         }
@@ -5470,19 +5705,54 @@ fn play_channel(
                 status.set_label("No custom player path is configured.");
             } else {
                 let name = detect_from_path(&path);
-                launch_external(player, &name, &path, &request, status);
+                if launch_external(player, &name, &path, &request, status) && request.live {
+                    record_recent(persist, channel);
+                }
             }
         }
     }
 }
 
+/// Record one live channel in the persisted recent-channels
+/// MRU (P17). Python records only live kind, and only on a
+/// confirmed start: the built-in route records when the
+/// engine confirms Playing (see the poll loops), the external
+/// route when the launch is accepted and spawned.
+fn record_recent(persist: &Persist, channel: &Channel) {
+    let key = channel_key(channel);
+    if key.is_empty() {
+        return;
+    }
+    let keys = remember_recent(&persist.recent_keys(), &key);
+    persist.save_recent_keys(&keys);
+}
+
+/// The built-in route's half of P17 recording: once per play,
+/// when the session's current request is live and playback
+/// has been confirmed.
+fn record_history_once(player: &Rc<RefCell<PlayerState>>, persist: &Persist) {
+    let channel = {
+        let mut state = player.borrow_mut();
+        if state.history_recorded || !state.session.current().is_some_and(|request| request.live) {
+            return;
+        }
+        state.history_recorded = true;
+        state.current_channel.clone()
+    };
+    if let Some(channel) = channel {
+        record_recent(persist, &channel);
+    }
+}
+
+/// Launch an external player; true when the process spawned
+/// (a debounced duplicate or a spawn failure is false).
 fn launch_external(
     player: &Rc<RefCell<PlayerState>>,
     name: &str,
     exe: &str,
     request: &PlaybackRequest,
     status: Status,
-) {
+) -> bool {
     let ipc = std::env::temp_dir()
         .join("accessible-iptv-mpv.sock")
         .to_string_lossy()
@@ -5492,34 +5762,259 @@ fn launch_external(
         .gate
         .accept(name, exe, &request.url, now_ms());
     if accepted.is_none() {
-        return; // Debounced duplicate, as in Python: accepted silently.
+        return false; // Debounced duplicate, as in Python: accepted silently.
     }
     let argv = external_argv(name, exe, &request.url, &ipc);
     match Command::new(&argv[0]).args(&argv[1..]).spawn() {
-        Ok(_) => status.set_label(&format!("Playing {} in {name}.", request.title)),
-        Err(error) => status.set_label(&format!("Could not start {name}: {error}")),
+        Ok(_) => {
+            status.set_label(&format!("Playing {} in {name}.", request.title));
+            true
+        }
+        Err(error) => {
+            status.set_label(&format!("Could not start {name}: {error}"));
+            false
+        }
     }
 }
 
+/// Whether the channel's metadata declares it audio-only
+/// (radio), which keeps the freeze watchdog's video evidence
+/// disarmed (P03).
+fn is_audio_only_channel(channel: &Channel) -> bool {
+    iptv_core::playback::audio_only_hint(&channel.unknown_attributes)
+}
+
+/// Resolve an HLS master URL against the rendition cap on a
+/// worker, waiting at most Python's 400 ms probe window; any
+/// failure or timeout keeps the master URL (P05).
+fn resolve_variant_url(
+    url: &str,
+    headers: &iptv_core::playback::StreamHeaders,
+    cap: f64,
+) -> String {
+    let (sender, receiver) = std::sync::mpsc::channel::<String>();
+    let worker_url = url.to_string();
+    let worker_headers = headers.clone();
+    std::thread::spawn(move || {
+        let resolved = buffer::resolve_hls_input(&worker_url, &worker_headers, Some(cap))
+            .unwrap_or(worker_url);
+        let _ = sender.send(resolved);
+    });
+    receiver
+        .recv_timeout(std::time::Duration::from_millis(400))
+        .unwrap_or_else(|_| url.to_string())
+}
+
+/// One transport operation for the VLC ops worker (P18).
+/// Loads and stops execute in send order on one background
+/// thread — Python's `VLCControl` serialization — so a slow
+/// open or stop never blocks the keyboard, and a stop can
+/// never overtake the load it belongs to.
+enum VlcOp {
+    Load {
+        engine: iptv_vlc::VlcEngine,
+        url: String,
+        headers: iptv_core::playback::StreamHeaders,
+        options: iptv_vlc::MediaOptions,
+        reply: std::sync::Arc<std::sync::Mutex<Option<Result<(), String>>>>,
+    },
+    Stop {
+        engine: iptv_vlc::VlcEngine,
+    },
+}
+
+fn spawn_vlc_ops() -> std::sync::mpsc::Sender<VlcOp> {
+    let (sender, receiver) = std::sync::mpsc::channel::<VlcOp>();
+    std::thread::spawn(move || {
+        while let Ok(op) = receiver.recv() {
+            match op {
+                VlcOp::Load {
+                    engine,
+                    url,
+                    headers,
+                    options,
+                    reply,
+                } => {
+                    let result = engine.play_url(&url, &headers, options);
+                    if let Ok(mut guard) = reply.lock() {
+                        *guard = Some(result);
+                    }
+                }
+                VlcOp::Stop { engine } => engine.stop(),
+            }
+        }
+    });
+    sender
+}
+
+/// Queue a load on the ops worker; the result lands in the
+/// state's reply slot for `deliver_vlc_load`. False when no
+/// engine or worker exists (the caller falls back).
+fn queue_vlc_load(
+    player: &Rc<RefCell<PlayerState>>,
+    request: &PlaybackRequest,
+    options: iptv_vlc::MediaOptions,
+    retry: bool,
+) -> bool {
+    let (engine, sender, generation) = {
+        let state = player.borrow();
+        (
+            state.vlc.clone(),
+            state.vlc_ops.clone(),
+            state.session.generation(),
+        )
+    };
+    let (Some(engine), Some(sender)) = (engine, sender) else {
+        return false;
+    };
+    let reply = std::sync::Arc::new(std::sync::Mutex::new(None));
+    player.borrow_mut().vlc_load_reply = Some((generation, retry, std::sync::Arc::clone(&reply)));
+    sender
+        .send(VlcOp::Load {
+            engine,
+            url: request.url.clone(),
+            headers: request.headers.clone(),
+            options,
+            reply,
+        })
+        .is_ok()
+}
+
+/// Queue a stop on the ops worker, ordered after any load
+/// already queued.
+fn queue_vlc_stop(player: &Rc<RefCell<PlayerState>>) {
+    let (engine, sender) = {
+        let state = player.borrow();
+        (state.vlc.clone(), state.vlc_ops.clone())
+    };
+    if let (Some(engine), Some(sender)) = (engine, sender) {
+        let _ = sender.send(VlcOp::Stop { engine });
+    }
+}
+
+/// Deliver a finished worker load (P18): a superseded result
+/// is dropped; an initial load the full player refused falls
+/// back to the basic player for that request; a refused retry
+/// feeds the session's recovery as an error.
+fn deliver_vlc_load(player: &Rc<RefCell<PlayerState>>, persist: &Persist, status: Status) {
+    let ready = {
+        let state = player.borrow();
+        state
+            .vlc_load_reply
+            .as_ref()
+            .and_then(|(generation, retry, slot)| {
+                slot.lock()
+                    .ok()
+                    .and_then(|mut guard| guard.take().map(|result| (*generation, *retry, result)))
+            })
+    };
+    let Some((generation, retry, result)) = ready else {
+        return;
+    };
+    player.borrow_mut().vlc_load_reply = None;
+    if player.borrow().session.generation() != generation {
+        return; // superseded or stopped while loading
+    }
+    let Err(error) = result else {
+        return;
+    };
+    let mut state = player.borrow_mut();
+    if !retry && state.engine == ActiveEngine::Vlc && !state.session.played_once() {
+        state.engine = ActiveEngine::Fallback;
+        state.vlc_active = false;
+        state.vlc_error = Some(error);
+        let request = state.session.current().cloned();
+        if let (Some(win), Some(request)) = (&state.window, request) {
+            win.media.load_uri(&request.url);
+            win.media.play();
+        }
+        drop(state);
+        apply_engine_to_playback_menu(player);
+        let state = player.borrow();
+        if let Some(error) = &state.vlc_error {
+            status.set_label(&format!(
+                "The full player could not play this stream ({error}); basic player in use."
+            ));
+        }
+    } else {
+        let action = state.session.on_event(EngineEvent::Error(error), now_ms());
+        drop(state);
+        store_session_action(player, persist, status, action);
+    }
+}
+#[allow(clippy::too_many_lines)]
 fn play_builtin(
     player: &Rc<RefCell<PlayerState>>,
     persist: &Persist,
     channel: &Channel,
-    request: PlaybackRequest,
+    mut request: PlaybackRequest,
     status: Status,
 ) {
     if !request.buffer_bypass && buffer_intercept(player, persist, channel, &request, status) {
         return;
+    }
+    // Direct HLS playback honours the rendition bitrate cap
+    // (P05): resolve the master against the saved cap the way
+    // Python does (bounded wait, master URL on any failure).
+    // Buffer-owned and buffer-replay URLs bypass resolution.
+    if !request.buffer_bypass {
+        let cap = persist
+            .config
+            .borrow()
+            .internal_player_settings()
+            .variant_max_mbps;
+        let lowered = request.url.to_lowercase();
+        if cap > 0.0 && (lowered.contains("m3u8") || lowered.contains("manifest")) {
+            request.url = resolve_variant_url(&request.url, &request.headers, cap);
+        }
     }
     ensure_player_window(player, persist, status);
     let mut state = player.borrow_mut();
     state.current_channel = Some(channel.clone());
     state.pending_resume_ms = request.resume_ms;
     state.pending_reconnect = None;
-    // A channel change discards the old programme's spoken cue.
+    state.reconnect_rollover = false;
+    // A new choice restarts the cache plan at the saved opening
+    // value (P01) and re-arms the per-channel audio supply (P06).
+    state.cache_plan =
+        iptv_core::playback::CachePlan::new(&persist.config.borrow().internal_player_settings());
+    state.dispatcharr = channel.unknown_attributes.contains_key("catchup-timezone")
+        || channel.unknown_attributes.contains_key("dispatcharr");
+    let audio_key =
+        iptv_core::audiotracks::audio_memory_key(&channel.name, &channel.tvg_name, &channel.tvg_id);
+    let (names, indices) = persist.audio_memory();
+    state.supply_audio_name = names.get(&audio_key).cloned();
+    state.supply_audio_index = indices.get(&audio_key).copied();
+    state.audio_key = audio_key;
+    state.watchdog = iptv_core::playback::FreezeWatchdog::new(
+        is_audio_only_channel(channel),
+        persist
+            .config
+            .borrow()
+            .bool_or("show_player_on_enter", true),
+    );
+    state.track_attempts = 0;
+    state.selected_spu = -2;
+    state.file_subtitle_track = None;
+    state.spu_ids.clear();
+    // A channel change discards the old programme's spoken cue
+    // and invalidates any in-flight subtitle parse (P09).
     state.app_voice.stop();
     state.subtitle_cues.clear();
     state.last_spoken_cue = None;
+    state.subtitle_generation += 1;
+    state.pending_subtitles = None;
+    // Review starts empty on a new stream (P11), history
+    // recording re-arms (P17), and an adopted resume position
+    // is protected until the seek is confirmed (P16).
+    state.review.reset();
+    state.active_cue_index = None;
+    state.last_shown_cue = None;
+    state.shown_cues.clear();
+    state.history_recorded = false;
+    state.resume_guard = request
+        .resume_ms
+        .map(|ms| iptv_core::playback::ResumeGuard::new(ms, now_ms()));
     let action = state.session.play(request, now_ms());
     let Some(win) = state.window.clone() else {
         return;
@@ -5534,15 +6029,24 @@ fn play_builtin(
                 }
                 Err(error) => state.vlc_error = Some(error),
             }
-            if let Some(engine) = &mut state.vlc {
+            if let Some(engine) = &state.vlc {
                 engine.set_window_handle(win.media.get_handle() as usize);
             }
+            if state.vlc.is_some() && state.vlc_ops.is_none() {
+                state.vlc_ops = Some(spawn_vlc_ops());
+            }
         }
-        let vlc_started = match &mut state.vlc {
-            Some(engine) => engine.play_url(&load.url, &load.headers).is_ok(),
-            None => false,
+        let options = iptv_vlc::MediaOptions {
+            cache_ms: state.cache_plan.cache_ms(load.live, false, false),
+            live: load.live,
         };
-        let via_vlc = vlc_started;
+        let has_vlc = state.vlc.is_some();
+        drop(state);
+        // The load runs on the ops worker (P18); its result is
+        // delivered by deliver_vlc_load, which falls back to
+        // the basic player if the full player refuses.
+        let via_vlc = has_vlc && queue_vlc_load(player, &load, options, false);
+        state = player.borrow_mut();
         state.engine = if via_vlc {
             ActiveEngine::Vlc
         } else {
@@ -5551,6 +6055,8 @@ fn play_builtin(
         if via_vlc {
             state.vlc_active = true;
             state.vlc_tracks_ready = false;
+            state.play_started_ms = now_ms();
+            state.watchdog.reset();
             drop(state);
             apply_saved_audio_device(player, persist);
             state = player.borrow_mut();
@@ -5649,7 +6155,20 @@ fn store_session_action(
     match action {
         EngineAction::Reconnect(request, delay) => {
             let mut state = player.borrow_mut();
+            // A failure recovery grows the cache base by one
+            // second for the retry (P01; Dispatcharr live and
+            // the rollover path never grow).
+            let live = request.live;
+            let dispatcharr = state.dispatcharr;
+            state.cache_plan.grow(dispatcharr, live);
+            state.reconnect_rollover = false;
             state.pending_reconnect = Some((state.session.generation(), now_ms() + delay, request));
+        }
+        EngineAction::Rollover(request, delay) => {
+            let mut state = player.borrow_mut();
+            state.reconnect_rollover = true;
+            state.pending_reconnect = Some((state.session.generation(), now_ms() + delay, request));
+            player_status(status, persist, "Refreshing stream…", 3);
         }
         EngineAction::Stop => settle_session(player, persist, status),
         _ => {}
@@ -5660,13 +6179,13 @@ fn store_session_action(
 /// when the stream was lost say so at top priority with the long
 /// report in the status details.
 fn settle_session(player: &Rc<RefCell<PlayerState>>, persist: &Persist, status: Status) {
+    let mut stop_vlc = false;
     let lost_report = {
         let mut state = player.borrow_mut();
         state.pending_reconnect = None;
+        state.reconnect_rollover = false;
         if state.vlc_active {
-            if let Some(engine) = &mut state.vlc {
-                engine.stop();
-            }
+            stop_vlc = true;
             state.vlc_active = false;
         }
         if let Some(win) = &state.window {
@@ -5674,6 +6193,9 @@ fn settle_session(player: &Rc<RefCell<PlayerState>>, persist: &Persist, status: 
         }
         state.session.lost_report()
     };
+    if stop_vlc {
+        queue_vlc_stop(player);
+    }
     if let Some(report) = lost_report {
         player_status(status, persist, "Stream lost", 1);
         // Python shows the long form in its Stream Lost dialog.
@@ -5688,22 +6210,34 @@ fn settle_session(player: &Rc<RefCell<PlayerState>>, persist: &Persist, status: 
 }
 
 /// (Re)load a request into the engine that owns the current
-/// session. False when no engine accepted the load.
+/// session. False when no engine accepted the load. A retry
+/// load carries the cache plan's retry value; a rollover load
+/// the quick-start value (P01/P04).
 fn engine_load(player: &Rc<RefCell<PlayerState>>, request: &PlaybackRequest) -> bool {
-    let mut state = player.borrow_mut();
-    if state.engine == ActiveEngine::Vlc {
-        match &mut state.vlc {
-            Some(engine) => {
-                let ok = engine.play_url(&request.url, &request.headers).is_ok();
-                if ok {
-                    state.vlc_active = true;
-                    state.vlc_tracks_ready = false;
-                }
-                ok
+    if player.borrow().engine == ActiveEngine::Vlc {
+        let options = {
+            let state = player.borrow();
+            iptv_vlc::MediaOptions {
+                cache_ms: state
+                    .cache_plan
+                    .cache_ms(request.live, true, state.reconnect_rollover),
+                live: request.live,
             }
-            None => false,
+        };
+        // Queued on the ops worker (P18); a refused load comes
+        // back through deliver_vlc_load as a session error.
+        let queued = queue_vlc_load(player, request, options, true);
+        if queued {
+            let mut state = player.borrow_mut();
+            state.vlc_active = true;
+            state.vlc_tracks_ready = false;
+            state.track_attempts = 0;
+            state.play_started_ms = now_ms();
+            state.watchdog.reset();
         }
+        queued
     } else {
+        let state = player.borrow_mut();
         match &state.window {
             Some(win) => {
                 win.media.load_uri(&request.url);
@@ -5760,6 +6294,10 @@ struct PlayerWindow {
     time_label: StaticText,
     subtitle_label: StaticText,
     tracks: Choice,
+    /// The controls panel (everything but the video surface):
+    /// hidden in fullscreen (P19).
+    controls_panel: Panel,
+    fullscreen_button: Button,
 }
 
 /// Handles the player window needs from the main wiring (record and
@@ -5777,6 +6315,7 @@ struct PlayerShared {
 
 /// Build the built-in player window once: video surface, seek and
 /// volume sliders, time and subtitle labels, the audio track
+#[allow(clippy::too_many_lines)]
 /// choice, and the action buttons.
 fn ensure_player_window(player: &Rc<RefCell<PlayerState>>, persist: &Persist, status: Status) {
     if player.borrow().window.is_some() {
@@ -5788,47 +6327,63 @@ fn ensure_player_window(player: &Rc<RefCell<PlayerState>>, persist: &Persist, st
         .build();
     frame.set_accessibility_label("Player");
     let panel = Panel::builder(&frame).build();
-    let media = MediaCtrl::builder(&panel).build();
+    // The video surface gets its own panel so fullscreen can
+    // hide the controls panel while the video remains (P19).
+    let video_panel = Panel::builder(&panel).build();
+    let controls_panel = Panel::builder(&panel).build();
+    let media = MediaCtrl::builder(&video_panel).build();
     media.set_accessibility_label("Video");
-    let seek = Slider::builder(&panel).build();
+    let seek = Slider::builder(&controls_panel).build();
     seek.set_range(0, 1000);
     seek.set_accessibility_label("Seek");
-    let time_label = StaticText::builder(&panel).with_label("Live").build();
+    let time_label = StaticText::builder(&controls_panel)
+        .with_label("Live")
+        .build();
     time_label.set_accessibility_label("Playback position");
-    let subtitle_label = StaticText::builder(&panel).with_label("").build();
+    let subtitle_label = StaticText::builder(&controls_panel).with_label("").build();
     subtitle_label.set_accessibility_label("Current subtitle");
-    let volume_caption = StaticText::builder(&panel).with_label("&Volume").build();
+    let volume_caption = StaticText::builder(&controls_panel)
+        .with_label("&Volume")
+        .build();
     let _ = volume_caption;
-    let volume = Slider::builder(&panel).build();
+    let volume = Slider::builder(&controls_panel).build();
     volume.set_range(0, 100);
     volume.set_value(100);
     volume.set_accessibility_label("Volume");
-    let tracks_caption = StaticText::builder(&panel)
+    let tracks_caption = StaticText::builder(&controls_panel)
         .with_label("Choose &Audio Track")
         .build();
     let _ = tracks_caption;
-    let tracks = Choice::builder(&panel).build();
+    let tracks = Choice::builder(&controls_panel).build();
     tracks.append("Default");
     tracks.set_selection(0);
     tracks.set_accessibility_label("Choose Audio Track");
-    let pause = Button::builder(&panel)
+    let pause = Button::builder(&controls_panel)
         .with_label("&Pause or resume")
         .build();
     pause.set_accessibility_label("Pause or resume");
-    let stop = Button::builder(&panel).with_label("&Stop").build();
+    let stop = Button::builder(&controls_panel).with_label("&Stop").build();
     stop.set_accessibility_label("Stop");
-    let record = Button::builder(&panel).with_label("&Record").build();
+    let record = Button::builder(&controls_panel)
+        .with_label("&Record")
+        .build();
     record.set_accessibility_label("Record");
-    let cast = Button::builder(&panel).with_label("&Cast").build();
+    let cast = Button::builder(&controls_panel).with_label("&Cast").build();
     cast.set_accessibility_label("Cast");
-    let fullscreen = Button::builder(&panel).with_label("&Full Screen").build();
-    fullscreen.set_accessibility_label("Full screen");
-    let subs = Button::builder(&panel)
+    let fullscreen = Button::builder(&controls_panel)
+        .with_label("&Full Screen")
+        .build();
+    // Python constructs the button named "Toggle Full
+    // Screen"; the name follows the label after a toggle.
+    fullscreen.set_accessibility_label("Toggle Full Screen");
+    let subs = Button::builder(&controls_panel)
         .with_label("Load &subtitles…")
         .build();
     subs.set_accessibility_label("Load subtitles");
+    let video_sizer = BoxSizer::builder(Orientation::Vertical).build();
+    video_sizer.add(&media, 1, SizerFlag::Expand | SizerFlag::All, 4);
+    video_panel.set_sizer(video_sizer, true);
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
-    sizer.add(&media, 1, SizerFlag::Expand | SizerFlag::All, 4);
     sizer.add(&seek, 0, SizerFlag::Expand | SizerFlag::All, 4);
     sizer.add(&time_label, 0, SizerFlag::All, 4);
     sizer.add(&subtitle_label, 0, SizerFlag::All, 4);
@@ -5844,7 +6399,11 @@ fn ensure_player_window(player: &Rc<RefCell<PlayerState>>, persist: &Persist, st
     buttons.add(&fullscreen, 0, SizerFlag::All, 4);
     buttons.add(&subs, 0, SizerFlag::All, 4);
     sizer.add_sizer(&buttons, 0, SizerFlag::Expand, 0);
-    panel.set_sizer(sizer, true);
+    controls_panel.set_sizer(sizer, true);
+    let root = BoxSizer::builder(Orientation::Vertical).build();
+    root.add(&video_panel, 1, SizerFlag::Expand, 0);
+    root.add(&controls_panel, 0, SizerFlag::Expand, 0);
+    panel.set_sizer(root, true);
 
     let win = PlayerWindow {
         frame,
@@ -5854,6 +6413,8 @@ fn ensure_player_window(player: &Rc<RefCell<PlayerState>>, persist: &Persist, st
         time_label,
         subtitle_label,
         tracks,
+        controls_panel,
+        fullscreen_button: fullscreen,
     };
     wire_player_events(
         player,
@@ -5895,6 +6456,7 @@ const PM_WHATS_PLAYING: i32 = 5332;
 const PM_HIDE: i32 = 5333;
 const PM_EXIT: i32 = 5334;
 const PM_TRACK_BASE: i32 = 5340;
+const PM_SUB_BASE: i32 = 5400;
 
 /// The Playback menu's transport block: Play/Pause (label
 /// carries the effective shortcut), Stop, Sleep Timer, the
@@ -5907,7 +6469,13 @@ fn playback_transport_items(menu: &Menu, keys: &std::collections::BTreeMap<Strin
         "",
         ItemKind::Normal,
     );
-    menu_add(menu, PM_STOP, "&Stop", "", ItemKind::Normal);
+    menu_add(
+        menu,
+        PM_STOP,
+        &menu_label(keys, "&Stop", "stop"),
+        "",
+        ItemKind::Normal,
+    );
     menu_add(menu, PM_SLEEP, "Sleep &Timer...", "", ItemKind::Normal);
     menu_add(
         menu,
@@ -5924,12 +6492,19 @@ fn playback_transport_items(menu: &Menu, keys: &std::collections::BTreeMap<Strin
         "",
         ItemKind::Normal,
     );
-    menu_add(menu, PM_RECORD, "&Record", "", ItemKind::Normal);
+    menu_add(
+        menu,
+        PM_RECORD,
+        &menu_label(keys, "&Record", "record"),
+        "",
+        ItemKind::Normal,
+    );
 }
 
 /// Build the player window's Playback menu (Python's order and
 /// items). Dynamic pieces: the Audio Track submenu fills when
 /// libVLC publishes tracks (`apply_vlc_tracks`), and the Speak
+#[allow(clippy::too_many_lines)]
 /// Subtitles check mirrors the setting.
 fn build_playback_menu(
     player: &Rc<RefCell<PlayerState>>,
@@ -5953,7 +6528,24 @@ fn build_playback_menu(
         ItemKind::Normal,
     );
     audio_menu.enable_item(PM_NO_TRACKS, false);
-    menu.append_submenu(audio_menu, "Audio Trac&k", "");
+    menu.append_submenu(
+        audio_menu,
+        &menu_label(&keys, "Audio Trac&k", "audio_track"),
+        "",
+    );
+    // The Subtitles submenu (P08): Off plus the embedded SPU
+    // tracks as radios, rebuilt by refresh_subtitle_menu
+    // whenever libVLC publishes a different list.
+    let sub_menu = Menu::builder().build();
+    menu_add(
+        &sub_menu,
+        PM_SUB_BASE,
+        "No subtitle tracks available",
+        "",
+        ItemKind::Normal,
+    );
+    sub_menu.enable_item(PM_SUB_BASE, false);
+    menu.append_submenu(sub_menu, &menu_label(&keys, "Sub&titles", "subtitles"), "");
     menu_add(
         &menu,
         PM_LOAD_SUBS,
@@ -5964,7 +6556,7 @@ fn build_playback_menu(
     menu_add(
         &menu,
         PM_SPEAK_SUBS,
-        "Spea&k Subtitles",
+        &menu_label(&keys, "Spea&k Subtitles", "speak_subtitles"),
         "",
         ItemKind::Check,
     );
@@ -5973,18 +6565,24 @@ fn build_playback_menu(
     menu_add(
         &menu,
         PM_READ_SUB,
-        "Read &Current Subtitle",
+        &menu_label(&keys, "Read &Current Subtitle", "read_subtitle"),
         "",
         ItemKind::Normal,
     );
     menu_add(
         &menu,
         PM_PREV_SUB,
-        "&Previous Subtitle",
+        &menu_label(&keys, "&Previous Subtitle", "previous_subtitle"),
         "",
         ItemKind::Normal,
     );
-    menu_add(&menu, PM_NEXT_SUB, "&Next Subtitle", "", ItemKind::Normal);
+    menu_add(
+        &menu,
+        PM_NEXT_SUB,
+        &menu_label(&keys, "&Next Subtitle", "next_subtitle"),
+        "",
+        ItemKind::Normal,
+    );
     // Python shows a hard-coded D accelerator on this item.
     menu_add(
         &menu,
@@ -5994,24 +6592,42 @@ fn build_playback_menu(
         ItemKind::Normal,
     );
     menu.append_separator();
-    menu_add(&menu, PM_CAST, "&Cast...", "", ItemKind::Normal);
+    menu_add(
+        &menu,
+        PM_CAST,
+        &menu_label(&keys, "&Cast...", "cast"),
+        "",
+        ItemKind::Normal,
+    );
     menu_add(
         &menu,
         PM_FULLSCREEN,
-        "Toggle &Full Screen",
+        &menu_label(&keys, "Toggle &Full Screen", "fullscreen"),
         "",
         ItemKind::Normal,
     );
     menu_add(
         &menu,
         PM_WHATS_PLAYING,
-        "What Is &Playing",
+        &menu_label(&keys, "What Is &Playing", "what_is_playing"),
         "",
         ItemKind::Normal,
     );
     menu.append_separator();
-    menu_add(&menu, PM_HIDE, "&Hide Window", "", ItemKind::Normal);
-    menu_add(&menu, PM_EXIT, "E&xit Player", "", ItemKind::Normal);
+    menu_add(
+        &menu,
+        PM_HIDE,
+        &menu_label(&keys, "&Hide Window", "hide"),
+        "",
+        ItemKind::Normal,
+    );
+    menu_add(
+        &menu,
+        PM_EXIT,
+        &menu_label(&keys, "E&xit Player", "exit"),
+        "",
+        ItemKind::Normal,
+    );
     let bar = MenuBar::builder().append(menu, "&Playback").build();
     win.frame.set_menu_bar(bar);
     let menu_player = Rc::clone(player);
@@ -6035,6 +6651,14 @@ fn dispatch_player_menu(
             win.tracks.set_selection(index);
         }
         choose_audio_track(player, persist, index, status);
+        return;
+    }
+    if (PM_SUB_BASE..PM_SUB_BASE + 41).contains(&id) {
+        let index = usize::try_from(id - PM_SUB_BASE).unwrap_or(0);
+        let spu = player.borrow().spu_ids.get(index).copied();
+        if let Some(spu) = spu {
+            select_subtitle_track(player, persist, status, spu);
+        }
         return;
     }
     let win = player.borrow().window.clone();
@@ -6083,9 +6707,9 @@ fn dispatch_player_menu(
                 2,
             );
         }
-        PM_READ_SUB => announce_cue(player, "read_subtitle", status),
-        PM_PREV_SUB => announce_cue(player, "previous_subtitle", status),
-        PM_NEXT_SUB => announce_cue(player, "next_subtitle", status),
+        PM_READ_SUB => announce_cue(player, persist, "read_subtitle", status),
+        PM_PREV_SUB => announce_cue(player, persist, "previous_subtitle", status),
+        PM_NEXT_SUB => announce_cue(player, persist, "next_subtitle", status),
         PM_CAST => {
             let state = player.borrow();
             if let Some(shared) = &state.shared {
@@ -6099,7 +6723,7 @@ fn dispatch_player_menu(
                 );
             }
         }
-        PM_FULLSCREEN => win.frame.show_full_screen(!win.frame.is_full_screen()),
+        PM_FULLSCREEN => set_fullscreen(player, !win.frame.is_full_screen()),
         PM_WHATS_PLAYING => {
             let state = player.borrow();
             match &state.current_channel {
@@ -6127,6 +6751,174 @@ fn audio_track_menu(player: &Rc<RefCell<PlayerState>>) -> Option<Menu> {
     playback_menu(player)?
         .find_item_by_position(8)?
         .get_sub_menu()
+}
+
+/// The Subtitles submenu (position 9, after Audio Track).
+fn subtitle_menu(player: &Rc<RefCell<PlayerState>>) -> Option<Menu> {
+    playback_menu(player)?
+        .find_item_by_position(9)?
+        .get_sub_menu()
+}
+
+/// Republish the Subtitles submenu from libVLC (P08): radio
+/// items Off + the embedded tracks in description order, the
+/// current selection checked. Runs when the audio refresh sees
+/// a changed track list and when a selection is made.
+fn refresh_subtitle_menu(player: &Rc<RefCell<PlayerState>>) {
+    let (tracks, current) = {
+        let state = player.borrow();
+        if !state.vlc_active {
+            return;
+        }
+        match &state.vlc {
+            Some(engine) => (engine.subtitle_tracks(), engine.subtitle_track()),
+            None => return,
+        }
+    };
+    let choices: Vec<i32> = std::iter::once(-1)
+        .chain(tracks.iter().map(|(id, _)| *id).filter(|id| *id >= 0))
+        .collect();
+    let selected = if choices.contains(&current) {
+        current
+    } else {
+        player.borrow().selected_spu
+    };
+    let Some(menu) = subtitle_menu(player) else {
+        return;
+    };
+    let mut state = player.borrow_mut();
+    for old in state.spu_menu_ids.drain(..) {
+        menu.delete(old);
+    }
+    for (index, spu) in choices.iter().enumerate() {
+        let id = PM_SUB_BASE + i32::try_from(index).unwrap_or(0);
+        let label = if *spu == -1 {
+            "Off".to_string()
+        } else {
+            tracks
+                .iter()
+                .find(|(track_id, _)| track_id == spu)
+                .map_or_else(
+                    || format!("Track {spu}"),
+                    |(_, name)| {
+                        if name.is_empty() {
+                            format!("Track {spu}")
+                        } else {
+                            name.clone()
+                        }
+                    },
+                )
+        };
+        menu_add(&menu, id, &label, "", ItemKind::Radio);
+        state.spu_menu_ids.push(id);
+        if *spu == selected {
+            menu.check_item(id, true);
+        }
+    }
+    state.spu_ids = choices;
+    if current >= -1 {
+        state.selected_spu = current;
+    }
+}
+
+/// Select an embedded subtitle track (or Off) in VLC (P08).
+/// Selecting an embedded track discards the sidecar file's
+/// cues, as Python does; selecting Off keeps already-shown
+/// review text but silences display and speech.
+fn select_subtitle_track(
+    player: &Rc<RefCell<PlayerState>>,
+    persist: &Persist,
+    status: Status,
+    spu: i32,
+) {
+    let name = {
+        let state = player.borrow();
+        state
+            .vlc
+            .as_ref()
+            .map(iptv_vlc::VlcEngine::subtitle_tracks)
+            .unwrap_or_default()
+            .iter()
+            .find(|(id, _)| *id == spu)
+            .map(|(_, name)| {
+                if name.is_empty() {
+                    format!("Track {spu}")
+                } else {
+                    name.clone()
+                }
+            })
+    };
+    let mut state = player.borrow_mut();
+    state.selected_spu = spu;
+    if state.vlc_active {
+        if let Some(engine) = &mut state.vlc {
+            engine.set_subtitle_track(spu);
+        }
+    }
+    if spu >= 0 && state.file_subtitle_track != Some(spu) {
+        state.subtitle_cues.clear();
+        state.last_spoken_cue = None;
+        state.last_label_cue = None;
+        state.file_subtitle_track = None;
+        state.subtitle_generation += 1;
+        state.pending_subtitles = None;
+        // The file's cues are discarded: review starts
+        // empty for the new source (P11).
+        state.review.reset();
+        state.active_cue_index = None;
+        state.last_shown_cue = None;
+        state.shown_cues.clear();
+        if let Some(win) = &state.window {
+            win.subtitle_label.set_label("");
+        }
+    }
+    drop(state);
+    refresh_subtitle_menu(player);
+    player_status(
+        status,
+        persist,
+        &format!(
+            "Subtitles: {}",
+            if spu == -1 {
+                "Off".to_string()
+            } else {
+                name.unwrap_or_else(|| format!("Track {spu}"))
+            }
+        ),
+        2,
+    );
+}
+
+/// Cycle subtitles (the player `S` key, P13/P08): Off, then
+/// the embedded tracks in order, then back to Off.
+fn cycle_subtitle_track(player: &Rc<RefCell<PlayerState>>, persist: &Persist, status: Status) {
+    let (choices, current) = {
+        let state = player.borrow();
+        if !state.vlc_active {
+            status.set_label("Subtitle tracks are not available with the basic player.");
+            return;
+        }
+        match &state.vlc {
+            Some(engine) => {
+                let mut choices = vec![-1];
+                choices.extend(
+                    engine
+                        .subtitle_tracks()
+                        .iter()
+                        .map(|(id, _)| *id)
+                        .filter(|id| *id >= 0),
+                );
+                let live = engine.subtitle_track();
+                (choices, if live >= -1 { live } else { state.selected_spu })
+            }
+            None => return,
+        }
+    };
+    let next = choices
+        .iter()
+        .position(|id| *id == current)
+        .map_or(choices[0], |index| choices[(index + 1) % choices.len()]);
+    select_subtitle_track(player, persist, status, next);
 }
 
 /// Apply the persisted audio output device to the libVLC
@@ -6239,7 +7031,10 @@ fn prompt_audio_device(
 }
 
 /// Select an audio track by Choice index (the Choice and the
-/// Audio Track menu share this).
+/// Audio Track menu share this). A manual choice is persisted
+/// (P06): the channel's remembered name and slot, plus the
+/// global last track — automatic preference application never
+/// writes that memory.
 fn choose_audio_track(
     player: &Rc<RefCell<PlayerState>>,
     persist: &Persist,
@@ -6260,12 +7055,41 @@ fn choose_audio_track(
             }
         }
     }
+    let key = state.audio_key.clone();
+    drop(state);
+    if !key.is_empty() && !label.is_empty() {
+        persist.save_audio_choice(&key, &label, i64::from(index));
+    }
     player_status(
         status,
         persist,
         &format!("Audio track preference: {label}"),
         2,
     );
+}
+
+/// Cycle to the next audio track (the player `A` key, P13):
+/// wraps through the published choice entries.
+fn cycle_audio_track(player: &Rc<RefCell<PlayerState>>, persist: &Persist, status: Status) {
+    let (count, current) = {
+        let state = player.borrow();
+        let Some(win) = &state.window else {
+            return;
+        };
+        (
+            state.vlc_track_ids.len(),
+            win.tracks.get_selection().unwrap_or(0),
+        )
+    };
+    if count == 0 {
+        status.set_label("No audio tracks available.");
+        return;
+    }
+    let next = (current + 1) % u32::try_from(count).unwrap_or(1);
+    if let Some(win) = player.borrow().window.clone() {
+        win.tracks.set_selection(next);
+    }
+    choose_audio_track(player, persist, next, status);
 }
 
 /// Python's Sleep Timer prompts: minutes (0-1440, 0 cancels),
@@ -6281,7 +7105,7 @@ fn prompt_sleep_timer(
         let state = player.borrow();
         state
             .sleep_deadline
-            .map(|deadline| ((deadline - now_epoch()).max(0) + 59) / 60)
+            .map(|deadline| ((deadline - now_ms()).max(0) / 1000 + 59) / 60)
     };
     let dialog = TextEntryDialog::builder(
         &frame,
@@ -6335,7 +7159,7 @@ fn prompt_sleep_timer(
     }
     persist.set_and_save("sleep_fade_seconds", serde_json::json!(fade));
     let mut state = player.borrow_mut();
-    state.sleep_deadline = Some(now_epoch() + minutes * 60);
+    state.sleep_deadline = Some(now_ms() + minutes * 60_000);
     state.sleep_fade_secs = fade;
     state.sleep_fading = false;
     status.set_label(&format!(
@@ -6363,7 +7187,7 @@ fn cancel_sleep_timer(player: &Rc<RefCell<PlayerState>>) {
 /// volume ramps linearly to zero, and the deadline stops
 /// playback (restoring the pre-fade volume for the next play).
 fn drive_sleep_timer(player: &Rc<RefCell<PlayerState>>, persist: &Persist, status: Status) {
-    let now = now_epoch();
+    let now = now_ms();
     let (deadline, fade, fading) = {
         let state = player.borrow();
         (
@@ -6386,7 +7210,7 @@ fn drive_sleep_timer(player: &Rc<RefCell<PlayerState>>, persist: &Persist, statu
         player_set_volume(player, start_volume);
         return;
     }
-    if fade > 0 && now >= deadline - fade {
+    if fade > 0 && now >= deadline - fade * 1000 {
         if !fading {
             let start_volume = player
                 .borrow()
@@ -6404,8 +7228,8 @@ fn drive_sleep_timer(player: &Rc<RefCell<PlayerState>>, persist: &Persist, statu
             );
         }
         let start = player.borrow().sleep_start_volume;
-        let remaining = deadline - now;
-        let level = (i64::from(start) * remaining / fade).clamp(0, i64::from(start));
+        let remaining_secs = (deadline - now) / 1000;
+        let level = (i64::from(start) * remaining_secs / fade).clamp(0, i64::from(start));
         player_set_volume(player, i32::try_from(level).unwrap_or(0));
     }
 }
@@ -6424,9 +7248,10 @@ struct PlayerButtons {
 /// resume checkpointing, subtitle speech, engine state,
 /// the sleep timer and the window chrome.
 fn player_tick(player: &Rc<RefCell<PlayerState>>, persist: &Persist, status: Status) {
+    deliver_vlc_load(player, persist, status);
     deliver_buffer_pending(player, persist, status);
     poll_buffer(player, persist, status);
-    checkpoint_resume(player, persist);
+    checkpoint_resume(player, persist, status, false);
     speak_subtitle_cue(player, persist, status);
     drive_speech_watchdog(player, persist, status);
     poll_vlc_state(player, persist, status);
@@ -6437,6 +7262,7 @@ fn player_tick(player: &Rc<RefCell<PlayerState>>, persist: &Persist, status: Sta
 }
 
 /// Timer, buttons, media events, keys and close behavior for the
+#[allow(clippy::too_many_lines)]
 /// player window.
 fn wire_player_events(
     player: &Rc<RefCell<PlayerState>>,
@@ -6454,6 +7280,16 @@ fn wire_player_events(
         player_tick(&tick_player, &tick_persist, status);
     });
     let _ = timer.start(1000, false);
+    // Subtitle sampling runs at Python's 150 ms (P10), on its
+    // own timer so short cues are never skipped between the
+    // one-second ticks.
+    let sub_timer = Rc::new(Timer::new(&frame));
+    let sub_player = Rc::clone(player);
+    let sub_persist = persist.clone();
+    sub_timer.on_tick(move |_| {
+        subtitle_tick(&sub_player, &sub_persist, status);
+    });
+    let _ = sub_timer.start(150, false);
 
     bind_subtitle_load(buttons.subs, player, frame, persist, status);
     let pause_player = Rc::clone(player);
@@ -6497,8 +7333,9 @@ fn wire_player_events(
             state.current_channel.as_ref(),
         );
     });
+    let fullscreen_player = Rc::clone(player);
     buttons.fullscreen.on_click(move |_| {
-        frame.show_full_screen(!frame.is_full_screen());
+        set_fullscreen(&fullscreen_player, !frame.is_full_screen());
     });
     let loaded_player = Rc::clone(player);
     let loaded_persist = persist.clone();
@@ -6516,15 +7353,19 @@ fn wire_player_events(
     media.on_stop(move |_| {
         let action = {
             let mut state = stopped_player.borrow_mut();
-            let near_end = state.window.as_ref().is_some_and(|win| {
-                win.media.length() > 0 && win.media.tell() >= win.media.length() - 1500
-            });
-            let event = if near_end {
-                EngineEvent::Ended
+            if let Some(action) = rollover_action(&mut state) {
+                action
             } else {
-                EngineEvent::Stalled
-            };
-            state.session.on_event(event, now_ms())
+                let near_end = state.window.as_ref().is_some_and(|win| {
+                    win.media.length() > 0 && win.media.tell() >= win.media.length() - 1500
+                });
+                let event = if near_end {
+                    EngineEvent::Ended
+                } else {
+                    EngineEvent::Stalled
+                };
+                state.session.on_event(event, now_ms())
+            }
         };
         store_session_action(&stopped_player, &stopped_persist, status, action);
         let state = stopped_player.borrow();
@@ -6533,12 +7374,42 @@ fn wire_player_events(
     let close_player = Rc::clone(player);
     let close_persist = persist.clone();
     frame.on_close(move |event| {
-        checkpoint_resume(&close_player, &close_persist);
+        checkpoint_resume(&close_player, &close_persist, status, true);
+        // Closing the player stops the actual engine, not just
+        // the session (P02): VLC stops (sound and upstream
+        // connection end), the live-buffer lease is released
+        // (buffer ingest ends), and no reconnect stays pending.
+        if let Some(buffers) = buffers_of(&close_player) {
+            buffers.borrow_mut().release_current();
+            buffers.borrow_mut().pending = None;
+        }
+        cancel_sleep_timer(&close_player);
         let mut state = close_player.borrow_mut();
+        state.pending_reconnect = None;
+        state.resume_guard = None;
+        state.app_voice.stop();
+        // Quiesce clears the subtitle cues and review state
+        // (P09/P11), as in Python's close path.
+        state.subtitle_cues.clear();
+        state.last_spoken_cue = None;
+        state.last_label_cue = None;
+        state.subtitle_generation += 1;
+        state.pending_subtitles = None;
+        state.review.reset();
+        state.active_cue_index = None;
+        state.last_shown_cue = None;
+        state.shown_cues.clear();
         state.session.stop();
+        let stop_vlc = state.vlc_active;
+        state.vlc_active = false;
         if let Some(win) = &state.window {
             win.media.stop();
+            win.subtitle_label.set_label("");
             win.frame.show(false);
+        }
+        drop(state);
+        if stop_vlc {
+            queue_vlc_stop(&close_player);
         }
         event.skip(false);
     });
@@ -6627,14 +7498,14 @@ fn stop_engines_keep_window(player: &Rc<RefCell<PlayerState>>) {
     state.pending_reconnect = None;
     state.app_voice.stop();
     state.session.stop();
-    if state.vlc_active {
-        if let Some(engine) = &mut state.vlc {
-            engine.stop();
-        }
-        state.vlc_active = false;
-    }
+    let stop_vlc = state.vlc_active;
+    state.vlc_active = false;
     if let Some(win) = &state.window {
         win.media.stop();
+    }
+    drop(state);
+    if stop_vlc {
+        queue_vlc_stop(player);
     }
 }
 
@@ -7212,28 +8083,46 @@ fn release_recording_lease(buffers: &Rc<RefCell<buffer::BufferRegistry>>, key: &
 }
 
 /// Stop playback and hide the player window (Stop button, the stop
-/// and exit shortcuts).
+/// and exit shortcuts). A manual Stop also cancels the sleep
+/// timer and restores the pre-fade volume (P14), so a later
+/// stream never inherits the old deadline or a faded level.
 fn player_stop(player: &Rc<RefCell<PlayerState>>, persist: &Persist, status: Status) {
+    cancel_sleep_timer(player);
     if let Some(buffers) = buffers_of(player) {
         buffers.borrow_mut().release_current();
     }
     if let Some(buffers) = buffers_of(player) {
         buffers.borrow_mut().pending = None;
     }
-    checkpoint_resume(player, persist);
+    checkpoint_resume(player, persist, status, true);
     let mut state = player.borrow_mut();
     state.pending_reconnect = None;
+    state.reconnect_rollover = false;
+    state.resume_guard = None;
     state.app_voice.stop();
+    // Stop clears the subtitle cues and review state and
+    // invalidates any in-flight parse (P09/P11), as Python's
+    // stop does.
+    state.subtitle_cues.clear();
+    state.last_spoken_cue = None;
+    state.last_label_cue = None;
+    state.subtitle_generation += 1;
+    state.pending_subtitles = None;
+    state.review.reset();
+    state.active_cue_index = None;
+    state.last_shown_cue = None;
+    state.shown_cues.clear();
     state.session.stop();
-    if state.vlc_active {
-        if let Some(engine) = &mut state.vlc {
-            engine.stop();
-        }
-        state.vlc_active = false;
-    }
+    let stop_vlc = state.vlc_active;
+    state.vlc_active = false;
     if let Some(win) = &state.window {
         win.media.stop();
+        win.subtitle_label.set_label("");
         win.frame.show(false);
+    }
+    drop(state);
+    if stop_vlc {
+        queue_vlc_stop(player);
     }
     player_status(status, persist, "Stopped.", 2);
 }
@@ -7269,17 +8158,32 @@ fn player_set_volume(player: &Rc<RefCell<PlayerState>>, percent: i32) {
     }
 }
 
+/// The P04 interception: when the current request is an
+/// expected live TS stream that has played, an ending goes to
+/// the session's rollover path instead of ordinary recovery.
+fn rollover_action(state: &mut PlayerState) -> Option<EngineAction> {
+    let request = state.session.current()?;
+    if !iptv_core::playback::looks_like_live_ts(&request.url, request.live) {
+        return None;
+    }
+    state.session.note_rollover(now_ms())
+}
+
 /// Poll the libVLC engine on the 1 s tick: resume seek, one-time
 /// track setup, and end/error transitions into the session
 /// machine (with its reconnect handling).
 fn poll_vlc_state(player: &Rc<RefCell<PlayerState>>, persist: &Persist, status: Status) {
     let mut setup_tracks = false;
+    let mut confirm_history = false;
     {
         let mut state = player.borrow_mut();
         if !state.vlc_active {
             return;
         }
-        let Some(engine) = &state.vlc else {
+        // The engine is a shared handle (P18): polling works
+        // on a clone so the state stays mutable for the
+        // session machine.
+        let Some(engine) = state.vlc.clone() else {
             return;
         };
         match engine.state() {
@@ -7293,22 +8197,59 @@ fn poll_vlc_state(player: &Rc<RefCell<PlayerState>>, persist: &Persist, status: 
                     // confirmation, never at load time.
                     state.session.on_event(EngineEvent::Started, now_ms());
                     player_status(status, persist, &state.session.announcement(), 3);
+                    confirm_history = true;
                 }
                 if let Some(ms) = state.pending_resume_ms.take() {
-                    if let Some(engine) = &mut state.vlc {
-                        engine.set_time(ms);
-                    }
+                    engine.set_time(ms);
                 }
-                if !state.vlc_tracks_ready {
-                    state.vlc_tracks_ready = true;
-                    setup_tracks = true;
+                // The freeze watchdog (P03): Playing on the
+                // surface while counters/position freeze is a
+                // stall and earns an ordinary recovery.
+                let playing_now = matches!(state.session.state(), SessionState::Playing);
+                let counters = engine.stats();
+                let position = engine.time();
+                let play_started_ms = state.play_started_ms;
+                let base_ms = i64::from(state.cache_plan.base_ms());
+                let stalled = state.watchdog.sample(
+                    counters,
+                    Some(position),
+                    playing_now,
+                    now_ms(),
+                    play_started_ms,
+                    base_ms,
+                );
+                if stalled {
+                    let action = state.session.on_event(EngineEvent::Stalled, now_ms());
+                    state.vlc_active = false;
+                    drop(state);
+                    store_session_action(player, persist, status, action);
+                    let state = player.borrow();
+                    player_status(status, persist, &state.session.announcement(), 3);
+                    return;
                 }
+                // Track publication is retried (P07): the
+                // refresh runs every poll until the preference
+                // settles or the attempt budget runs out, and
+                // republishes the controls whenever the list
+                // changes.
+                setup_tracks = true;
             }
             iptv_vlc::VlcState::Buffering => {
                 state.session.note_buffering(true, now_ms());
             }
             iptv_vlc::VlcState::Ended | iptv_vlc::VlcState::Error => {
                 let ended = engine.state() == iptv_vlc::VlcState::Ended;
+                // An expected TS segment ending refreshes on
+                // the rollover path (P04), never the failure
+                // budget.
+                if let Some(action) = rollover_action(&mut state) {
+                    state.vlc_active = false;
+                    drop(state);
+                    store_session_action(player, persist, status, action);
+                    let state = player.borrow();
+                    player_status(status, persist, &state.session.announcement(), 3);
+                    return;
+                }
                 let (position, length) = (engine.time(), engine.length());
                 let near_end = length > 0 && position >= length - 1500;
                 let event = if ended || near_end {
@@ -7326,6 +8267,9 @@ fn poll_vlc_state(player: &Rc<RefCell<PlayerState>>, persist: &Persist, status: 
             }
             _ => {}
         }
+    }
+    if confirm_history {
+        record_history_once(player, persist);
     }
     if setup_tracks {
         apply_vlc_tracks(player, persist);
@@ -7374,6 +8318,14 @@ fn poll_fallback_state(player: &Rc<RefCell<PlayerState>>, persist: &Persist, sta
                 }
             }
             MediaState::Stopped => {
+                // An expected TS segment ending refreshes on
+                // the rollover path (P04), never the failure
+                // budget.
+                if let Some(action) = rollover_action(&mut state) {
+                    drop(state);
+                    store_session_action(player, persist, status, action);
+                    return;
+                }
                 let confirmed = matches!(
                     state.session.state(),
                     SessionState::Playing | SessionState::Paused
@@ -7396,15 +8348,25 @@ fn poll_fallback_state(player: &Rc<RefCell<PlayerState>>, persist: &Persist, sta
             _ => Act::None,
         }
     };
+    if matches!(act, Act::Started) {
+        record_history_once(player, persist);
+    }
     if matches!(act, Act::Started | Act::Settled) {
         let state = player.borrow();
         player_status(status, persist, &state.session.announcement(), 3);
     }
 }
 
-/// Fill the player window's audio track choice from libVLC and
-/// apply the recorded preference (explicit choice first, then
-/// the slice-9 keyword engine).
+/// Refresh the player window's audio tracks from libVLC
+/// (P06/P07): republish the choice and menu whenever the
+/// published list changes, and keep applying the preference —
+/// this session's manual pick first, then the ordered keyword
+/// assembly (channel memory, audio-description set or the
+/// global last pick, saved keywords) with the remembered slot
+/// as fallback — until it settles or the ~10 s attempt budget
+/// runs out. Automatic application never writes the persisted
+#[allow(clippy::too_many_lines)]
+/// memory; only manual choices do.
 fn apply_vlc_tracks(player: &Rc<RefCell<PlayerState>>, persist: &Persist) {
     let tracks = {
         let state = player.borrow();
@@ -7415,79 +8377,116 @@ fn apply_vlc_tracks(player: &Rc<RefCell<PlayerState>>, persist: &Persist) {
             .unwrap_or_default()
     };
     if tracks.is_empty() {
+        // Nothing published yet: count the attempt (two 500 ms
+        // units per 1 s poll) and stop applying after ~10 s;
+        // publication still lands whenever the list appears.
+        let mut state = player.borrow_mut();
+        if !state.vlc_tracks_ready {
+            state.track_attempts += 2;
+            if state.track_attempts >= 20 {
+                state.vlc_tracks_ready = true;
+            }
+        }
         return;
     }
+    let ids: Vec<i32> = tracks.iter().map(|(id, _)| *id).collect();
+    let changed = ids != player.borrow().vlc_track_ids;
     let win = {
         let mut state = player.borrow_mut();
-        state.vlc_track_ids = tracks.iter().map(|(id, _)| *id).collect();
+        if changed {
+            state.vlc_track_ids = ids;
+        }
         state.window.clone()
     };
     let Some(win) = win else {
         return;
     };
-    win.tracks.clear();
-    for (_, name) in &tracks {
-        win.tracks.append(name);
+    if changed {
+        win.tracks.clear();
+        for (_, name) in &tracks {
+            win.tracks.append(name);
+        }
     }
-    let (keywords, prefer_ad, desired) = {
-        let config = persist.config.borrow();
-        (
-            iptv_core::audiotracks::preferred_audio_keywords(
-                &config.string_list("preferred_audio_tracks"),
+    if !player.borrow().vlc_tracks_ready {
+        let (keywords, prefer_ad, desired, supply_index) = {
+            let config = persist.config.borrow();
+            let state = player.borrow();
+            (
+                iptv_core::audiotracks::ordered_preference_keywords(
+                    state.supply_audio_name.as_deref(),
+                    config.bool_or("prefer_audio_description", false),
+                    Some(config.string_or("last_audio_track", "")).as_deref(),
+                    &config.string_list("preferred_audio_tracks"),
+                ),
                 config.bool_or("prefer_audio_description", false),
-            ),
-            config.bool_or("prefer_audio_description", false),
-            player.borrow().desired_track.clone(),
-        )
-    };
-    let pairs: Vec<(i64, String)> = tracks
-        .iter()
-        .map(|(id, name)| (i64::from(*id), name.clone()))
-        .collect();
-    let chosen = desired
-        .as_ref()
-        .and_then(|want| {
-            tracks
-                .iter()
-                .find(|(_, name)| name == want)
-                .map(|(id, _)| *id)
-        })
-        .or_else(|| {
-            iptv_core::audiotracks::select_preferred_audio_track(&pairs, &keywords, None, prefer_ad)
+                state.desired_track.clone(),
+                state.supply_audio_index,
+            )
+        };
+        let pairs: Vec<(i64, String)> = tracks
+            .iter()
+            .map(|(id, name)| (i64::from(*id), name.clone()))
+            .collect();
+        let chosen = desired
+            .as_ref()
+            .and_then(|want| {
+                tracks
+                    .iter()
+                    .find(|(_, name)| name == want)
+                    .map(|(id, _)| *id)
+            })
+            .or_else(|| {
+                iptv_core::audiotracks::select_preferred_audio_track(
+                    &pairs,
+                    &keywords,
+                    supply_index,
+                    prefer_ad,
+                )
                 .map(|id| i32::try_from(id).unwrap_or(-1))
-        });
-    if let Some(id) = chosen {
+            });
         let mut state = player.borrow_mut();
-        if let Some(engine) = &mut state.vlc {
-            engine.set_audio_track(id);
+        state.track_attempts += 2;
+        if let Some(id) = chosen {
+            if let Some(engine) = &mut state.vlc {
+                engine.set_audio_track(id);
+            }
+            if let Some(position) = state.vlc_track_ids.iter().position(|track| *track == id) {
+                win.tracks
+                    .set_selection(u32::try_from(position).unwrap_or(0));
+            }
+            state.vlc_tracks_ready = true;
+        } else if state.track_attempts >= 20 {
+            state.vlc_tracks_ready = true;
         }
-        if let Some(position) = state.vlc_track_ids.iter().position(|track| *track == id) {
-            win.tracks
-                .set_selection(u32::try_from(position).unwrap_or(0));
-        }
+        drop(state);
     }
-    if let Some(menu) = audio_track_menu(player) {
-        let mut state = player.borrow_mut();
-        for old in state.track_menu_ids.drain(..) {
-            menu.delete(old);
+    if changed {
+        if let Some(menu) = audio_track_menu(player) {
+            let mut state = player.borrow_mut();
+            for old in state.track_menu_ids.drain(..) {
+                menu.delete(old);
+            }
+            menu.delete(PM_NO_TRACKS);
+            for (index, (_, name)) in tracks.iter().enumerate() {
+                let id = PM_TRACK_BASE + i32::try_from(index).unwrap_or(0);
+                menu_add(&menu, id, name, "", ItemKind::Radio);
+                state.track_menu_ids.push(id);
+            }
+            let selected = win.tracks.get_selection().unwrap_or(0);
+            if let Some(id) = state.track_menu_ids.get(selected as usize) {
+                menu.check_item(*id, true);
+            }
         }
-        menu.delete(PM_NO_TRACKS);
-        for (index, (_, name)) in tracks.iter().enumerate() {
-            let id = PM_TRACK_BASE + i32::try_from(index).unwrap_or(0);
-            menu_add(&menu, id, name, "", ItemKind::Radio);
-            state.track_menu_ids.push(id);
-        }
-        let selected = win.tracks.get_selection().unwrap_or(0);
-        if let Some(id) = state.track_menu_ids.get(selected as usize) {
-            menu.check_item(*id, true);
-        }
+        // The embedded subtitle list republishes alongside.
+        refresh_subtitle_menu(player);
     }
 }
 
-/// Refresh the player window's time label, seek position and
-/// subtitle label from the media position (1 s tick).
+/// Refresh the player window's time label and seek position
+/// from the media position (1 s tick; the subtitle label is
+/// sampled separately at 150 ms, P10).
 fn update_player_chrome(player: &Rc<RefCell<PlayerState>>) {
-    let mut state = player.borrow_mut();
+    let state = player.borrow_mut();
     let Some(win) = state.window.clone() else {
         return;
     };
@@ -7507,12 +8506,6 @@ fn update_player_chrome(player: &Rc<RefCell<PlayerState>>) {
     if length > 0 {
         win.seek
             .set_value(i32::try_from(position * 1000 / length).unwrap_or(0));
-    }
-    let current = active_cue(&state.subtitle_cues, position);
-    if current != state.last_label_cue {
-        state.last_label_cue = current;
-        let label = current.map_or("", |index| state.subtitle_cues[index].text.as_str());
-        win.subtitle_label.set_label(label);
     }
 }
 
@@ -7558,6 +8551,33 @@ fn key_event_label(event: wxdragon::event::Event) -> Option<String> {
 
 /// Dispatch one player-window key against the effective player
 /// shortcuts. Returns whether the key was a command.
+/// Fullscreen (P19, Python `_set_fullscreen`): no-op when
+/// already in the target state; the whole controls panel
+/// hides while the video surface remains, the button's label
+/// and accessible name follow the state, and focus moves to
+/// the video surface.
+fn set_fullscreen(player: &Rc<RefCell<PlayerState>>, enable: bool) {
+    let win = player.borrow().window.clone();
+    let Some(win) = win else {
+        return;
+    };
+    if win.frame.is_full_screen() == enable {
+        return;
+    }
+    win.frame.show_full_screen(enable);
+    win.controls_panel.show(!enable);
+    if enable {
+        win.fullscreen_button.set_label("E&xit Full Screen");
+        win.fullscreen_button
+            .set_accessibility_label("Exit Full Screen");
+    } else {
+        win.fullscreen_button.set_label("&Full Screen");
+        win.fullscreen_button.set_accessibility_label("Full Screen");
+    }
+    win.frame.layout();
+    win.media.set_focus();
+}
+#[allow(clippy::too_many_lines)]
 fn dispatch_player_key(
     player: &Rc<RefCell<PlayerState>>,
     persist: &Persist,
@@ -7569,12 +8589,41 @@ fn dispatch_player_key(
     };
     let config = serde_json::Value::Object(persist.config.borrow().raw().clone());
     let bindings = iptv_core::shortcuts::effective(&config, "player");
-    let Some(action) = bindings
+    // Python's order (P13): a configured binding matches
+    // first. Only when nothing matches do the fallbacks run —
+    // Ctrl+Up/Down synthesise the volume action when its
+    // binding is still the plain arrow (the event's Ctrl
+    // gives the coarse 5% step in the volume arm below), and
+    // Esc leaves fullscreen (P19).
+    let binding_for = |name: &str| {
+        bindings
+            .iter()
+            .find(|(action, _)| action.as_str() == name)
+            .map(|(_, binding)| binding.clone())
+    };
+    let action = bindings
         .iter()
         .find(|(_, binding)| binding.eq_ignore_ascii_case(&label))
-        .map(|(action, _)| action.clone())
-    else {
-        return false;
+        .map(|(action, _)| action.clone());
+    let action = match action {
+        Some(action) => action,
+        None if label == "Ctrl+Up" && binding_for("volume_up").as_deref() == Some("Up") => {
+            "volume_up".to_string()
+        }
+        None if label == "Ctrl+Down" && binding_for("volume_down").as_deref() == Some("Down") => {
+            "volume_down".to_string()
+        }
+        None if label == "Esc" => {
+            let win = player.borrow().window.clone();
+            if let Some(win) = win {
+                if win.frame.is_full_screen() {
+                    set_fullscreen(player, false);
+                    return true;
+                }
+            }
+            return false;
+        }
+        None => return false,
     };
     let win = player.borrow().window.clone();
     let Some(win) = win else {
@@ -7610,13 +8659,16 @@ fn dispatch_player_key(
             }
         }
         "volume_up" | "volume_down" => {
-            let delta = if action == "volume_up" { 10 } else { -10 };
+            // Python's steps: 2% normally, 5% with Ctrl held
+            // (the event label carries the modifier).
+            let step = if label.starts_with("Ctrl+") { 5 } else { 2 };
+            let delta = if action == "volume_up" { step } else { -step };
             let value = (win.volume.get_value() + delta).clamp(0, 100);
             player_set_volume(player, value);
             status.set_silent(&format!("Volume {value} percent."));
         }
-        "audio_track" => win.tracks.set_focus(),
-        "subtitles" => prompt_subtitle_file(player, win.frame, persist, status),
+        "audio_track" => cycle_audio_track(player, persist, status),
+        "subtitles" => cycle_subtitle_track(player, persist, status),
         "speak_subtitles" => {
             let next = !persist.config.borrow().bool_or("speak_subtitles", false);
             persist.set_and_save("speak_subtitles", serde_json::json!(next));
@@ -7632,9 +8684,9 @@ fn dispatch_player_key(
             );
         }
         "read_subtitle" | "previous_subtitle" | "next_subtitle" => {
-            announce_cue(player, &action, status);
+            announce_cue(player, persist, &action, status);
         }
-        "fullscreen" => win.frame.show_full_screen(!win.frame.is_full_screen()),
+        "fullscreen" => set_fullscreen(player, !win.frame.is_full_screen()),
         "hide" => win.frame.hide(),
         "what_is_playing" => {
             let state = player.borrow();
@@ -7648,32 +8700,47 @@ fn dispatch_player_key(
     true
 }
 
-/// Announce the current, previous, or next subtitle cue's text.
-fn announce_cue(player: &Rc<RefCell<PlayerState>>, action: &str, status: Status) {
-    let state = player.borrow();
-    if state.subtitle_cues.is_empty() {
-        status.set_label("No subtitles are loaded.");
-        return;
-    }
-    let position = position_length(&state).0;
-    let current = active_cue(&state.subtitle_cues, position);
-    let index = match action {
-        "previous_subtitle" => current.and_then(|i| i.checked_sub(1)).or(current),
-        "next_subtitle" => current
-            .map(|i| (i + 1).min(state.subtitle_cues.len() - 1))
-            .or(Some(0)),
-        _ => current,
+/// Announce the current, previous, or next subtitle cue
+/// through the review cursor (P11): only cues already shown
+/// can be read, the last shown cue survives gaps, and Next
+/// never reads the file's unplayed tail. Review speech goes
+/// through the shared cue route (`speak_cue_text`, P12): the
+/// selected backend speaks it, exactly one result, whether
+/// or not automatic subtitle speech is enabled — never the
+/// live region directly.
+fn announce_cue(
+    player: &Rc<RefCell<PlayerState>>,
+    persist: &Persist,
+    action: &str,
+    status: Status,
+) {
+    let step = match action {
+        "previous_subtitle" => -1,
+        "next_subtitle" => 1,
+        _ => 0,
     };
-    match index.and_then(|i| state.subtitle_cues.get(i)) {
-        Some(cue) => {
-            live_region::announce_with_priority(
-                status.label,
-                &cue.text,
-                live_region::Priority::Medium,
-            );
-        }
-        None => status.set_label("No subtitle is showing."),
-    }
+    review_subtitle(player, persist, status, step);
+}
+
+/// Speak one review step (shared by the player window and
+/// the main window's subtitle-speech menu, as in Python).
+fn review_subtitle(
+    player: &Rc<RefCell<PlayerState>>,
+    persist: &Persist,
+    status: Status,
+    step: i32,
+) {
+    // Refresh the sample first so review is right even
+    // between 150 ms ticks.
+    sample_subtitles(player);
+    let text = {
+        let mut state = player.borrow_mut();
+        let active = state.active_cue_index;
+        let last = state.last_shown_cue;
+        let cues = state.subtitle_cues.clone();
+        state.review.review(&cues, active, last, step)
+    };
+    speak_cue_text(player, persist, status, &text);
 }
 
 /// Open the cast window for an explicit channel (the player
@@ -7717,34 +8784,119 @@ fn bind_subtitle_load(
     subs.on_click(move |_| prompt_subtitle_file(&subs_player, frame, &subs_persist, status));
 }
 
-/// Ask for a subtitle file and load its cues into the player state.
+/// A `file://` URI for a subtitle sidecar (Python passes
+/// `Path.as_uri()` to `add_slave`).
+fn file_uri(path: &std::path::Path) -> String {
+    let text = path.to_string_lossy().replace('\\', "/");
+    let encoded = text.replace(' ', "%20").replace('#', "%23");
+    if encoded.starts_with('/') {
+        format!("file://{encoded}")
+    } else {
+        format!("file:///{encoded}")
+    }
+}
+
+/// Ask for a subtitle file, attach it to VLC for rendering
+/// (P08) and parse it on a worker for display and speech
+/// (P09). External files are refused during local-buffer
+/// playback — they are not synchronized with the buffer.
 fn prompt_subtitle_file(
     player: &Rc<RefCell<PlayerState>>,
     frame: Frame,
     persist: &Persist,
     status: Status,
 ) {
-    let subs_player = Rc::clone(player);
-    {
-        let dialog = FileDialog::builder(&frame)
-            .with_message("Load subtitles")
-            .with_wildcard(
-                "Subtitles (*.srt;*.vtt;*.ass;*.ssa)|*.srt;*.vtt;*.ass;*.ssa|All files (*.*)|*.*",
-            )
-            .with_style(FileDialogStyle::Open | FileDialogStyle::FileMustExist)
-            .build();
-        if dialog.show_modal() != ID_OK {
+    if buffers_of(player).is_some_and(|buffers| buffers.borrow().current.is_some()) {
+        let _ = MessageDialog::builder(
+            &frame,
+            "External subtitle files are not synchronized with the local live buffer. Use the stream's embedded subtitles.",
+            "Load subtitles",
+        )
+        .with_style(MessageDialogStyle::OK)
+        .build()
+        .show_modal();
+        return;
+    }
+    let dialog = FileDialog::builder(&frame)
+        .with_message("Load subtitles")
+        .with_wildcard(
+            "Subtitles (*.srt;*.vtt;*.ass;*.ssa)|*.srt;*.vtt;*.ass;*.ssa|All files (*.*)|*.*",
+        )
+        .with_style(FileDialogStyle::Open | FileDialogStyle::FileMustExist)
+        .build();
+    if dialog.show_modal() != ID_OK {
+        return;
+    }
+    let Some(path) = dialog.get_path() else {
+        return;
+    };
+    if player.borrow().vlc_active {
+        let uri = file_uri(std::path::Path::new(&path));
+        let attached = {
+            let mut state = player.borrow_mut();
+            state
+                .vlc
+                .as_mut()
+                .is_some_and(|engine| engine.add_subtitle_slave(&uri))
+        };
+        if !attached {
+            player_status(status, persist, "Could not load subtitle file.", 1);
             return;
         }
-        let Some(path) = dialog.get_path() else {
+    }
+    let generation = {
+        let mut state = player.borrow_mut();
+        state.subtitle_generation += 1;
+        state.subtitle_generation
+    };
+    let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
+    player.borrow_mut().pending_subtitles = Some(std::sync::Arc::clone(&slot));
+    let path_buf = PathBuf::from(&path);
+    std::thread::spawn(move || {
+        let result = load_cues(&path_buf);
+        if let Ok(mut guard) = slot.lock() {
+            *guard = Some((generation, result));
+        }
+    });
+}
+
+/// Deliver a finished subtitle parse (P09): a result whose
+/// generation has moved on (new play, stop, track select) is
+/// dropped silently; the current one installs its cues.
+fn deliver_subtitles(player: &Rc<RefCell<PlayerState>>, persist: &Persist, status: Status) {
+    let delivered = {
+        let state = player.borrow();
+        let Some(slot) = &state.pending_subtitles else {
             return;
         };
-        match load_cues(std::path::Path::new(&path)) {
-            Ok(cues) => {
-                let count = cues.len();
-                let mut state = subs_player.borrow_mut();
-                state.subtitle_cues = cues;
-                state.last_spoken_cue = None;
+        let Ok(mut guard) = slot.lock() else {
+            return;
+        };
+        guard.take()
+    };
+    let Some((generation, result)) = delivered else {
+        return;
+    };
+    let mut state = player.borrow_mut();
+    if generation != state.subtitle_generation {
+        return; // stale work from a superseded load
+    }
+    state.pending_subtitles = None;
+    match result {
+        Ok(cues) => {
+            let count = cues.len();
+            state.subtitle_cues = cues;
+            state.last_spoken_cue = None;
+            state.last_label_cue = None;
+            // A new source starts review empty (P11).
+            state.review.reset();
+            state.active_cue_index = None;
+            state.last_shown_cue = None;
+            state.shown_cues.clear();
+            drop(state);
+            if count == 0 {
+                player_status(status, persist, "No subtitle text found in this file.", 1);
+            } else {
                 player_status(
                     status,
                     persist,
@@ -7752,15 +8904,113 @@ fn prompt_subtitle_file(
                     2,
                 );
             }
-            Err(error) => {
-                player_status(
-                    status,
-                    persist,
-                    &format!("Could not load subtitles: {error}"),
-                    1,
-                );
+        }
+        Err(error) => {
+            drop(state);
+            player_status(
+                status,
+                persist,
+                &format!("Could not load subtitles: {error}"),
+                1,
+            );
+        }
+    }
+}
+
+/// The 150 ms subtitle tick (P10): deliver finished parses,
+/// adopt the sidecar's VLC track once it binds, and sample
+/// the active cue for the label and for speech — a cue lying
+/// entirely between one-second ticks is still presented.
+fn subtitle_tick(player: &Rc<RefCell<PlayerState>>, persist: &Persist, status: Status) {
+    deliver_vlc_load(player, persist, status);
+    deliver_subtitles(player, persist, status);
+    {
+        let mut state = player.borrow_mut();
+        if !state.subtitle_cues.is_empty() && state.file_subtitle_track.is_none() {
+            if let Some(engine) = &state.vlc {
+                let spu = engine.subtitle_track();
+                if spu >= 0 {
+                    state.file_subtitle_track = Some(spu);
+                    state.selected_spu = spu;
+                }
             }
         }
+    }
+    sample_subtitles(player);
+    update_subtitle_label(player);
+    speak_subtitle_cue(player, persist, status);
+}
+
+/// The subtitle sampling clock (P10): media position minus
+/// the engine's subtitle delay — media-clock only, never
+/// wall-clock extrapolation. The fallback engine has no
+/// delay.
+fn subtitle_position(state: &PlayerState) -> i64 {
+    let (position, _) = position_length(state);
+    if state.vlc_active {
+        if let Some(engine) = &state.vlc {
+            return position - engine.subtitle_delay_ms();
+        }
+    }
+    position
+}
+
+/// One subtitle sample (P11): maintain the active and
+/// latest-shown indexes the review cursor is bounded by, and
+/// record each newly delivered cue for review and Recent —
+/// non-empty, duplicates by text+start suppressed, capped
+/// at the manager's 50.
+fn sample_subtitles(player: &Rc<RefCell<PlayerState>>) {
+    let mut state = player.borrow_mut();
+    if state.subtitle_cues.is_empty() {
+        state.active_cue_index = None;
+        state.last_shown_cue = None;
+        return;
+    }
+    let position = subtitle_position(&state);
+    let active = active_cue(&state.subtitle_cues, position);
+    let last = started_cue(&state.subtitle_cues, position);
+    let changed = active != state.active_cue_index;
+    state.active_cue_index = active;
+    state.last_shown_cue = last;
+    state.review.on_sample(active, last, changed);
+    if changed {
+        if let Some(index) = active {
+            let cue = state.subtitle_cues[index].clone();
+            let duplicate = state
+                .shown_cues
+                .back()
+                .is_some_and(|tail| tail.start == cue.start && tail.text == cue.text);
+            if !cue.text.is_empty() && !duplicate {
+                state.shown_cues.push_back(cue);
+                while state.shown_cues.len() > 50 {
+                    state.shown_cues.pop_front();
+                }
+            }
+        }
+    }
+}
+
+/// Refresh the subtitle label from the media position (the
+/// sampling half of the old 1 s chrome update, now at 150 ms).
+fn update_subtitle_label(player: &Rc<RefCell<PlayerState>>) {
+    let mut state = player.borrow_mut();
+    let Some(win) = state.window.clone() else {
+        return;
+    };
+    if state.selected_spu == -1 {
+        if state.last_label_cue.is_some() {
+            state.last_label_cue = None;
+            win.subtitle_label.set_label("");
+        }
+        return;
+    }
+    let position = subtitle_position(&state);
+    let current = active_cue(&state.subtitle_cues, position);
+    if current != state.last_label_cue {
+        state.last_label_cue = current;
+        let label = current.map_or("", |index| state.subtitle_cues[index].text.as_str());
+        win.subtitle_label.set_label(label);
     }
 }
 
@@ -7902,7 +9152,10 @@ fn speak_subtitle_cue(player: &Rc<RefCell<PlayerState>>, persist: &Persist, stat
     if !persist.config.borrow().bool_or("speak_subtitles", false) {
         return;
     }
-    let position = position_length(&player.borrow()).0;
+    if player.borrow().selected_spu == -1 {
+        return; // Subtitles Off: nothing is presented or spoken.
+    }
+    let position = subtitle_position(&player.borrow());
     if position <= 0 {
         return;
     }
@@ -7925,31 +9178,73 @@ fn speak_subtitle_cue(player: &Rc<RefCell<PlayerState>>, persist: &Persist, stat
     }
 }
 
-/// Persist the current position for seekable content (Python checkpoint
-/// rules decide whether it is kept).
-fn checkpoint_resume(player: &Rc<RefCell<PlayerState>>, persist: &Persist) {
-    let state = player.borrow();
-    if state.session.current().is_none_or(|r| r.live) {
-        return;
-    }
-    let Some(channel) = &state.current_channel else {
-        return;
+/// Persist the current position for seekable content (Python
+/// checkpoint rules decide whether it is kept). While a
+/// resumed position is unconfirmed, the guard (P16) suppresses
+/// the write so a failed seek cannot overwrite the useful
+/// checkpoint; an unconfirmed resume is reported once after
+/// 60 s. Non-forced checkpoints are throttled to one per
+/// 30 s, as in Python; stop/close/prepare force one.
+fn checkpoint_resume(
+    player: &Rc<RefCell<PlayerState>>,
+    persist: &Persist,
+    status: Status,
+    force: bool,
+) {
+    let (channel, position, length) = {
+        let state = player.borrow();
+        if state.session.current().is_none_or(|r| r.live) {
+            return;
+        }
+        let Some(channel) = &state.current_channel else {
+            return;
+        };
+        let (position, length) = position_length(&state);
+        (channel.clone(), position, length)
     };
-    let key = channel_key(channel);
-    let title = channel.name.clone();
-    let (position, length) = position_length(&state);
-    drop(state);
     if position <= 0 || length <= 0 {
         return;
     }
-    let mut entries = persist.resume_entries();
-    resume_checkpoint(
-        &mut entries,
+    {
+        let mut state = player.borrow_mut();
+        if let Some(guard) = &mut state.resume_guard {
+            match guard.on_checkpoint(position, now_ms()) {
+                iptv_core::playback::GuardVerdict::Protected => return,
+                iptv_core::playback::GuardVerdict::Failed => {
+                    state.resume_guard = None;
+                    // Python re-anchors the 30 s throttle at
+                    // the failure report.
+                    state.last_checkpoint_ms = now_ms();
+                    drop(state);
+                    player_status(
+                        status,
+                        persist,
+                        "The saved playback position could not be restored.",
+                        2,
+                    );
+                    return;
+                }
+                iptv_core::playback::GuardVerdict::Confirmed => {
+                    state.resume_guard = None;
+                }
+            }
+        }
+        if !force && now_ms() - state.last_checkpoint_ms < 30_000 {
+            return;
+        }
+        state.last_checkpoint_ms = now_ms();
+    }
+    let key = iptv_core::bookmarks::item_key(&channel);
+    if key.is_empty() {
+        return;
+    }
+    let entries = iptv_core::bookmarks::checkpoint(
+        &persist.resume_entries(),
         &key,
-        &title,
+        &channel,
         position,
         length,
-        now_ms() / 1000,
+        now_epoch(),
     );
     persist.save_resume(&entries);
 }
@@ -9440,7 +10735,10 @@ fn open_continue_watching(wiring: &Wiring, status: Status) {
     let mut rows: Vec<CwRow> = entries
         .iter()
         .map(|(key, entry)| {
-            let channel = channels.iter().find(|c| channel_key(c) == *key).cloned();
+            // Resolution is by bookmark identity against the
+            // current catalogue (P21): exactly one unambiguous
+            // match, never a saved URL.
+            let channel = iptv_core::bookmarks::find_current(key, &channels);
             let title = if !entry.title.is_empty() {
                 entry.title.clone()
             } else if let Some(channel) = &channel {
@@ -9499,7 +10797,7 @@ fn cw_check_availability(
     let Some(row) = guard.get_mut(index) else {
         return;
     };
-    if let Some(channel) = fresh.iter().find(|c| channel_key(c) == row.key).cloned() {
+    if let Some(channel) = iptv_core::bookmarks::find_current(&row.key, &fresh) {
         if row.title.starts_with("Previously saved content") {
             row.title.clone_from(&channel.name);
         }
@@ -9616,11 +10914,31 @@ fn wire_continue_watching(
     close.on_click(move |_| frame.hide());
 }
 
-/// View > Recently Watched...: this session's playback history.
+/// Resolve the persisted recent-channels keys against the
+/// current catalogue (P17): later duplicate keys win; stored
+/// keys with no current match stay persisted but are skipped
+/// here, so renewed URLs resolve to the fresh entries.
+fn resolved_recent(wiring: &Wiring) -> Vec<Channel> {
+    let keys = wiring.persist.recent_keys();
+    let channels = wiring.browser.borrow().all_channels();
+    let mut by_key: BTreeMap<String, Channel> = BTreeMap::new();
+    for channel in channels {
+        let key = channel_key(&channel);
+        if !key.is_empty() {
+            by_key.insert(key, channel);
+        }
+    }
+    keys.iter()
+        .filter_map(|key| by_key.get(key).cloned())
+        .collect()
+}
+
+/// View > Recently Watched...: the persisted history (P17),
+/// resolved against the current catalogue.
 fn open_recent_channels(wiring: &Wiring, status: Status) {
-    let history = wiring.player.borrow().history.clone();
+    let history = resolved_recent(wiring);
     if history.is_empty() {
-        status.set_label("No channels watched yet this session.");
+        status.set_label("No channels watched yet.");
         return;
     }
     let (frame, panel, list, dstatus) =

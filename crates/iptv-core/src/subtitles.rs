@@ -469,9 +469,170 @@ pub fn active(cues: &[Cue], ms: i64) -> Option<usize> {
     }
 }
 
+/// The subtitle review cursor (P11, Python
+/// `_subtitle_review_text`): review traverses only cues that
+/// have actually been shown — never the file's unplayed tail —
+/// and the last shown cue stays readable through gaps.
+#[derive(Clone, Debug, Default)]
+pub struct ReviewCursor {
+    cursor: Option<usize>,
+}
+
+impl ReviewCursor {
+    /// New source, stop or track change: review starts empty.
+    pub fn reset(&mut self) {
+        self.cursor = None;
+    }
+
+    /// Per-sample maintenance: a newly active cue becomes the
+    /// cursor; the cursor never passes the latest shown cue
+    /// (a rewind pulls it back), and nothing shown means no
+    /// cursor.
+    pub fn on_sample(
+        &mut self,
+        active: Option<usize>,
+        last_shown: Option<usize>,
+        active_changed: bool,
+    ) {
+        if active_changed {
+            if let Some(index) = active {
+                self.cursor = Some(index);
+            }
+        }
+        match last_shown {
+            None => self.cursor = None,
+            Some(last) => {
+                if self.cursor.is_some_and(|cursor| cursor > last) {
+                    self.cursor = Some(last);
+                }
+            }
+        }
+    }
+
+    /// Speakable review text for one step: 0 = current (or the
+    /// last shown cue, named as such, during a gap), -1 =
+    /// previous, +1 = next. The cursor moves only when a cue
+    /// is actually read.
+    pub fn review(
+        &mut self,
+        cues: &[Cue],
+        active: Option<usize>,
+        last_shown: Option<usize>,
+        step: i32,
+    ) -> String {
+        if cues.is_empty() {
+            return "No subtitle text to read. Load a supported subtitle file.".to_string();
+        }
+        let Some(last) = last_shown else {
+            return "No subtitle has been shown yet.".to_string();
+        };
+        if step == 0 {
+            if let Some(index) = active {
+                self.cursor = Some(index);
+                return cues[index].text.clone();
+            }
+            self.cursor = Some(last);
+            return format!("Last subtitle: {}", cues[last].text);
+        }
+        let base = self.cursor.unwrap_or(last);
+        let target = i64::try_from(base).unwrap_or(0) + i64::from(step);
+        if target < 0 {
+            return "No earlier subtitle.".to_string();
+        }
+        let target = usize::try_from(target).unwrap_or(usize::MAX);
+        if target > last {
+            return "No later subtitle.".to_string();
+        }
+        self.cursor = Some(target);
+        cues[target].text.clone()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn three_cues() -> Vec<Cue> {
+        vec![
+            Cue {
+                start: 0,
+                end: 1_000,
+                text: "one".to_string(),
+            },
+            Cue {
+                start: 2_000,
+                end: 3_000,
+                text: "two".to_string(),
+            },
+            Cue {
+                start: 4_000,
+                end: 5_000,
+                text: "three".to_string(),
+            },
+        ]
+    }
+
+    #[test]
+    fn review_cursor_walks_shown_history_only() {
+        let cues = three_cues();
+        let mut review = ReviewCursor::default();
+        // Nothing shown yet, whatever the step.
+        assert_eq!(
+            review.review(&cues, None, None, 0),
+            "No subtitle has been shown yet."
+        );
+        assert_eq!(
+            review.review(&cues, None, None, -1),
+            "No subtitle has been shown yet."
+        );
+        // No cues at all.
+        assert_eq!(
+            review.review(&[], None, None, 0),
+            "No subtitle text to read. Load a supported subtitle file."
+        );
+        // Cues 0 and 1 have been shown; cue 1 is active.
+        review.on_sample(Some(1), Some(1), true);
+        // Next must stop at the latest shown cue, never read
+        // the file's unplayed tail.
+        assert_eq!(
+            review.review(&cues, Some(1), Some(1), 1),
+            "No later subtitle."
+        );
+        // Previous walks back one cue per press, to cue 0.
+        assert_eq!(review.review(&cues, Some(1), Some(1), -1), "one");
+        assert_eq!(
+            review.review(&cues, Some(1), Some(1), -1),
+            "No earlier subtitle."
+        );
+        // And forward again over shown history.
+        assert_eq!(review.review(&cues, Some(1), Some(1), 1), "two");
+    }
+
+    #[test]
+    fn review_cursor_retains_the_last_shown_cue_through_gaps() {
+        let cues = three_cues();
+        let mut review = ReviewCursor::default();
+        review.on_sample(Some(0), Some(0), true);
+        // A gap: no active cue, cue 0 remains the last shown.
+        review.on_sample(None, Some(0), true);
+        assert_eq!(review.review(&cues, None, Some(0), 0), "Last subtitle: one");
+        // Current with an active cue reads it bare and moves
+        // the cursor to it.
+        assert_eq!(review.review(&cues, Some(0), Some(0), 0), "one");
+        // A rewind pulls the cursor back to the rewound-to
+        // latest shown cue.
+        review.on_sample(Some(1), Some(1), true);
+        review.on_sample(Some(0), Some(0), false);
+        assert_eq!(
+            review.review(&cues, Some(0), Some(0), 1),
+            "No later subtitle."
+        );
+        review.reset();
+        assert_eq!(
+            review.review(&cues, Some(0), Some(0), -1),
+            "No earlier subtitle."
+        );
+    }
 
     #[test]
     fn srt_and_vtt_blocks_parse() {

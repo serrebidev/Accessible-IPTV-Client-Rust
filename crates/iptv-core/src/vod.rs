@@ -397,7 +397,24 @@ fn str_field(row: &Value, keys: &[&str]) -> Option<String> {
     None
 }
 
-fn playable_item(name: String, group: String, url: String, provider_id: Option<String>) -> VodItem {
+fn playable_item(
+    name: String,
+    group: String,
+    url: String,
+    provider_id: Option<String>,
+    resume_type: &str,
+    resume_id: &str,
+) -> VodItem {
+    // The channel carries the same identity keys Python's
+    // vod.py sets, so playback bookmarks (P21) key Xtream
+    // items by their account-scoped locator, not by URL.
+    let mut unknown_attributes = BTreeMap::new();
+    unknown_attributes.insert("provider-type".to_string(), "xtream".to_string());
+    if let Some(id) = &provider_id {
+        unknown_attributes.insert("provider-id".to_string(), id.clone());
+    }
+    unknown_attributes.insert("resume-type".to_string(), resume_type.to_string());
+    unknown_attributes.insert("resume-id".to_string(), resume_id.to_string());
     let channel = Channel {
         name: name.clone(),
         group: group.clone(),
@@ -405,7 +422,7 @@ fn playable_item(name: String, group: String, url: String, provider_id: Option<S
         tvg_id: String::new(),
         tvg_name: String::new(),
         tvg_logo: String::new(),
-        unknown_attributes: BTreeMap::new(),
+        unknown_attributes,
     };
     VodItem {
         kind: VodKind::Movie,
@@ -445,7 +462,14 @@ pub fn xtream_catalog(client: &XtreamClient, provider_id: &str) -> VodCatalog {
                     .and_then(|id| categories.get(&id).cloned())
                     .unwrap_or_else(|| "Movies".to_string());
                 let url = client.vod_stream_url(&sid, &ext);
-                let item = playable_item(name, group.clone(), url, Some(provider_id.to_string()));
+                let item = playable_item(
+                    name,
+                    group.clone(),
+                    url,
+                    Some(provider_id.to_string()),
+                    "movie",
+                    &sid,
+                );
                 catalog.add(&format!("Movies — {group}"), item);
             }
         }
@@ -515,7 +539,19 @@ pub fn xtream_series_episodes(
             let title = str_field(ep, &["title"]).unwrap_or_else(|| format!("Episode {e_no}"));
             let label = format!("S{season_no:02}E{e_no:02} - {title}");
             let url = client.series_stream_url(&eid, &ext);
-            let mut item = playable_item(label, String::new(), url, Some(provider_id.to_string()));
+            let mut item = playable_item(
+                label,
+                String::new(),
+                url,
+                Some(provider_id.to_string()),
+                "episode",
+                &eid,
+            );
+            if let Some(channel) = &mut item.channel {
+                channel
+                    .unknown_attributes
+                    .insert("series_id".to_string(), series_id.to_string());
+            }
             item.season_episode = Some((season_no, e_no));
             item.series_id = Some(series_id.to_string());
             episodes.push(item);

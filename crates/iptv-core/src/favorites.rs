@@ -75,6 +75,30 @@ pub fn normalize_keys(values: impl IntoIterator<Item = String>) -> Vec<String> {
         .collect()
 }
 
+/// The persisted recent-channels MRU cap (Python keeps 20).
+pub const MAX_RECENT_CHANNELS: usize = 20;
+
+/// Record one played channel in the recent-channels MRU
+/// (Python `_remember_played_channel`, P17): the key moves to
+/// the front, duplicates collapse to the single front entry,
+/// and the list truncates at [`MAX_RECENT_CHANNELS`]. A key
+/// already at the front changes nothing; an empty key records
+/// nothing. A/B/A therefore yields exactly `[A, B]`.
+#[must_use]
+pub fn remember_recent(keys: &[String], key: &str) -> Vec<String> {
+    if key.is_empty() || keys.first().is_some_and(|front| front == key) {
+        return keys.to_vec();
+    }
+    let mut next = vec![key.to_string()];
+    next.extend(
+        keys.iter()
+            .filter(|existing| existing.as_str() != key)
+            .cloned(),
+    );
+    next.truncate(MAX_RECENT_CHANNELS);
+    next
+}
+
 /// The outcome of toggling one channel in a [`FavoriteSet`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Toggle {
@@ -260,6 +284,28 @@ mod tests {
             set,
             FavoriteSet::from_stored(["Bravo".to_owned(), "Alpha".to_owned()])
         );
+    }
+
+    #[test]
+    fn recent_history_is_a_deduped_twenty_entry_mru() {
+        let keys: Vec<String> = Vec::new();
+        let keys = remember_recent(&keys, "A");
+        let keys = remember_recent(&keys, "B");
+        // A/B/A: A promoted to the front, still a single entry.
+        let keys = remember_recent(&keys, "A");
+        assert_eq!(keys, ["A", "B"]);
+        // Already at the front: no reorder, no growth.
+        assert_eq!(remember_recent(&keys, "A"), ["A", "B"]);
+        // Empty keys record nothing.
+        assert_eq!(remember_recent(&keys, ""), ["A", "B"]);
+        // The cap holds at 20, newest first.
+        let mut keys: Vec<String> = Vec::new();
+        for n in 0..25 {
+            keys = remember_recent(&keys, &format!("K{n}"));
+        }
+        assert_eq!(keys.len(), 20);
+        assert_eq!(keys[0], "K24");
+        assert_eq!(keys[19], "K5");
     }
 
     #[test]
