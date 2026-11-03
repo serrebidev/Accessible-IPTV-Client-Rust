@@ -39,8 +39,47 @@ use wxdragon::prelude::*;
 use wxdragon::timer::Timer;
 use wxdragon::widgets::media_ctrl::SeekMode;
 
+/// One copy per user (S01, Python's `single_instance`): take the
+/// instance lock, or hand over to the running copy — often hidden in
+/// the tray — and exit. The returned guard lives until the event
+/// loop ends; without it a second scheduler would fight the first
+/// for recordings, config saves and provider streams.
+fn acquire_instance() -> Option<iptv_core::instance::InstanceGuard> {
+    let instance_dir = config::user_config_dir();
+    let guard = match iptv_core::instance::acquire(&instance_dir) {
+        Some(guard) => Some(guard),
+        None => {
+            match iptv_core::instance::hand_over(&instance_dir, std::time::Duration::from_secs(15))
+            {
+                iptv_core::instance::HandOver::Shown => {
+                    std::process::exit(iptv_core::instance::HANDED_OVER_EXIT_CODE);
+                }
+                iptv_core::instance::HandOver::Acquired(guard) => Some(guard),
+                iptv_core::instance::HandOver::Unresponsive => {
+                    let _ = wxdragon::main(|_| {
+                        let frame = Frame::builder()
+                            .with_title("Accessible IPTV Client")
+                            .build();
+                        let dialog = MessageDialog::builder(
+                            &frame,
+                            "Accessible IPTV Client is already running, but it did not respond. Wait a moment and try again, or close it from the notification area.",
+                            "Accessible IPTV Client",
+                        )
+                        .build();
+                        dialog.show_modal();
+                    });
+                    std::process::exit(iptv_core::instance::HANDED_OVER_EXIT_CODE);
+                }
+            }
+        }
+    };
+    iptv_core::instance::clear_show_request(&instance_dir);
+    guard
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     SystemOptions::set_option_by_int("msw.no-manifest-check", 1);
+    let _instance_guard = acquire_instance();
     wxdragon::main(|_| {
         let frame = Frame::builder()
             .with_title("Accessible IPTV Client")
@@ -294,19 +333,43 @@ struct Status {
 }
 
 /// The UI translator, installed once the configuration (and its
-/// language) is loaded. `tr` is the gettext choke point for menu
-/// labels and status announcements; untranslated strings pass
-/// through unchanged.
-static TRANSLATOR: std::sync::OnceLock<I18n> = std::sync::OnceLock::new();
+/// language) is loaded, and replaced when the language changes so
+/// new dialogs activate the new language at once (Python's
+/// `i18n.set_language` in the language selector). `tr` is the
+/// gettext choke point for menu labels and status announcements;
+/// untranslated strings pass through unchanged.
+static TRANSLATOR: std::sync::RwLock<Option<I18n>> = std::sync::RwLock::new(None);
 
 fn set_translator(i18n: &I18n) {
-    let _ = TRANSLATOR.set(i18n.clone());
+    if let Ok(mut slot) = TRANSLATOR.write() {
+        *slot = Some(i18n.clone());
+    }
 }
 
 fn tr(text: &str) -> String {
-    TRANSLATOR
-        .get()
-        .map_or_else(|| text.to_string(), |i18n| i18n.gettext(text))
+    TRANSLATOR.read().map_or_else(
+        |_| text.to_string(),
+        |slot| {
+            slot.as_ref()
+                .map_or_else(|| text.to_string(), |i18n| i18n.gettext(text))
+        },
+    )
+}
+
+/// Translate a template, then fill its `{name}` placeholders.
+/// Formatting before lookup (the old `tr(&format!(...))` shape) can
+/// never match a catalogue template, so dynamic messages always go
+/// through here.
+fn trf(template: &str, args: &[(&str, &str)]) -> String {
+    TRANSLATOR.read().map_or_else(
+        |_| iptv_core::i18n::interpolate(template, args),
+        |slot| {
+            slot.as_ref().map_or_else(
+                || iptv_core::i18n::interpolate(template, args),
+                |i18n| i18n.gettextf(template, args),
+            )
+        },
+    )
 }
 
 impl Status {
@@ -440,7 +503,14 @@ struct Wiring {
     proxy: Rc<RefCell<Option<iptv_core::proxy::ProxyServer>>>,
     guide_ui: Rc<RefCell<Option<GuideUi>>>,
     tray: Rc<TaskBarIcon>,
-    i18n: Rc<I18n>,
+    i18n: Rc<RefCell<I18n>>,
+    /// Always-on 1 s timer: single-instance show requests (S01)
+    /// and the hourly automatic update check (S07). The main tick
+    /// timer stops when idle, so these live on their own.
+    housekeeping: Rc<Timer<Frame>>,
+    /// The help topic of the main-window control that last took
+    /// focus, so the Help menu opens where the user is (S10).
+    help_focus_topic: Rc<RefCell<&'static str>>,
     vod_worker: Rc<VodWorker>,
     vod_pending: Rc<std::cell::Cell<bool>>,
     vod_ui: Rc<RefCell<Option<VodUi>>>,
@@ -801,6 +871,25 @@ impl Persist {
     }
 }
 
+/// Open the real log file (S05): one sink for the process, in the
+/// per-user config directory's logs folder, and record how the
+/// config load went.
+fn init_app_log(loaded: &iptv_core::config::Loaded) {
+    iptv_core::applog::init(&iptv_core::applog::log_path(
+        &iptv_core::config::user_config_dir(),
+    ));
+    for kept in &loaded.recovered {
+        iptv_core::applog::warn(
+            "config",
+            &format!("Unreadable config preserved as {}", kept.display()),
+        );
+    }
+    iptv_core::applog::info(
+        "app",
+        &format!("Started; config loaded from {}", loaded.path.display()),
+    );
+}
+
 #[allow(clippy::too_many_lines)] // grew with the batch wiring (R01/R06 state)
 fn bind_browser(
     frame: Frame,
@@ -810,7 +899,8 @@ fn bind_browser(
     epg_rows: Rc<RefCell<Vec<EpgSearchRow>>>,
 ) {
     let candidates = config::config_candidates();
-    let loaded = config::load(&candidates, &candidates[0]);
+    let loaded = config::load(&candidates, &config::default_write_target());
+    init_app_log(&loaded);
     if !loaded.config.bool_or("show_channel_url", true) {
         controls.stream_url.hide();
     }
@@ -818,7 +908,7 @@ fn bind_browser(
     let i18n = {
         let mut i18n = I18n::default();
         i18n.init_from_config(&iptv_core::i18n::locale_dir(), loaded.config.raw());
-        Rc::new(i18n)
+        Rc::new(RefCell::new(i18n))
     };
     let mut browser_worker = BrowserWorker::default();
     browser_worker.set_favorites(FavoriteSet::from_stored(loaded.config.favorites()));
@@ -870,6 +960,8 @@ fn bind_browser(
         guide_ui: Rc::new(RefCell::new(None)),
         tray: Rc::new(build_tray_icon()),
         i18n,
+        housekeeping: Rc::new(Timer::new(&frame)),
+        help_focus_topic: Rc::new(RefCell::new("user-guide")),
         vod_worker: Rc::new(VodWorker::new()),
         vod_pending: Rc::new(std::cell::Cell::new(false)),
         vod_ui: Rc::new(RefCell::new(None)),
@@ -898,6 +990,8 @@ fn bind_browser(
         cast_worker: Rc::clone(&wiring.cast_worker),
         cast_pending: Rc::clone(&wiring.cast_pending),
         timer: Rc::clone(&wiring.timer),
+        guide_ui: Rc::clone(&wiring.guide_ui),
+        i18n: Rc::clone(&wiring.i18n),
     });
     *wiring.reminders.borrow_mut() = wiring.persist.reminders();
     init_speech(&wiring.player, &wiring.persist, controls.status);
@@ -924,6 +1018,38 @@ fn bind_browser(
         .provider_worker
         .set_cache_dir(iptv_core::config::user_config_dir().join("provider-cache"));
     bind_main_close(frame, &wiring);
+    bind_housekeeping(frame, &wiring);
+}
+
+/// The always-on housekeeping tick (1 s), independent of the main
+/// tick timer that stops when idle: answer single-instance show
+/// requests by restoring the window (S01, Python's
+/// `watch_for_show_requests`), and run the automatic update check
+/// hourly while the option is enabled (S07, Python's update-check
+/// timer, whose handler likewise re-reads the option each time).
+fn bind_housekeeping(frame: Frame, wiring: &Wiring) {
+    let tick_wiring = clone_wiring(wiring);
+    let last_check = Rc::new(std::cell::Cell::new(now_seconds()));
+    let config_dir = iptv_core::config::user_config_dir();
+    wiring.housekeeping.on_tick(move |_| {
+        if iptv_core::instance::take_show_request(&config_dir) {
+            frame.show(true);
+            frame.raise();
+        }
+        let now = now_seconds();
+        if now - last_check.get() >= 3600.0 {
+            last_check.set(now);
+            if tick_wiring
+                .persist
+                .config
+                .borrow()
+                .bool_or("auto_check_updates", false)
+            {
+                check_updates(&frame, ship_shape::ui::CheckTrigger::Automatic);
+            }
+        }
+    });
+    let _ = wiring.housekeeping.start(1000, false);
 }
 
 /// The main window's close behavior: minimize-to-tray hides
@@ -1424,8 +1550,9 @@ fn prompt_schedule_padding(wiring: &Wiring, frame: Frame, status: Status) {
     wiring
         .persist
         .set_and_save("recording_post_padding_minutes", serde_json::json!(post));
-    status.set_label(&format!(
-        "Schedule padding: {pre} minutes before, {post} minutes after."
+    status.set_label(&trf(
+        "Schedule padding: {pre} minutes before, {post} minutes after.",
+        &[("pre", &pre.to_string()), ("post", &post.to_string())],
     ));
 }
 
@@ -1560,7 +1687,10 @@ fn poll_providers(wiring: &Wiring, controls: Controls) {
                     .borrow_mut()
                     .replace_provider_channels(channels, &controls.search.get_value());
                 if count > 0 {
-                    status.set_label(&format!("{count} provider channels loaded."));
+                    status.set_label(&trf(
+                        "{count} provider channels loaded.",
+                        &[("count", &count.to_string())],
+                    ));
                     assert!(wiring.timer.start(50, false));
                 }
                 if !epg_urls.is_empty() {
@@ -1689,9 +1819,13 @@ fn poll_epg(wiring: &Wiring, status: Status) {
                     "epg_last_sources_hash",
                     serde_json::json!(hash_epg_sources(&imported)),
                 );
-                status.set_label(&format!(
-                    "Guide loaded: {} channels, {} programmes.{store_note}",
-                    counts.0, counts.1
+                status.set_label(&trf(
+                    "Guide loaded: {channels} channels, {programmes} programmes.{note}",
+                    &[
+                        ("channels", &counts.0.to_string()),
+                        ("programmes", &counts.1.to_string()),
+                        ("note", &store_note),
+                    ],
                 ));
                 // Sources changed while this load ran (a provider
                 // finished after it started): run the load the
@@ -1704,7 +1838,10 @@ fn poll_epg(wiring: &Wiring, status: Status) {
                     }
                 }
             }
-            Err(error) => status.set_label(&format!("Guide failed to load: {error}")),
+            Err(error) => {
+                iptv_core::applog::error("epg", &format!("Guide failed to load: {error}"));
+                status.set_label(&trf("Guide failed to load: {error}", &[("error", &error)]));
+            }
         }
     }
     let now = std::time::SystemTime::now()
@@ -2297,7 +2434,10 @@ fn toggle_recording(
     if recordings.borrow().is_recording(&key) {
         recordings.borrow_mut().stop(&key);
         release_recording_lease(buffers, &key);
-        status.set_label(&format!("Stopping recording of {}.", channel.name));
+        status.set_label(&trf(
+            "Stopping recording of {name}.",
+            &[("name", &channel.name)],
+        ));
         return;
     }
     if channel.url.is_empty() {
@@ -2316,10 +2456,12 @@ fn toggle_recording(
         &channel.name.clone(),
         witness,
     ) {
-        Ok(path) => status.set_label(&format!(
-            "Recording {} to {}.",
-            channel.name,
-            path.display()
+        Ok(path) => status.set_label(&trf(
+            "Recording {name} to {path}.",
+            &[
+                ("name", &channel.name),
+                ("path", &path.display().to_string()),
+            ],
         )),
         Err(error) => status.set_label(&error),
     }
@@ -2448,9 +2590,9 @@ fn start_dvr_job(wiring: &Wiring, status: Status, job_id: &str, now: f64) {
                         next_try: now + 10.0,
                     },
                 );
-                status.set_label(&format!(
-                    "Resolving the stream link for the scheduled recording of {}.",
-                    channel.name
+                status.set_label(&trf(
+                    "Resolving the stream link for the scheduled recording of {name}.",
+                    &[("name", &channel.name)],
                 ));
             }
             _ => {
@@ -2492,7 +2634,7 @@ fn record_dvr_channel(
         &display,
         None,
     ) {
-        Ok(_) => status.set_label(&format!("Recording {display}.")),
+        Ok(_) => status.set_label(&trf("Recording {display}.", &[("display", &display)])),
         Err(error) => {
             wiring
                 .dvr
@@ -2831,15 +2973,16 @@ fn poll_recordings(wiring: &Wiring, status: Status) {
         }
         if success {
             let size = std::fs::metadata(&finished.out_path).map_or(0, |m| m.len());
-            status.set_label(&format!(
-                "Recording saved: {name} ({}.{} MB)",
-                size / 1_000_000,
-                (size % 1_000_000) / 100_000
+            let mb = format!("{}.{}", size / 1_000_000, (size % 1_000_000) / 100_000);
+            status.set_label(&trf(
+                "Recording saved: {name} ({mb} MB)",
+                &[("name", &name), ("mb", &mb)],
             ));
         } else if finished.success {
             status.set_label("Nothing was recorded: the stream ended before it wrote anything.");
         } else {
-            status.set_label(&format!("Recording failed: {name}"));
+            iptv_core::applog::error("recording", &format!("Recording failed: {name}"));
+            status.set_label(&trf("Recording failed: {name}", &[("name", &name)]));
         }
     }
     if now - wiring.last_dvr_tick.get() >= 10.0 {
@@ -3169,8 +3312,12 @@ fn poll_vod(wiring: &Wiring, status: Status) {
                 if !refs.is_empty() {
                     ui.groups.set_selection(0, true);
                 }
-                ui.status.set_label(&format!(
-                    "VOD catalogue ready: {groups_count} groups, {items_count} items."
+                ui.status.set_label(&trf(
+                    "VOD catalogue ready: {groups} groups, {items} items.",
+                    &[
+                        ("groups", &groups_count.to_string()),
+                        ("items", &items_count.to_string()),
+                    ],
                 ));
                 status.set_label("VOD catalogue loaded.");
             }
@@ -3184,13 +3331,18 @@ fn poll_vod(wiring: &Wiring, status: Status) {
                 view.stack.push(previous);
                 view.showing = episodes;
                 show_items(ui.items, &view.showing);
-                ui.status.set_label(&format!("{count} episodes loaded."));
+                ui.status.set_label(&trf(
+                    "{count} episodes loaded.",
+                    &[("count", &count.to_string())],
+                ));
             }
             VodEvent::Episodes {
                 result: Err(error), ..
             } => {
-                ui.status
-                    .set_label(&format!("Could not load episodes: {error}"));
+                ui.status.set_label(&trf(
+                    "Could not load episodes: {error}",
+                    &[("error", &error)],
+                ));
             }
         }
     }
@@ -3257,6 +3409,11 @@ fn bind_cast_buttons(
             };
             let (clean_url, _) = iptv_core::playback::split_stream_modifiers(&channel.url);
             let headers = iptv_core::downloads::channel_headers(channel);
+            // The media type is probed from the original stream and
+            // travels independently of the playback URL (S04): the
+            // proxy URL below is an opaque `/s/<hash>` path that
+            // cannot reveal HLS/TS to the renderer.
+            let probed_mime = iptv_core::cast::guess_mime(&clean_url);
             let play_url = if headers.is_empty() {
                 clean_url
             } else {
@@ -3269,10 +3426,18 @@ fn bind_cast_buttons(
                     None => clean_url,
                 }
             };
-            worker.play(device.clone(), play_url, channel.name.clone());
+            worker.play(
+                device.clone(),
+                play_url,
+                channel.name.clone(),
+                Some(probed_mime),
+            );
             pending.set(true);
             assert!(timer.start(50, false));
-            status.set_label(&format!("Casting {} to {}...", channel.name, device.name));
+            status.set_label(&trf(
+                "Casting {channel} to {device}...",
+                &[("channel", &channel.name), ("device", &device.name)],
+            ));
         });
     }
     {
@@ -3380,21 +3545,26 @@ fn poll_cast(wiring: &Wiring, status: Status) {
                     ui.status
                         .set_label("No cast devices found. Check the TV is on and on this network, then Refresh.");
                 } else {
-                    ui.status.set_label(&format!(
-                        "Found {count} cast device(s). Choose one and press Play."
+                    ui.status.set_label(&trf(
+                        "Found {count} cast device(s). Choose one and press Play.",
+                        &[("count", &count.to_string())],
                     ));
                 }
                 status.set_label("Cast device search finished.");
             }
             CastEvent::Played(Ok(name)) => {
-                ui.status.set_label(&format!("Casting to {name}."));
-                status.set_label(&format!("Casting to {name}."));
+                ui.status
+                    .set_label(&trf("Casting to {name}.", &[("name", &name)]));
+                status.set_label(&trf("Casting to {name}.", &[("name", &name)]));
             }
             CastEvent::Played(Err(error)) => {
-                ui.status.set_label(&format!("Casting failed: {error}"));
+                iptv_core::applog::error("cast", &format!("Casting failed: {error}"));
+                ui.status
+                    .set_label(&trf("Casting failed: {error}", &[("error", &error)]));
             }
             CastEvent::Stopped(name) => {
-                ui.status.set_label(&format!("Stopped casting to {name}."));
+                ui.status
+                    .set_label(&trf("Stopped casting to {name}.", &[("name", &name)]));
             }
         }
     }
@@ -3454,6 +3624,8 @@ fn clone_wiring(wiring: &Wiring) -> Wiring {
         guide_ui: Rc::clone(&wiring.guide_ui),
         tray: Rc::clone(&wiring.tray),
         i18n: Rc::clone(&wiring.i18n),
+        housekeeping: Rc::clone(&wiring.housekeeping),
+        help_focus_topic: Rc::clone(&wiring.help_focus_topic),
         vod_worker: Rc::clone(&wiring.vod_worker),
         vod_pending: Rc::clone(&wiring.vod_pending),
         vod_ui: Rc::clone(&wiring.vod_ui),
@@ -3474,20 +3646,6 @@ fn clone_wiring(wiring: &Wiring) -> Wiring {
         account_text: Rc::clone(&wiring.account_text),
         buffers: Rc::clone(&wiring.buffers),
     }
-}
-
-/// Open the User Guide window at the start of the manual.
-fn open_guide_window(wiring: &Wiring, status: Status) {
-    let ui = ensure_guide_ui(&wiring.guide_ui);
-    let language = wiring.i18n.resolved_language();
-    let (guide, section) = iptv_core::guide::open_topic(Some(&language), None, None);
-    show_guide(&ui, guide);
-    if let Some(section) = section {
-        move_caret(&ui, &section);
-    }
-    ui.frame.show(true);
-    ui.frame.raise();
-    status.set_label("User Guide opened.");
 }
 
 /// The tray icon (kept alive on the wiring). Its popup menu is
@@ -3620,7 +3778,10 @@ fn dispatch_tray_menu(wiring: &Wiring, frame: Frame, status: Status, id: i32) {
                 wiring.recordings.borrow_mut().stop(key);
             }
             if count > 0 {
-                status.set_label(&format!("Stopping {count} recordings."));
+                status.set_label(&trf(
+                    "Stopping {count} recordings.",
+                    &[("count", &count.to_string())],
+                ));
             }
         }
         TRAY_EXIT => {
@@ -3749,7 +3910,7 @@ fn menu_label(keys: &std::collections::BTreeMap<String, String>, text: &str, nam
 }
 
 fn build_menu(frame: Frame, wiring: &Wiring, controls: Controls) {
-    set_translator(&wiring.i18n);
+    set_translator(&wiring.i18n.borrow());
     let config = wiring.persist.config.borrow();
     let raw = serde_json::Value::Object(config.raw().clone());
     let keys = iptv_core::shortcuts::effective(&raw, "main");
@@ -4089,7 +4250,10 @@ fn open_review_subtitles(wiring: &Wiring, status: Status) {
     let (frame, _panel, list, dstatus) = list_dialog("Recent Subtitles", "Recent subtitles");
     list.set_items(&recent.iter().map(String::as_str).collect::<Vec<_>>());
     list.set_selection(0, true);
-    dstatus.set_label(&format!("{} recent subtitles.", recent.len()));
+    dstatus.set_label(&trf(
+        "{count} recent subtitles.",
+        &[("count", &recent.len().to_string())],
+    ));
     frame.show(true);
 }
 
@@ -4369,7 +4533,7 @@ fn app_voice_output_dialog(wiring: &Wiring, frame: Frame, status: Status) {
         wiring
             .persist
             .set_and_save("subtitle_app_output", serde_json::json!(selected));
-        status.set_label(&format!("Application voice output: {name}"));
+        status.set_label(&trf("Application voice output: {name}", &[("name", &name)]));
     } else {
         state.app_voice.set_output(&previous, policy);
         state.cue_speech.set_preview_active(false);
@@ -4446,8 +4610,9 @@ fn prompt_min_free_space(wiring: &Wiring, frame: Frame, status: Status) {
     wiring
         .persist
         .set_and_save("recording_min_free_mib", serde_json::json!(normalized));
-    status.set_label(&format!(
-        "Minimum free space before recording: {normalized} MiB."
+    status.set_label(&trf(
+        "Minimum free space before recording: {normalized} MiB.",
+        &[("normalized", &normalized.to_string())],
     ));
 }
 
@@ -4742,7 +4907,13 @@ fn bind_menu_actions(frame: Frame, wiring: &Wiring, controls: Controls) {
         }
         match id {
             4004 => frame.close(false),
-            5002 => open_guide_window(&wiring, status),
+            // The Help menu opens the guide at the topic of the
+            // control the user is actually on (S10), not always at
+            // the top of the manual.
+            5002 => {
+                let topic = *wiring.help_focus_topic.borrow();
+                open_guide_window_at(&wiring, status, topic);
+            }
             5003 => check_updates(&frame, ship_shape::ui::CheckTrigger::Manual),
             5004 => {
                 frame.show(true);
@@ -4752,7 +4923,9 @@ fn bind_menu_actions(frame: Frame, wiring: &Wiring, controls: Controls) {
             WHAT_IS_PLAYING => {
                 let player = wiring.player.borrow();
                 match &player.current_channel {
-                    Some(channel) => status.set_label(&format!("Now playing: {}", channel.name)),
+                    Some(channel) => {
+                        status.set_label(&trf("Now playing: {name}", &[("name", &channel.name)]));
+                    }
                     None => status.set_label("Nothing is playing."),
                 }
             }
@@ -4860,7 +5033,10 @@ fn menu_recordings_action(
                         wiring.recordings.borrow_mut().stop(key);
                         release_recording_lease(&wiring.buffers, key);
                     }
-                    status.set_label(&format!("Stopping {count} recordings."));
+                    status.set_label(&trf(
+                        "Stopping {count} recordings.",
+                        &[("count", &count.to_string())],
+                    ));
                 }
             }
         }
@@ -4874,7 +5050,10 @@ fn menu_recordings_action(
                     wiring.recordings.borrow_mut().stop(key);
                     release_recording_lease(&wiring.buffers, key);
                 }
-                status.set_label(&format!("Stopping {count} recordings."));
+                status.set_label(&trf(
+                    "Stopping {count} recordings.",
+                    &[("count", &count.to_string())],
+                ));
             }
         }
         REC_REMINDERS => open_reminders_dialog(wiring, status),
@@ -4941,7 +5120,7 @@ fn menu_recordings_action(
                 wiring
                     .persist
                     .set_and_save(key, serde_json::json!(format_id));
-                status.set_label(&format!("Recording format: {label}."));
+                status.set_label(&trf("Recording format: {label}.", &[("label", label)]));
             }
         }
         _ => return false,
@@ -4957,17 +5136,33 @@ fn menu_radio_action(id: i32, wiring: &Wiring, status: Status) -> bool {
         let index = usize::try_from(id - PLAYER_RADIO_BASE).unwrap_or(0);
         if let Some(name) = PLAYER_LABELS.get(index) {
             persist.set_and_save("media_player", serde_json::json!(name));
-            status.set_label(&format!("Media player set to {name}."));
+            status.set_label(&trf("Media player set to {name}.", &[("name", name)]));
         }
         return true;
     }
     if (LANGUAGE_BASE..LANGUAGE_BASE + 15).contains(&id) {
         let index = usize::try_from(id - LANGUAGE_BASE).unwrap_or(0);
-        if let Some((code, name)) = iptv_core::i18n::language_labels().get(index) {
-            persist.set_and_save("language", serde_json::json!(code));
-            status.set_label(&format!(
-                "Language set to {name}. Restart to apply everywhere."
-            ));
+        if let Some((code, _name)) = iptv_core::i18n::language_labels().get(index) {
+            if *code != wiring.i18n.borrow().language() {
+                persist.set_and_save("language", serde_json::json!(code));
+                // Activate at once (S06, Python's `_on_select_language`):
+                // the confirmation below — and every dialog opened from
+                // now on — uses the new language; already-built menus
+                // pick it up on restart.
+                let mut fresh = I18n::default();
+                fresh.set_language(&iptv_core::i18n::locale_dir(), code);
+                *wiring.i18n.borrow_mut() = fresh;
+                set_translator(&wiring.i18n.borrow());
+                if let Some(bar) = status.bar {
+                    let dialog = MessageDialog::builder(
+                        &bar,
+                        &tr("The language has been changed. Please restart Accessible IPTV Client for the change to take full effect."),
+                        &tr("Language"),
+                    )
+                    .build();
+                    dialog.show_modal();
+                }
+            }
         }
         return true;
     }
@@ -5041,27 +5236,20 @@ fn bind_menu_option_actions(frame: Frame, wiring: &Wiring, controls: Controls) {
             DEVICE_POLICY_DEFAULT => set_device_policy(&wiring, status, DevicePolicy::Default),
             PREFERRED_AUDIO => open_audio_prefs(&wiring, status),
             KEYBOARD_SHORTCUTS => open_shortcuts_editor(&wiring, status),
-            WHATS_NEW => open_whats_new(status),
+            WHATS_NEW => open_whats_new(&wiring, status),
             READ_CURRENT_SUBTITLE => menu_read_current_subtitle(&wiring, status),
             READ_PREVIOUS_SUBTITLE => menu_read_previous_subtitle(&wiring, status),
             REVIEW_SUBTITLES => open_review_subtitles(&wiring, status),
             SUBTITLE_CAPABILITIES => show_subtitle_capabilities(frame, status),
             OPEN_LOGS => {
-                let dir = iptv_core::config::user_config_dir();
+                // The real log folder (S05): the sink writes
+                // iptvclient_epg_debug.log inside it.
+                let dir = iptv_core::applog::logs_dir(&iptv_core::config::user_config_dir());
+                let _ = std::fs::create_dir_all(&dir);
                 open_folder(&dir);
-                status.set_label("Opened the settings folder, which holds the logs.");
+                status.set_label("Opened the logs folder.");
             }
-            COPY_DEBUG => {
-                let text = format!(
-                    "Accessible IPTV Client {}\nOS: {}\nConfig: {}",
-                    env!("CARGO_PKG_VERSION"),
-                    std::env::consts::OS,
-                    persist.path.display()
-                );
-                if Clipboard::get().set_text(&text) {
-                    status.set_label("Log and debug information copied.");
-                }
-            }
+            COPY_DEBUG => copy_debug_information(&wiring, status),
             ABOUT => {
                 let dialog = MessageDialog::builder(
                     &frame,
@@ -5077,6 +5265,36 @@ fn bind_menu_option_actions(frame: Frame, wiring: &Wiring, controls: Controls) {
             _ => {}
         }
     });
+}
+
+/// Real diagnostics (S05): operational facts plus the redacted,
+/// bounded 128 KiB log tail on the clipboard — and a clipboard
+/// failure is reported, not swallowed.
+fn copy_debug_information(wiring: &Wiring, status: Status) {
+    let config = wiring.persist.config.borrow();
+    let playlist_count = config
+        .value("playlists")
+        .and_then(serde_json::Value::as_array)
+        .map_or(0, Vec::len);
+    let tail = iptv_core::applog::read_tail(
+        &iptv_core::applog::log_path(&iptv_core::config::user_config_dir()),
+        iptv_core::applog::DIAGNOSTIC_TAIL_BYTES,
+    );
+    let text = iptv_core::applog::diagnostics_report(
+        env!("CARGO_PKG_VERSION"),
+        std::env::consts::OS,
+        &wiring.persist.path,
+        config.bool_or("epg_enabled", true),
+        playlist_count,
+        wiring.recordings.borrow().active_count(),
+        &tail,
+    );
+    drop(config);
+    if Clipboard::get().set_text(&text) {
+        status.set_label("Log and debug information copied.");
+    } else {
+        status.set_label("Could not copy diagnostic information: the clipboard is unavailable.");
+    }
 }
 
 /// File > Import EPG to DB: pick an XMLTV file, remember it as a
@@ -5144,7 +5362,10 @@ fn menu_go_to_channel_number(wiring: &Wiring, frame: Frame, list: ListCtrl, stat
     list.ensure_visible(row_i64);
     list.set_focus();
     if let Some(channel) = wiring.browser.borrow().channel(index) {
-        status.set_label(&format!("Channel {}: {}", number, channel.name));
+        status.set_label(&trf(
+            "Channel {number}: {name}",
+            &[("number", &number.to_string()), ("name", &channel.name)],
+        ));
     }
 }
 
@@ -5249,9 +5470,15 @@ fn menu_export_settings(wiring: &Wiring, frame: Frame, status: Status) {
                 .show_modal();
                 status.set_label("Encrypted settings backup saved.");
             }
-            Err(error) => status.set_label(&format!("Could not export settings: {error}")),
+            Err(error) => status.set_label(&trf(
+                "Could not export settings: {error}",
+                &[("error", &error.to_string())],
+            )),
         },
-        Err(error) => status.set_label(&format!("Could not export settings: {error}")),
+        Err(error) => status.set_label(&trf(
+            "Could not export settings: {error}",
+            &[("error", &error)],
+        )),
     }
 }
 
@@ -5296,8 +5523,9 @@ fn make_recovery_copy(wiring: &Wiring, frame: Frame, status: Status) -> Option<S
     ) {
         Ok(recovery) => recovery,
         Err(error) => {
-            status.set_label(&format!(
-                "Import stopped: the recovery copy could not be created: {error} Your settings are unchanged."
+            status.set_label(&trf(
+                "Import stopped: the recovery copy could not be created: {error} Your settings are unchanged.",
+                &[("error", &error)],
             ));
             return None;
         }
@@ -5330,8 +5558,9 @@ fn make_recovery_copy(wiring: &Wiring, frame: Frame, status: Status) -> Option<S
 /// applies, as Python instructs).
 fn menu_import_settings(wiring: &Wiring, frame: Frame, status: Status) {
     if let Some(blocker) = import_blocker(wiring) {
-        status.set_label(&format!(
-            "Import stopped: {blocker}. Finish or stop them, then import. Your settings are unchanged."
+        status.set_label(&trf(
+            "Import stopped: {blocker}. Finish or stop them, then import. Your settings are unchanged.",
+            &[("blocker", blocker)],
         ));
         return;
     }
@@ -5359,7 +5588,10 @@ fn menu_import_settings(wiring: &Wiring, frame: Frame, status: Status) {
     let decrypted = match iptv_core::settings_backup::import_settings(&bytes, &password) {
         Ok(decrypted) => decrypted,
         Err(error) => {
-            status.set_label(&format!("Could not import settings: {error}"));
+            status.set_label(&trf(
+                "Could not import settings: {error}",
+                &[("error", &error)],
+            ));
             return;
         }
     };
@@ -5384,14 +5616,18 @@ fn menu_import_settings(wiring: &Wiring, frame: Frame, status: Status) {
     // Rechecked at the moment of applying: work that started
     // while the dialogs were open still blocks the swap.
     if let Some(blocker) = import_blocker(wiring) {
-        status.set_label(&format!(
-            "Import canceled: {blocker}. Your settings are unchanged; the recovery copy remains saved."
+        status.set_label(&trf(
+            "Import canceled: {blocker}. Your settings are unchanged; the recovery copy remains saved.",
+            &[("blocker", blocker)],
         ));
         return;
     }
     match std::fs::write(&wiring.persist.path, decrypted) {
         Ok(()) => status.set_label("Settings imported. Restart the app to use them."),
-        Err(error) => status.set_label(&format!("Could not import settings: {error}")),
+        Err(error) => status.set_label(&trf(
+            "Could not import settings: {error}",
+            &[("error", &error.to_string())],
+        )),
     }
 }
 
@@ -5586,10 +5822,10 @@ fn ensure_guide_ui(slot: &Rc<RefCell<Option<GuideUi>>>) -> GuideUi {
                     let char_index = haystack[..byte_index].chars().count();
                     body.set_insertion_point(i64::try_from(char_index).unwrap_or(0));
                     body.set_focus();
-                    status.set_label(&format!("Found \"{query}\"."));
+                    status.set_label(&trf("Found \"{query}\".", &[("query", &query)]));
                 }
                 None => {
-                    status.set_label(&format!("Cannot find \"{query}\"."));
+                    status.set_label(&trf("Cannot find \"{query}\".", &[("query", &query)]));
                 }
             }
         });
@@ -5618,10 +5854,12 @@ fn show_guide(ui: &GuideUi, guide: Guide) {
     if !refs.is_empty() {
         ui.toc.set_selection(0, true);
     }
-    ui.status.set_label(&format!(
-        "User Guide ({}). {} sections. Choose a section, or use Find.",
-        guide.language,
-        guide.sections.len()
+    ui.status.set_label(&trf(
+        "User Guide ({language}). {count} sections. Choose a section, or use Find.",
+        &[
+            ("language", &guide.language),
+            ("count", &guide.sections.len().to_string()),
+        ],
     ));
     *ui.guide.borrow_mut() = guide;
 }
@@ -5744,10 +5982,12 @@ fn add_reminder(
             let rows = wiring.reminders.borrow().clone();
             wiring.persist.save_reminders(&rows);
             ensure_polling(wiring);
-            status.set_label(&format!(
-                "Reminder set for {} at {}.",
-                programme.title,
-                local_hhmm(programme.start)
+            status.set_label(&trf(
+                "Reminder set for {title} at {time}.",
+                &[
+                    ("title", &programme.title),
+                    ("time", &local_hhmm(programme.start)),
+                ],
             ));
         }
         Err(_) => {
@@ -5843,10 +6083,12 @@ fn add_dvr_job(
         wiring.series_last_scan.set(0.0);
     }
     ensure_polling(wiring);
-    status.set_label(&format!(
-        "Recording scheduled: {} at {}.",
-        programme.title,
-        local_hhmm(programme.start)
+    status.set_label(&trf(
+        "Recording scheduled: {title} at {time}.",
+        &[
+            ("title", &programme.title),
+            ("time", &local_hhmm(programme.start)),
+        ],
     ));
 }
 
@@ -6133,6 +6375,11 @@ fn open_channel_epg(wiring: &Wiring, channel: &Channel, main_status: Status) {
     catchup_button.on_click(move |_| open_catchup_dialog(&wiring_cat, &channel_cat, status));
     let frame_hide = frame;
     close_button.on_click(move |_| frame_hide.hide());
+    // F1 anywhere in this window opens the guide at the channel
+    // guide topic (S10).
+    bind_f1_help(&frame, wiring, "channel-epg", status);
+    bind_f1_help(&list, wiring, "channel-epg", status);
+    bind_f1_help(&details, wiring, "channel-epg", status);
     frame.show(true);
 }
 
@@ -6409,8 +6656,10 @@ fn play_channel(
                         record_recent(persist, channel);
                     }
                 }
-                None => status.set_label(&format!("Could not locate {name} executable.")),
-            }
+                None => status.set_label(&trf(
+                    "Could not locate {name} executable.",
+                    &[("name", &name)],
+                )),
         }
         PlayerChoice::Custom(path) => {
             if path.is_empty() {
@@ -6479,11 +6728,17 @@ fn launch_external(
     let argv = external_argv(name, exe, &request.url, &ipc);
     match Command::new(&argv[0]).args(&argv[1..]).spawn() {
         Ok(_) => {
-            status.set_label(&format!("Playing {} in {name}.", request.title));
+            status.set_label(&trf(
+                "Playing {title} in {name}.",
+                &[("title", &request.title), ("name", name)],
+            ));
             true
         }
         Err(error) => {
-            status.set_label(&format!("Could not start {name}: {error}"));
+            status.set_label(&trf(
+                "Could not start {name}: {error}",
+                &[("name", name), ("error", &error.to_string())],
+            ));
             false
         }
     }
@@ -6790,8 +7045,9 @@ fn play_builtin(
     player_status(status, persist, &state.session.announcement(), 3);
     if !state.vlc_active {
         if let Some(error) = &state.vlc_error {
-            status.set_label(&format!(
-                "libVLC is not available ({error}); basic player in use, many streams will not play."
+            status.set_label(&trf(
+                "libVLC is not available ({error}); basic player in use, many streams will not play.",
+                &[("error", error)],
             ));
         }
     }
@@ -7023,6 +7279,10 @@ struct PlayerShared {
     cast_worker: Rc<CastWorker>,
     cast_pending: Rc<std::cell::Cell<bool>>,
     timer: Rc<Timer<Frame>>,
+    /// Guide window + language, so F1 in the player reaches its
+    /// own topic without the full wiring (S10).
+    guide_ui: Rc<RefCell<Option<GuideUi>>>,
+    i18n: Rc<RefCell<I18n>>,
 }
 
 /// Build the built-in player window once: video surface, seek and
@@ -7144,7 +7404,50 @@ fn ensure_player_window(player: &Rc<RefCell<PlayerState>>, persist: &Persist, st
     );
     bind_player_controls(player, persist, status, &win);
     build_playback_menu(player, persist, status, &win);
+    // F1 anywhere in the player opens the guide at the player's
+    // topic (S10) — previously only the main window had F1 at all.
+    bind_player_f1(&win.frame, player, status, "built-in-player");
+    bind_player_f1(&win.media, player, status, "built-in-player");
+    bind_player_f1(&win.seek, player, status, "built-in-player");
+    bind_player_f1(&win.volume, player, status, "built-in-player");
+    bind_player_f1(&win.tracks, player, status, "built-in-player");
     player.borrow_mut().window = Some(win);
+}
+
+/// Open the guide at a topic from the player window, which holds
+/// only its shared slice of the main wiring.
+fn open_guide_from_player(shared: &PlayerShared, status: Status, topic: &str) {
+    let ui = ensure_guide_ui(&shared.guide_ui);
+    let language = shared.i18n.borrow().resolved_language();
+    let (guide, section) = iptv_core::guide::open_topic(Some(&language), Some(topic), None);
+    show_guide(&ui, guide);
+    if let Some(section) = section {
+        move_caret(&ui, &section);
+    }
+    ui.frame.show(true);
+    ui.frame.raise();
+    status.set_label("User Guide opened.");
+}
+
+/// F1 help inside the player window (S10).
+fn bind_player_f1<T>(
+    control: &T,
+    player: &Rc<RefCell<PlayerState>>,
+    status: Status,
+    topic: &'static str,
+) where
+    T: wxdragon::event::WxEvtHandler,
+{
+    let player = Rc::clone(player);
+    control.bind_internal(EventType::KEY_DOWN, move |event| {
+        if event.get_key_code() == Some(340) {
+            let state = player.borrow();
+            if let Some(shared) = &state.shared {
+                open_guide_from_player(shared, status, topic);
+            }
+        }
+        event.skip(true);
+    });
 }
 
 /// Player Playback-menu ids.
@@ -7440,7 +7743,9 @@ fn dispatch_player_menu(
         PM_WHATS_PLAYING => {
             let state = player.borrow();
             match &state.current_channel {
-                Some(channel) => status.set_label(&format!("Now playing: {}", channel.name)),
+                Some(channel) => {
+                    status.set_label(&trf("Now playing: {name}", &[("name", &channel.name)]));
+                }
                 None => status.set_label("Nothing is playing."),
             }
         }
@@ -7867,7 +8172,10 @@ fn prompt_sleep_timer(
         return;
     };
     if !(0..=fade_cap).contains(&fade) {
-        status.set_label(&format!("Enter fade-out seconds between 0 and {fade_cap}."));
+        status.set_label(&trf(
+            "Enter fade-out seconds between 0 and {fade_cap}.",
+            &[("fade_cap", &fade_cap.to_string())],
+        ));
         return;
     }
     persist.set_and_save("sleep_fade_seconds", serde_json::json!(fade));
@@ -7875,8 +8183,9 @@ fn prompt_sleep_timer(
     state.sleep_deadline = Some(now_ms() + minutes * 60_000);
     state.sleep_fade_secs = fade;
     state.sleep_fading = false;
-    status.set_label(&format!(
-        "Sleep timer set: playback stops in {minutes} minutes."
+    status.set_label(&trf(
+        "Sleep timer set: playback stops in {minutes} minutes.",
+        &[("minutes", &minutes.to_string())],
     ));
 }
 
@@ -8642,7 +8951,10 @@ fn prompt_live_buffer_config(
     }
     let text = dialog.get_value().unwrap_or_default();
     let Ok(minutes) = text.trim().parse::<i64>() else {
-        status.set_label(&format!("\"{text}\" is not a whole number of minutes."));
+        status.set_label(&trf(
+            "\"{text}\" is not a whole number of minutes.",
+            &[("text", &text)],
+        ));
         return;
     };
     if !(0..=30).contains(&minutes) {
@@ -8684,7 +8996,10 @@ fn prompt_live_buffer_config(
         }
         let text = dialog.get_value().unwrap_or_default();
         let Ok(mib) = text.trim().parse::<i64>() else {
-            status.set_label(&format!("\"{text}\" is not a whole number of MiB."));
+            status.set_label(&trf(
+                "\"{text}\" is not a whole number of MiB.",
+                &[("text", &text)],
+            ));
             return;
         };
         if !(64..=4096).contains(&mib) {
@@ -8754,7 +9069,10 @@ fn prompt_rewind(
     }
     let text = dialog.get_value().unwrap_or_default();
     let Ok(seconds) = text.trim().parse::<i64>() else {
-        status.set_label(&format!("\"{text}\" is not a whole number of seconds."));
+        status.set_label(&trf(
+            "\"{text}\" is not a whole number of seconds.",
+            &[("text", &text)],
+        ));
         return;
     };
     let seconds = seconds.clamp(0, max_seconds.max(0));
@@ -9406,7 +9724,9 @@ fn dispatch_player_key(
         "what_is_playing" => {
             let state = player.borrow();
             match &state.current_channel {
-                Some(channel) => status.set_label(&format!("Now playing: {}", channel.name)),
+                Some(channel) => {
+                    status.set_label(&trf("Now playing: {name}", &[("name", &channel.name)]));
+                }
                 None => status.set_label("Nothing is playing."),
             }
         }
@@ -9474,8 +9794,10 @@ fn show_cast_for(
     ui.view.borrow_mut().channel = channel.cloned();
     match channel {
         Some(channel) => {
-            ui.status
-                .set_label(&format!("Looking for cast devices for {}...", channel.name));
+            ui.status.set_label(&trf(
+                "Looking for cast devices for {name}...",
+                &[("name", &channel.name)],
+            ));
         }
         None => {
             ui.status
@@ -10858,6 +11180,17 @@ fn open_account_form(
     auto_epg.set_value(get_bool("auto_epg", true));
     let ok = Button::builder(&panel).with_label("&OK").build();
     let cancel = Button::builder(&panel).with_label("&Cancel").build();
+    // F1 in the provider form opens the guide at the account's own
+    // topic (S10). Bound before the OK handler takes the fields.
+    let form_topic = if kind == "stalker" {
+        "stalker-portal"
+    } else {
+        "xtream-codes"
+    };
+    bind_f1_help(&form, wiring, form_topic, mstatus);
+    for (_, field) in &fields {
+        bind_f1_help(field, wiring, form_topic, mstatus);
+    }
     let form_hide = form;
     cancel.on_click(move |_| form_hide.hide());
     let kind_owned = kind.to_string();
@@ -11383,7 +11716,10 @@ fn open_whats_on_now(wiring: &Wiring, status: Status) {
             if !labels.is_empty() {
                 list.set_selection(0, true);
             }
-            count_label.set_label(&format!("{} programs", filtered.len()));
+            count_label.set_label(&trf(
+                "{count} programs",
+                &[("count", &filtered.len().to_string())],
+            ));
         }
     };
     render(list, count_label);
@@ -11508,7 +11844,10 @@ fn open_continue_watching(wiring: &Wiring, status: Status) {
     if !rows.is_empty() {
         list.set_selection(0, true);
     }
-    dstatus.set_label(&format!("{} programmes to resume.", rows.len()));
+    dstatus.set_label(&trf(
+        "{count} programmes to resume.",
+        &[("count", &rows.len().to_string())],
+    ));
     let resume = Button::builder(&panel).with_label("&Resume").build();
     let check = Button::builder(&panel)
         .with_label("C&heck Availability")
@@ -11691,7 +12030,10 @@ fn open_recent_channels(wiring: &Wiring, status: Status) {
     let labels: Vec<String> = history.iter().map(|c| c.name.clone()).collect();
     list.set_items(&labels.iter().map(String::as_str).collect::<Vec<_>>());
     list.set_selection(0, true);
-    dstatus.set_label(&format!("{} recently watched channels.", history.len()));
+    dstatus.set_label(&trf(
+        "{count} recently watched channels.",
+        &[("count", &history.len().to_string())],
+    ));
     let play = Button::builder(&panel).with_label("&Play").build();
     let close = Button::builder(&panel).with_label("&Close").build();
     let history = Rc::new(RefCell::new(history));
@@ -11759,12 +12101,14 @@ fn open_reminders_dialog(wiring: &Wiring, main_status: Status) {
                 list.set_selection(u32::try_from(index).unwrap_or(0), true);
             }
         }
-        let count_text = if rows.is_empty() {
-            "No reminders.".to_string()
+        if rows.is_empty() {
+            dstatus.set_label("No reminders.");
         } else {
-            format!("{} reminders.", rows.len())
-        };
-        dstatus.set_label(&count_text);
+            dstatus.set_label(&trf(
+                "{count} reminders.",
+                &[("count", &rows.len().to_string())],
+            ));
+        }
     };
     render(wiring, list, dstatus);
     if wiring.reminders.borrow().is_empty() {
@@ -12008,7 +12352,10 @@ fn render_scheduled_jobs(wiring: &Wiring, list: ListCtrl, dstatus: Status) {
             list.set_item_state(row, ListItemState::Selected, ListItemState::Selected);
         }
     }
-    dstatus.set_label(&format!("{} scheduled recordings.", dvr.jobs().len()));
+    dstatus.set_label(&trf(
+        "{count} scheduled recordings.",
+        &[("count", &dvr.jobs().len().to_string())],
+    ));
 }
 
 /// Delete every selected finished job (the Delete button and
@@ -12199,7 +12546,10 @@ fn open_catchup_dialog(wiring: &Wiring, channel: &Channel, main_status: Status) 
         .collect();
     list.set_items(&labels.iter().map(String::as_str).collect::<Vec<_>>());
     list.set_selection(0, true);
-    dstatus.set_label(&format!("{} catch-up programmes.", programmes.len()));
+    dstatus.set_label(&trf(
+        "{count} catch-up programmes.",
+        &[("count", &programmes.len().to_string())],
+    ));
     let programmes = Rc::new(RefCell::new(programmes));
     // The selected programme's description is readable in the
     // details text (audit R20), starting with the first row.
@@ -12487,7 +12837,10 @@ fn begin_catchup_download(
     }
     wiring.downloads_active.set(true);
     assert!(wiring.timer.start(50, false));
-    status.set_label(&format!("Downloading {}...", programme.title));
+    status.set_label(&trf(
+        "Downloading {title}...",
+        &[("title", &programme.title)],
+    ));
 }
 
 /// Launch (or relaunch) one staged ffmpeg catch-up capture:
@@ -12627,8 +12980,10 @@ fn refresh_downloads_window(wiring: &Wiring) {
             ui.list.set_selection(index, true);
         }
     }
-    ui.dstatus
-        .set_label(&format!("{} downloads.", labels.len()));
+    ui.dstatus.set_label(&trf(
+        "{count} downloads.",
+        &[("count", &labels.len().to_string())],
+    ));
 }
 
 /// View > Show Downloads: tracked downloads with live progress
@@ -12647,7 +13002,10 @@ fn open_downloads_window(wiring: &Wiring, status: Status) {
     let (frame, panel, list, dstatus) = list_dialog("Downloads", "Downloads");
     let labels = download_row_labels(wiring);
     list.set_items(&labels.iter().map(String::as_str).collect::<Vec<_>>());
-    dstatus.set_label(&format!("{} downloads.", labels.len()));
+    dstatus.set_label(&trf(
+        "{count} downloads.",
+        &[("count", &labels.len().to_string())],
+    ));
     *wiring.downloads_ui.borrow_mut() = Some(DownloadsUi {
         frame,
         list,
@@ -12783,7 +13141,7 @@ fn poll_downloads(wiring: &Wiring, status: Status) {
             if !was_done && row.done && row.progress.starts_with("Done") {
                 let name = row.name.clone();
                 drop(rows);
-                status.set_label(&format!("Download finished: {name}"));
+                status.set_label(&trf("Download finished: {name}", &[("name", &name)]));
             }
             changed = true;
         }
@@ -12809,7 +13167,7 @@ fn format_bytes(bytes: u64) -> String {
 /// Open the User Guide at a specific help topic (per-control F1).
 fn open_guide_window_at(wiring: &Wiring, status: Status, topic: &str) {
     let ui = ensure_guide_ui(&wiring.guide_ui);
-    let language = wiring.i18n.resolved_language();
+    let language = wiring.i18n.borrow().resolved_language();
     let (guide, section) = iptv_core::guide::open_topic(Some(&language), Some(topic), None);
     show_guide(&ui, guide);
     if let Some(section) = section {
@@ -12820,17 +13178,24 @@ fn open_guide_window_at(wiring: &Wiring, status: Status, topic: &str) {
     status.set_label("User Guide opened.");
 }
 
-/// Attach F1 help to one main-window control: F1 opens the guide
-/// at the control's topic, as Python's `set_help_topic` does.
+/// Attach F1 help to one control: F1 opens the guide at the
+/// control's topic, as Python's `set_help_topic` does. Taking focus
+/// also records the topic, so the main window's Help menu command
+/// opens where the user currently is (S10).
 fn bind_f1_help<T>(control: &T, wiring: &Wiring, topic: &'static str, status: Status)
 where
     T: wxdragon::event::WxEvtHandler,
 {
+    let focus_topic = Rc::clone(&wiring.help_focus_topic);
     let wiring = clone_wiring(wiring);
     control.bind_internal(EventType::KEY_DOWN, move |event| {
         if event.get_key_code() == Some(340) {
             open_guide_window_at(&wiring, status, topic);
         }
+        event.skip(true);
+    });
+    control.bind_internal(EventType::SET_FOCUS, move |event| {
+        *focus_topic.borrow_mut() = topic;
         event.skip(true);
     });
 }
@@ -12882,7 +13247,10 @@ fn dispatch_main_hotkey(
             if let Some(current) = current {
                 let value = (current + delta).clamp(0, 100);
                 player_set_volume(&player, value);
-                status.set_label(&format!("Volume {value} percent."));
+                status.set_label(&trf(
+                    "Volume {value} percent.",
+                    &[("value", &value.to_string())],
+                ));
             }
             true
         }
@@ -12932,8 +13300,9 @@ fn open_shortcuts_editor(wiring: &Wiring, status: Status) {
         labels.len()
     };
     let count = render(wiring, list);
-    dstatus.set_label(&format!(
-        "{count} commands. Edit changes a binding; menus pick up changes on restart."
+    dstatus.set_label(&trf(
+        "{count} commands. Edit changes a binding; menus pick up changes on restart.",
+        &[("count", &count.to_string())],
     ));
     let edit = Button::builder(&panel).with_label("&Edit Binding").build();
     let reset = Button::builder(&panel).with_label("&Reset All").build();
@@ -12973,7 +13342,7 @@ fn open_shortcuts_editor(wiring: &Wiring, status: Status) {
                     .unwrap_or(serde_json::json!({}));
                 wiring_e.persist.set_and_save("shortcuts", shortcuts);
                 render(&wiring_e, list);
-                dstatus.set_label(&format!("Shortcut for {label} updated."));
+                dstatus.set_label(&trf("Shortcut for {label} updated.", &[("label", label)]));
             }
             Err(error) => dstatus.set_label(&error),
         }
@@ -13049,16 +13418,47 @@ fn open_audio_prefs(wiring: &Wiring, status: Status) {
     frame.show(true);
 }
 
-/// Help > What's New: the current version's notes.
-fn open_whats_new(status: Status) {
-    let (frame, _panel, _list, dstatus) = list_dialog("What's New", "Changes");
-    dstatus.details.set_value(WHATS_NEW_TEXT);
-    dstatus.set_label(&format!(
-        "What's new in version {}",
-        env!("CARGO_PKG_VERSION")
+/// Help > What's New: the newest releases' notes, localized
+/// through the release-notes catalogue (S09, Python's
+/// `ChangelogDialog`), with the older history one button away in the
+/// same document.
+fn open_whats_new(wiring: &Wiring, status: Status) {
+    let (frame, panel, _list, dstatus) = list_dialog("What's New", "Changes");
+    let localized = {
+        let i18n = wiring.i18n.borrow();
+        iptv_core::i18n::localize_notes(&i18n, WHATS_NEW_TEXT)
+    };
+    let (recent, older) =
+        iptv_core::i18n::split_notes_window(&localized, iptv_core::i18n::RELEASE_WINDOW);
+    dstatus.details.set_value(&recent);
+    dstatus.set_label(&trf(
+        "What's new in version {version}",
+        &[("version", env!("CARGO_PKG_VERSION"))],
     ));
+    if !older.trim().is_empty() {
+        let toggle = Button::builder(&panel)
+            .with_label(&tr("Show older releases"))
+            .build();
+        toggle.set_accessibility_label("Show older releases");
+        let shown = Rc::new(std::cell::Cell::new(false));
+        let details = dstatus.details;
+        let handle = toggle;
+        toggle.on_click(move |_| {
+            let next = !shown.get();
+            shown.set(next);
+            if next {
+                details.set_value(&format!("{recent}\n{older}"));
+                handle.set_label(&tr("Hide older releases"));
+            } else {
+                details.set_value(&recent);
+                handle.set_label(&tr("Show older releases"));
+            }
+        });
+    }
+    // F1 in this window opens the guide at its own topic (S10).
+    bind_f1_help(&frame, wiring, "updates", status);
+    bind_f1_help(&dstatus.details, wiring, "updates", status);
     frame.show(true);
-    let _ = status;
 }
 
 /// The What's New text for the running version (updated per release).
@@ -13077,7 +13477,7 @@ fn execute_shutdown(status: Status) {
     let root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
     match recording::shutdown_computer(system, &root) {
         Ok(_) => status.set_label("All recordings finished. Shutting down."),
-        Err(error) => status.set_label(&format!("Shutdown failed: {error}")),
+        Err(error) => status.set_label(&trf("Shutdown failed: {error}", &[("error", &error)])),
     }
 }
 
@@ -13125,8 +13525,9 @@ fn open_shutdown_countdown(wiring: &Wiring, status: Status) {
             execute_shutdown(status);
             frame.hide();
         } else {
-            label.set_label(&format!(
-                "All recordings have finished.\n\nThe computer will shut down by itself. Seconds remaining: {next}"
+            label.set_label(&trf(
+                "All recordings have finished.\n\nThe computer will shut down by itself. Seconds remaining: {next}",
+                &[("next", &next.to_string())],
             ));
         }
     });
