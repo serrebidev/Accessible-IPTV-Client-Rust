@@ -26,7 +26,6 @@ pub mod shortcuts;
 pub mod sources;
 pub mod subtitles;
 pub mod timeshift;
-pub mod updater;
 pub mod vod;
 
 use std::collections::BTreeMap;

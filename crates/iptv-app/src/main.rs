@@ -2,7 +2,6 @@ mod buffer;
 
 use iptv_core::guide::Guide;
 use iptv_core::i18n::I18n;
-use iptv_core::updater::{UpdateEvent, UpdateWorker};
 use iptv_core::{
     browser::{BrowseEvent, BrowserWorker},
     cast::{CastDevice, CastEvent, CastWorker},
@@ -374,9 +373,6 @@ struct Wiring {
     cast_ui: Rc<RefCell<Option<CastUi>>>,
     proxy: Rc<RefCell<Option<iptv_core::proxy::ProxyServer>>>,
     guide_ui: Rc<RefCell<Option<GuideUi>>>,
-    update_worker: Rc<UpdateWorker>,
-    update_pending: Rc<std::cell::Cell<bool>>,
-    pending_update: Rc<RefCell<Option<iptv_core::updater::UpdateManifest>>>,
     tray: Rc<TaskBarIcon>,
     i18n: Rc<I18n>,
     vod_worker: Rc<VodWorker>,
@@ -583,9 +579,6 @@ fn bind_browser(frame: Frame, controls: Controls, model: Rc<RefCell<SearchResult
         cast_ui: Rc::new(RefCell::new(None)),
         proxy: Rc::new(RefCell::new(None)),
         guide_ui: Rc::new(RefCell::new(None)),
-        update_worker: Rc::new(UpdateWorker::new()),
-        update_pending: Rc::new(std::cell::Cell::new(false)),
-        pending_update: Rc::new(RefCell::new(None)),
         tray: Rc::new(build_tray_icon()),
         i18n,
         vod_worker: Rc::new(VodWorker::new()),
@@ -622,7 +615,7 @@ fn bind_browser(frame: Frame, controls: Controls, model: Rc<RefCell<SearchResult
     bind_completion(&wiring, controls);
     build_menu(frame, &wiring, controls);
     bind_tray(frame, &wiring, controls.status);
-    maybe_auto_check_updates(&wiring);
+    maybe_auto_check_updates(&wiring, frame);
     bind_actions(frame, &wiring, controls);
     bind_context_menu(frame, &wiring, controls);
     wiring
@@ -697,7 +690,6 @@ fn bind_completion(wiring: &Wiring, controls: Controls) {
         poll_recordings(&completed, status);
         poll_vod(&completed, status);
         poll_cast(&completed, status);
-        poll_updates(&completed, status);
         poll_downloads(&completed, status);
         if !completed.browser.borrow().is_busy()
             && !completed.epg_pending.get()
@@ -712,7 +704,6 @@ fn bind_completion(wiring: &Wiring, controls: Controls) {
             && !completed.vod_pending.get()
             && !completed.cast_pending.get()
             && !completed.downloads_active.get()
-            && !completed.update_pending.get()
         {
             if let Some(timer) = completed_timer.upgrade() {
                 timer.stop();
@@ -2074,9 +2065,6 @@ fn clone_wiring(wiring: &Wiring) -> Wiring {
         cast_ui: Rc::clone(&wiring.cast_ui),
         proxy: Rc::clone(&wiring.proxy),
         guide_ui: Rc::clone(&wiring.guide_ui),
-        update_worker: Rc::clone(&wiring.update_worker),
-        update_pending: Rc::clone(&wiring.update_pending),
-        pending_update: Rc::clone(&wiring.pending_update),
         tray: Rc::clone(&wiring.tray),
         i18n: Rc::clone(&wiring.i18n),
         vod_worker: Rc::clone(&wiring.vod_worker),
@@ -3001,7 +2989,7 @@ fn bind_menu_actions(frame: Frame, wiring: &Wiring, controls: Controls) {
         match id {
             4004 => frame.close(false),
             5002 => open_guide_window(&wiring, status),
-            5003 => open_update_prompt(&wiring, frame, status),
+            5003 => check_updates(&frame, ship_shape::ui::CheckTrigger::Manual),
             5004 => {
                 frame.show(true);
                 frame.raise();
@@ -3565,102 +3553,55 @@ fn open_folder(dir: &std::path::Path) {
     let _ = std::process::Command::new(program).arg(dir).spawn();
 }
 
+/// The minisign public key (line 2 of assets/minisign.pub, read
+/// in by build.rs). Release assets are signed with the matching
+/// secret, which lives only in the release pipeline and the
+/// owner's vault — the same keypair `BlindRadio` uses.
+const PUBLIC_KEY: &str = env!("IPTV_MINISIGN_PUBLIC_KEY");
+
+/// ship-shape updater configuration: this repo, the portable
+/// asset names the release workflow publishes, verified against
+/// `PUBLIC_KEY`. Portable on every platform: the packages are
+/// archives extracted over the app folder (on macOS ship-shape
+/// falls back to opening the signed disk image for a manual
+/// install, since the package is not a signed app bundle).
+fn updater_config() -> std::sync::Arc<ship_shape::UpdaterConfig> {
+    std::sync::Arc::new(
+        ship_shape::UpdaterConfig::new(
+            "serrebidev/Accessible-IPTV-Client-Rust",
+            "accessible-iptv-client",
+            "Accessible IPTV Client",
+            PUBLIC_KEY,
+            env!("CARGO_PKG_VERSION"),
+        )
+        .with_install_kind(ship_shape::InstallKind::Portable),
+    )
+}
+
+/// Run a signed update check. ship-shape does the work on its
+/// own thread and drives its dialogs from the frame: Manual
+/// also reports "up to date" and errors; Automatic stays quiet
+/// unless an update is actually available.
+fn check_updates(frame: &Frame, trigger: ship_shape::ui::CheckTrigger) {
+    ship_shape::ui::run_update_check(
+        updater_config(),
+        frame,
+        ship_shape::UpdateChannel::Stable,
+        trigger,
+    );
+}
+
 /// Start a background update check at launch when the user enabled
 /// auto-check in Options.
-fn maybe_auto_check_updates(wiring: &Wiring) {
+fn maybe_auto_check_updates(wiring: &Wiring, frame: Frame) {
     if wiring
         .persist
         .config
         .borrow()
         .bool_or("auto_check_updates", false)
     {
-        start_update_check(wiring);
+        check_updates(&frame, ship_shape::ui::CheckTrigger::Automatic);
     }
-}
-
-/// Kick a background update check and arm the completion poll.
-fn start_update_check(wiring: &Wiring) {
-    wiring.update_worker.check(
-        "serrebidev",
-        "Accessible-IPTV-Client-Rust",
-        "update-manifest.json",
-        env!("CARGO_PKG_VERSION"),
-    );
-    wiring.update_pending.set(true);
-    assert!(wiring.timer.start(50, false));
-}
-
-/// Collect update-check outcomes onto the status line.
-fn poll_updates(wiring: &Wiring, status: Status) {
-    while let Some(event) = wiring.update_worker.try_recv() {
-        wiring.update_pending.set(false);
-        match event {
-            UpdateEvent::Checked { manifest, newer } => {
-                if newer {
-                    status.set_label(&format!(
-                        "Version {} is available. You have {}. Choose Check for Updates in the Help menu to download and install it.",
-                        manifest.version,
-                        env!("CARGO_PKG_VERSION")
-                    ));
-                    *wiring.pending_update.borrow_mut() = Some(manifest);
-                } else {
-                    status.set_label(&format!(
-                        "Accessible IPTV Client is up to date ({}).",
-                        env!("CARGO_PKG_VERSION")
-                    ));
-                }
-            }
-            UpdateEvent::Downloaded { path } => {
-                status.set_label(&format!(
-                    "Update downloaded and verified: {}. Opening it now.",
-                    path.display()
-                ));
-                open_downloaded_package(&path);
-            }
-            UpdateEvent::Failed(error) => {
-                status.set_label(&format!("Update failed: {error}"));
-            }
-        }
-    }
-}
-
-/// Ask whether to download the pending update, then queue it.
-fn open_update_prompt(wiring: &Wiring, frame: Frame, status: Status) {
-    let Some(manifest) = wiring.pending_update.borrow().clone() else {
-        start_update_check(wiring);
-        status.set_label("Checking for updates...");
-        return;
-    };
-    let dialog = MessageDialog::builder(
-        &frame,
-        &format!(
-            "Version {} is available. Download and open it now?",
-            manifest.version
-        ),
-        "Update Accessible IPTV Client",
-    )
-    .with_style(MessageDialogStyle::YesNo)
-    .build();
-    if dialog.show_modal() != ID_YES {
-        status.set_label("Update postponed.");
-        return;
-    }
-    let dest = iptv_core::config::user_config_dir().join("updates");
-    wiring.update_worker.download(&manifest, dest);
-    wiring.update_pending.set(true);
-    assert!(wiring.timer.start(50, false));
-    status.set_label(&format!("Downloading version {}...", manifest.version));
-}
-
-/// Open a downloaded package with the platform's handler.
-fn open_downloaded_package(path: &std::path::Path) {
-    #[cfg(target_os = "windows")]
-    let program = "explorer";
-    #[cfg(target_os = "macos")]
-    let program = "open";
-    #[cfg(all(unix, not(target_os = "macos")))]
-    let program = "xdg-open";
-    let _ = std::process::Command::new(program).arg(path).spawn();
 }
 
 /// Build the guide window once and keep it (closing hides it).
