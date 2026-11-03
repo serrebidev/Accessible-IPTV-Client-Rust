@@ -1668,6 +1668,7 @@ fn handle_dvr_resolve(
     }
     record_dvr_channel(wiring, status, &job, &channel, now);
 }
+#[allow(clippy::too_many_lines)]
 fn poll_providers(wiring: &Wiring, controls: Controls) {
     let status = controls.status;
     while let Some(event) = wiring.provider_worker.try_recv() {
