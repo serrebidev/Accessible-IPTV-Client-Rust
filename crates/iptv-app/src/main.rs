@@ -5010,8 +5010,7 @@ fn menu_recordings_action(
             // fallback (audit R18) — exactly one active recording
             // stops even after the selection moved; none says so;
             // several stop all, like Python's fallback.
-            let selected_key =
-                selected_channel(wiring, list).map(|channel| channel_key(&channel));
+            let selected_key = selected_channel(wiring, list).map(|channel| channel_key(&channel));
             if let Some(key) = &selected_key {
                 if wiring.recordings.borrow().is_recording(key) {
                     wiring.recordings.borrow_mut().stop(key);
