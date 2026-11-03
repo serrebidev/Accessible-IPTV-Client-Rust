@@ -194,6 +194,22 @@ mod tests {
         assert_eq!(contents, PYTHON_CONFIG_JSON.as_bytes());
     }
 
+    /// A second Python-written fixture, generated fresh from the
+    /// pinned reference on 2026-11-02 for issue #133, carrying
+    /// synthetic credential-shaped values (never real ones).
+    const PYTHON_BACKUP_133: &str = "{\"format\": \"accessible-iptv-settings-v1\", \"salt\": \"EZVTllZNDL+CNYOvAqJUaA==\", \"data\": \"gAAAAABq6V3oORiJEfDNz-grK_a5wEYWmN-Ex2oD0ohPK6r_BeM27sIwqLf3-y6jLaZ_V0Fiyj5NEJEMFQiDWRSr9rklRio7CZK5uuKtIvEnY5YL-mXgGARdKY3iIXUbjv21IglEO9ElNpjuGvN65yMwf9Ly2SWTxNf4ZD2DUElsTiCzAhgLKGJmtswZFPJDMVu2qhOmNRVpBJGl9FIE32xJHVQFxztYUrLNDrH4gGqTNlUJ3MqeDAEPY_RUuLaKDrivM9uCUvbNZld3elzoymdHBVH05IlkllAkXezeX8unCFZAoF4po-WSHVYYamN1mqOhrcyVN0HscjIkcgIjVhQxjn3a0mGG2mqJIFvfhV_FrM13hbupViVRAUac7I5Pd-iN1DD0L-zb7B30TXcdALSBW8nVZsN4fA==\"}";
+    const PYTHON_CONFIG_133: &str = "{\"playlists\": [{\"type\": \"xtream\", \"name\": \"Synthetic Provider\", \"server\": \"http://example.invalid:8080\", \"username\": \"synthetic-user-133\", \"password\": \"synthetic-pass-133\"}], \"epgs\": [\"http://example.invalid/guide.xml\"], \"language\": \"en\", \"volume\": 65}";
+
+    #[test]
+    fn decrypts_the_fresh_python_fixture_with_synthetic_credentials() {
+        let contents = import_settings(PYTHON_BACKUP_133.as_bytes(), "interop-133-test").unwrap();
+        assert_eq!(contents, PYTHON_CONFIG_133.as_bytes());
+        assert_eq!(
+            import_settings(PYTHON_BACKUP_133.as_bytes(), "wrong").unwrap_err(),
+            "Wrong password or damaged backup."
+        );
+    }
+
     #[test]
     fn roundtrip_preserves_bytes_and_unicode() {
         let config = "{\"playlists\": [], \"epgs\": [], \"note\": \"Café — déjà vu\"}";
