@@ -621,6 +621,10 @@ pub struct BufferRegistry {
     /// itself is UI-thread state), delivered on the player
     /// tick.
     pub pending: Option<Arc<Mutex<Option<BufferOutcome>>>>,
+    /// Playback-session generation when the pending start was
+    /// launched; a delivery whose generation has moved on (Stop
+    /// or a newer channel choice) is dropped, never played.
+    pub pending_generation: u64,
     /// Recording key → (session, lease) held while recording.
     pub recording_leases: HashMap<String, (Arc<BufferSession>, u64)>,
     /// Last buffered channel, for Return to Live's resume.
