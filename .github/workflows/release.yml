@@ -118,10 +118,10 @@ jobs:
           Copy-Item "docs/help" "$stage/docs/help" -Recurse
           Copy-Item "bundle/libvlc.dll", "bundle/libvlccore.dll" $stage
           Copy-Item "bundle/plugins" "$stage/plugins" -Recurse
-          Compress-Archive -Path $stage -DestinationPath "$stage.zip"
+          Compress-Archive -Path "$stage/*" -DestinationPath "accessible-iptv-client.zip"
 
-      - name: Package (Linux/macOS)
-        if: runner.os != 'Windows'
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
         run: |
           tag="${{ inputs.tag || github.ref_name }}"
           stage="accessible-iptv-client-${tag}-${{ matrix.asset_suffix }}"
@@ -129,7 +129,18 @@ jobs:
           cp "target/release/${{ matrix.binary }}" "$stage/"
           cp -R docs/help "$stage/docs/help"
           cp -a bundle/. "$stage/"
-          tar -czf "$stage.tar.gz" "$stage"
+          tar -czf accessible-iptv-client.tar.gz -C "$stage" .
+
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          tag="${{ inputs.tag || github.ref_name }}"
+          stage="accessible-iptv-client-${tag}-${{ matrix.asset_suffix }}"
+          mkdir -p "$stage/docs"
+          cp "target/release/${{ matrix.binary }}" "$stage/"
+          cp -R docs/help "$stage/docs/help"
+          cp -a bundle/. "$stage/"
+          hdiutil create -volname "Accessible IPTV Client" -srcfolder "$stage" -ov -format UDZO accessible-iptv-client.dmg
 
       - name: Upload package
         uses: actions/upload-artifact@v4
@@ -138,6 +149,7 @@ jobs:
           path: |
             *.zip
             *.tar.gz
+            *.dmg
           if-no-files-found: error
 
   publish:
@@ -156,11 +168,29 @@ jobs:
           path: dist
           merge-multiple: true
 
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      # Signed updates (ship-shape): every downloadable asset gets a
+      # .minisig sibling, signed with the repo's MINISIGN_KEY secret
+      # (same keypair as BlindRadio). Publish refuses to proceed
+      # when any signature is missing — an unsigned asset would
+      # make the updater silently offer nothing.
+      - name: Sign release assets
+        env:
+          MINISIGN_KEY: ${{ secrets.MINISIGN_KEY }}
+        run: |
+          cargo build --release -p iptv-signer
+          ./target/release/iptv-signer dist/accessible-iptv-client.zip dist/accessible-iptv-client.tar.gz dist/accessible-iptv-client.dmg
+          for f in dist/accessible-iptv-client.zip dist/accessible-iptv-client.tar.gz dist/accessible-iptv-client.dmg; do
+            test -f "$f.minisig" || { echo "missing signature for $f"; exit 1; }
+          done
+
       - name: Write update manifest
         run: |
           tag="${{ inputs.tag || github.ref_name }}"
           version="${tag#v}"
-          asset="accessible-iptv-client-${tag}-windows-x64.zip"
+          asset="accessible-iptv-client.zip"
           sha="$(sha256sum "dist/$asset" | cut -d' ' -f1)"
           published="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           cat > dist/update-manifest.json <<EOF

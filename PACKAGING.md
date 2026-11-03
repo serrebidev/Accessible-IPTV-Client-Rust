@@ -43,13 +43,30 @@ data files at runtime:
 
 ## Update check contract
 
-Help → Check for Updates reads the latest GitHub release of
-`serrebidev/Accessible-IPTV-Client-Rust`, finds the
-`update-manifest.json` asset (case-insensitive), and compares its
-`version` against the running build. The environment's GitHub token
-is only ever sent to GitHub hosts. Downloading and installing an
-update in-app is not wired yet (the Python product's installer is a
-Windows PowerShell helper with Authenticode pinning); the check
-announces availability on the status line, and the core's verified
-download helper (`download_file_sha256`) is ready for the install
-step when it is ported.
+Since v0.4.0, updates run on ship-shape (the same signed
+updater as BlindRadio). Help → Check for Updates — and the
+optional launch check in Options — ask GitHub for the latest
+release; when its version is newer, ship-shape requires the
+platform asset below AND its `.minisig` sibling, downloads
+both, and verifies the minisign signature against the public
+key compiled into the app (assets/minisign.pub; the secret
+half signs in the release workflow from the MINISIGN_KEY
+Actions secret and lives in the owner's vault, never in
+git). A release without signature pairs offers no update.
+
+Asset names are fixed by ship-shape's contract and the
+archive contents sit at the root (the updater extracts over
+the app folder):
+
+- `accessible-iptv-client.zip` — Windows (portable);
+- `accessible-iptv-client.tar.gz` — Linux (portable);
+- `accessible-iptv-client.dmg` — macOS. The macOS package is
+  a bare unsigned binary rather than a signed app bundle, so
+  ship-shape falls back to opening the verified disk image
+  for a manual install there; Windows and Linux self-install
+  and relaunch.
+
+Transition: `update-manifest.json` is still published,
+pointing at `accessible-iptv-client.zip`, so installs up to
+v0.3.2 (the hand-rolled updater) can download the new
+package and move onto the signed updater.

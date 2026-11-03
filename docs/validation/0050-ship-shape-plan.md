@@ -1,4 +1,27 @@
-# 0050 — Signed updates via ship-shape (plan; implementation follows)
+# 0050 — Signed updates via ship-shape (implemented; ships as v0.4.0)
+
+Implementation notes (2026-11-02, on top of the plan below):
+- The hand-rolled updater is gone entirely: iptv-core::updater
+  deleted (nothing else used it), and the adapter's worker,
+  pending-manifest state, prompt dialog and open-the-package
+  fallback went with it. Help → Check for Updates and the
+  Options-gated launch check now call
+  ship_shape::ui::run_update_check (Manual / Automatic).
+- ship-shape's Portable apply extracts the archive over the
+  app folder with no top-folder stripping, so the packages
+  now put their contents at the archive root under the fixed
+  names from the plan. The macOS tarball is retired in favour
+  of the dmg; macOS self-install cannot apply to an unsigned
+  bare binary, so ship-shape's manual-install fallback opens
+  the verified dmg there — recorded as the platform limit,
+  not a silent gap.
+- Signing runs in the Publish job via the new iptv-signer
+  workspace tool (minisign 0.10.0; same sign recipe as
+  BlindRadio's xtask); publish verifies every .minisig
+  exists before the release is created.
+- Local proof before shipping: iptv-signer signed a test
+  asset with the real key from its private store and the
+  signature verified against the committed public key.
 
 Owner order 2026-11-02: "I also want this using shipfitter
 like BLindRadio does, with this private signing key. This is
