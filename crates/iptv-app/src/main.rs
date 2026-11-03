@@ -1165,7 +1165,7 @@ fn handle_dvr_resolve(
     }
     let mut channel = channel_from_snapshot(&job.channel);
     channel.url = url;
-    if !wiring.dvr.borrow_mut().resolution_succeeded(job_id) {
+    if !wiring.dvr.borrow_mut().resolution_succeeded(job_id, now) {
         wiring.dvr_resolve.borrow_mut().remove(job_id);
         return;
     }
@@ -7583,6 +7583,11 @@ fn open_scheduled_dialog(wiring: &Wiring, main_status: Status) {
             if dvr.cancel_job(&id) {
                 dvr.save();
                 drop(dvr);
+                // Stop the capture too: a canceled job leaves the
+                // Recording state, so the scheduler will never
+                // emit its Stop action — an in-flight or running
+                // capture must be halted here (issue #130).
+                wiring_c.recordings.borrow_mut().stop(&format!("dvr:{id}"));
                 wiring_c.dvr_resolve.borrow_mut().remove(&id);
                 wiring_c.pending_resolves.borrow_mut().retain(
                     |_, pending| !matches!(pending, PendingResolve::Dvr(job) if job == &id),
