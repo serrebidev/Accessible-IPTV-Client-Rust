@@ -510,40 +510,7 @@ pub fn resolve_hls_input(
         {
             return Err("separate HLS renditions require direct playback".to_string());
         }
-        let mut variants: Vec<(i64, String)> = Vec::new();
-        let mut bandwidth: Option<i64> = None;
-        for line in &lines {
-            if let Some(rest) = line.strip_prefix("#EXT-X-STREAM-INF:") {
-                bandwidth = Some(parse_bandwidth(rest));
-            } else if !line.starts_with('#') {
-                if let Some(bw) = bandwidth.take() {
-                    let target = join_url(&base, line);
-                    if !(target.starts_with("http://") || target.starts_with("https://")) {
-                        return Err("invalid HLS variant protocol".to_string());
-                    }
-                    variants.push((bw, target));
-                }
-            }
-        }
-        if variants.is_empty() {
-            return Err("no usable HLS variant".to_string());
-        }
-        let cap = cap_mbps.unwrap_or(0.0);
-        let chosen = if cap > 0.0 {
-            let limit = (cap * 1_000_000.0) as i64;
-            let bounded: Vec<&(i64, String)> = variants
-                .iter()
-                .filter(|v| v.0 > 0 && v.0 <= limit)
-                .collect();
-            if let Some(best) = bounded.iter().max_by_key(|v| v.0) {
-                (*best).clone()
-            } else {
-                variants.iter().min_by_key(|v| v.0).unwrap().clone()
-            }
-        } else {
-            variants.iter().max_by_key(|v| v.0).unwrap().clone()
-        };
-        current = chosen.1;
+        current = select_hls_variant(&lines, &base, cap_mbps)?;
         // Loop: the variant may itself be a master (Python
         // resolves up to 4 levels); a media playlist returns
         // at the STREAM-INF check above on the next pass —
@@ -556,6 +523,50 @@ pub fn resolve_hls_input(
         }
     }
     Err("excessive HLS nesting".to_string())
+}
+
+/// Pick one variant from a master playlist's lines under the
+/// bandwidth cap (P05; Python's `_parse_hls_variants` +
+/// `_select_hls_variant`): the highest bandwidth at or under
+/// the cap; when none fits, the smallest bandwidth overall;
+/// with no cap, the highest overall. Pure, so the selection
+/// law is testable without a fetch.
+#[allow(clippy::cast_possible_truncation)] // Python int(cap * 1_000_000)
+fn select_hls_variant(lines: &[&str], base: &str, cap_mbps: Option<f64>) -> Result<String, String> {
+    let mut variants: Vec<(i64, String)> = Vec::new();
+    let mut bandwidth: Option<i64> = None;
+    for line in lines {
+        if let Some(rest) = line.strip_prefix("#EXT-X-STREAM-INF:") {
+            bandwidth = Some(parse_bandwidth(rest));
+        } else if !line.starts_with('#') {
+            if let Some(bw) = bandwidth.take() {
+                let target = join_url(base, line);
+                if !(target.starts_with("http://") || target.starts_with("https://")) {
+                    return Err("invalid HLS variant protocol".to_string());
+                }
+                variants.push((bw, target));
+            }
+        }
+    }
+    if variants.is_empty() {
+        return Err("no usable HLS variant".to_string());
+    }
+    let cap = cap_mbps.unwrap_or(0.0);
+    let chosen = if cap > 0.0 {
+        let limit = (cap * 1_000_000.0) as i64;
+        let bounded: Vec<&(i64, String)> = variants
+            .iter()
+            .filter(|v| v.0 > 0 && v.0 <= limit)
+            .collect();
+        if let Some(best) = bounded.iter().max_by_key(|v| v.0) {
+            (*best).clone()
+        } else {
+            variants.iter().min_by_key(|v| v.0).unwrap().clone()
+        }
+    } else {
+        variants.iter().max_by_key(|v| v.0).unwrap().clone()
+    };
+    Ok(chosen.1)
 }
 
 fn parse_bandwidth(attributes: &str) -> i64 {
@@ -1136,4 +1147,62 @@ fn render_playlist(
         out.push_str("#EXT-X-ENDLIST\n");
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::select_hls_variant;
+
+    const BASE: &str = "http://example.com/master.m3u8";
+    const MASTER: [&str; 7] = [
+        "#EXTM3U",
+        "#EXT-X-STREAM-INF:BANDWIDTH=800000,AVERAGE-BANDWIDTH=700000",
+        "low.m3u8",
+        "#EXT-X-STREAM-INF:BANDWIDTH=2500000",
+        "mid.m3u8",
+        "#EXT-X-STREAM-INF:BANDWIDTH=6000000",
+        "high.m3u8",
+    ];
+
+    #[test]
+    fn variant_cap_picks_the_highest_at_or_under_it() {
+        // AVERAGE-BANDWIDTH wins over BANDWIDTH where both are
+        // present, so the low variant counts as 0.7 Mbps.
+        assert_eq!(
+            select_hls_variant(&MASTER, BASE, Some(3.0)).unwrap(),
+            "http://example.com/mid.m3u8"
+        );
+        assert_eq!(
+            select_hls_variant(&MASTER, BASE, Some(1.0)).unwrap(),
+            "http://example.com/low.m3u8"
+        );
+    }
+
+    #[test]
+    fn variant_cap_falls_back_to_the_smallest_overshoot() {
+        assert_eq!(
+            select_hls_variant(&MASTER, BASE, Some(0.25)).unwrap(),
+            "http://example.com/low.m3u8"
+        );
+    }
+
+    #[test]
+    fn no_variant_cap_picks_the_highest_overall() {
+        assert_eq!(
+            select_hls_variant(&MASTER, BASE, None).unwrap(),
+            "http://example.com/high.m3u8"
+        );
+        assert_eq!(
+            select_hls_variant(&MASTER, BASE, Some(0.0)).unwrap(),
+            "http://example.com/high.m3u8"
+        );
+    }
+
+    #[test]
+    fn master_without_variants_is_an_error() {
+        assert_eq!(
+            select_hls_variant(&["#EXTM3U"], BASE, Some(3.0)),
+            Err("no usable HLS variant".to_string())
+        );
+    }
 }

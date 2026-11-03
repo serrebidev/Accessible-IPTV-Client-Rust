@@ -219,6 +219,58 @@ pub fn ordered_preference_keywords(
     dedupe_keywords(&keywords)
 }
 
+/// The per-channel memory key (Python `main._channel_audio_key`):
+/// the first non-empty of name, tvg-name, tvg-id, trimmed and
+/// case-folded. Deliberately not URL or provider data, so the
+/// memory survives URL reissue and is shared across playlists.
+#[must_use]
+pub fn audio_memory_key(name: &str, tvg_name: &str, tvg_id: &str) -> String {
+    for value in [name, tvg_name, tvg_id] {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_lowercase();
+        }
+    }
+    String::new()
+}
+
+/// Python's cap on remembered per-channel tracks
+/// (`MAX_REMEMBERED_CHANNEL_AUDIO_TRACKS`).
+pub const MAX_REMEMBERED_CHANNEL_TRACKS: usize = 500;
+/// Python's cap on a remembered track slot (`MAX_AUDIO_TRACKS`).
+pub const MAX_AUDIO_TRACK_INDEX: i64 = 64;
+
+/// Remember one manual track choice for a channel (Python
+/// `_remember_channel_audio_track`): name and slot are written
+/// together, the slot only when it is a valid track position,
+/// and the maps stay capped (the reference evicts oldest-first;
+/// these sorted maps evict by key, which bounds the size the
+/// same way).
+pub fn remember_channel_track(
+    names: &mut std::collections::BTreeMap<String, String>,
+    indices: &mut std::collections::BTreeMap<String, i64>,
+    key: &str,
+    name: &str,
+    index: i64,
+) {
+    if key.is_empty() || name.trim().is_empty() {
+        return;
+    }
+    names.insert(key.to_string(), name.trim().to_string());
+    if (0..MAX_AUDIO_TRACK_INDEX).contains(&index) {
+        indices.insert(key.to_string(), index);
+    } else {
+        indices.remove(key);
+    }
+    while names.len() > MAX_REMEMBERED_CHANNEL_TRACKS {
+        let Some(oldest) = names.keys().next().cloned() else {
+            break;
+        };
+        names.remove(&oldest);
+        indices.remove(&oldest);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -265,6 +317,32 @@ mod tests {
             select_preferred_audio_track(&plain, &[], None, true),
             Some(2)
         );
+    }
+
+    #[test]
+    fn memory_key_is_first_nonempty_name_casefolded() {
+        assert_eq!(audio_memory_key("  BBC One ", "bbc", "id"), "bbc one");
+        assert_eq!(audio_memory_key("", " TVG Name ", "id"), "tvg name");
+        assert_eq!(audio_memory_key("", "", " Some ID "), "some id");
+        assert_eq!(audio_memory_key("", "", ""), "");
+    }
+
+    #[test]
+    fn remembered_tracks_write_name_and_slot_together() {
+        let mut names = std::collections::BTreeMap::new();
+        let mut indices = std::collections::BTreeMap::new();
+        remember_channel_track(&mut names, &mut indices, "chan", "English AD", 2);
+        assert_eq!(names.get("chan").map(String::as_str), Some("English AD"));
+        assert_eq!(indices.get("chan"), Some(&2));
+        // A renamed track keeps its name memory; an out-of-range
+        // slot is dropped rather than restored wrongly.
+        remember_channel_track(&mut names, &mut indices, "chan", "English AD", 99);
+        assert_eq!(names.get("chan").map(String::as_str), Some("English AD"));
+        assert_eq!(indices.get("chan"), None);
+        // Blank keys/names never write.
+        remember_channel_track(&mut names, &mut indices, "", "X", 0);
+        remember_channel_track(&mut names, &mut indices, "k", " ", 0);
+        assert_eq!(names.len(), 1);
     }
 
     #[test]

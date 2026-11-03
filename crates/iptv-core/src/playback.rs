@@ -241,6 +241,318 @@ pub fn start_cache(settings: &InternalPlayerSettings) -> StartCache {
     }
 }
 
+/// The cache plan for one player lifetime (Python's buffer
+/// profile, `internal_player.py` `_compute_buffer_profile`): a
+/// fresh live play starts at the half-second quick-start cache;
+/// a live retry uses the current base; a rollover retry goes
+/// back to the quick start; on-demand content always uses the
+/// base. Recovery restarts with buffer adjustment grow the base
+/// by one second at a time up to the saved maximum — except
+/// Dispatcharr live streams, whose server-side buffering makes
+/// a bigger client cache pure delay, so their saved base is
+/// kept exactly. A new channel choice resets the base to the
+/// saved opening value.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CachePlan {
+    /// The saved opening value (ms).
+    initial: u32,
+    /// The current base (ms), grown by recovery restarts.
+    base: u32,
+    /// The saved maximum (ms).
+    max: u32,
+}
+
+impl CachePlan {
+    #[must_use]
+    pub fn new(settings: &InternalPlayerSettings) -> Self {
+        let cache = start_cache(settings);
+        Self {
+            initial: cache.target_ms,
+            base: cache.target_ms,
+            max: cache.max_ms,
+        }
+    }
+
+    /// A new (non-retry) channel choice: the base returns to
+    /// the saved opening value.
+    pub fn reset(&mut self) {
+        self.base = self.initial;
+    }
+
+    /// One recovery restart with buffer adjustment: grow the
+    /// base by one second, capped at the saved maximum.
+    /// Dispatcharr live streams never grow.
+    pub fn grow(&mut self, dispatcharr: bool, live: bool) {
+        if dispatcharr && live {
+            return;
+        }
+        self.base = (self.base + 1_000).min(self.max);
+    }
+
+    /// The cache (ms) for one load. `retry` marks a recovery or
+    /// rollover reload of the same choice; `rollover` marks the
+    /// expected-TS-ending refresh path (P04).
+    #[must_use]
+    pub fn cache_ms(&self, live: bool, retry: bool, rollover: bool) -> u32 {
+        if live && (!retry || rollover) {
+            500
+        } else {
+            self.base
+        }
+    }
+
+    /// The current base (ms); the freeze watchdog's startup
+    /// grace extends by this much (P03).
+    #[must_use]
+    pub const fn base_ms(&self) -> u32 {
+        self.base
+    }
+}
+
+/// Whether a URL is an expected Xtream-style live TS segment
+/// stream (Python `_looks_like_xtream_live_ts`): a `.ts` path
+/// with at least three parts whose final stem (or, with four or
+/// more parts, the segment before it) is all digits, or a
+/// content-detected TS pattern (numeric last part, `/live/`
+/// plus a numeric part, or an `/auth/`, `/stream/` or `/play/`
+/// path). Timeshift, movie, series, archive, catch-up and
+/// recording URLs are never rollovers.
+// The path is lowercased before the extension test, exactly
+// as the Python check sees it, so the comparison is already
+// case-insensitive in effect.
+#[allow(clippy::case_sensitive_file_extension_comparisons)]
+#[must_use]
+pub fn looks_like_live_ts(url: &str, live: bool) -> bool {
+    if !live {
+        return false;
+    }
+    let path = url.split(['?', '#']).next().unwrap_or(url).to_lowercase();
+    for token in [
+        "/timeshift/",
+        "/movie/",
+        "/series/",
+        "/archive/",
+        "catchup",
+        "recording",
+    ] {
+        if path.contains(token) {
+            return false;
+        }
+    }
+    let parts: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
+    let digits = |text: &str| !text.is_empty() && text.chars().all(|c| c.is_ascii_digit());
+    if path.ends_with(".ts") && parts.len() >= 3 {
+        let stem = parts[parts.len() - 1].trim_end_matches(".ts");
+        if digits(stem) {
+            return true;
+        }
+        if parts.len() >= 4 && digits(parts[parts.len() - 2]) {
+            return true;
+        }
+    }
+    // Content-detected TS (extensionless, e.g. Dispatcharr):
+    // a numeric final part, or /live/ with a numeric part, or
+    // an auth/stream/play path.
+    if parts.last().is_some_and(|last| digits(last)) {
+        return true;
+    }
+    if path.contains("/live/") && parts.iter().any(|part| digits(part)) {
+        return true;
+    }
+    ["/auth/", "/stream/", "/play/"]
+        .iter()
+        .any(|token| path.contains(token))
+}
+
+/// Whether a channel's own metadata declares it audio-only
+/// (Python `media_type.media_hint_from_attributes`): a `radio`
+/// attribute is authoritative (true/1/yes = audio, false/0/no =
+/// video); otherwise the media-type equivalents decide with
+/// audio/radio/music vs video/tv/television values.
+#[must_use]
+pub fn audio_only_hint(attributes: &BTreeMap<String, String>) -> bool {
+    let get = |key: &str| -> String {
+        attributes
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(key))
+            .map_or(String::new(), |(_, value)| value.trim().to_lowercase())
+    };
+    let radio = get("radio");
+    if ["true", "1", "yes"].contains(&radio.as_str()) {
+        return true;
+    }
+    if ["false", "0", "no"].contains(&radio.as_str()) {
+        return false;
+    }
+    for key in [
+        "media-type",
+        "mediatype",
+        "media_type",
+        "stream-type",
+        "streamtype",
+        "tvg-type",
+        "tvgtype",
+    ] {
+        let value = get(key);
+        if ["audio", "radio", "music"].contains(&value.as_str()) {
+            return true;
+        }
+        if ["video", "tv", "television"].contains(&value.as_str()) {
+            return false;
+        }
+    }
+    false
+}
+
+/// Decoded/played counters from the engine (libVLC media
+/// statistics), the freeze watchdog's primary evidence (P03).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AvCounters {
+    pub read_bytes: i64,
+    pub decoded_video: i64,
+    pub displayed_pictures: i64,
+    pub decoded_audio: i64,
+    pub played_abuffers: i64,
+}
+
+/// The frozen-stream watchdog (Python `_monitor_av_progress`
+/// plus its presentation-clock fallback): a stream that keeps
+/// reporting Playing while its decoded/played counters — or,
+/// when no counters exist, its position — stop advancing is
+/// stalled. Any counter change counts as progress, so a reset
+/// or wrapped counter re-baselines instead of stalling. Video
+/// evidence arms only for a visible, non-audio-only stream
+/// after two progressing samples; nothing is judged inside
+/// the startup grace (12 s plus the current base buffer).
+#[derive(Debug)]
+pub struct FreezeWatchdog {
+    audio_only: bool,
+    video_visible: bool,
+    previous: Option<AvCounters>,
+    video_samples: u32,
+    audio_samples: u32,
+    last_video_progress_ms: i64,
+    last_audio_progress_ms: i64,
+    last_position_ms: Option<i64>,
+    last_position_progress_ms: i64,
+}
+
+impl FreezeWatchdog {
+    #[must_use]
+    pub fn new(audio_only: bool, video_visible: bool) -> Self {
+        Self {
+            audio_only,
+            video_visible,
+            previous: None,
+            video_samples: 0,
+            audio_samples: 0,
+            last_video_progress_ms: 0,
+            last_audio_progress_ms: 0,
+            last_position_ms: None,
+            last_position_progress_ms: 0,
+        }
+    }
+
+    /// Forget all evidence (new load, or playback left the
+    /// Playing state).
+    pub fn reset(&mut self) {
+        self.previous = None;
+        self.video_samples = 0;
+        self.audio_samples = 0;
+        self.last_position_ms = None;
+    }
+
+    /// Feed one poll. `playing` is the engine-confirmed state;
+    /// `play_start_ms` anchors the startup grace together with
+    /// `base_buffer_ms`. Returns true exactly once per stall:
+    /// the watchdog resets itself when it fires.
+    pub fn sample(
+        &mut self,
+        counters: Option<AvCounters>,
+        position_ms: Option<i64>,
+        playing: bool,
+        now_ms: i64,
+        play_start_ms: i64,
+        base_buffer_ms: i64,
+    ) -> bool {
+        if !playing {
+            self.reset();
+            return false;
+        }
+        let in_grace = now_ms - play_start_ms < 12_000 + base_buffer_ms;
+        if let Some(counters) = counters {
+            return self.sample_counters(counters, now_ms, in_grace);
+        }
+        self.sample_clock(position_ms, now_ms, in_grace)
+    }
+
+    fn sample_counters(&mut self, counters: AvCounters, now_ms: i64, in_grace: bool) -> bool {
+        let Some(previous) = self.previous else {
+            self.previous = Some(counters);
+            self.last_video_progress_ms = now_ms;
+            self.last_audio_progress_ms = now_ms;
+            return false;
+        };
+        let video_progressed = counters.decoded_video != previous.decoded_video
+            || counters.displayed_pictures != previous.displayed_pictures;
+        let audio_progressed = counters.decoded_audio != previous.decoded_audio
+            || counters.played_abuffers != previous.played_abuffers;
+        self.previous = Some(counters);
+        if video_progressed {
+            if self.video_visible {
+                self.video_samples += 1;
+            }
+            self.last_video_progress_ms = now_ms;
+        }
+        if audio_progressed {
+            self.audio_samples += 1;
+            self.last_audio_progress_ms = now_ms;
+        }
+        let video_armed = self.video_visible && !self.audio_only && self.video_samples >= 2;
+        let audio_armed = self.audio_samples >= 2;
+        if in_grace || (!video_armed && !audio_armed) {
+            return false;
+        }
+        let stalled = (video_armed && now_ms - self.last_video_progress_ms >= 10_000)
+            || (audio_armed && now_ms - self.last_audio_progress_ms >= 10_000);
+        if stalled {
+            self.reset();
+        }
+        stalled
+    }
+
+    fn sample_clock(&mut self, position_ms: Option<i64>, now_ms: i64, in_grace: bool) -> bool {
+        let Some(position) = position_ms.filter(|value| *value >= 0) else {
+            self.last_position_ms = None;
+            return false;
+        };
+        let Some(last) = self.last_position_ms else {
+            self.last_position_ms = Some(position);
+            self.last_position_progress_ms = now_ms;
+            return false;
+        };
+        if position < last - 1_000 {
+            // Timestamp reset / discontinuity: re-baseline.
+            self.last_position_ms = Some(position);
+            self.last_position_progress_ms = now_ms;
+            return false;
+        }
+        if position > last + 200 {
+            self.last_position_ms = Some(position);
+            self.last_position_progress_ms = now_ms;
+            return false;
+        }
+        if in_grace {
+            return false;
+        }
+        let stalled = now_ms - self.last_position_progress_ms >= 10_000;
+        if stalled {
+            self.reset();
+        }
+        stalled
+    }
+}
+
 /// The configured player choice (`media_player` config values).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PlayerChoice {
@@ -528,12 +840,24 @@ pub enum EngineAction {
     /// Reload after `delay_ms`; the caller guards execution with
     /// the session generation so a superseded retry never fires.
     Reconnect(PlaybackRequest, i64),
+    /// Reload after an expected TS segment ending (P04): same
+    /// scheduling shape as a reconnect, but the caller must not
+    /// grow the cache or treat it as a failure — it runs on the
+    /// rollover budget and the quick-start cache.
+    Rollover(PlaybackRequest, i64),
     Stop,
 }
 
 /// Reconnect attempts per channel choice (Python
 /// `_max_reconnect_attempts`).
 pub const MAX_RECONNECTS: u32 = 6;
+/// Expected TS segment rollovers per channel choice, on their
+/// own budget separate from the failure budget (Python
+/// `_max_xtream_refreshes`, P04).
+pub const MAX_ROLLOVERS: u32 = 6;
+/// Delay before reopening after an expected TS ending
+/// (Python's `wx.CallLater(200, ...)`).
+pub const ROLLOVER_DELAY_MS: i64 = 200;
 /// No-playback deadline from the moment a channel is chosen;
 /// retries never extend it (Python `_first_play_deadline_seconds`).
 pub const STARTUP_DEADLINE_MS: i64 = 30_000;
@@ -579,6 +903,7 @@ pub struct PlaybackSession {
     played: bool,
     last_error: Option<String>,
     stall_since_ms: Option<i64>,
+    rollovers: u32,
 }
 
 impl Default for PlaybackSession {
@@ -602,6 +927,7 @@ impl PlaybackSession {
             played: false,
             last_error: None,
             stall_since_ms: None,
+            rollovers: 0,
         }
     }
 
@@ -615,6 +941,7 @@ impl PlaybackSession {
         self.played = false;
         self.last_error = None;
         self.stall_since_ms = None;
+        self.rollovers = 0;
         self.state = SessionState::Opening;
         EngineAction::Load(request)
     }
@@ -671,6 +998,9 @@ impl PlaybackSession {
                 self.state = SessionState::Playing;
                 self.played = true;
                 self.stall_since_ms = None;
+                // Reaching Playing refills the rollover budget
+                // (Python resets it on every Playing transition).
+                self.rollovers = 0;
                 EngineAction::None
             }
             EngineEvent::Stalled => self.recover(now_ms, "stream stopped unexpectedly"),
@@ -708,6 +1038,43 @@ impl PlaybackSession {
             }
         }
         EngineAction::None
+    }
+
+    /// An expected live TS ending (P04): reopen after the
+    /// rollover delay on the rollover budget, never the failure
+    /// budget, and never for a stream that has not played yet
+    /// (a never-played ending is a failed open and belongs to
+    /// ordinary recovery — the adapter routes it there when
+    /// this returns `None`). Exhausting the rollover budget
+    /// loses the stream. The caller passes only endings it has
+    /// classified as expected TS rollovers.
+    pub fn note_rollover(&mut self, now_ms: i64) -> Option<EngineAction> {
+        let request = self.current.clone()?;
+        if !request.live || !self.played {
+            return None;
+        }
+        if self.rollovers >= MAX_ROLLOVERS {
+            self.last_error = Some("stream ended unexpectedly".to_string());
+            return Some(self.give_up());
+        }
+        self.rollovers += 1;
+        self.started_ms = now_ms + ROLLOVER_DELAY_MS;
+        self.stall_since_ms = None;
+        self.state = SessionState::Opening;
+        Some(EngineAction::Rollover(request, ROLLOVER_DELAY_MS))
+    }
+
+    /// Rollovers spent since playback last reached Playing.
+    #[must_use]
+    pub const fn rollovers(&self) -> u32 {
+        self.rollovers
+    }
+
+    /// Whether this session has confirmed playback at least
+    /// once for the current choice.
+    #[must_use]
+    pub const fn played_once(&self) -> bool {
+        self.played
     }
 
     /// One bounded recovery step, shared by every failure trigger:
@@ -805,66 +1172,57 @@ impl PlaybackSession {
     }
 }
 
-/// One resume checkpoint (Python `playback_resume` record shape).
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ResumeEntry {
-    pub position_ms: i64,
-    pub length_ms: i64,
-    pub updated: i64,
-    /// The channel name captured at checkpoint time, so a saved
-    /// position stays identifiable after the channel leaves the
-    /// catalogue (Python keeps the bookmark title in metadata).
-    pub title: String,
+/// The verdict of one guarded checkpoint (P16).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GuardVerdict {
+    /// The engine has not reached the saved position yet: the
+    /// old checkpoint stays untouched.
+    Protected,
+    /// Playback reached the saved position (within the 2 s
+    /// window): checkpoints proceed normally from here.
+    Confirmed,
+    /// Sixty seconds of playback never reached the saved
+    /// position: report the failure once; protection ends.
+    Failed,
 }
 
-const RESUME_MIN_MS: i64 = 30_000;
-const RESUME_MAX_ENTRIES: usize = 200;
+/// Resume-seek protection (P16, Python `_save_resume_checkpoint`):
+/// after a resume is adopted, an early engine position (a
+/// rejected or ignored seek) must not overwrite the useful
+/// saved checkpoint through the ordinary early-position rules.
+/// Armed when a non-retry play adopts a saved position; all
+/// times are monotonic milliseconds.
+#[derive(Clone, Debug)]
+pub struct ResumeGuard {
+    start_ms: i64,
+    armed_ms: i64,
+}
 
-/// Apply the Python checkpoint rules: a position under 30 s is not worth
-/// keeping; a position inside the end window (30 s or the last 5%)
-/// removes the entry because the item counts as finished.
-pub fn resume_checkpoint(
-    entries: &mut BTreeMap<String, ResumeEntry>,
-    key: &str,
-    title: &str,
-    position_ms: i64,
-    length_ms: i64,
-    now: i64,
-) {
-    if key.is_empty() || length_ms <= 0 || !(0..=length_ms).contains(&position_ms) {
-        return;
-    }
-    let end_window = RESUME_MIN_MS.max(length_ms / 20);
-    if position_ms < RESUME_MIN_MS || length_ms - position_ms <= end_window {
-        entries.remove(key);
-    } else {
-        entries.insert(
-            key.to_string(),
-            ResumeEntry {
-                position_ms,
-                length_ms,
-                updated: now,
-                title: title.to_string(),
-            },
-        );
-    }
-    // Keep the newest 200, like Python's normalize cap.
-    if entries.len() > RESUME_MAX_ENTRIES {
-        let mut by_age: Vec<(String, i64)> = entries
-            .iter()
-            .map(|(k, v)| (k.clone(), v.updated))
-            .collect();
-        by_age.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        for (stale, _) in by_age.into_iter().skip(RESUME_MAX_ENTRIES) {
-            entries.remove(&stale);
+impl ResumeGuard {
+    #[must_use]
+    pub fn new(start_ms: i64, now_ms: i64) -> Self {
+        Self {
+            start_ms,
+            armed_ms: now_ms,
         }
     }
-}
 
-/// The stored resume position for a key, if one survives the rules.
-#[must_use]
-pub fn resume_position(entries: &BTreeMap<String, ResumeEntry>, key: &str) -> Option<i64> {
-    entries.get(key).map(|entry| entry.position_ms)
+    /// Judge one checkpoint at `position_ms`. Confirmation and
+    /// failure both disarm the guard.
+    pub fn on_checkpoint(&mut self, position_ms: i64, now_ms: i64) -> GuardVerdict {
+        if self.start_ms == 0 {
+            return GuardVerdict::Confirmed;
+        }
+        if position_ms >= self.start_ms - 2_000 {
+            self.start_ms = 0;
+            return GuardVerdict::Confirmed;
+        }
+        if now_ms - self.armed_ms > 60_000 {
+            self.start_ms = 0;
+            return GuardVerdict::Failed;
+        }
+        GuardVerdict::Protected
+    }
 }
 
 #[cfg(test)]
@@ -1104,15 +1462,25 @@ mod tests {
     }
 
     #[test]
-    fn resume_checkpoint_rules_match_python() {
-        let mut entries = BTreeMap::new();
-        resume_checkpoint(&mut entries, "k", "Show", 10_000, 3_600_000, 100);
-        assert!(entries.is_empty(), "under 30s not kept");
-        resume_checkpoint(&mut entries, "k", "Show", 900_000, 3_600_000, 100);
-        assert_eq!(resume_position(&entries, "k"), Some(900_000));
-        assert_eq!(entries["k"].title, "Show", "title captured at checkpoint");
-        resume_checkpoint(&mut entries, "k", "Show", 3_590_000, 3_600_000, 200);
-        assert!(entries.is_empty(), "inside end window removes");
+    fn resume_guard_protects_until_the_seek_is_confirmed() {
+        // A rejected seek leaves the engine near zero: every
+        // checkpoint is suppressed, so the saved position is
+        // never overwritten by the early-position rules.
+        let mut guard = ResumeGuard::new(900_000, 1_000);
+        assert_eq!(guard.on_checkpoint(0, 2_000), GuardVerdict::Protected);
+        assert_eq!(guard.on_checkpoint(5_000, 30_000), GuardVerdict::Protected);
+        // Within 2 s before the target counts as restored, and
+        // the guard disarms.
+        assert_eq!(
+            guard.on_checkpoint(898_500, 31_000),
+            GuardVerdict::Confirmed
+        );
+        assert_eq!(guard.on_checkpoint(0, 32_000), GuardVerdict::Confirmed);
+        // Unconfirmed after 60 s: one failure verdict, then the
+        // guard is done.
+        let mut guard = ResumeGuard::new(900_000, 1_000);
+        assert_eq!(guard.on_checkpoint(0, 61_500), GuardVerdict::Failed);
+        assert_eq!(guard.on_checkpoint(0, 62_000), GuardVerdict::Confirmed);
     }
 
     #[test]
@@ -1127,6 +1495,211 @@ mod tests {
         assert_eq!(fallback_stop(false, true), FallbackStop::Withhold);
         assert_eq!(fallback_stop(true, true), FallbackStop::Ended);
         assert_eq!(fallback_stop(true, false), FallbackStop::Stalled);
+    }
+
+    #[test]
+    fn cache_plan_quick_starts_live_and_grows_the_base_on_recovery() {
+        let settings = InternalPlayerSettings {
+            buffer_seconds: 25.0,
+            max_buffer_seconds: 30.0,
+            variant_max_mbps: 0.0,
+        };
+        let mut plan = CachePlan::new(&settings);
+        // Initial live play: half-second quick start.
+        assert_eq!(plan.cache_ms(true, false, false), 500);
+        // On-demand content always uses the saved base.
+        assert_eq!(plan.cache_ms(false, false, false), 25_000);
+        assert_eq!(plan.cache_ms(false, true, false), 25_000);
+        // A live failure retry uses the (grown) base, not 500.
+        assert_eq!(plan.cache_ms(true, true, false), 25_000);
+        plan.grow(false, true);
+        assert_eq!(plan.cache_ms(true, true, false), 26_000);
+        // Rollover retries return to the quick start.
+        assert_eq!(plan.cache_ms(true, true, true), 500);
+        // Growth caps at the saved maximum.
+        for _ in 0..10 {
+            plan.grow(false, true);
+        }
+        assert_eq!(plan.base_ms(), 30_000);
+        // Dispatcharr live never grows; Dispatcharr on-demand does.
+        plan.reset();
+        plan.grow(true, true);
+        assert_eq!(plan.base_ms(), 25_000);
+        plan.grow(true, false);
+        assert_eq!(plan.base_ms(), 26_000);
+        // A new choice resets the base to the saved opening value.
+        plan.reset();
+        assert_eq!(plan.base_ms(), 25_000);
+    }
+
+    #[test]
+    fn live_ts_detection_matches_python() {
+        assert!(looks_like_live_ts(
+            "http://host/live/user/pass/12345.ts",
+            true
+        ));
+        assert!(looks_like_live_ts("http://host/user/pass/12345.ts", true));
+        assert!(!looks_like_live_ts("http://host/user/pass/12345.ts", false));
+        // Segment-before-last numeric form.
+        assert!(looks_like_live_ts("http://host/live/998877/seg.ts", true));
+        // Never for timeshift / movie / series / archive URLs.
+        assert!(!looks_like_live_ts(
+            "http://host/timeshift/user/pass/60/2024-01-01/12345.ts",
+            true
+        ));
+        assert!(!looks_like_live_ts(
+            "http://host/movie/user/pass/12345.ts",
+            true
+        ));
+        assert!(!looks_like_live_ts(
+            "http://host/series/user/pass/12345.ts",
+            true
+        ));
+        // Content-detected extensionless TS (Dispatcharr style).
+        assert!(looks_like_live_ts("http://host/play/12345", true));
+        assert!(looks_like_live_ts("http://host/live/12345", true));
+        // An ordinary VOD file is not a rollover.
+        assert!(!looks_like_live_ts("http://host/movie.mp4", true));
+    }
+
+    #[test]
+    fn rollovers_use_their_own_budget_and_refill_on_playing() {
+        let mut session = PlaybackSession::new();
+        let request = PlaybackRequest::for_channel(&channel("http://live/12345.ts"), None);
+        session.play(request, 0);
+        // Never played: not a rollover (failed open instead).
+        assert!(session.note_rollover(100).is_none());
+        session.on_event(EngineEvent::Started, 200);
+        // Seven segment endings: six roll over at 200 ms without
+        // touching the failure budget; the seventh loses.
+        for index in 0..MAX_ROLLOVERS {
+            let now = 1_000 + i64::from(index) * 1_000;
+            assert!(
+                matches!(
+                    session.note_rollover(now),
+                    Some(EngineAction::Rollover(_, ROLLOVER_DELAY_MS))
+                ),
+                "rollover {} must reopen",
+                index + 1
+            );
+            assert_eq!(session.attempts(), 0, "failure budget untouched");
+        }
+        assert!(matches!(
+            session.note_rollover(20_000),
+            Some(EngineAction::Stop)
+        ));
+        assert_eq!(session.state(), &SessionState::Lost);
+        // Reaching Playing refills the rollover budget.
+        let mut again = PlaybackSession::new();
+        let request = PlaybackRequest::for_channel(&channel("http://live/12345.ts"), None);
+        again.play(request, 0);
+        again.on_event(EngineEvent::Started, 100);
+        assert!(again.note_rollover(200).is_some());
+        again.on_event(EngineEvent::Started, 500);
+        assert_eq!(again.rollovers(), 0);
+    }
+
+    #[test]
+    fn audio_only_hint_reads_the_radio_attribute_first() {
+        let mut attrs = Map::new();
+        attrs.insert("radio".to_string(), "true".to_string());
+        attrs.insert("media-type".to_string(), "video".to_string());
+        assert!(audio_only_hint(&attrs), "radio=true is authoritative");
+        attrs.insert("radio".to_string(), "false".to_string());
+        assert!(!audio_only_hint(&attrs), "radio=false marks video");
+        attrs.remove("radio");
+        attrs.insert("media-type".to_string(), "audio".to_string());
+        assert!(audio_only_hint(&attrs));
+        attrs.insert("tvg-type".to_string(), "tv".to_string());
+        assert!(audio_only_hint(&attrs), "first recognized key decides");
+        attrs.clear();
+        assert!(!audio_only_hint(&attrs));
+    }
+
+    #[test]
+    fn freeze_watchdog_detects_frozen_counters_after_grace() {
+        let base = AvCounters {
+            read_bytes: 1_000,
+            decoded_video: 10,
+            displayed_pictures: 10,
+            decoded_audio: 20,
+            played_abuffers: 20,
+        };
+        let mut watch = FreezeWatchdog::new(false, true);
+        // First sample only baselines.
+        assert!(!watch.sample(Some(base), None, true, 0, 0, 25_000));
+        // Progressing samples arm the watchdog (grace is 37 s).
+        let mut progressed = base;
+        progressed.decoded_video += 5;
+        progressed.displayed_pictures += 5;
+        progressed.decoded_audio += 5;
+        progressed.played_abuffers += 5;
+        assert!(!watch.sample(Some(progressed), None, true, 500, 0, 25_000));
+        let mut progressed2 = progressed;
+        progressed2.decoded_video += 5;
+        progressed2.displayed_pictures += 5;
+        progressed2.decoded_audio += 5;
+        progressed2.played_abuffers += 5;
+        assert!(!watch.sample(Some(progressed2), None, true, 1_000, 0, 25_000));
+        // Frozen inside the grace: no verdict.
+        assert!(!watch.sample(Some(progressed2), None, true, 20_000, 0, 25_000));
+        // Frozen past grace + 10 s stall threshold: stall.
+        assert!(watch.sample(Some(progressed2), None, true, 37_500, 0, 25_000));
+        let progressed = progressed2;
+        // It fires once; the watchdog reset itself.
+        assert!(!watch.sample(Some(progressed), None, true, 60_000, 0, 25_000));
+    }
+
+    #[test]
+    fn freeze_watchdog_never_arms_video_for_radio_or_hidden_video() {
+        let base = AvCounters {
+            decoded_video: 2,
+            displayed_pictures: 2,
+            ..AvCounters::default()
+        };
+        // Radio: cover art decodes twice then freezes; the audio
+        // group never progresses either, so nothing arms.
+        let mut radio = FreezeWatchdog::new(true, true);
+        assert!(!radio.sample(Some(base), None, true, 0, 0, 0));
+        let mut art = base;
+        art.decoded_video += 1;
+        art.displayed_pictures += 1;
+        assert!(!radio.sample(Some(art), None, true, 500, 0, 0));
+        assert!(!radio.sample(Some(art), None, true, 1_000, 0, 0));
+        assert!(!radio.sample(Some(art), None, true, 120_000, 0, 0));
+        // A counter reset counts as progress, never as a stall.
+        let mut watch = FreezeWatchdog::new(false, true);
+        let big = AvCounters {
+            decoded_video: 900,
+            displayed_pictures: 900,
+            decoded_audio: 900,
+            played_abuffers: 900,
+            ..AvCounters::default()
+        };
+        assert!(!watch.sample(Some(big), None, true, 0, 0, 0));
+        assert!(!watch.sample(Some(big), None, true, 500, 0, 0));
+        assert!(!watch.sample(Some(big), None, true, 1_000, 0, 0));
+        let wrapped = AvCounters::default();
+        assert!(!watch.sample(Some(wrapped), None, true, 30_000, 0, 0));
+        assert!(!watch.sample(Some(wrapped), None, true, 39_000, 0, 0));
+    }
+
+    #[test]
+    fn freeze_watchdog_clock_fallback_rebaselines_on_timestamp_resets() {
+        let mut watch = FreezeWatchdog::new(false, true);
+        assert!(!watch.sample(None, Some(10_000), true, 0, 0, 0));
+        assert!(!watch.sample(None, Some(11_000), true, 1_000, 0, 0));
+        // Frozen position past the stall window: stall.
+        assert!(watch.sample(None, Some(11_100), true, 13_500, 0, 0));
+        // A backwards jump is a discontinuity, not a stall.
+        let mut watch = FreezeWatchdog::new(false, true);
+        assert!(!watch.sample(None, Some(50_000), true, 0, 0, 0));
+        assert!(!watch.sample(None, Some(51_000), true, 1_000, 0, 0));
+        assert!(!watch.sample(None, Some(2_000), true, 30_000, 0, 0));
+        assert!(!watch.sample(None, Some(2_100), true, 35_000, 0, 0));
+        // Leaving Playing clears all evidence.
+        watch.sample(None, Some(2_100), false, 36_000, 0, 0);
+        assert!(!watch.sample(None, Some(2_100), true, 90_000, 0, 0));
     }
 
     #[test]
