@@ -4158,10 +4158,89 @@ fn menu_export_settings(wiring: &Wiring, frame: Frame, status: Status) {
     }
 }
 
-/// Options > Import Settings...: choose a backup, enter its
-/// password once, confirm the replace, then swap the config
-/// file (restart applies, as Python instructs).
+/// Work that blocks a settings import (issue #136): an active
+/// recording or an unfinished download.
+fn import_blocker(wiring: &Wiring) -> Option<&'static str> {
+    if wiring.recordings.borrow().active_count() > 0 {
+        return Some("recordings are in progress");
+    }
+    if wiring.downloads.borrow().iter().any(|row| !row.done) {
+        return Some("downloads are in progress");
+    }
+    None
+}
+
+/// The recovery step of an import: prompt for the recovery
+/// password (entered and confirmed, never stored), save the
+/// verified copy where the user chooses, and prove the copy on
+/// disk decrypts back to the current settings. Returns the
+/// saved path; any failure sets the status and returns None
+/// with the settings untouched.
+fn make_recovery_copy(wiring: &Wiring, frame: Frame, status: Status) -> Option<String> {
+    let recovery_password = backup_password(frame, true)?;
+    let stamp = chrono::Local::now().format("%Y-%m-%d %H-%M-%S").to_string();
+    let save = FileDialog::builder(&frame)
+        .with_message("Save a Recovery Copy of Your Current Settings First")
+        .with_default_file(&format!("settings-recovery-{stamp}.aiptv"))
+        .with_wildcard("Accessible IPTV backup (*.aiptv)|*.aiptv|All files (*.*)|*.*")
+        .with_style(FileDialogStyle::Save | FileDialogStyle::OverwritePrompt)
+        .build();
+    if save.show_modal() != ID_OK {
+        return None;
+    }
+    let recovery_path = save.get_path()?;
+    let config_json = {
+        let config = wiring.persist.config.borrow();
+        serde_json::to_vec(&serde_json::Value::Object(config.raw().clone())).unwrap_or_default()
+    };
+    let recovery = match iptv_core::settings_backup::create_verified_recovery(
+        &config_json,
+        &recovery_password,
+    ) {
+        Ok(recovery) => recovery,
+        Err(error) => {
+            status.set_label(&format!(
+                "Import stopped: the recovery copy could not be created: {error} Your settings are unchanged."
+            ));
+            return None;
+        }
+    };
+    // The copy on disk must verify too — a write that cannot be
+    // read back and decrypted blocks the import.
+    let on_disk =
+        std::fs::write(&recovery_path, &recovery).and_then(|()| std::fs::read(&recovery_path));
+    let verified = on_disk.is_ok_and(|bytes| {
+        iptv_core::settings_backup::verify_recovery(&bytes, &recovery_password, &config_json)
+            .is_ok()
+    });
+    if !verified {
+        status.set_label(
+            "Import stopped: the recovery copy could not be verified after writing. Your settings are unchanged.",
+        );
+        return None;
+    }
+    status.set_label("Recovery copy saved and verified. Now choose the backup to import.");
+    Some(recovery_path)
+}
+
+/// Options > Import Settings... (issue #136): before the
+/// incoming backup is even read, a verified encrypted recovery
+/// copy of the current settings is written to a location the
+/// user chooses, under its own entered-and-confirmed password
+/// that is never stored. Only then is the backup chosen,
+/// decrypted, confirmed, and — after a second active-work
+/// check at the moment of applying — swapped in (restart
+/// applies, as Python instructs).
 fn menu_import_settings(wiring: &Wiring, frame: Frame, status: Status) {
+    if let Some(blocker) = import_blocker(wiring) {
+        status.set_label(&format!(
+            "Import stopped: {blocker}. Finish or stop them, then import. Your settings are unchanged."
+        ));
+        return;
+    }
+    let Some(recovery_path) = make_recovery_copy(wiring, frame, status) else {
+        return;
+    };
     let dialog = FileDialog::builder(&frame)
         .with_message("Import Settings")
         .with_wildcard("Accessible IPTV backup (*.aiptv)|*.aiptv|All files (*.*)|*.*")
@@ -4195,12 +4274,22 @@ fn menu_import_settings(wiring: &Wiring, frame: Frame, status: Status) {
     }
     let confirm = MessageDialog::builder(
         &frame,
-        "Replace current settings with this backup? Restart the app after importing.",
+        &format!(
+            "Replace current settings with this backup? A verified recovery copy of your current settings is saved at {recovery_path}. Restart the app after importing."
+        ),
         "Import Settings",
     )
     .with_style(MessageDialogStyle::YesNo)
     .build();
     if confirm.show_modal() != ID_YES {
+        return;
+    }
+    // Rechecked at the moment of applying: work that started
+    // while the dialogs were open still blocks the swap.
+    if let Some(blocker) = import_blocker(wiring) {
+        status.set_label(&format!(
+            "Import canceled: {blocker}. Your settings are unchanged; the recovery copy remains saved."
+        ));
         return;
     }
     match std::fs::write(&wiring.persist.path, decrypted) {

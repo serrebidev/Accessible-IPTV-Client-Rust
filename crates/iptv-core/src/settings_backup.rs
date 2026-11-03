@@ -114,6 +114,47 @@ pub fn import_settings(bytes: &[u8], password: &str) -> Result<Vec<u8>, String> 
     Ok(contents)
 }
 
+/// Create a recovery copy of the current settings and prove it
+/// before handing it out (issue #136): the exported bytes are
+/// decrypted again with the same password and must parse back
+/// to the identical settings object. A copy that cannot be
+/// verified is never returned.
+///
+/// # Errors
+/// The export errors, or the verification errors below.
+pub fn create_verified_recovery(
+    config_json_bytes: &[u8],
+    password: &str,
+) -> Result<Vec<u8>, String> {
+    let bytes = export_settings(config_json_bytes, password)?;
+    verify_recovery(&bytes, password, config_json_bytes)?;
+    Ok(bytes)
+}
+
+/// Verify recovery bytes against the settings they were made
+/// from: decrypt with the password and compare the parsed
+/// settings objects exactly.
+///
+/// # Errors
+/// The import errors (wrong password, damaged or foreign
+/// backup), an unreadable current-settings value, or a
+/// mismatch between the copy and the expected settings.
+pub fn verify_recovery(
+    bytes: &[u8],
+    password: &str,
+    expected_config_json: &[u8],
+) -> Result<(), String> {
+    let decrypted = import_settings(bytes, password)?;
+    let expected: serde_json::Value = serde_json::from_slice(expected_config_json)
+        .map_err(|_| "Current settings could not be read for the recovery copy.".to_string())?;
+    let restored: serde_json::Value = serde_json::from_slice(&decrypted)
+        .map_err(|_| "The recovery copy could not be verified.".to_string())?;
+    if expected != restored {
+        return Err("The recovery copy could not be verified.".to_string());
+    }
+    Ok(())
+}
+
 fn derive_key(password: &str, salt: &[u8]) -> [u8; 32] {
     let mut key = [0u8; 32];
     pbkdf2::pbkdf2_hmac::<Sha256>(password.as_bytes(), salt, ITERATIONS, &mut key);
@@ -287,5 +328,26 @@ mod tests {
             import_settings(&backup, PASSWORD).unwrap_err(),
             "Backup settings are invalid."
         );
+    }
+
+    #[test]
+    fn verified_recovery_round_trips_and_rejects_tampering() {
+        use super::{create_verified_recovery, verify_recovery};
+        let config = PYTHON_CONFIG_133.as_bytes();
+        let bytes = create_verified_recovery(config, "recovery-pass").unwrap();
+        // The copy on its own decrypts to the same settings.
+        assert_eq!(import_settings(&bytes, "recovery-pass").unwrap(), config);
+        assert!(verify_recovery(&bytes, "recovery-pass", config).is_ok());
+        // A wrong confirmation password cannot verify it.
+        assert!(verify_recovery(&bytes, "wrong-pass", config).is_err());
+        // A different settings object cannot verify against it.
+        assert!(verify_recovery(&bytes, "recovery-pass", PYTHON_CONFIG_JSON.as_bytes()).is_err());
+        // Tampered ciphertext fails verification.
+        let mut tampered = bytes.clone();
+        let middle = tampered.len() / 2;
+        tampered[middle] ^= 0x01;
+        assert!(verify_recovery(&tampered, "recovery-pass", config).is_err());
+        // An empty recovery password is refused at creation.
+        assert!(create_verified_recovery(config, "").is_err());
     }
 }
