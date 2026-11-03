@@ -2,7 +2,7 @@
 resolver = "2"
 members = [
     "crates/iptv-core",
-    "crates/iptv-app", "crates/iptv-vlc", "crates/iptv-signer",
+    "crates/iptv-app", "crates/iptv-vlc", "crates/iptv-signer", "crates/iptv-sapi",
 ]
 
 [workspace.package]

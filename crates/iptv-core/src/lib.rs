@@ -24,6 +24,7 @@ pub mod search;
 pub mod settings_backup;
 pub mod shortcuts;
 pub mod sources;
+pub mod speech;
 pub mod subtitles;
 pub mod timeshift;
 pub mod vod;
