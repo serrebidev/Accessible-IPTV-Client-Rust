@@ -6162,7 +6162,9 @@ fn bind_context_menu(frame: Frame, wiring: &Wiring, controls: Controls) {
                     .and_then(|row| row_epg(&wiring_menu, row))
                     .map(|epg_row| epg_row.programme);
                 match row_programme {
-                    Some(programme) => add_reminder(&wiring_menu, &channel, &programme, status),
+                    Some(programme) => {
+                        add_reminder(&wiring_menu, frame, &channel, &programme, status);
+                    }
                     None => open_channel_epg(&wiring_menu, &channel, status),
                 }
             }
@@ -6171,7 +6173,9 @@ fn bind_context_menu(frame: Frame, wiring: &Wiring, controls: Controls) {
                     .and_then(|row| row_epg(&wiring_menu, row))
                     .map(|epg_row| epg_row.programme);
                 match row_programme {
-                    Some(programme) => add_dvr_job(&wiring_menu, &channel, &programme, status),
+                    Some(programme) => {
+                        add_dvr_job(&wiring_menu, frame, &channel, &programme, status, "none");
+                    }
                     None => open_channel_epg(&wiring_menu, &channel, status),
                 }
             }
@@ -6660,6 +6664,7 @@ fn play_channel(
                     "Could not locate {name} executable.",
                     &[("name", &name)],
                 )),
+            }
         }
         PlayerChoice::Custom(path) => {
             if path.is_empty() {
