@@ -149,19 +149,34 @@ impl BrowserWorker {
         &self.favorites
     }
 
+    /// The browse model the published search rows index into.
+    /// Extras are merged into it by `apply_model` and promoted
+    /// into `playlist` when their results land, so the model's
+    /// channels ARE the whole catalogue — appending `extras`
+    /// again would double-count every provider channel.
+    fn catalogue(&self) -> &[crate::Channel] {
+        self.playlist.channels()
+    }
+
     /// Every loaded channel (playlist plus provider extras), for
     /// catalogue builders that scan the whole browse state.
     #[must_use]
     pub fn all_channels(&self) -> Vec<crate::Channel> {
-        let mut out: Vec<crate::Channel> = self.playlist.channels().to_vec();
-        out.extend(self.extras.iter().cloned());
-        out
+        self.catalogue().to_vec()
     }
 
     /// The channel at a playlist index in the current projection's source.
     #[must_use]
     pub fn channel(&self, playlist_index: usize) -> Option<crate::Channel> {
         self.playlist.channels().get(playlist_index).cloned()
+    }
+
+    /// Run `f` over every loaded channel (playlist plus provider
+    /// extras, in `all_channels` order) without cloning the
+    /// catalogue (audit E12 — suffix building over 500,000
+    /// channels must not start by cloning all of them).
+    pub fn with_all_channels<R>(&self, f: impl FnOnce(&[crate::Channel]) -> R) -> R {
+        f(self.catalogue())
     }
 
     /// Favorited channels present in the current playlist (display counts).
@@ -390,6 +405,29 @@ mod tests {
         assert!(!groups.iter().any(|g| g == "Sport"), "{groups:?}");
         browser.set_scope(None, "");
         assert_eq!(results(wait(&mut browser, "")).len(), 3);
+    }
+
+    #[test]
+    fn with_all_channels_covers_playlist_and_extras_in_order() {
+        let mut browser = BrowserWorker::default();
+        browser.load(fixture("local.m3u"));
+        assert_eq!(results(wait(&mut browser, "")).len(), 4);
+        assert_eq!(browser.with_all_channels(<[crate::Channel]>::len), 4);
+        let extra = crate::Channel {
+            name: "Extra".to_owned(),
+            group: String::new(),
+            url: "http://example.com/extra".to_owned(),
+            tvg_id: String::new(),
+            tvg_name: String::new(),
+            tvg_logo: String::new(),
+            unknown_attributes: std::collections::BTreeMap::new(),
+        };
+        browser.add_channels(vec![extra], "");
+        assert_eq!(results(wait(&mut browser, "")).len(), 5);
+        let names: Vec<String> =
+            browser.with_all_channels(|channels| channels.iter().map(|c| c.name.clone()).collect());
+        assert_eq!(names.last().map(String::as_str), Some("Extra"));
+        assert_eq!(browser.all_channels().len(), 5);
     }
 
     #[test]

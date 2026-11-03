@@ -9,8 +9,10 @@ use iptv_core::{
     config::{self, Config},
     dvr::{channel_from_snapshot, DvrAction, DvrSchedule},
     epg::{
-        local_datetime, local_hhmm, match_guide_channel, EpgGuide, EpgWorker, GuideIndexes,
-        Programme,
+        airing_index, build_row_guide, epg_info_message, epg_row_label, epg_time_range,
+        hash_epg_sources, local_datetime, local_hhmm, match_guide_channel, merged_epg_sources,
+        should_auto_import_epg, should_run_epg_search, EpgGuide, EpgWorker, GuideIndexes, NowNext,
+        Programme, SEARCH_EPG_RESULT_LIMIT,
     },
     favorites::{channel_key, FavoriteSet, Toggle},
     playback::{
@@ -80,8 +82,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let suffixes: Rc<EpgSuffixes> =
             Rc::new(RefCell::new((0, 0, std::collections::HashMap::new())));
         let suffixes_for_text = Rc::clone(&suffixes);
+        let epg_rows: Rc<RefCell<Vec<EpgSearchRow>>> = Rc::new(RefCell::new(Vec::new()));
+        let epg_rows_for_text = Rc::clone(&epg_rows);
         assert!(list.set_virtual_text_callback(move |index, column| {
-            channel_text(&rows.borrow(), &suffixes_for_text.borrow(), index, column)
+            channel_text(
+                &rows.borrow(),
+                &suffixes_for_text.borrow(),
+                &epg_rows_for_text.borrow(),
+                index,
+                column,
+            )
         }));
         list.set_item_count(0);
 
@@ -115,7 +125,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             status,
         };
         let controls_for_layout = controls_all;
-        bind_browser(frame, controls_all, model, suffixes);
+        bind_browser(frame, controls_all, model, suffixes, epg_rows);
         layout_main(
             frame,
             panel,
@@ -354,6 +364,16 @@ struct Controls {
 /// reads "{name} — {now} — Next: {next}".
 type EpgSuffixes = RefCell<(i64, usize, std::collections::HashMap<usize, String>)>;
 
+/// One programme row appended to the Channels list by the
+/// main-window EPG search (Python's `{"type": "epg"}` rows): the
+/// row label, the programme, and the playlist channel it routes
+/// to, resolved when the row is appended.
+struct EpgSearchRow {
+    label: String,
+    programme: Programme,
+    playlist_index: Option<usize>,
+}
+
 #[derive(Clone)]
 struct Wiring {
     browser: Rc<RefCell<BrowserWorker>>,
@@ -368,6 +388,27 @@ struct Wiring {
     epg_worker: Rc<EpgWorker>,
     epg_pending: Rc<std::cell::Cell<bool>>,
     epg_deferred: Rc<std::cell::Cell<bool>>,
+    /// Programme rows appended below the channel rows by the
+    /// current search (audit E08); shared with the list's text
+    /// callback.
+    epg_rows: Rc<RefCell<Vec<EpgSearchRow>>>,
+    /// Guide sources discovered from providers (and, later,
+    /// playlist headers): merged with the user's own `epgs` by
+    /// `effective_epg_sources` (audit E01).
+    epg_extra_sources: Rc<RefCell<Vec<String>>>,
+    /// The source list of the in-flight guide load, recorded on
+    /// completion as the imported-sources hash (audit E03).
+    epg_inflight_sources: Rc<RefCell<Vec<String>>>,
+    /// A load was requested while one was already running; the
+    /// completion re-checks whether the sources changed under it.
+    epg_recheck: Rc<std::cell::Cell<bool>>,
+    /// The independent 60-second guide-freshness timer (audit
+    /// E11): row suffixes track programme boundaries even when
+    /// every worker is idle.
+    epg_timer: Rc<Timer<Frame>>,
+    /// Guide indexes built from the store alone (after a restart,
+    /// before any load), invalidated when a load lands.
+    epg_store_indexes: Rc<RefCell<Option<GuideIndexes>>>,
     reminders: Rc<RefCell<Vec<Reminder>>>,
     provider_worker: Rc<ProviderWorker>,
     provider_pending: Rc<std::cell::Cell<bool>>,
@@ -584,6 +625,7 @@ fn bind_browser(
     controls: Controls,
     model: Rc<RefCell<SearchResults>>,
     suffixes: Rc<EpgSuffixes>,
+    epg_rows: Rc<RefCell<Vec<EpgSearchRow>>>,
 ) {
     let candidates = config::config_candidates();
     let loaded = config::load(&candidates, &candidates[0]);
@@ -610,10 +652,22 @@ fn bind_browser(
         player: Rc::new(RefCell::new(PlayerState::default())),
         epg: Rc::new(RefCell::new(None)),
         epg_suffixes: suffixes,
-        epg_store: Rc::new(RefCell::new(None)),
+        // The saved guide database is reopened for reading at
+        // startup (audit E02): schedules, What's on Now and the
+        // information panel answer from it before — and without —
+        // a fresh import.
+        epg_store: Rc::new(RefCell::new(
+            iptv_core::epgstore::EpgStore::open(&epg_store_path()).ok(),
+        )),
         epg_worker: Rc::new(EpgWorker::new()),
         epg_pending: Rc::new(std::cell::Cell::new(false)),
         epg_deferred: Rc::new(std::cell::Cell::new(false)),
+        epg_rows,
+        epg_extra_sources: Rc::new(RefCell::new(Vec::new())),
+        epg_inflight_sources: Rc::new(RefCell::new(Vec::new())),
+        epg_recheck: Rc::new(std::cell::Cell::new(false)),
+        epg_timer: Rc::new(Timer::new(&frame)),
+        epg_store_indexes: Rc::new(RefCell::new(None)),
         reminders: Rc::new(RefCell::new(Vec::new())),
         provider_worker: Rc::new(ProviderWorker::new()),
         provider_pending: Rc::new(std::cell::Cell::new(false)),
@@ -665,6 +719,7 @@ fn bind_browser(
     reload_epg(&wiring);
     fill_scope_choices(&wiring, controls.scope_choice);
     bind_completion(&wiring, controls);
+    bind_epg_timer(frame, &wiring, controls);
     build_menu(frame, &wiring, controls);
     bind_tray(frame, &wiring, controls.status);
     maybe_auto_check_updates(&wiring, frame);
@@ -703,6 +758,31 @@ fn bind_main_close(frame: Frame, wiring: &Wiring) {
     });
 }
 
+/// The independent guide-freshness timer (audit E11): every 60
+/// seconds the row suffixes are rebuilt from the current bulk
+/// snapshot, so a programme boundary updates the rows even when
+/// every loader, recording and reminder is idle and the poll
+/// timer has stopped. Python's now-playing timer is exactly this;
+/// it skips while the window is hidden in the tray.
+fn bind_epg_timer(frame: Frame, wiring: &Wiring, controls: Controls) {
+    let list = controls.list;
+    let tick = clone_wiring(wiring);
+    wiring.epg_timer.on_tick(move |_| {
+        if !frame.is_shown() {
+            return;
+        }
+        if !tick.persist.config.borrow().bool_or("epg_enabled", true) {
+            return;
+        }
+        refresh_epg_suffixes(&tick);
+        let total = tick.model.borrow().len() + tick.epg_rows.borrow().len();
+        if total > 0 {
+            list.refresh_items(0, i64::try_from(total).unwrap_or(i64::MAX) - 1);
+        }
+    });
+    let _ = wiring.epg_timer.start(60_000, false);
+}
+
 fn bind_completion(wiring: &Wiring, controls: Controls) {
     let search = controls.search;
     let list = controls.list;
@@ -725,7 +805,14 @@ fn bind_completion(wiring: &Wiring, controls: Controls) {
         match event {
             Some(BrowseEvent::Results(results)) => {
                 loading_noted.set(false);
+                // New channel rows retire the previous search's
+                // programme rows before the new append runs.
+                completed.epg_rows.borrow_mut().clear();
+                let query = results.query().to_owned();
+                let matches = results.len();
+                let in_all = matches!(results.category(), Category::All);
                 publish_results(list, status, &completed.model, results);
+                append_epg_rows(&completed, list, &query, matches, in_all);
                 sync_category_control(category, &completed.categories, &completed.browser);
             }
             Some(BrowseEvent::Recovery(error)) => {
@@ -736,8 +823,7 @@ fn bind_completion(wiring: &Wiring, controls: Controls) {
         }
         if completed.epg_deferred.get() && !completed.browser.borrow().is_busy() {
             completed.epg_deferred.set(false);
-            let urls = completed.persist.config.borrow().string_list("epg_urls");
-            dispatch_epg_load(&completed, urls);
+            reload_epg(&completed);
         }
         poll_epg(&completed, status);
         {
@@ -894,27 +980,26 @@ fn bind_actions(_frame: Frame, wiring: &Wiring, controls: Controls) {
 /// Toggle the favorite state of the channel behind the selected or
 /// focused Channels row (View menu, Ctrl+D and the context menu).
 #[allow(clippy::too_many_arguments)]
-fn toggle_selected_favorite(
-    browser: &Rc<RefCell<BrowserWorker>>,
-    model: &Rc<RefCell<SearchResults>>,
-    persist: &Persist,
-    timer: &Rc<Timer<Frame>>,
-    list: ListCtrl,
-    search: TextCtrl,
-    status: Status,
-) {
+/// The list row actions apply to: the selected row, else the
+/// focused row (the same pick `selected_channel` makes).
+fn selected_row(list: ListCtrl) -> Option<usize> {
     let selected = usize::try_from(list.get_first_selected_item()).ok();
     let focused =
         usize::try_from(list.get_next_item(-1, ListNextItemFlag::All, ListItemState::Focused)).ok();
-    let Some(row) = pick_row(selected, focused) else {
+    pick_row(selected, focused)
+}
+
+fn toggle_selected_favorite(wiring: &Wiring, list: ListCtrl, search: TextCtrl, status: Status) {
+    let Some(row) = selected_row(list) else {
         status.set_label("No channel selected. Choose a channel in Channels first.");
         return;
     };
-    let Some(index) = model.borrow().playlist_index(row) else {
+    let Some(index) = row_playlist_index(wiring, row) else {
         status.set_label("No channel selected. Choose a channel in Channels first.");
         return;
     };
-    match browser
+    match wiring
+        .browser
         .borrow_mut()
         .toggle_favorite(index, &search.get_value())
     {
@@ -923,9 +1008,9 @@ fn toggle_selected_favorite(
         }
         Some(outcome) => {
             status.set_label(&outcome.announcement);
-            let keys = browser.borrow().favorites().keys().to_vec();
-            persist.save_favorites(&keys);
-            assert!(timer.start(50, false));
+            let keys = wiring.browser.borrow().favorites().keys().to_vec();
+            wiring.persist.save_favorites(&keys);
+            assert!(wiring.timer.start(50, false));
         }
         None => status.set_label("No channel selected. Choose a channel in Channels first."),
     }
@@ -1227,7 +1312,17 @@ fn poll_providers(wiring: &Wiring, controls: Controls) {
                     assert!(wiring.timer.start(50, false));
                 }
                 if !epg_urls.is_empty() {
-                    dispatch_epg_load(wiring, epg_urls);
+                    // Provider-discovered guides join the source
+                    // list (audit E01); the load itself reads the
+                    // merged effective list.
+                    let mut extra = wiring.epg_extra_sources.borrow_mut();
+                    for url in epg_urls {
+                        if !extra.contains(&url) {
+                            extra.push(url);
+                        }
+                    }
+                    drop(extra);
+                    dispatch_epg_load(wiring, effective_epg_sources(wiring));
                 }
                 for failure in failures {
                     status.set_label(&failure);
@@ -1311,14 +1406,51 @@ fn poll_epg(wiring: &Wiring, status: Status) {
         wiring.epg_pending.set(false);
         match result {
             Ok((guide, store_note)) => {
-                let counts = (guide.channels.len(), guide.programme_count());
-                let indexes = GuideIndexes::build(&guide.channels);
-                *wiring.epg.borrow_mut() = Some((guide, indexes));
+                // Merge into the guide already in memory: a run
+                // that loaded one source must not drop the rows of
+                // the sources it did not touch (audit E04).
+                let counts = {
+                    let mut slot = wiring.epg.borrow_mut();
+                    match slot.as_mut() {
+                        Some((existing, _)) => existing.merge(guide),
+                        None => *slot = Some((guide, GuideIndexes::default())),
+                    }
+                    match slot.as_mut() {
+                        Some((merged, indexes)) => {
+                            *indexes = GuideIndexes::build(&merged.channels);
+                            (merged.channels.len(), merged.programme_count())
+                        }
+                        None => (0, 0),
+                    }
+                };
+                // The store changed under the cached indexes.
+                *wiring.epg_store_indexes.borrow_mut() = None;
                 wiring.epg_suffixes.borrow_mut().0 = 0;
+                // Python records the import stamp and the hash of
+                // the sources actually imported, so the next
+                // automatic decision can respect the interval.
+                let imported = wiring.epg_inflight_sources.borrow().clone();
+                wiring
+                    .persist
+                    .set_and_save("epg_last_import_epoch", serde_json::json!(now_epoch()));
+                wiring.persist.set_and_save(
+                    "epg_last_sources_hash",
+                    serde_json::json!(hash_epg_sources(&imported)),
+                );
                 status.set_label(&format!(
                     "Guide loaded: {} channels, {} programmes.{store_note}",
                     counts.0, counts.1
                 ));
+                // Sources changed while this load ran (a provider
+                // finished after it started): run the load the
+                // change asked for, as Python does.
+                if wiring.epg_recheck.get() {
+                    wiring.epg_recheck.set(false);
+                    let current = effective_epg_sources(wiring);
+                    if hash_epg_sources(&current) != hash_epg_sources(&imported) {
+                        dispatch_epg_load(wiring, current);
+                    }
+                }
             }
             Err(error) => status.set_label(&format!("Guide failed to load: {error}")),
         }
@@ -1352,18 +1484,178 @@ fn poll_epg(wiring: &Wiring, status: Status) {
     }
 }
 
-/// The channel behind the list's current selection, if any.
-fn selected_channel(
-    browser: &Rc<RefCell<BrowserWorker>>,
-    model: &Rc<RefCell<SearchResults>>,
+/// Guide indexes from the store alone (after a restart, before
+/// any load), built once and cached until a load lands.
+fn store_indexes(wiring: &Wiring) -> Option<GuideIndexes> {
+    if let Some(indexes) = wiring.epg_store_indexes.borrow().as_ref() {
+        return Some(indexes.clone());
+    }
+    let channels = wiring
+        .epg_store
+        .borrow()
+        .as_ref()
+        .and_then(|store| store.channels().ok())?;
+    let indexes = GuideIndexes::build(&channels);
+    *wiring.epg_store_indexes.borrow_mut() = Some(indexes.clone());
+    Some(indexes)
+}
+
+/// The guide indexes to match against: the in-memory guide's
+/// when a load has landed, otherwise the store's.
+fn guide_indexes_any(wiring: &Wiring) -> Option<GuideIndexes> {
+    if let Some((_, indexes)) = wiring.epg.borrow().as_ref() {
+        return Some(indexes.clone());
+    }
+    store_indexes(wiring)
+}
+
+/// The (current, next) programmes for a channel from whichever
+/// guide surface is live: `None` when the channel has no guide
+/// match at all (distinct from a match with nothing on).
+fn guide_now_next(wiring: &Wiring, channel: &Channel) -> Option<NowNext> {
+    if !wiring.persist.config.borrow().bool_or("epg_enabled", true) {
+        return None;
+    }
+    let now = now_epoch();
+    if let Some((guide, indexes)) = wiring.epg.borrow().as_ref() {
+        let id = match_guide_channel(channel, indexes, Some(&indexes.known_ids))?;
+        let (current, next) = guide.now_next(&id, now);
+        return Some(NowNext { current, next });
+    }
+    let indexes = store_indexes(wiring)?;
+    let id = match_guide_channel(channel, &indexes, Some(&indexes.known_ids))?;
+    let store = wiring.epg_store.borrow();
+    let (current, next) = store.as_ref()?.now_next(&id, now).ok()?;
+    Some(NowNext { current, next })
+}
+
+/// An owned bulk snapshot (indexes + now/next per guide channel)
+/// for whole-catalogue work (What's on Now, EPG search routing).
+fn guide_snapshot(
+    wiring: &Wiring,
+    now: i64,
+) -> Option<(GuideIndexes, std::collections::HashMap<String, NowNext>)> {
+    if let Some((guide, indexes)) = wiring.epg.borrow().as_ref() {
+        return Some((indexes.clone(), guide.bulk_now_next(now)));
+    }
+    let indexes = store_indexes(wiring)?;
+    let store = wiring.epg_store.borrow();
+    let rows = store.as_ref()?.all_now_next(now).ok()?;
+    let bulk = rows
+        .into_iter()
+        .map(|(channel, entry)| (channel.id, entry))
+        .collect();
+    Some((indexes, bulk))
+}
+
+/// The EPG search row at a list row, when the row is one of the
+/// appended programme rows rather than a channel row.
+fn row_epg(wiring: &Wiring, row: usize) -> Option<EpgSearchRow> {
+    let base = wiring.model.borrow().len();
+    if row < base {
+        return None;
+    }
+    wiring
+        .epg_rows
+        .borrow()
+        .get(row - base)
+        .map(|r| EpgSearchRow {
+            label: r.label.clone(),
+            programme: r.programme.clone(),
+            playlist_index: r.playlist_index,
+        })
+}
+
+/// The playlist index behind a list row: the row's own for
+/// channel rows, the routed channel for EPG search rows.
+fn row_playlist_index(wiring: &Wiring, row: usize) -> Option<usize> {
+    if let Some(epg_row) = row_epg(wiring, row) {
+        return epg_row.playlist_index;
+    }
+    wiring.model.borrow().playlist_index(row)
+}
+
+/// Append bounded programme rows to a fresh channel search
+/// (audit E08): the store answers the channel-name query, each
+/// hit is routed to its playlist channel once, and the rows land
+/// below the channel rows. The guard keeps broad queries and
+/// non–All Channels views channel-only, as Python does.
+fn append_epg_rows(
+    wiring: &Wiring,
     list: ListCtrl,
-) -> Option<Channel> {
+    query: &str,
+    channel_matches: usize,
+    in_all_channels: bool,
+) {
+    let enabled = wiring.persist.config.borrow().bool_or("epg_enabled", true);
+    let store_available = wiring.epg_store.borrow().is_some();
+    if !should_run_epg_search(
+        enabled,
+        in_all_channels,
+        wiring.epg_pending.get(),
+        query,
+        channel_matches,
+        store_available,
+    ) {
+        return;
+    }
+    let now = now_epoch();
+    let hits = {
+        let guard = wiring.epg_store.borrow();
+        guard
+            .as_ref()
+            .and_then(|store| {
+                store
+                    .channels_with_show(query, now, SEARCH_EPG_RESULT_LIMIT)
+                    .ok()
+            })
+            .unwrap_or_default()
+    };
+    if hits.is_empty() {
+        return;
+    }
+    let Some(indexes) = guide_indexes_any(wiring) else {
+        return;
+    };
+    // Route every hit to its playlist channel in one pass over
+    // the catalogue (Python builds the same match index before
+    // appending, off its search path).
+    let mut rows: Vec<EpgSearchRow> = Vec::new();
+    wiring.browser.borrow().with_all_channels(|channels| {
+        let mut by_guide: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        for (index, channel) in channels.iter().enumerate() {
+            if let Some(id) = match_guide_channel(channel, &indexes, Some(&indexes.known_ids)) {
+                by_guide.entry(id).or_insert(index);
+            }
+        }
+        for (name, programme) in &hits {
+            rows.push(EpgSearchRow {
+                label: epg_row_label(name, programme),
+                programme: programme.clone(),
+                playlist_index: by_guide.get(&programme.channel_id).copied(),
+            });
+        }
+    });
+    if rows.is_empty() {
+        return;
+    }
+    let base = i64::try_from(wiring.model.borrow().len()).unwrap_or(0);
+    let total = base + i64::try_from(rows.len()).unwrap_or(0);
+    *wiring.epg_rows.borrow_mut() = rows;
+    list.set_item_count(total);
+    list.refresh_items(base, total - 1);
+}
+
+/// The channel behind the list's current selection, if any.
+/// EPG search rows resolve to the channel they route to.
+fn selected_channel(wiring: &Wiring, list: ListCtrl) -> Option<Channel> {
     let selected = usize::try_from(list.get_first_selected_item()).ok();
     let focused =
         usize::try_from(list.get_next_item(-1, ListNextItemFlag::All, ListItemState::Focused)).ok();
     let row = pick_row(selected, focused)?;
-    let index = model.borrow().playlist_index(row)?;
-    browser.borrow().channel(index)
+    let index = row_playlist_index(wiring, row)?;
+    wiring.browser.borrow().channel(index)
 }
 
 /// Start or stop a manual recording of the channel.
@@ -2168,7 +2460,7 @@ struct CastView {
 /// Open (or raise) the Cast window and start discovery for the
 /// selected channel (shared by the button and the menus).
 fn open_cast_window(wiring: &Wiring, list: ListCtrl) {
-    let channel = selected_channel(&wiring.browser, &wiring.model, list);
+    let channel = selected_channel(wiring, list);
     show_cast_for(
         &wiring.cast_ui,
         &wiring.cast_worker,
@@ -2383,6 +2675,12 @@ fn clone_wiring(wiring: &Wiring) -> Wiring {
         epg_worker: Rc::clone(&wiring.epg_worker),
         epg_pending: Rc::clone(&wiring.epg_pending),
         epg_deferred: Rc::clone(&wiring.epg_deferred),
+        epg_rows: Rc::clone(&wiring.epg_rows),
+        epg_extra_sources: Rc::clone(&wiring.epg_extra_sources),
+        epg_inflight_sources: Rc::clone(&wiring.epg_inflight_sources),
+        epg_recheck: Rc::clone(&wiring.epg_recheck),
+        epg_timer: Rc::clone(&wiring.epg_timer),
+        epg_store_indexes: Rc::clone(&wiring.epg_store_indexes),
         reminders: Rc::clone(&wiring.reminders),
         provider_worker: Rc::clone(&wiring.provider_worker),
         provider_pending: Rc::clone(&wiring.provider_pending),
@@ -3722,15 +4020,7 @@ fn bind_menu_actions(frame: Frame, wiring: &Wiring, controls: Controls) {
             PLAY_PAUSE | STOP => menu_player_transport(&wiring, id == PLAY_PAUSE),
             VIEW_LIVE => status.set_label("Live TV and catch-up view."),
             VIEW_VOD => open_vod_window(&wiring, status),
-            FAVORITE => toggle_selected_favorite(
-                &wiring.browser,
-                &wiring.model,
-                persist,
-                &wiring.timer,
-                list,
-                search,
-                status,
-            ),
+            FAVORITE => toggle_selected_favorite(&wiring, list, search, status),
             GO_TO_FAVORITES => {
                 if let Some(item) = tree_item_at(category_box, 1) {
                     category_box.select_item(&item);
@@ -3771,7 +4061,7 @@ fn menu_recordings_action(
     let persist = &wiring.persist;
     match id {
         REC_START => {
-            if let Some(channel) = selected_channel(&wiring.browser, &wiring.model, list) {
+            if let Some(channel) = selected_channel(wiring, list) {
                 toggle_recording(
                     &wiring.recordings,
                     &wiring.buffers,
@@ -3784,7 +4074,7 @@ fn menu_recordings_action(
             }
         }
         REC_STOP => {
-            if let Some(channel) = selected_channel(&wiring.browser, &wiring.model, list) {
+            if let Some(channel) = selected_channel(wiring, list) {
                 let key = channel_key(&channel);
                 if wiring.recordings.borrow().is_recording(&key) {
                     wiring.recordings.borrow_mut().stop(&key);
@@ -4006,14 +4296,21 @@ fn menu_import_epg(wiring: &Wiring, frame: Frame, status: Status) {
     let Some(path) = dialog.get_path() else {
         return;
     };
-    let mut urls = wiring.persist.config.borrow().string_list("epg_urls");
+    // Remember the file under Python's `epgs` key (mirrored to
+    // the legacy `epg_urls` so both spellings stay in sync), then
+    // load just this source — the per-source import leaves every
+    // other source's stored guide intact (audit E01, E04).
+    let mut urls = wiring.persist.config.borrow().string_list("epgs");
     if !urls.contains(&path) {
         urls.push(path.clone());
         wiring
             .persist
+            .set_and_save("epgs", serde_json::json!(urls.clone()));
+        wiring
+            .persist
             .set_and_save("epg_urls", serde_json::json!(urls));
     }
-    dispatch_epg_load(wiring, vec![path]);
+    dispatch_epg_load_mode(wiring, vec![path], true);
     status.set_label("Importing EPG data...");
 }
 
@@ -4553,9 +4850,7 @@ fn guide_programmes(wiring: &Wiring, channel: &Channel) -> Vec<Programme> {
         let guard = wiring.epg.borrow();
         match guard.as_ref() {
             Some((guide, indexes)) => {
-                let known: std::collections::HashSet<String> =
-                    guide.channels.iter().map(|c| c.id.to_lowercase()).collect();
-                match match_guide_channel(channel, indexes, Some(&known)) {
+                match match_guide_channel(channel, indexes, Some(&indexes.known_ids)) {
                     Some(id) => guide.programmes.get(&id).cloned().unwrap_or_default(),
                     None => Vec::new(),
                 }
@@ -4570,7 +4865,11 @@ fn guide_programmes(wiring: &Wiring, channel: &Channel) -> Vec<Programme> {
 }
 
 /// Programmes from the `SQLite` store for a channel (tvg-id
-/// candidates in match order), from an hour ago, capped at 200.
+/// candidates in match order), uncapped: seven days back (the
+/// catch-up window) through the seven-day current/upcoming
+/// horizon the Channel EPG view queries (Python's
+/// `_CHANNEL_EPG_HORIZON`). Callers filter to their own window,
+/// as the in-memory path's callers already do.
 fn store_programmes(wiring: &Wiring, channel: &Channel) -> Vec<Programme> {
     let guard = wiring.epg_store.borrow();
     let Some(store) = guard.as_ref() else {
@@ -4580,9 +4879,11 @@ fn store_programmes(wiring: &Wiring, channel: &Channel) -> Vec<Programme> {
     let mut candidates = iptv_core::epg::expand_tvg_id_candidates(channel.tvg_id.trim());
     candidates.push(channel.tvg_id.trim().to_string());
     for candidate in candidates {
-        if let Ok(programmes) = store.programmes_between(&candidate, now - 3600, now + 14 * 86400) {
+        if let Ok(programmes) =
+            store.programmes_between(&candidate, now - 7 * 86_400, now + 7 * 86_400)
+        {
             if !programmes.is_empty() {
-                return programmes.into_iter().take(200).collect();
+                return programmes;
             }
         }
     }
@@ -4591,10 +4892,7 @@ fn store_programmes(wiring: &Wiring, channel: &Channel) -> Vec<Programme> {
 
 /// The programme airing now on a channel, when the guide has one.
 fn current_programme(wiring: &Wiring, channel: &Channel) -> Option<Programme> {
-    let now = now_epoch();
-    guide_programmes(wiring, channel)
-        .into_iter()
-        .find(|p| p.start <= now && now < p.stop)
+    guide_now_next(wiring, channel)?.current
 }
 
 /// Add a reminder for a programme (5-minute lead from the context
@@ -4672,7 +4970,7 @@ fn bind_context_menu(frame: Frame, wiring: &Wiring, controls: Controls) {
     let wiring = clone_wiring(wiring);
     let wiring_menu = clone_wiring(&wiring);
     list.bind_internal(EventType::CONTEXT_MENU, move |_| {
-        let Some(channel) = selected_channel(&wiring.browser, &wiring.model, list) else {
+        let Some(channel) = selected_channel(&wiring, list) else {
             return;
         };
         let favorite_label = if wiring.browser.borrow().favorites().is_favorite(&channel) {
@@ -4703,20 +5001,12 @@ fn bind_context_menu(frame: Frame, wiring: &Wiring, controls: Controls) {
     // Popup-menu selections arrive as menu events on the frame
     // (command events propagate up from the list).
     frame.on_menu(move |event| {
-        let Some(channel) = selected_channel(&wiring_menu.browser, &wiring_menu.model, list) else {
+        let Some(channel) = selected_channel(&wiring_menu, list) else {
             return;
         };
         match event.get_id() {
             CTX_PLAY => activate_channel(&wiring_menu, list, status),
-            CTX_FAVORITE => toggle_selected_favorite(
-                &wiring_menu.browser,
-                &wiring_menu.model,
-                &wiring_menu.persist,
-                &wiring_menu.timer,
-                list,
-                search,
-                status,
-            ),
+            CTX_FAVORITE => toggle_selected_favorite(&wiring_menu, list, search, status),
             CTX_RECORD => {
                 toggle_recording(
                     &wiring_menu.recordings,
@@ -4727,14 +5017,29 @@ fn bind_context_menu(frame: Frame, wiring: &Wiring, controls: Controls) {
                 );
                 assert!(wiring_menu.timer.start(50, false));
             }
-            CTX_REMINDER => match current_programme(&wiring_menu, &channel) {
-                Some(programme) => add_reminder(&wiring_menu, &channel, &programme, status),
-                None => status.set_label("No current programme to set a reminder for."),
-            },
-            CTX_SCHEDULE => match current_programme(&wiring_menu, &channel) {
-                Some(programme) => add_dvr_job(&wiring_menu, &channel, &programme, status),
-                None => status.set_label("No current programme to schedule a recording for."),
-            },
+            // On an EPG search row, Reminder and Schedule act on
+            // the row's own programme (Python's EPG-row menu); on
+            // a channel row they act on the current programme.
+            CTX_REMINDER => {
+                let row_programme = selected_row(list)
+                    .and_then(|row| row_epg(&wiring_menu, row))
+                    .map(|epg_row| epg_row.programme);
+                match row_programme.or_else(|| current_programme(&wiring_menu, &channel)) {
+                    Some(programme) => add_reminder(&wiring_menu, &channel, &programme, status),
+                    None => status.set_label("No current programme to set a reminder for."),
+                }
+            }
+            CTX_SCHEDULE => {
+                let row_programme = selected_row(list)
+                    .and_then(|row| row_epg(&wiring_menu, row))
+                    .map(|epg_row| epg_row.programme);
+                match row_programme.or_else(|| current_programme(&wiring_menu, &channel)) {
+                    Some(programme) => add_dvr_job(&wiring_menu, &channel, &programme, status),
+                    None => {
+                        status.set_label("No current programme to schedule a recording for.");
+                    }
+                }
+            }
             CTX_EPG => open_channel_epg(&wiring_menu, &channel, status),
             CTX_CATCHUP => play_catchup(&wiring_menu, &channel, status),
             _ => {}
@@ -4792,17 +5097,39 @@ fn play_catchup_for(wiring: &Wiring, channel: &Channel, programme: &Programme, s
 /// The Channel EPG window: the channel's upcoming programmes with
 /// Set Reminder and Schedule Recording actions on the selection.
 /// G6 grows this into the full EPG viewer.
+/// Keep a Channel EPG dialog's description field on the
+/// highlighted programme as the selection moves.
+fn bind_epg_description(
+    list: ListBox,
+    description: TextCtrl,
+    programmes: Rc<RefCell<Vec<Programme>>>,
+) {
+    list.bind_internal(EventType::COMMAND_LISTBOX_SELECTED, move |event| {
+        let index = list
+            .get_selection()
+            .map_or(usize::MAX, |selected| selected as usize);
+        if let Some(programme) = programmes.borrow().get(index) {
+            description.set_value(&programme.description);
+        }
+        event.skip(true);
+    });
+}
+
 fn open_channel_epg(wiring: &Wiring, channel: &Channel, main_status: Status) {
     let now = now_epoch();
+    // Python's Channel EPG query: from the programme on air now
+    // through seven days of upcoming programmes, uncapped —
+    // finished programmes belong to Catch-up, not this window.
     let programmes: Vec<Programme> = guide_programmes(wiring, channel)
         .into_iter()
-        .filter(|p| p.stop > now - 3600)
-        .take(200)
+        .filter(|p| p.stop > now && p.start < now + 7 * 86_400)
         .collect();
     if programmes.is_empty() {
         main_status.set_label("No guide information for this channel.");
         return;
     }
+    // Begin on the programme airing now, not row zero.
+    let initial = airing_index(&programmes, now).unwrap_or(0);
     let frame = Frame::builder()
         .with_title(&format!("EPG — {}", channel.name))
         .with_size(Size::new(640, 480))
@@ -4813,10 +5140,10 @@ fn open_channel_epg(wiring: &Wiring, channel: &Channel, main_status: Status) {
     list.set_accessibility_label("Programmes");
     let labels: Vec<String> = programmes
         .iter()
-        .map(|p| format!("{}-{} {}", local_hhmm(p.start), local_hhmm(p.stop), p.title))
+        .map(|p| format!("{} {}", epg_time_range(p, now), p.title))
         .collect();
     list.set_items(&labels.iter().map(String::as_str).collect::<Vec<_>>());
-    list.set_selection(0, true);
+    list.set_selection(u32::try_from(initial).unwrap_or(0), true);
     let reminder_button = Button::builder(&panel).with_label("Set &Reminder").build();
     let schedule_button = Button::builder(&panel)
         .with_label("Schedule &Recording")
@@ -4825,7 +5152,6 @@ fn open_channel_epg(wiring: &Wiring, channel: &Channel, main_status: Status) {
     let status_label = StaticText::builder(&panel).with_label("EPG status").build();
     let details = TextCtrl::builder(&panel)
         .with_style(TextCtrlStyle::ReadOnly | TextCtrlStyle::MultiLine)
-        .with_value("Choose a programme, then Set Reminder or Schedule Recording.")
         .build();
     details.set_accessibility_label("EPG status");
     let status = Status {
@@ -4833,7 +5159,21 @@ fn open_channel_epg(wiring: &Wiring, channel: &Channel, main_status: Status) {
         details,
         bar: None,
     };
+    // Tab from the list reaches the highlighted programme's
+    // description (Python's Channel EPG dialog): a read-only
+    // field that follows the selection, never action instructions.
+    let description = TextCtrl::builder(&panel)
+        .with_style(TextCtrlStyle::ReadOnly | TextCtrlStyle::MultiLine)
+        .with_value(
+            programmes
+                .get(initial)
+                .map(|p| p.description.as_str())
+                .unwrap_or_default(),
+        )
+        .build();
+    description.set_accessibility_label("Episode description");
     let programmes = Rc::new(RefCell::new(programmes));
+    bind_epg_description(list, description, Rc::clone(&programmes));
     let channel_r = channel.clone();
     let wiring_r = clone_wiring(wiring);
     let programmes_r = Rc::clone(&programmes);
@@ -4902,6 +5242,21 @@ fn activate_channel(wiring: &Wiring, list: ListCtrl, status: Status) {
         status.set_label("No channel selected. Choose a channel in Channels first.");
         return;
     };
+    // An EPG search row plays its programme through its channel:
+    // the catch-up resolution decides live versus archive from
+    // the programme's window, exactly as Python's activation does.
+    if let Some(epg_row) = row_epg(wiring, row) {
+        let Some(index) = epg_row.playlist_index else {
+            status.set_label("Could not match this programme to a playlist channel.");
+            return;
+        };
+        let Some(channel) = wiring.browser.borrow().channel(index) else {
+            status.set_label("Could not match this programme to a playlist channel.");
+            return;
+        };
+        play_catchup_for(wiring, &channel, &epg_row.programme, status);
+        return;
+    }
     let Some(index) = wiring.model.borrow().playlist_index(row) else {
         status.set_label("No channel selected. Choose a channel in Channels first.");
         return;
@@ -4948,32 +5303,37 @@ fn bind_epg_highlight(
     episode_description: TextCtrl,
     stream_url: TextCtrl,
 ) {
-    let browser = Rc::clone(&wiring.browser);
-    let model = Rc::clone(&wiring.model);
-    let epg = Rc::clone(&wiring.epg);
+    let wiring = clone_wiring(wiring);
     list.on_item_selected(move |event| {
         let Some(row) = usize::try_from(event.get_item_index()).ok() else {
             return;
         };
-        let Some(index) = model.borrow().playlist_index(row) else {
+        // An EPG search row shows its own programme's description
+        // and its channel's URL (Python's EPG-row highlight).
+        if let Some(epg_row) = row_epg(&wiring, row) {
+            if let Some(channel) = epg_row
+                .playlist_index
+                .and_then(|index| wiring.browser.borrow().channel(index))
+            {
+                stream_url.set_value(&channel.url);
+            }
+            episode_description.set_value(&epg_row.programme.description);
+            return;
+        }
+        let Some(index) = wiring.model.borrow().playlist_index(row) else {
             return;
         };
-        let Some(channel) = browser.borrow().channel(index) else {
+        let Some(channel) = wiring.browser.borrow().channel(index) else {
             return;
         };
         stream_url.set_value(&channel.url);
-        let current = {
-            let guard = epg.borrow();
-            guard.as_ref().and_then(|(guide, indexes)| {
-                let known: std::collections::HashSet<String> =
-                    guide.channels.iter().map(|c| c.id.to_lowercase()).collect();
-                match_guide_channel(&channel, indexes, Some(&known))
-                    .and_then(|id| guide.now_next(&id, now_epoch()).0)
-            })
-        };
-        let text = match &current {
-            Some(p) if !p.description.is_empty() => p.description.clone(),
-            Some(p) => p.title.clone(),
+        // The panel carries the full now/next context — current
+        // title, times and description, then the next programme
+        // and its description (audit E10) — not just a bare
+        // description or a placeholder when a next programme
+        // exists.
+        let text = match guide_now_next(&wiring, &channel) {
+            Some(entry) => epg_info_message(entry.current.as_ref(), entry.next.as_ref()),
             None => "No description available for this programme.".to_owned(),
         };
         episode_description.set_value(&text);
@@ -7555,39 +7915,99 @@ fn reload_sources(wiring: &Wiring) {
     }
 }
 
-/// Reload the guide from the configured EPG URLs.
 /// Where the guide's `SQLite` mirror lives.
 fn epg_store_path() -> std::path::PathBuf {
     iptv_core::config::user_config_dir().join("epg.db")
 }
 
-/// Start a guide load now (the worker also mirrors the guide to
-/// the store on its own thread).
-fn dispatch_epg_load(wiring: &Wiring, epg_urls: Vec<String>) {
-    if epg_urls.is_empty() {
+/// The guide sources a load should read (audit E01): the user's
+/// own list — Python's `epgs` key, unioned with this port's legacy
+/// `epg_urls` so existing configurations keep working — merged
+/// with provider-discovered guides and (when `use_playlist_epg`
+/// allows) playlist-discovered ones, deduplicated the way
+/// Python's `reload_epg_sources` does.
+fn effective_epg_sources(wiring: &Wiring) -> Vec<String> {
+    let config = wiring.persist.config.borrow();
+    let mut own = config.string_list("epgs");
+    for legacy in config.string_list("epg_urls") {
+        if !own.contains(&legacy) {
+            own.push(legacy);
+        }
+    }
+    let use_playlist = config.bool_or("use_playlist_epg", true);
+    let extra = wiring.epg_extra_sources.borrow();
+    merged_epg_sources(&own, &extra, &[], use_playlist)
+}
+
+/// Start a guide load (the worker also mirrors the guide to the
+/// store on its own thread). Automatic loads honor Python's
+/// decision (audit E03): a disabled guide never loads, and an
+/// already usable guide inside its refresh interval is not
+/// fetched again. `force` is for explicit user actions.
+fn dispatch_epg_load(wiring: &Wiring, sources: Vec<String>) {
+    dispatch_epg_load_mode(wiring, sources, false);
+}
+
+fn dispatch_epg_load_mode(wiring: &Wiring, sources: Vec<String>, force: bool) {
+    if sources.is_empty() {
         return;
     }
-    wiring.epg_worker.load(epg_urls, Some(epg_store_path()));
+    if wiring.epg_pending.get() {
+        // A load is already running; Python re-runs afterwards
+        // when the sources changed under it.
+        wiring.epg_recheck.set(true);
+        return;
+    }
+    {
+        let config = wiring.persist.config.borrow();
+        if !config.bool_or("epg_enabled", true) {
+            return;
+        }
+        if !force {
+            let usable = wiring
+                .epg_store
+                .borrow()
+                .as_ref()
+                .and_then(|store| store.has_usable_data(now_epoch()).ok())
+                .unwrap_or(false);
+            #[allow(clippy::cast_possible_truncation)]
+            let last_import = config.f64_or("epg_last_import_epoch", 0.0) as i64;
+            if !should_auto_import_epg(
+                &sources,
+                &config.string_or("epg_last_sources_hash", ""),
+                last_import,
+                now_epoch(),
+                config.f64_or("epg_auto_import_interval_hours", 6.0),
+                usable,
+            ) {
+                return;
+            }
+        }
+    }
+    wiring
+        .epg_inflight_sources
+        .borrow_mut()
+        .clone_from(&sources);
+    wiring.epg_worker.load(sources, Some(epg_store_path()));
     wiring.epg_pending.set(true);
     assert!(wiring.timer.start(50, false));
 }
 
-/// Reload the guide from the configured EPG URLs. While a playlist
+/// Reload the guide from the effective sources. While a playlist
 /// load is running, the guide waits: at real-world scale the guide
 /// is hundreds of MB and racing it starved the playlist download
 /// and parse, so channels appeared minutes late (validation 0049).
 /// The completion tick dispatches the deferred load the moment the
 /// browser settles.
 fn reload_epg(wiring: &Wiring) {
-    let epg_urls = wiring.persist.config.borrow().string_list("epg_urls");
-    if epg_urls.is_empty() {
+    if effective_epg_sources(wiring).is_empty() {
         return;
     }
     if wiring.browser.borrow().is_busy() {
         wiring.epg_deferred.set(true);
         return;
     }
-    dispatch_epg_load(wiring, epg_urls);
+    dispatch_epg_load(wiring, effective_epg_sources(wiring));
 }
 
 /// Display name for one `playlists` config entry in the manager.
@@ -7959,11 +8379,22 @@ fn open_account_form(
     form.show(true);
 }
 
-/// File > EPG Manager: edit the `epg_urls` config list.
+/// File > EPG Manager: edit the user's own guide sources
+/// (Python's `epgs` key; the legacy `epg_urls` spelling is read
+/// as the same list and kept in sync on save — audit E01).
+/// Discovered provider/playlist guides are not the user's list
+/// and never land here.
 fn open_epg_manager(wiring: &Wiring, status: Status) {
-    let urls: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(
-        wiring.persist.config.borrow().string_list("epg_urls"),
-    ));
+    let urls: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new({
+        let config = wiring.persist.config.borrow();
+        let mut own = config.string_list("epgs");
+        for legacy in config.string_list("epg_urls") {
+            if !own.contains(&legacy) {
+                own.push(legacy);
+            }
+        }
+        own
+    }));
     let manager = Frame::builder()
         .with_title("EPG Manager")
         .with_size(Size::new(640, 440))
@@ -8038,6 +8469,9 @@ fn open_epg_manager(wiring: &Wiring, status: Status) {
     });
     let wiring_ok = clone_wiring(wiring);
     ok.on_click(move |_| {
+        wiring_ok
+            .persist
+            .set_and_save("epgs", serde_json::json!(urls.borrow().clone()));
         wiring_ok
             .persist
             .set_and_save("epg_urls", serde_json::json!(urls.borrow().clone()));
@@ -8178,11 +8612,21 @@ fn wire_whats_on_buttons(
 /// or channel name), the "{count} programs" label, and Play /
 /// Schedule Recording / Close.
 fn open_whats_on_now(wiring: &Wiring, status: Status) {
+    // One bulk snapshot for the whole catalogue (audit E12),
+    // from the in-memory guide or, after a restart, the store.
     let mut rows: Vec<(Channel, Programme)> = Vec::new();
-    for channel in wiring.browser.borrow().all_channels() {
-        if let Some(programme) = current_programme(wiring, &channel) {
-            rows.push((channel, programme));
-        }
+    if let Some((indexes, bulk)) = guide_snapshot(wiring, now_epoch()) {
+        wiring.browser.borrow().with_all_channels(|channels| {
+            for channel in channels {
+                let Some(id) = match_guide_channel(channel, &indexes, Some(&indexes.known_ids))
+                else {
+                    continue;
+                };
+                if let Some(current) = bulk.get(&id).and_then(|entry| entry.current.clone()) {
+                    rows.push((channel.clone(), current));
+                }
+            }
+        });
     }
     if rows.is_empty() {
         status.set_label("No guide information is loaded yet.");
@@ -9145,7 +9589,7 @@ fn dispatch_main_hotkey(
             true
         }
         Some("record") => {
-            if let Some(channel) = selected_channel(&wiring.browser, &wiring.model, controls.list) {
+            if let Some(channel) = selected_channel(wiring, controls.list) {
                 toggle_recording(
                     &wiring.recordings,
                     &wiring.buffers,
@@ -9512,6 +9956,7 @@ fn publish_results(
 fn channel_text(
     model: &SearchResults,
     suffixes: &(i64, usize, std::collections::HashMap<usize, String>),
+    epg_rows: &[EpgSearchRow],
     index: i64,
     column: i32,
 ) -> String {
@@ -9522,7 +9967,12 @@ fn channel_text(
         return String::new();
     };
     let Some(channel) = model.channel(row) else {
-        return String::new();
+        // Rows past the channel rows are the EPG search appends.
+        return row
+            .checked_sub(model.len())
+            .and_then(|offset| epg_rows.get(offset))
+            .map(|epg_row| epg_row.label.clone())
+            .unwrap_or_default();
     };
     let name = if channel.name.is_empty() {
         // Stream URLs can contain credentials; never use them as row labels.
@@ -9541,46 +9991,42 @@ fn channel_text(
     }
 }
 
-/// One channel's row suffix from its now/next programmes
-/// (Python's `_programme_label` shapes).
-fn epg_suffix(current: Option<&Programme>, next: Option<&Programme>) -> String {
-    use std::fmt::Write as _;
-    let mut suffix = String::new();
-    if let Some(p) = current {
-        let _ = write!(
-            suffix,
-            " — {} ({}–{})",
-            p.title,
-            local_hhmm(p.start),
-            local_hhmm(p.stop)
-        );
-    }
-    if let Some(p) = next {
-        let _ = write!(suffix, " — Next: {} ({})", p.title, local_hhmm(p.start));
-    }
-    suffix
-}
-
-/// Rebuild the row suffixes for the current playlist + guide.
+/// Rebuild the row suffixes and on-air descriptions for the
+/// current playlist + guide from ONE bulk now/next snapshot
+/// (audit E12): the snapshot walks every guide channel once,
+/// the catalogue is borrowed rather than cloned, and the guide
+/// indexes are the ones built with the guide — nothing is
+/// rebuilt per channel. The store alone can drive the rebuild
+/// after a restart (audit E02).
 fn refresh_epg_suffixes(wiring: &Wiring) {
     let now = now_epoch();
     let playlist_ptr = wiring.model.borrow().playlist_ptr();
-    let mut map = std::collections::HashMap::new();
-    if let Some((guide, indexes)) = wiring.epg.borrow().as_ref() {
-        let known: std::collections::HashSet<String> =
-            guide.channels.iter().map(|c| c.id.to_lowercase()).collect();
-        for (index, channel) in wiring.browser.borrow().all_channels().iter().enumerate() {
-            let Some(guide_id) = match_guide_channel(channel, indexes, Some(&known)) else {
-                continue;
-            };
-            let (current, next) = guide.now_next(&guide_id, now);
-            let suffix = epg_suffix(current.as_ref(), next.as_ref());
-            if !suffix.is_empty() {
-                map.insert(index, suffix);
+    let mut suffixes = std::collections::HashMap::new();
+    if wiring.persist.config.borrow().bool_or("epg_enabled", true) {
+        let browser = wiring.browser.borrow();
+        if let Some((guide, indexes)) = wiring.epg.borrow().as_ref() {
+            let bulk = guide.bulk_now_next(now);
+            browser.with_all_channels(|channels| {
+                suffixes = build_row_guide(channels, indexes, &bulk).0;
+            });
+        } else if let Some(indexes) = store_indexes(wiring) {
+            if let Some(bulk) = wiring
+                .epg_store
+                .borrow()
+                .as_ref()
+                .and_then(|store| store.all_now_next(now).ok())
+            {
+                let bulk: std::collections::HashMap<String, NowNext> = bulk
+                    .into_iter()
+                    .map(|(channel, entry)| (channel.id, entry))
+                    .collect();
+                browser.with_all_channels(|channels| {
+                    suffixes = build_row_guide(channels, &indexes, &bulk).0;
+                });
             }
         }
     }
-    *wiring.epg_suffixes.borrow_mut() = (now, playlist_ptr, map);
+    *wiring.epg_suffixes.borrow_mut() = (now, playlist_ptr, suffixes);
 }
 
 #[cfg(test)]
@@ -9598,8 +10044,8 @@ mod tests {
         let model = SearchResults::default();
         let suffixes = no_suffixes();
         for index in [-1, 0, 1, i64::MAX] {
-            assert_eq!(channel_text(&model, &suffixes, index, 0), "");
-            assert_eq!(channel_text(&model, &suffixes, index, 1), "");
+            assert_eq!(channel_text(&model, &suffixes, &[], index, 0), "");
+            assert_eq!(channel_text(&model, &suffixes, &[], index, 1), "");
         }
     }
 
@@ -9626,11 +10072,50 @@ mod tests {
             std::thread::yield_now();
         };
         assert_eq!(
-            channel_text(&model, &suffixes, 0, 0),
+            channel_text(&model, &suffixes, &[], 0, 0),
             "ABC East HD — News Hour (18:00–19:00) — Next: Movie (19:00)"
         );
         // A channel without guide data keeps the bare name.
-        assert_eq!(channel_text(&model, &suffixes, 1, 0), "映画, HD");
+        assert_eq!(channel_text(&model, &suffixes, &[], 1, 0), "映画, HD");
+    }
+
+    #[test]
+    fn epg_search_rows_render_their_labels_past_the_channel_rows() {
+        // Audit E08: rows appended below the channel rows render
+        // the programme label; rows past them stay empty.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../iptv-core/tests/fixtures/local.m3u");
+        let worker = SearchWorker::default();
+        worker.submit(
+            Arc::new(BrowseModel::open_local(&path).unwrap()),
+            String::new(),
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let model = loop {
+            if let Some(result) = worker.try_latest() {
+                break result;
+            }
+            assert!(std::time::Instant::now() < deadline, "search timed out");
+            std::thread::yield_now();
+        };
+        let suffixes = no_suffixes();
+        let epg_rows = vec![EpgSearchRow {
+            label: "ABC East HD - News Hour (18:00–19:00)".to_owned(),
+            programme: Programme {
+                channel_id: "abc".to_owned(),
+                start: 0,
+                stop: 3600,
+                title: "News Hour".to_owned(),
+                description: String::new(),
+            },
+            playlist_index: Some(0),
+        }];
+        assert_eq!(
+            channel_text(&model, &suffixes, &epg_rows, 4, 0),
+            "ABC East HD - News Hour (18:00–19:00)"
+        );
+        assert_eq!(channel_text(&model, &suffixes, &epg_rows, 5, 0), "");
+        assert_eq!(channel_text(&model, &suffixes, &epg_rows, 4, 1), "");
     }
 
     #[test]
@@ -9648,10 +10133,10 @@ mod tests {
             stop: 7200,
             ..now.clone()
         };
-        let suffix = epg_suffix(Some(&now), Some(&next));
+        let suffix = iptv_core::epg::programme_suffix(Some(&now), Some(&next));
         assert!(suffix.starts_with(" — News Hour ("), "{suffix}");
         assert!(suffix.contains(" — Next: Movie ("), "{suffix}");
-        assert_eq!(epg_suffix(None, None), "");
+        assert_eq!(iptv_core::epg::programme_suffix(None, None), "");
     }
 
     #[test]
@@ -9672,16 +10157,19 @@ mod tests {
             std::thread::yield_now();
         };
         let suffixes = no_suffixes();
-        assert_eq!(channel_text(&model, &suffixes, 0, 0), "ABC East HD");
-        assert_eq!(channel_text(&model, &suffixes, 1, 0), "映画, HD");
+        assert_eq!(channel_text(&model, &suffixes, &[], 0, 0), "ABC East HD");
+        assert_eq!(channel_text(&model, &suffixes, &[], 1, 0), "映画, HD");
         assert_eq!(
-            channel_text(&model, &suffixes, 2, 0),
+            channel_text(&model, &suffixes, &[], 2, 0),
             "Bob's Burgers, Season 1"
         );
-        assert_eq!(channel_text(&model, &suffixes, 3, 0), "Unnamed channel");
-        assert_eq!(channel_text(&model, &suffixes, 4, 0), "");
-        assert_eq!(channel_text(&model, &suffixes, -1, 0), "");
-        assert_eq!(channel_text(&model, &suffixes, 0, 1), "");
+        assert_eq!(
+            channel_text(&model, &suffixes, &[], 3, 0),
+            "Unnamed channel"
+        );
+        assert_eq!(channel_text(&model, &suffixes, &[], 4, 0), "");
+        assert_eq!(channel_text(&model, &suffixes, &[], -1, 0), "");
+        assert_eq!(channel_text(&model, &suffixes, &[], 0, 1), "");
     }
 
     #[test]

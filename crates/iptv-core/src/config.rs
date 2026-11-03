@@ -220,6 +220,15 @@ impl Config {
             let list = coerce_string_list(self.values.get(key));
             self.values.insert(key.to_string(), json!(list));
         }
+        // Guide source lists are string lists in both spellings:
+        // Python's `epgs` (the key its manager and backup format
+        // use) and this port's legacy `epg_urls`. Normalizing both
+        // keeps an imported Python backup's guide list intact and
+        // loadable instead of preserved-but-ignored (audit E01).
+        for key in ["epgs", "epg_urls"] {
+            let list = coerce_string_list(self.values.get(key));
+            self.values.insert(key.to_string(), json!(list));
+        }
         for key in ["prefer_audio_description", "shutdown_after_recordings"] {
             let flag = coerce_bool(self.values.get(key), false);
             self.values.insert(key.to_string(), json!(flag));
@@ -294,6 +303,11 @@ impl Config {
     #[must_use]
     pub fn bool_or(&self, key: &str, default: bool) -> bool {
         coerce_bool(self.values.get(key), default)
+    }
+
+    #[must_use]
+    pub fn f64_or(&self, key: &str, default: f64) -> f64 {
+        coerce_f64(self.values.get(key)).unwrap_or(default)
     }
 
     #[must_use]
@@ -479,6 +493,24 @@ mod tests {
         assert_eq!(config.favorites(), vec!["a|b", "c"]);
         assert!(config.bool_or("shutdown_after_recordings", false));
         assert_eq!(config.raw()["announcement_level"], json!(3));
+    }
+
+    #[test]
+    fn python_epgs_key_is_normalized_and_round_trips() {
+        // Audit E01: a Python settings backup carries its guide
+        // list under `epgs` only; it must load as a usable string
+        // list and survive a save unchanged in shape.
+        let config = config_from(
+            r#"{"epgs": "https://example.com/guide.xml, /tmp/local.xml.gz", "epg_last_import_epoch": 42}"#,
+        );
+        assert_eq!(
+            config.string_list("epgs"),
+            ["https://example.com/guide.xml", "/tmp/local.xml.gz"]
+        );
+        let reparsed = config_from(&config.to_json_string());
+        assert_eq!(reparsed.string_list("epgs"), config.string_list("epgs"));
+        assert!((reparsed.f64_or("epg_last_import_epoch", 0.0) - 42.0).abs() < 1e-9);
+        assert_eq!(reparsed.string_or("epg_last_sources_hash", ""), "");
     }
 
     #[test]

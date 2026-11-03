@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<x:tv xmlns:x="urn:xmltv:variant">
+  <x:channel id="var1"><x:display-name>Variant One</x:display-name></x:channel>
+  <x:channel id="var2"><x:display-name>Variant Two</x:display-name></x:channel>
+  <x:programme channel="var1" start="20261101180000 +0000" end="20261101190000 +0000">
+    <x:title>End Attr Show</x:title>
+    <x:desc>Uses the end attribute.</x:desc>
+  </x:programme>
+  <x:programme channel="var1" start="20261101190000 +0000">
+    <x:title><![CDATA[Length Minutes Show]]></x:title>
+    <x:desc><![CDATA[CDATA description survives.]]></x:desc>
+    <x:length units="minutes">30</x:length>
+  </x:programme>
+  <x:programme channel="var1" start="20261101193000 +0000">
+    <x:title>Length Seconds Show</x:title>
+    <x:length units="seconds">1800</x:length>
+  </x:programme>
+  <x:programme channel="var2" start="20261101200000 +0000">
+    <x:title>ISO Duration Show</x:title>
+    <x:duration>PT1H30M</x:duration>
+  </x:programme>
+  <x:programme channel="var2" start="20261101213000 +0000">
+    <x:title>Bare Duration Show</x:title>
+    <x:duration>45</x:duration>
+  </x:programme>
+</x:tv>
