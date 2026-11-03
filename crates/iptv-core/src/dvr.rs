@@ -11,6 +11,10 @@ use serde::{Deserialize, Serialize};
 use crate::Channel;
 
 pub const STATUS_SCHEDULED: &str = "scheduled";
+/// Due, but a provider connection conflict keeps it from
+/// starting (issue #134). Persisted so the reason survives; on
+/// load it re-arms to scheduled and capacity is reassessed.
+pub const STATUS_WAITING: &str = "waiting";
 pub const STATUS_RECORDING: &str = "recording";
 pub const STATUS_STOPPING: &str = "stopping";
 pub const STATUS_COMPLETED: &str = "completed";
@@ -55,6 +59,11 @@ pub struct DvrJob {
     /// carries the missed-beginning warning (issue #130).
     #[serde(default)]
     pub started_late: bool,
+    /// Why a waiting job is waiting (the connection conflict's
+    /// user-visible reason); kept after the wait ends so the
+    /// outcome stays explainable (issues #134/#135).
+    #[serde(default)]
+    pub wait_reason: String,
     pub recording_id: Option<String>,
     pub output_path: String,
     pub message: String,
@@ -225,6 +234,7 @@ pub fn build_job(spec: &NewJob<'_>, now: f64) -> Result<DvrJob, String> {
         post_padding_minutes: post,
         created_at: iso_from_ts(now),
         started_late: false,
+        wait_reason: String::new(),
         recording_id: None,
         output_path: String::new(),
         message: String::new(),
@@ -249,6 +259,10 @@ pub enum DvrAction {
     Start(String),
     /// Stop the recording for this job.
     Stop(String),
+    /// The job just entered the waiting state over a connection
+    /// conflict (emitted once, on the transition, so the caller
+    /// announces it once).
+    Conflict(String),
 }
 
 /// The persisted schedule.
@@ -257,6 +271,10 @@ pub struct DvrSchedule {
     jobs: Vec<DvrJob>,
     stopping_since: std::collections::BTreeMap<String, f64>,
     resolving: BTreeSet<String>,
+    /// Jobs the caller is checking capacity for: the tick leaves
+    /// them entirely alone (no start, no missed) until released.
+    /// Transient, like `resolving`.
+    holds: BTreeSet<String>,
     path: PathBuf,
 }
 
@@ -269,6 +287,7 @@ impl DvrSchedule {
             jobs: Vec::new(),
             stopping_since: std::collections::BTreeMap::new(),
             resolving: BTreeSet::new(),
+            holds: BTreeSet::new(),
             path,
         };
         let Ok(text) = std::fs::read_to_string(&schedule.path) else {
@@ -282,6 +301,11 @@ impl DvrSchedule {
             return schedule;
         };
         for job in &mut jobs {
+            if job.status == STATUS_WAITING {
+                // A wait is not replayed after a restart: the job
+                // re-arms and capacity is reassessed fresh.
+                job.status = STATUS_SCHEDULED.to_string();
+            }
             if job.status == STATUS_RECORDING || job.status == STATUS_STOPPING {
                 job.recording_id = None;
                 if job.stop_ts > 0.0 && now >= job.stop_ts {
@@ -336,7 +360,7 @@ impl DvrSchedule {
             .filter(|j| {
                 matches!(
                     j.status.as_str(),
-                    STATUS_SCHEDULED | STATUS_RECORDING | STATUS_STOPPING
+                    STATUS_SCHEDULED | STATUS_WAITING | STATUS_RECORDING | STATUS_STOPPING
                 )
             })
             .count()
@@ -372,10 +396,28 @@ impl DvrSchedule {
             return false;
         }
         self.resolving.remove(job_id);
+        self.holds.remove(job_id);
         job.status = STATUS_CANCELED.to_string();
         job.message = "Canceled by user.".to_string();
         self.save();
         true
+    }
+
+    /// Hold a due job while the caller checks provider capacity
+    /// for it: ticks skip held jobs entirely until released.
+    pub fn hold_job(&mut self, job_id: &str) {
+        self.holds.insert(job_id.to_string());
+    }
+
+    /// Release a capacity hold; the next tick reassesses the job.
+    pub fn release_hold(&mut self, job_id: &str) {
+        self.holds.remove(job_id);
+    }
+
+    /// Whether the caller is currently holding this job.
+    #[must_use]
+    pub fn is_held(&self, job_id: &str) -> bool {
+        self.holds.contains(job_id)
     }
 
     fn set_status(&mut self, job_id: &str, status: &str, message: &str) {
@@ -458,6 +500,21 @@ impl DvrSchedule {
     /// Advance due jobs (port of `tick`): start what's due, stop what's
     /// over, mark what was missed, time out stuck stops.
     pub fn tick(&mut self, now: f64) -> Vec<DvrAction> {
+        self.tick_gated(now, &mut |_| None)
+    }
+
+    /// `tick` with a provider-capacity gate (issue #134): before a
+    /// due job starts, the gate is asked about it; `Some(reason)`
+    /// means a new connection is not available and the job waits
+    /// with that user-visible reason, `None` lets it start. The
+    /// gate is only consulted for jobs that are due. A waiting job
+    /// whose window closes is missed with its conflict reason; a
+    /// waiting job the gate later clears starts (late, per #130).
+    pub fn tick_gated(
+        &mut self,
+        now: f64,
+        gate: &mut dyn FnMut(&DvrJob) -> Option<String>,
+    ) -> Vec<DvrAction> {
         let mut actions = Vec::new();
         let mut changed = false;
         let ids: Vec<String> = self.jobs.iter().map(|j| j.id.clone()).collect();
@@ -466,7 +523,7 @@ impl DvrSchedule {
                 continue;
             };
             match job.status.as_str() {
-                STATUS_SCHEDULED => {
+                STATUS_SCHEDULED | STATUS_WAITING => {
                     if self.resolving.contains(&id) {
                         if job.stop_ts > 0.0 && now >= job.stop_ts {
                             self.resolving.remove(&id);
@@ -479,19 +536,52 @@ impl DvrSchedule {
                         }
                         continue;
                     }
+                    if self.holds.contains(&id) {
+                        continue;
+                    }
                     if job.stop_ts > 0.0 && now >= job.stop_ts {
-                        self.set_status(&id, STATUS_MISSED, "Scheduled recording was missed.");
+                        if job.status == STATUS_WAITING && !job.wait_reason.is_empty() {
+                            let message = format!(
+                                "Missed while waiting for a connection: {}",
+                                job.wait_reason
+                            );
+                            self.set_status(&id, STATUS_MISSED, &message);
+                        } else {
+                            self.set_status(&id, STATUS_MISSED, "Scheduled recording was missed.");
+                        }
                         changed = true;
                     } else if now >= job.start_ts {
-                        if let Some((provider_id, data)) = stalker_resolution_request(&job) {
+                        if let Some(reason) = gate(&job) {
+                            if job.status != STATUS_WAITING {
+                                if let Some(job) = self.jobs.iter_mut().find(|j| j.id == id) {
+                                    job.status = STATUS_WAITING.to_string();
+                                    job.wait_reason.clone_from(&reason);
+                                    job.message.clone_from(&reason);
+                                }
+                                actions.push(DvrAction::Conflict(id));
+                            } else if job.wait_reason != reason {
+                                if let Some(job) = self.jobs.iter_mut().find(|j| j.id == id) {
+                                    job.wait_reason.clone_from(&reason);
+                                    job.message.clone_from(&reason);
+                                }
+                            }
+                            changed = true;
+                        } else if let Some((provider_id, data)) = stalker_resolution_request(&job) {
                             actions.push(DvrAction::Resolve {
                                 job_id: id,
                                 provider_id,
                                 data,
                             });
                         } else {
+                            let was_waiting = job.status == STATUS_WAITING;
                             self.set_status(&id, STATUS_RECORDING, "");
                             if let Some(job) = self.jobs.iter_mut().find(|j| j.id == id) {
+                                if was_waiting {
+                                    // The wait is over; its reason
+                                    // stays on the job, the live
+                                    // message clears.
+                                    job.message = String::new();
+                                }
                                 note_started(job, now);
                             }
                             changed = true;
@@ -615,6 +705,7 @@ impl DvrSchedule {
         );
         next.status = STATUS_SCHEDULED.to_string();
         next.started_late = false;
+        next.wait_reason = String::new();
         next.recording_id = None;
         next.output_path = String::new();
         next.message = String::new();
@@ -891,6 +982,100 @@ mod tests {
         assert!(!schedule.get(&id).expect("job").started_late);
         schedule.mark_finished(&id, true, "/tmp/out.mkv", "", 2301.0);
         assert_eq!(schedule.get(&id).expect("job").message, "");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn gated_tick_waits_once_then_starts_when_cleared() {
+        let dir = std::env::temp_dir().join(format!("iptv-dvr-gate-{}", std::process::id()));
+        let path = dir.join("scheduled_recordings.json");
+        let mut schedule = DvrSchedule::load(path, 0.0);
+        let chan = channel();
+        let job = build_job(&spec(&chan, "Show", 100, 200, 0, 0), 0.0).expect("j");
+        let id = job.id.clone();
+        schedule.add_job(job);
+        let mut blocked = |_: &DvrJob| Some("All 1 provider connection(s) are in use.".to_string());
+        let actions = schedule.tick_gated(150.0, &mut blocked);
+        assert_eq!(actions, vec![DvrAction::Conflict(id.clone())]);
+        let job = schedule.get(&id).expect("job");
+        assert_eq!(job.status, STATUS_WAITING);
+        assert_eq!(job.wait_reason, "All 1 provider connection(s) are in use.");
+        // Still blocked: no second Conflict (announced once).
+        let actions = schedule.tick_gated(160.0, &mut blocked);
+        assert!(actions.is_empty());
+        assert_eq!(schedule.get(&id).expect("job").status, STATUS_WAITING);
+        // Cleared: the job starts, late (programme began at 100).
+        let actions = schedule.tick_gated(170.0, &mut |_| None);
+        assert_eq!(actions, vec![DvrAction::Start(id.clone())]);
+        let job = schedule.get(&id).expect("job");
+        assert_eq!(job.status, STATUS_RECORDING);
+        assert!(job.started_late);
+        assert_eq!(job.wait_reason, "All 1 provider connection(s) are in use.");
+        assert_eq!(job.message, "");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn gated_tick_expires_a_waiting_job_with_its_reason() {
+        let dir = std::env::temp_dir().join(format!("iptv-dvr-wexp-{}", std::process::id()));
+        let path = dir.join("scheduled_recordings.json");
+        let mut schedule = DvrSchedule::load(path, 0.0);
+        let chan = channel();
+        let job = build_job(&spec(&chan, "Show", 100, 200, 0, 0), 0.0).expect("j");
+        let id = job.id.clone();
+        schedule.add_job(job);
+        let mut blocked = |_: &DvrJob| Some("busy".to_string());
+        let _ = schedule.tick_gated(150.0, &mut blocked);
+        let _ = schedule.tick_gated(250.0, &mut blocked);
+        let job = schedule.get(&id).expect("job");
+        assert_eq!(job.status, STATUS_MISSED);
+        assert_eq!(job.message, "Missed while waiting for a connection: busy");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn held_jobs_neither_start_nor_miss() {
+        let dir = std::env::temp_dir().join(format!("iptv-dvr-hold-{}", std::process::id()));
+        let path = dir.join("scheduled_recordings.json");
+        let mut schedule = DvrSchedule::load(path, 0.0);
+        let chan = channel();
+        let job = build_job(&spec(&chan, "Show", 100, 200, 0, 0), 0.0).expect("j");
+        let id = job.id.clone();
+        schedule.add_job(job);
+        schedule.hold_job(&id);
+        // Past the whole window while held: nothing happens.
+        assert!(schedule.tick(500.0).is_empty());
+        assert_eq!(schedule.get(&id).expect("job").status, STATUS_SCHEDULED);
+        schedule.release_hold(&id);
+        // Released after the window: the ordinary missed path.
+        let _ = schedule.tick(500.0);
+        assert_eq!(schedule.get(&id).expect("job").status, STATUS_MISSED);
+        // A waiting job can be canceled like any other.
+        let job2 = build_job(&spec(&chan, "Two", 100, 200, 0, 0), 1.0).expect("j");
+        let id2 = job2.id.clone();
+        schedule.add_job(job2);
+        let _ = schedule.tick_gated(150.0, &mut |_| Some("busy".to_string()));
+        assert_eq!(schedule.get(&id2).expect("job").status, STATUS_WAITING);
+        assert!(schedule.cancel_job(&id2));
+        assert_eq!(schedule.get(&id2).expect("job").status, STATUS_CANCELED);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn waiting_jobs_rearm_to_scheduled_on_load() {
+        let dir = std::env::temp_dir().join(format!("iptv-dvr-wload-{}", std::process::id()));
+        let path = dir.join("scheduled_recordings.json");
+        let mut schedule = DvrSchedule::load(path.clone(), 0.0);
+        let chan = channel();
+        let job = build_job(&spec(&chan, "Show", 100, 200, 0, 0), 0.0).expect("j");
+        let id = job.id.clone();
+        schedule.add_job(job);
+        let _ = schedule.tick_gated(150.0, &mut |_| Some("busy".to_string()));
+        assert_eq!(schedule.get(&id).expect("job").status, STATUS_WAITING);
+        // The persisted waiting job comes back scheduled: the
+        // wait is reassessed, never replayed.
+        let reloaded = DvrSchedule::load(path, 0.0);
+        assert_eq!(reloaded.get(&id).expect("job").status, STATUS_SCHEDULED);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

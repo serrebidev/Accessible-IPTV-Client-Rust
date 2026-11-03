@@ -379,6 +379,18 @@ struct Wiring {
     resolve_seq: Rc<std::cell::Cell<u64>>,
     pending_resolves: Rc<RefCell<std::collections::HashMap<u64, PendingResolve>>>,
     dvr_resolve: Rc<RefCell<std::collections::HashMap<String, DvrResolve>>>,
+    /// Known provider connection limits by account key (issue
+    /// #134's capacity cache); a present key with a `None` value
+    /// means the provider declared no limit.
+    account_limits: Rc<RefCell<std::collections::BTreeMap<String, Option<i64>>>>,
+    /// The provider id of an in-flight background limit fetch,
+    /// and the job holds waiting on capacity answers (job id ->
+    /// hold expiry, seconds).
+    limit_fetch: Rc<RefCell<Option<String>>>,
+    limit_holds: Rc<RefCell<std::collections::BTreeMap<String, f64>>>,
+    /// Jobs the user ordered to record over a conflict (Stop
+    /// Playback and Record): the capacity gate lets them start.
+    conflict_override: Rc<RefCell<std::collections::BTreeSet<String>>>,
     recordings: Rc<RefCell<RecordingEngine>>,
     cast_worker: Rc<CastWorker>,
     cast_pending: Rc<std::cell::Cell<bool>>,
@@ -613,6 +625,10 @@ fn bind_browser(
         resolve_seq: Rc::new(std::cell::Cell::new(0)),
         pending_resolves: Rc::new(RefCell::new(std::collections::HashMap::new())),
         dvr_resolve: Rc::new(RefCell::new(std::collections::HashMap::new())),
+        account_limits: Rc::new(RefCell::new(std::collections::BTreeMap::new())),
+        limit_fetch: Rc::new(RefCell::new(None)),
+        limit_holds: Rc::new(RefCell::new(std::collections::BTreeMap::new())),
+        conflict_override: Rc::new(RefCell::new(std::collections::BTreeSet::new())),
         recordings: Rc::new(RefCell::new(RecordingEngine::new())),
         cast_worker: Rc::new(CastWorker::new()),
         cast_pending: Rc::new(std::cell::Cell::new(false)),
@@ -1229,16 +1245,51 @@ fn poll_providers(wiring: &Wiring, controls: Controls) {
                     None => {}
                 }
             }
-            ProviderEvent::Account(result) => match result {
-                Ok(report) => {
-                    let first = report.lines().next().unwrap_or_default().to_string();
-                    status.set_label(&first);
-                    if let Some(text) = wiring.account_text.borrow().as_ref() {
-                        text.set_value(&report);
+            ProviderEvent::Account {
+                report,
+                max_connections,
+                provider_id,
+            } => {
+                // Every account fetch feeds the capacity cache;
+                // a background limit fetch (issue #134) also
+                // releases the holds waiting on its answer.
+                let (_, accounts) = configured_entries(wiring);
+                if let Some(account) = accounts
+                    .iter()
+                    .find(|a| a.provider_id().as_deref() == Some(provider_id.as_str()))
+                {
+                    wiring
+                        .account_limits
+                        .borrow_mut()
+                        .insert(account.account_key(), max_connections);
+                }
+                let background =
+                    wiring.limit_fetch.borrow().as_deref() == Some(provider_id.as_str());
+                if background {
+                    *wiring.limit_fetch.borrow_mut() = None;
+                    let held: Vec<String> = wiring.limit_holds.borrow().keys().cloned().collect();
+                    for id in held {
+                        wiring.dvr.borrow_mut().release_hold(&id);
+                        wiring.limit_holds.borrow_mut().remove(&id);
                     }
                 }
-                Err(error) => status.set_label(&error),
-            },
+                match report {
+                    Ok(report) => {
+                        if !background {
+                            let first = report.lines().next().unwrap_or_default().to_string();
+                            status.set_label(&first);
+                            if let Some(text) = wiring.account_text.borrow().as_ref() {
+                                text.set_value(&report);
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        if !background {
+                            status.set_label(&error);
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -1522,6 +1573,260 @@ fn record_dvr_channel(
     }
 }
 
+/// The account a DVR job's channel belongs to, with the
+/// account's provider id when it has one (issue #134).
+fn job_account(
+    job: &iptv_core::dvr::DvrJob,
+    accounts: &[ProviderAccount],
+) -> Option<(String, Option<String>)> {
+    let channel = channel_from_snapshot(&job.channel);
+    let key = iptv_core::providers::channel_account_key(&channel, accounts)?;
+    let provider_id = accounts
+        .iter()
+        .find(|a| a.account_key() == key)
+        .and_then(ProviderAccount::provider_id);
+    Some((key, provider_id))
+}
+
+/// Whether a recording of this job's channel would read an
+/// existing buffer session instead of opening a new provider
+/// connection (the sharing `start_recording` already performs).
+fn job_shares_buffer(wiring: &Wiring, job: &iptv_core::dvr::DvrJob) -> bool {
+    let channel = channel_from_snapshot(&job.channel);
+    let (clean_url, _) = iptv_core::playback::split_stream_modifiers(&channel.url);
+    let headers = iptv_core::playback::StreamHeaders::for_channel(&channel);
+    let key = buffer::source_key(&clean_url, &headers);
+    wiring.buffers.borrow().sessions.contains_key(&key)
+}
+
+/// Connections this app currently holds on one account:
+/// playback (direct, or through the buffer that feeds it), plus
+/// DVR recordings that are not reading a buffer lease. Other
+/// apps' and devices' connections are unknowable and never
+/// assumed (issue #134).
+fn account_connections_in_use(wiring: &Wiring, accounts: &[ProviderAccount], key: &str) -> usize {
+    let mut used = 0;
+    {
+        let player = wiring.player.borrow();
+        if player.session.current().is_some() {
+            if let Some(channel) = &player.current_channel {
+                if iptv_core::providers::channel_account_key(channel, accounts).as_deref()
+                    == Some(key)
+                {
+                    used += 1;
+                }
+            }
+        }
+    }
+    let leased: Vec<String> = wiring
+        .buffers
+        .borrow()
+        .recording_leases
+        .keys()
+        .cloned()
+        .collect();
+    for job in wiring.dvr.borrow().jobs() {
+        if job.status != iptv_core::dvr::STATUS_RECORDING {
+            continue;
+        }
+        if leased.iter().any(|k| k == &format!("dvr:{}", job.id)) {
+            continue;
+        }
+        if job_account(job, accounts).map(|(k, _)| k).as_deref() == Some(key) {
+            used += 1;
+        }
+    }
+    used
+}
+
+/// Before the DVR tick: release stale capacity holds, and for a
+/// due job whose account limit is unknown, hold it and fetch the
+/// account info once (the answer fills `account_limits` in the
+/// provider event drain). A job is never blocked on an answer
+/// that does not come: holds expire and the job proceeds without
+/// an assumed capacity.
+fn prepare_capacity_holds(wiring: &Wiring, accounts: &[ProviderAccount], now: f64) {
+    let expired: Vec<String> = wiring
+        .limit_holds
+        .borrow()
+        .iter()
+        .filter(|(_, expiry)| now >= **expiry)
+        .map(|(id, _)| id.clone())
+        .collect();
+    for id in expired {
+        wiring.dvr.borrow_mut().release_hold(&id);
+        wiring.limit_holds.borrow_mut().remove(&id);
+    }
+    let due: Vec<iptv_core::dvr::DvrJob> = wiring
+        .dvr
+        .borrow()
+        .jobs()
+        .iter()
+        .filter(|job| {
+            matches!(
+                job.status.as_str(),
+                iptv_core::dvr::STATUS_SCHEDULED | iptv_core::dvr::STATUS_WAITING
+            ) && now >= job.start_ts
+                && (job.stop_ts <= 0.0 || now < job.stop_ts)
+        })
+        .cloned()
+        .collect();
+    for job in due {
+        if wiring.dvr.borrow().is_held(&job.id) {
+            continue;
+        }
+        let Some((key, provider_id)) = job_account(&job, accounts) else {
+            continue;
+        };
+        if wiring.account_limits.borrow().contains_key(&key) {
+            continue;
+        }
+        let Some(provider_id) = provider_id else {
+            continue;
+        };
+        wiring.dvr.borrow_mut().hold_job(&job.id);
+        wiring
+            .limit_holds
+            .borrow_mut()
+            .insert(job.id.clone(), now + 45.0);
+        if wiring.limit_fetch.borrow().is_none() {
+            *wiring.limit_fetch.borrow_mut() = Some(provider_id.clone());
+            wiring.provider_worker.account(provider_id);
+            wiring.provider_pending.set(true);
+            assert!(wiring.timer.start(50, false));
+        }
+    }
+}
+
+/// One DVR state-machine step (every 10 s): capacity holds,
+/// the gated tick, and its actions.
+fn run_dvr_tick(wiring: &Wiring, status: Status, now: f64) {
+    let (_, accounts) = configured_entries(wiring);
+    prepare_capacity_holds(wiring, &accounts, now);
+    // The capacity gate (issue #134): a due job waits when
+    // its account's known limit is already fully used by
+    // playback or recordings and the job cannot share an
+    // existing buffer stream. Unknown limits never block.
+    let playing: Option<(String, String)> = {
+        let player = wiring.player.borrow();
+        match (&player.current_channel, player.session.current()) {
+            (Some(channel), Some(_)) => {
+                iptv_core::providers::channel_account_key(channel, &accounts)
+                    .map(|key| (key, channel.name.clone()))
+            }
+            _ => None,
+        }
+    };
+    // In-use counts are snapshotted before the tick: the
+    // gate runs while the schedule is borrowed.
+    let used_by_account: std::collections::BTreeMap<String, usize> = accounts
+        .iter()
+        .map(|account| {
+            let key = account.account_key();
+            let used = account_connections_in_use(wiring, &accounts, &key);
+            (key, used)
+        })
+        .collect();
+    let mut gate = |job: &iptv_core::dvr::DvrJob| -> Option<String> {
+        if wiring.conflict_override.borrow().contains(&job.id) {
+            return None;
+        }
+        let (key, _) = job_account(job, &accounts)?;
+        if job_shares_buffer(wiring, job) {
+            return None;
+        }
+        let limit = wiring.account_limits.borrow().get(&key).copied()??;
+        let used = used_by_account.get(&key).copied().unwrap_or(0);
+        if used < usize::try_from(limit).unwrap_or(0) {
+            return None;
+        }
+        Some(match &playing {
+            Some((playing_key, name)) if *playing_key == key => {
+                format!("All {limit} provider connection(s) are in use; {name} is playing.")
+            }
+            _ => format!("All {limit} provider connection(s) are in use."),
+        })
+    };
+    let actions = wiring.dvr.borrow_mut().tick_gated(now, &mut gate);
+    run_dvr_actions(wiring, status, now, actions);
+    retry_dvr_resolves(wiring, now);
+}
+
+/// Carry out one DVR tick's actions: resolutions, stops,
+/// starts, and conflict announcements.
+fn run_dvr_actions(wiring: &Wiring, status: Status, now: f64, actions: Vec<DvrAction>) {
+    for action in actions {
+        match action {
+            DvrAction::Resolve {
+                job_id,
+                provider_id,
+                data,
+            } => {
+                if provider_id.is_empty() {
+                    wiring.dvr.borrow_mut().mark_finished(
+                        &job_id,
+                        false,
+                        "",
+                        "Scheduled recording has no provider account.",
+                        now,
+                    );
+                    continue;
+                }
+                if wiring.dvr_resolve.borrow().contains_key(&job_id) {
+                    continue;
+                }
+                wiring.dvr.borrow_mut().mark_resolving(&job_id);
+                let request = dispatch_resolve(
+                    wiring,
+                    PendingResolve::Dvr(job_id.clone()),
+                    provider_id,
+                    data,
+                );
+                wiring.dvr_resolve.borrow_mut().insert(
+                    job_id,
+                    DvrResolve {
+                        request,
+                        in_flight: true,
+                        next_try: now + 10.0,
+                    },
+                );
+                status.set_label("Resolving scheduled recording stream...");
+            }
+            DvrAction::Stop(job_id) => {
+                wiring
+                    .recordings
+                    .borrow_mut()
+                    .stop(&format!("dvr:{job_id}"));
+            }
+            DvrAction::Start(job_id) => {
+                wiring.conflict_override.borrow_mut().remove(&job_id);
+                start_dvr_job(wiring, status, &job_id, now);
+            }
+            DvrAction::Conflict(job_id) => {
+                // Announced once, on the transition into
+                // waiting; playback keeps running and no
+                // dialog opens (no focus theft). The decision
+                // waits in Scheduled Recordings (issue #134).
+                if let Some(job) = wiring.dvr.borrow().get(&job_id).cloned() {
+                    let name = if job.title.is_empty() {
+                        job.channel_name.clone()
+                    } else {
+                        job.title.clone()
+                    };
+                    player_status(
+                    status,
+                    &wiring.persist,
+                    &format!(
+                        "Recording conflict: {name} is waiting for a provider connection. Playback continues; open Scheduled Recordings to decide."
+                    ),
+                    1,
+                );
+                }
+            }
+        }
+    }
+}
+
 /// Per-tick recording housekeeping: collect finishes, run the DVR
 /// state machine (every 10 s, like the reference poll), and apply the
 /// shutdown-after-recordings gate.
@@ -1558,55 +1863,9 @@ fn poll_recordings(wiring: &Wiring, status: Status) {
     }
     if now - wiring.last_dvr_tick.get() >= 10.0 {
         wiring.last_dvr_tick.set(now);
-        let actions = wiring.dvr.borrow_mut().tick(now);
-        for action in actions {
-            match action {
-                DvrAction::Resolve {
-                    job_id,
-                    provider_id,
-                    data,
-                } => {
-                    if provider_id.is_empty() {
-                        wiring.dvr.borrow_mut().mark_finished(
-                            &job_id,
-                            false,
-                            "",
-                            "Scheduled recording has no provider account.",
-                            now,
-                        );
-                        continue;
-                    }
-                    if wiring.dvr_resolve.borrow().contains_key(&job_id) {
-                        continue;
-                    }
-                    wiring.dvr.borrow_mut().mark_resolving(&job_id);
-                    let request = dispatch_resolve(
-                        wiring,
-                        PendingResolve::Dvr(job_id.clone()),
-                        provider_id,
-                        data,
-                    );
-                    wiring.dvr_resolve.borrow_mut().insert(
-                        job_id,
-                        DvrResolve {
-                            request,
-                            in_flight: true,
-                            next_try: now + 10.0,
-                        },
-                    );
-                    status.set_label("Resolving scheduled recording stream...");
-                }
-                DvrAction::Stop(job_id) => {
-                    wiring
-                        .recordings
-                        .borrow_mut()
-                        .stop(&format!("dvr:{job_id}"));
-                }
-                DvrAction::Start(job_id) => start_dvr_job(wiring, status, &job_id, now),
-            }
-        }
-        retry_dvr_resolves(wiring, now);
+        run_dvr_tick(wiring, status, now);
     }
+
     let armed = wiring
         .persist
         .config
@@ -2118,6 +2377,10 @@ fn clone_wiring(wiring: &Wiring) -> Wiring {
         resolve_seq: Rc::clone(&wiring.resolve_seq),
         pending_resolves: Rc::clone(&wiring.pending_resolves),
         dvr_resolve: Rc::clone(&wiring.dvr_resolve),
+        account_limits: Rc::clone(&wiring.account_limits),
+        limit_fetch: Rc::clone(&wiring.limit_fetch),
+        limit_holds: Rc::clone(&wiring.limit_holds),
+        conflict_override: Rc::clone(&wiring.conflict_override),
         recordings: Rc::clone(&wiring.recordings),
         cast_worker: Rc::clone(&wiring.cast_worker),
         cast_pending: Rc::clone(&wiring.cast_pending),
@@ -8212,24 +8475,145 @@ fn open_reminders_dialog(wiring: &Wiring, main_status: Status) {
     frame.show(true);
 }
 
+/// The recording-conflict decision (issue #134): opened only
+/// when the user asks from Scheduled Recordings — the conflict
+/// itself never pops a dialog or takes focus. Playback keeps
+/// running until the user chooses otherwise.
+fn open_conflict_dialog(wiring: &Wiring, job: &iptv_core::dvr::DvrJob, main_status: Status) {
+    let name = if job.title.is_empty() {
+        job.channel_name.clone()
+    } else {
+        job.title.clone()
+    };
+    let frame = Frame::builder()
+        .with_title("Recording Conflict")
+        .with_size(Size::new(560, 320))
+        .build();
+    frame.set_accessibility_label("Recording Conflict");
+    let panel = Panel::builder(&frame).build();
+    let text = StaticText::builder(&panel)
+        .with_label(&format!(
+            "{name} is waiting to record. {}\n\nPlayback continues unless you stop it. If you keep watching, the recording starts on its own when a connection becomes free, until its scheduled end.",
+            job.wait_reason
+        ))
+        .build();
+    text.set_accessibility_label("Conflict details");
+    let keep = Button::builder(&panel)
+        .with_label("&Keep Watching and Wait")
+        .build();
+    keep.set_accessibility_label("Keep watching and wait");
+    let swap = Button::builder(&panel)
+        .with_label("&Stop Playback and Record")
+        .build();
+    swap.set_accessibility_label("Stop playback and record");
+    let cancel = Button::builder(&panel)
+        .with_label("Cancel &This Recording")
+        .build();
+    cancel.set_accessibility_label("Cancel this recording");
+    let close = Button::builder(&panel).with_label("C&lose").build();
+    let sizer = BoxSizer::builder(Orientation::Vertical).build();
+    sizer.add(&text, 0, SizerFlag::All, 8);
+    sizer.add(&keep, 0, SizerFlag::Expand | SizerFlag::All, 4);
+    sizer.add(&swap, 0, SizerFlag::Expand | SizerFlag::All, 4);
+    sizer.add(&cancel, 0, SizerFlag::Expand | SizerFlag::All, 4);
+    sizer.add(&close, 0, SizerFlag::Expand | SizerFlag::All, 4);
+    panel.set_sizer(sizer, true);
+    let job_id = job.id.clone();
+    let wiring_k = clone_wiring(wiring);
+    let frame_k = frame;
+    let name_k = name.clone();
+    keep.on_click(move |_| {
+        // The job stays waiting; the gate starts it when a
+        // connection frees (issue #135's queue). The outcome is
+        // announced once, here.
+        player_status(
+            main_status,
+            &wiring_k.persist,
+            &format!("Kept watching. {name_k} will record when a provider connection is free."),
+            1,
+        );
+        frame_k.hide();
+    });
+    let wiring_s = clone_wiring(wiring);
+    let frame_s = frame;
+    let job_s = job_id.clone();
+    swap.on_click(move |_| {
+        // Confirm the previous connection closes before opening
+        // its replacement: playback stops completely first, and
+        // only then does the recording start.
+        player_stop(&wiring_s.player, &wiring_s.persist, main_status);
+        if wiring_s.player.borrow().session.current().is_some() {
+            main_status.set_label("Playback did not stop; the recording stays waiting.");
+            return;
+        }
+        let now = now_seconds();
+        // Recheck time eligibility before the delayed action.
+        let Some(job) = wiring_s.dvr.borrow().get(&job_s).cloned() else {
+            return;
+        };
+        if job.stop_ts > 0.0 && now >= job.stop_ts {
+            main_status.set_label("The recording window has closed; nothing was recorded.");
+            frame_s.hide();
+            return;
+        }
+        if job.status != iptv_core::dvr::STATUS_WAITING {
+            main_status.set_label("That recording is no longer waiting.");
+            frame_s.hide();
+            return;
+        }
+        wiring_s
+            .conflict_override
+            .borrow_mut()
+            .insert(job_s.clone());
+        wiring_s.dvr.borrow_mut().mark_recording(&job_s, now);
+        start_dvr_job(&wiring_s, main_status, &job_s, now);
+        frame_s.hide();
+    });
+    let wiring_c2 = clone_wiring(wiring);
+    let frame_c = frame;
+    let name_c = name.clone();
+    cancel.on_click(move |_| {
+        if wiring_c2.dvr.borrow_mut().cancel_job(&job_id) {
+            player_status(
+                main_status,
+                &wiring_c2.persist,
+                &format!("Recording of {name_c} canceled."),
+                1,
+            );
+        }
+        frame_c.hide();
+    });
+    close.on_click(move |_| frame.hide());
+    frame.show(true);
+}
+
+/// Render the Scheduled Recordings list (waiting jobs carry
+/// their conflict reason in the row).
+fn render_scheduled_jobs(wiring: &Wiring, list: ListBox, dstatus: Status) {
+    let dvr = wiring.dvr.borrow();
+    let labels: Vec<String> = dvr
+        .jobs()
+        .iter()
+        .map(|job| {
+            let base = format!(
+                "{} {} — {} [{}]",
+                job.start_at, job.title, job.channel_name, job.status
+            );
+            if job.status == iptv_core::dvr::STATUS_WAITING && !job.wait_reason.is_empty() {
+                format!("{base}: {}", job.wait_reason)
+            } else {
+                base
+            }
+        })
+        .collect();
+    list.set_items(&labels.iter().map(String::as_str).collect::<Vec<_>>());
+    dstatus.set_label(&format!("{} scheduled recordings.", dvr.jobs().len()));
+}
+
 /// The Scheduled Recordings dialog: DVR jobs with Cancel.
 fn open_scheduled_dialog(wiring: &Wiring, main_status: Status) {
     let (frame, panel, list, dstatus) = list_dialog("Scheduled Recordings", "Scheduled recordings");
-    let render = |wiring: &Wiring, list: ListBox, dstatus: Status| {
-        let dvr = wiring.dvr.borrow();
-        let labels: Vec<String> = dvr
-            .jobs()
-            .iter()
-            .map(|job| {
-                format!(
-                    "{} {} — {} [{}]",
-                    job.start_at, job.title, job.channel_name, job.status
-                )
-            })
-            .collect();
-        list.set_items(&labels.iter().map(String::as_str).collect::<Vec<_>>());
-        dstatus.set_label(&format!("{} scheduled recordings.", dvr.jobs().len()));
-    };
+    let render = render_scheduled_jobs;
     render(wiring, list, dstatus);
     if wiring.dvr.borrow().jobs().is_empty() {
         main_status.set_label("No scheduled recordings.");
@@ -8237,6 +8621,10 @@ fn open_scheduled_dialog(wiring: &Wiring, main_status: Status) {
     let cancel_job = Button::builder(&panel)
         .with_label("&Cancel Recording")
         .build();
+    let resolve_conflict = Button::builder(&panel)
+        .with_label("&Resolve Conflict...")
+        .build();
+    resolve_conflict.set_accessibility_label("Resolve recording conflict");
     let delete_job = Button::builder(&panel).with_label("&Delete").build();
     let refresh = Button::builder(&panel).with_label("&Refresh").build();
     let close = Button::builder(&panel).with_label("&Close").build();
@@ -8269,6 +8657,23 @@ fn open_scheduled_dialog(wiring: &Wiring, main_status: Status) {
                 );
                 render(&wiring_c, list, dstatus);
             }
+        }
+    });
+    let wiring_x = clone_wiring(wiring);
+    resolve_conflict.on_click(move |_| {
+        let Some(index) = list.get_selection() else {
+            dstatus.set_label("Choose a waiting recording first.");
+            return;
+        };
+        let index = usize::try_from(index).unwrap_or(usize::MAX);
+        let job = wiring_x.dvr.borrow().jobs().get(index).cloned();
+        match job {
+            Some(job) if job.status == iptv_core::dvr::STATUS_WAITING => {
+                open_conflict_dialog(&wiring_x, &job, main_status);
+                render(&wiring_x, list, dstatus);
+            }
+            Some(_) => dstatus.set_label("That recording is not waiting on a conflict."),
+            None => dstatus.set_label("Choose a waiting recording first."),
         }
     });
     let wiring_d = clone_wiring(wiring);
