@@ -219,7 +219,7 @@ Run 2026-11-03 in this worktree (Linux, rust 1.97.1):
 
 - `cargo fmt --all -- --check` — pass.
 - `cargo test --workspace` — pass, 0 failures in every suite
-  (iptv-core lib 190 tests in the per-crate run; iptv-app,
+  (iptv-core lib 181 tests in the per-crate run; iptv-app,
   iptv-vlc, iptv-signer, iptv-sapi and the integration suites —
   local_browse, epg_variants, playlist_parity, stalker_portal —
   all ok).
