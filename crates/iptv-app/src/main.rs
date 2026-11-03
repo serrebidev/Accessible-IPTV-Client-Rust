@@ -4795,6 +4795,65 @@ fn play_builtin(
             ));
         }
     }
+    drop(state);
+    apply_engine_to_playback_menu(player);
+}
+
+/// Reflect the active engine in the player window (issue #129):
+/// the full player (libVLC) offers audio-track selection and an
+/// audio output device choice; the basic player (`MediaCtrl`)
+/// cannot, so its Audio Track submenu says so in words and the
+/// Audio Output Device item is disabled — a screen reader user
+/// meets the explanation in the menu instead of a control that
+/// silently does nothing. Supported controls (play/pause, stop,
+/// seek, volume, subtitle cues, buffered playback) stay enabled
+/// under both engines.
+fn apply_engine_to_playback_menu(player: &Rc<RefCell<PlayerState>>) {
+    let (engine, win) = {
+        let state = player.borrow();
+        (state.engine, state.window.clone())
+    };
+    let Some(win) = win else {
+        return;
+    };
+    let full = engine == ActiveEngine::Vlc;
+    if let Some(menu) = win.frame.get_menu_bar().and_then(|bar| bar.get_menu(0)) {
+        menu.enable_item(PM_AUDIO_DEVICE, full);
+    }
+    if let Some(menu) = audio_track_menu(player) {
+        // Drop whatever the previous play left in the submenu,
+        // then restore the placeholder with the engine's text.
+        let stale: Vec<i32> = {
+            let mut state = player.borrow_mut();
+            state.track_menu_ids.drain(..).collect()
+        };
+        for old in stale {
+            menu.delete(old);
+        }
+        menu.delete(PM_NO_TRACKS);
+        if full {
+            menu_add(
+                &menu,
+                PM_NO_TRACKS,
+                "No audio tracks available",
+                "",
+                ItemKind::Normal,
+            );
+        } else {
+            menu_add(
+                &menu,
+                PM_NO_TRACKS,
+                "Audio tracks are not available with the basic player",
+                "",
+                ItemKind::Normal,
+            );
+            // The window's track list belongs to the full player
+            // too; stale choices must not survive a fallback play.
+            win.tracks.clear();
+            player.borrow_mut().vlc_track_ids.clear();
+        }
+        menu.enable_item(PM_NO_TRACKS, false);
+    }
 }
 
 /// File a session action away: a reconnect is scheduled under
@@ -5315,14 +5374,30 @@ fn prompt_audio_device(
     persist: &Persist,
     status: Status,
 ) {
-    let devices = {
+    let (has_vlc, devices) = {
         let state = player.borrow();
-        state
-            .vlc
-            .as_ref()
-            .map(iptv_vlc::VlcEngine::audio_output_devices)
-            .unwrap_or_default()
+        (
+            state.vlc.is_some(),
+            state
+                .vlc
+                .as_ref()
+                .map(iptv_vlc::VlcEngine::audio_output_devices)
+                .unwrap_or_default(),
+        )
     };
+    if !has_vlc {
+        // The basic player cannot choose an output device; say
+        // so plainly instead of claiming none exist (issue #129).
+        let _ = MessageDialog::builder(
+            &frame,
+            "Audio output devices can only be chosen with the full player. The basic player is in use because libVLC is not available.",
+            "Audio Output Device",
+        )
+        .with_style(MessageDialogStyle::OK)
+        .build()
+        .show_modal();
+        return;
+    }
     if devices.is_empty() {
         let _ = MessageDialog::builder(
             &frame,
@@ -5576,6 +5651,7 @@ fn player_tick(player: &Rc<RefCell<PlayerState>>, persist: &Persist, status: Sta
     speak_subtitle_cue(player, persist, status);
     drive_speech_watchdog(player, persist, status);
     poll_vlc_state(player, persist, status);
+    poll_fallback_state(player, persist, status);
     drive_session(player, persist, status);
     drive_sleep_timer(player, persist, status);
     update_player_chrome(player);
@@ -6474,6 +6550,75 @@ fn poll_vlc_state(player: &Rc<RefCell<PlayerState>>, persist: &Persist, status: 
     }
     if setup_tracks {
         apply_vlc_tracks(player, persist);
+    }
+}
+
+/// Poll the basic player (`MediaCtrl`) on the 1 s tick, mirroring
+/// `poll_vlc_state` for the fallback engine (issue #129): the
+/// session hears Playing only on the control's own confirmation,
+/// and a stop after confirmed playback becomes Ended (near the
+/// end) or Stalled, so the session's bounded recovery and its
+/// Stream lost report work the same under both engines. A stop
+/// before any confirmation is left to the session's startup
+/// deadline — that deadline is the failed-start path, and
+/// `MediaCtrl` also reports Stopped while a load is still in
+/// flight, so treating it as failure here would burn the
+/// reconnect budget on healthy loads.
+fn poll_fallback_state(player: &Rc<RefCell<PlayerState>>, persist: &Persist, status: Status) {
+    enum Act {
+        None,
+        Started,
+        Settled,
+    }
+    let act = {
+        let mut state = player.borrow_mut();
+        if state.vlc_active || state.session.current().is_none() {
+            return;
+        }
+        let Some(win) = state.window.clone() else {
+            return;
+        };
+        match win.media.get_state() {
+            MediaState::Playing => {
+                state.session.note_buffering(false, now_ms());
+                if matches!(
+                    state.session.state(),
+                    SessionState::Playing | SessionState::Paused
+                ) {
+                    Act::None
+                } else {
+                    state.session.on_event(EngineEvent::Started, now_ms());
+                    if let Some(ms) = state.pending_resume_ms.take() {
+                        win.media.seek(ms, SeekMode::FromStart);
+                    }
+                    Act::Started
+                }
+            }
+            MediaState::Stopped => {
+                if !matches!(
+                    state.session.state(),
+                    SessionState::Playing | SessionState::Paused
+                ) {
+                    return;
+                }
+                let (position, length) = (win.media.tell(), win.media.length());
+                let near_end = length > 0 && position >= length - 1500;
+                let event = if near_end {
+                    EngineEvent::Ended
+                } else {
+                    EngineEvent::Stalled
+                };
+                let action = state.session.on_event(event, now_ms());
+                drop(state);
+                store_session_action(player, persist, status, action);
+                Act::Settled
+            }
+            _ => Act::None,
+        }
+    };
+    if matches!(act, Act::Started | Act::Settled) {
+        let state = player.borrow();
+        player_status(status, persist, &state.session.announcement(), 3);
     }
 }
 
