@@ -545,11 +545,121 @@ impl I18n {
         self.notes.gettext(message)
     }
 
+    /// Translate a template, then interpolate its `{name}`
+    /// placeholders — lookup first, formatting second, always.
+    #[must_use]
+    pub fn gettextf(&self, template: &str, args: &[(&str, &str)]) -> String {
+        interpolate(&self.gettext(template), args)
+    }
+
     /// Plural-aware translate (port of `ngettext`).
     #[must_use]
     pub fn ngettext(&self, singular: &str, plural: &str, n: u64) -> String {
         self.catalog.ngettext(singular, plural, n)
     }
+}
+
+/// Fill `{name}` placeholders in an already-looked-up template.
+/// Interpolation always runs *after* the catalogue lookup: looking
+/// up a pre-formatted message can never match a template key, which
+/// is why dynamic strings must be translated in this order.
+#[must_use]
+pub fn interpolate(template: &str, args: &[(&str, &str)]) -> String {
+    let mut out = template.to_string();
+    for (name, value) in args {
+        out = out.replace(&format!("{{{name}}}"), value);
+    }
+    out
+}
+
+/// How many newest releases What's New shows before the older
+/// history folds behind its expansion (port of
+/// `release_notes.RELEASE_WINDOW`).
+pub const RELEASE_WINDOW: usize = 3;
+
+/// Release-note section labels (port of `release_notes.SECTIONS`):
+/// section headings are ordinary application strings, translated
+/// through the main domain, unlike bullets.
+const SECTION_LABELS: [&str; 6] = [
+    "Breaking changes",
+    "Features",
+    "Accessibility",
+    "Bug fixes",
+    "Documentation",
+    "Other changes",
+];
+
+/// The canonical label for a section heading's text, accepting the
+/// bare keys older release bodies used (port of `section_label`).
+#[must_use]
+pub fn section_label(heading: &str) -> Option<&'static str> {
+    let key = heading.trim().to_lowercase();
+    for label in SECTION_LABELS {
+        if label.to_lowercase() == key {
+            return Some(label);
+        }
+    }
+    match key.as_str() {
+        "breaking" => Some("Breaking changes"),
+        "fixes" => Some("Bug fixes"),
+        "other" => Some("Other changes"),
+        _ => None,
+    }
+}
+
+fn is_version_heading(line: &str) -> bool {
+    let text = line.trim().trim_start_matches('#').trim();
+    if let Some(rest) = text.strip_prefix("Version ") {
+        return rest.chars().next().is_some_and(|c| c.is_ascii_digit());
+    }
+    let mut chars = text.chars();
+    chars.next() == Some('v')
+        && chars.next().is_some_and(|c| c.is_ascii_digit())
+        && text.contains('.')
+}
+
+/// Localize a What's New body (port of `release_notes.
+/// localize_notes`): version headings pass through, section labels
+/// translate through the main catalogue, and every other line —
+/// each note paragraph is one message — through the release-notes
+/// catalogue (`notes_gettext`), falling back to English.
+#[must_use]
+pub fn localize_notes(i18n: &I18n, text: &str) -> String {
+    text.lines()
+        .map(|line| {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || is_version_heading(trimmed) {
+                return line.to_string();
+            }
+            if let Some(label) = section_label(trimmed) {
+                return i18n.gettext(label);
+            }
+            i18n.notes_gettext(trimmed)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Split a (localized) What's New body into the newest `window`
+/// releases and the older history (port of
+/// `release_notes.split_changelog_window`). The older part is
+/// empty when the body holds `window` or fewer releases.
+#[must_use]
+pub fn split_notes_window(text: &str, window: usize) -> (String, String) {
+    let lines: Vec<&str> = text.lines().collect();
+    let headings: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| is_version_heading(line))
+        .map(|(index, _)| index)
+        .collect();
+    if headings.len() <= window {
+        return (text.to_string(), String::new());
+    }
+    let cut = headings[window];
+    let recent = format!("{}\n", lines[..cut].join("\n").trim_end());
+    let older = format!("{}\n", lines[cut..].join("\n").trim());
+    (recent, older)
 }
 
 /// Where catalogues live: `IPTV_LOCALE_DIR`, else `locale/` beside the
@@ -643,6 +753,86 @@ mod tests {
         assert_eq!(catalog.plural_index(5), 2);
         assert_eq!(catalog.plural_index(21), 0);
         assert_eq!(catalog.plural_index(111), 2);
+    }
+
+    #[test]
+    fn interpolation_runs_after_lookup() {
+        // S06 regression: formatting before lookup can never match
+        // the template key. The Spanish template must win, with the
+        // values filled in afterwards.
+        let dir = std::env::temp_dir().join(format!("iptv-i18n-test-{}", std::process::id()));
+        let lc = dir.join("es").join("LC_MESSAGES");
+        std::fs::create_dir_all(&lc).expect("dirs");
+        let main = mo_bytes(&[
+            ("", "Content-Type: text/plain; charset=UTF-8\n"),
+            ("{count} channels loaded.", "{count} canales cargados."),
+            ("Bug fixes", "Correcciones"),
+        ]);
+        std::fs::write(lc.join("iptvclient.mo"), main).expect("write");
+        let notes = mo_bytes(&[
+            ("", "Content-Type: text/plain; charset=UTF-8\n"),
+            (
+                "Less talk, working keys.",
+                "Menos charla, teclas que funcionan.",
+            ),
+        ]);
+        std::fs::write(lc.join("release_notes.mo"), notes).expect("write");
+        let mut i18n = I18n::default();
+        i18n.set_language(&dir, "es");
+        assert_eq!(
+            i18n.gettextf("{count} channels loaded.", &[("count", "42")]),
+            "42 canales cargados."
+        );
+        // And the old order demonstrably misses: the formatted
+        // string is not a key.
+        assert_eq!(i18n.gettext("42 channels loaded."), "42 channels loaded.");
+        assert_eq!(
+            interpolate("{a} and {b}", &[("a", "1"), ("b", "2")]),
+            "1 and 2"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn whats_new_localizes_and_splits_at_the_window() {
+        // S09: recent notes go through the notes catalogue, section
+        // labels through the main one, and older releases fold away.
+        let dir = std::env::temp_dir().join(format!("iptv-i18n-notes-{}", std::process::id()));
+        let lc = dir.join("es").join("LC_MESSAGES");
+        std::fs::create_dir_all(&lc).expect("dirs");
+        std::fs::write(
+            lc.join("iptvclient.mo"),
+            mo_bytes(&[
+                ("", "Content-Type: text/plain\n"),
+                ("Bug fixes", "Correcciones"),
+            ]),
+        )
+        .expect("write");
+        std::fs::write(
+            lc.join("release_notes.mo"),
+            mo_bytes(&[
+                ("", "Content-Type: text/plain\n"),
+                ("Less talk, working keys.", "Menos charla."),
+            ]),
+        )
+        .expect("write");
+        let mut i18n = I18n::default();
+        i18n.set_language(&dir, "es");
+        let body = "Version 0.4.4\n\nLess talk, working keys.\n\nVersion 0.4.3\n\nBug fixes\n\nOld fix.\n\nVersion 0.4.2\n\nOlder.\n\nVersion 0.4.1\n\nOldest.";
+        let localized = localize_notes(&i18n, body);
+        assert!(localized.contains("Menos charla."));
+        assert!(localized.contains("Correcciones"));
+        let (recent, older) = split_notes_window(&localized, RELEASE_WINDOW);
+        assert!(recent.contains("Version 0.4.4"));
+        assert!(recent.contains("Version 0.4.2"));
+        assert!(!recent.contains("Version 0.4.1"));
+        assert!(older.contains("Version 0.4.1"));
+        assert!(older.contains("Oldest."));
+        // At or under the window there is no older part.
+        let (all, none) = split_notes_window("Version 1.0\n\nOnly.", RELEASE_WINDOW);
+        assert!(all.contains("Only."));
+        assert!(none.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

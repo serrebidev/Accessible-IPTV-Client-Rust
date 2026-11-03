@@ -17,7 +17,7 @@ use std::ffi::{c_char, c_int, c_void, CString};
 
 use libloading::Library;
 
-use iptv_core::playback::StreamHeaders;
+use iptv_core::playback::{AvCounters, StreamHeaders};
 
 type NewFn = unsafe extern "C" fn(c_int, *const *const c_char) -> *mut c_void;
 type ReleaseFn = unsafe extern "C" fn(*mut c_void);
@@ -42,6 +42,31 @@ type AudioOutputEnumFn = unsafe extern "C" fn(*mut c_void) -> *mut AudioOutputDe
 type AudioOutputReleaseFn = unsafe extern "C" fn(*mut AudioOutputDevice);
 type AudioOutputSetFn = unsafe extern "C" fn(*mut c_void, *const c_char) -> c_int;
 type SetNsObjectFn = unsafe extern "C" fn(*mut c_void, *mut c_void);
+type GetMediaFn = unsafe extern "C" fn(*mut c_void) -> *mut c_void;
+type MediaGetStatsFn = unsafe extern "C" fn(*mut c_void, *mut MediaStats) -> c_int;
+type GetSpuFn = unsafe extern "C" fn(*mut c_void) -> c_int;
+type SetSpuFn = unsafe extern "C" fn(*mut c_void, c_int) -> c_int;
+type AddSlaveFn = unsafe extern "C" fn(*mut c_void, c_int, *const c_char, bool) -> c_int;
+type GetSpuDelayFn = unsafe extern "C" fn(*mut c_void) -> i64;
+
+/// `libvlc_media_stats_t` (field order per libvlc headers).
+#[repr(C)]
+#[derive(Default)]
+struct MediaStats {
+    read_bytes: c_int,
+    input_bitrate: f32,
+    demux_read_bytes: c_int,
+    demux_bitrate: f32,
+    decoded_video: c_int,
+    decoded_audio: c_int,
+    displayed_pictures: c_int,
+    lost_pictures: c_int,
+    played_abuffers: c_int,
+    lost_abuffers: c_int,
+    sent_packets: c_int,
+    sent_bytes: c_int,
+    send_bitrate: f32,
+}
 
 /// `libvlc_audio_output_device_t` (linked list node).
 #[repr(C)]
@@ -179,26 +204,85 @@ struct Functions {
     audio_output_enum: Option<AudioOutputEnumFn>,
     audio_output_release: Option<AudioOutputReleaseFn>,
     audio_output_set: Option<AudioOutputSetFn>,
+    get_media: Option<GetMediaFn>,
+    media_get_stats: Option<MediaGetStatsFn>,
+    spu_description: Option<GetTrackDescFn>,
+    get_spu: Option<GetSpuFn>,
+    set_spu: Option<SetSpuFn>,
+    add_slave: Option<AddSlaveFn>,
+    get_spu_delay: Option<GetSpuDelayFn>,
 }
 
-/// A loaded libVLC instance with one media player.
+/// The per-load media options the core's cache plan decides
+/// (P01): one cache value applied to all four libVLC caches,
+/// plus the live/on-demand clock behaviour. Python also always
+/// asks for HTTP reconnect and the adaptive access module.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MediaOptions {
+    pub cache_ms: u32,
+    pub live: bool,
+}
+
+impl MediaOptions {
+    /// The `:name=value` media-option strings for one load.
+    #[must_use]
+    pub fn option_strings(&self) -> Vec<String> {
+        let mut options = vec![
+            format!(":network-caching={}", self.cache_ms),
+            format!(":live-caching={}", self.cache_ms),
+            format!(":file-caching={}", self.cache_ms),
+            format!(":disc-caching={}", self.cache_ms),
+            ":http-reconnect=true".to_string(),
+            ":adaptive-use-access=1".to_string(),
+        ];
+        if self.live {
+            options.push(":clock-jitter=1500".to_string());
+        } else {
+            options.extend([
+                ":clock-jitter=0".to_string(),
+                ":clock-synchro=0".to_string(),
+                ":drop-late-frames=0".to_string(),
+                ":skip-frames=0".to_string(),
+            ]);
+        }
+        options
+    }
+}
+
+/// A loaded libVLC instance with one media player. The
+/// handles live behind an `Arc` (P18): transport operations
+/// (load/stop) run on a serialized worker thread — Python's
+/// `VLCControl` model — while state reads happen wherever the
+/// caller is. libVLC serializes calls on one player
+/// internally; the raw handles never leave this crate.
+#[derive(Clone)]
 pub struct VlcEngine {
+    inner: std::sync::Arc<EngineInner>,
+}
+
+struct EngineInner {
     _lib: Library,
     instance: *mut c_void,
     player: *mut c_void,
     fns: Functions,
 }
 
-// The engine is used only from the UI thread; raw handles never
-// leave it.
-unsafe impl Send for VlcEngine {}
+unsafe impl Send for EngineInner {}
+unsafe impl Sync for EngineInner {}
 
+// The engine's command methods report success as a bool that
+// callers may legitimately ignore (fire-and-forget transport
+// control), so `must_use` does not apply to them.
+#[allow(clippy::must_use_candidate)]
 impl VlcEngine {
     /// Load libVLC and create the instance and player.
     ///
     /// # Errors
     /// Returns the load or symbol error when libVLC is missing or
     /// too old, and a message when instance creation fails.
+    // A flat symbol-loading constructor: instance and player
+    // creation, then every function pointer in one table.
+    #[allow(clippy::too_many_lines)]
     pub fn new() -> Result<Self, String> {
         let lib = load_library()?;
         macro_rules! sym {
@@ -279,12 +363,37 @@ impl VlcEngine {
             }
             .ok()
             .map(|s| *s),
+            get_media: unsafe { lib.get::<GetMediaFn>(b"libvlc_media_player_get_media") }
+                .ok()
+                .map(|s| *s),
+            media_get_stats: unsafe { lib.get::<MediaGetStatsFn>(b"libvlc_media_get_stats") }
+                .ok()
+                .map(|s| *s),
+            spu_description: unsafe {
+                lib.get::<GetTrackDescFn>(b"libvlc_video_get_spu_description")
+            }
+            .ok()
+            .map(|s| *s),
+            get_spu: unsafe { lib.get::<GetSpuFn>(b"libvlc_video_get_spu") }
+                .ok()
+                .map(|s| *s),
+            set_spu: unsafe { lib.get::<SetSpuFn>(b"libvlc_video_set_spu") }
+                .ok()
+                .map(|s| *s),
+            add_slave: unsafe { lib.get::<AddSlaveFn>(b"libvlc_media_player_add_slave") }
+                .ok()
+                .map(|s| *s),
+            get_spu_delay: unsafe { lib.get::<GetSpuDelayFn>(b"libvlc_video_get_spu_delay") }
+                .ok()
+                .map(|s| *s),
         };
         Ok(Self {
-            _lib: lib,
-            instance,
-            player,
-            fns,
+            inner: std::sync::Arc::new(EngineInner {
+                _lib: lib,
+                instance,
+                player,
+                fns,
+            }),
         })
     }
 
@@ -292,30 +401,37 @@ impl VlcEngine {
     /// HWND, macOS `NSView`), passed as an opaque address. On Linux
     /// libVLC opens its own video window; the handle is ignored
     /// there.
-    pub fn set_window_handle(&mut self, handle: usize) {
+    pub fn set_window_handle(&self, handle: usize) {
         if handle == 0 {
             return;
         }
         let pointer = handle as *mut c_void;
         if cfg!(windows) {
-            if let Some(set) = self.fns.set_hwnd {
-                unsafe { set(self.player, pointer) };
+            if let Some(set) = self.inner.fns.set_hwnd {
+                unsafe { set(self.inner.player, pointer) };
             }
         } else if cfg!(target_os = "macos") {
-            if let Some(set) = self.fns.set_nsobject {
-                unsafe { set(self.player, pointer) };
+            if let Some(set) = self.inner.fns.set_nsobject {
+                unsafe { set(self.inner.player, pointer) };
             }
         }
     }
 
-    /// Load and play a URL with the stream's headers.
+    /// Load and play a URL with the stream's headers and the
+    /// cache plan's media options (P01).
     ///
     /// # Errors
     /// Returns a message when the URL is invalid, libVLC cannot
     /// create the media, or playback is refused.
-    pub fn play_url(&mut self, url: &str, headers: &StreamHeaders) -> Result<(), String> {
+    pub fn play_url(
+        &self,
+        url: &str,
+        headers: &StreamHeaders,
+        options: MediaOptions,
+    ) -> Result<(), String> {
         let c_url = CString::new(url).map_err(|_| "URL contains a NUL byte.".to_string())?;
-        let media = unsafe { (self.fns.media_new_location)(self.instance, c_url.as_ptr()) };
+        let media =
+            unsafe { (self.inner.fns.media_new_location)(self.inner.instance, c_url.as_ptr()) };
         if media.is_null() {
             return Err("libVLC could not create media.".to_string());
         }
@@ -325,71 +441,76 @@ impl VlcEngine {
         ] {
             if let Some(value) = headers.get(header) {
                 if let Ok(option) = CString::new(format!("{option}{value}")) {
-                    unsafe { (self.fns.media_add_option)(media, option.as_ptr()) };
+                    unsafe { (self.inner.fns.media_add_option)(media, option.as_ptr()) };
                 }
             }
         }
-        unsafe {
-            (self.fns.set_media)(self.player, media);
-            (self.fns.media_release)(media);
+        for option in options.option_strings() {
+            if let Ok(option) = CString::new(option) {
+                unsafe { (self.inner.fns.media_add_option)(media, option.as_ptr()) };
+            }
         }
-        if unsafe { (self.fns.play)(self.player) } != 0 {
+        unsafe {
+            (self.inner.fns.set_media)(self.inner.player, media);
+            (self.inner.fns.media_release)(media);
+        }
+        if unsafe { (self.inner.fns.play)(self.inner.player) } != 0 {
             return Err("libVLC refused to play.".to_string());
         }
         Ok(())
     }
 
     /// Resume playback.
-    pub fn play(&mut self) {
-        unsafe { (self.fns.play)(self.player) };
+    pub fn play(&self) {
+        unsafe { (self.inner.fns.play)(self.inner.player) };
     }
 
     /// Pause (libVLC's pause toggles the paused state).
-    pub fn pause(&mut self) {
-        unsafe { (self.fns.pause)(self.player) };
+    pub fn pause(&self) {
+        unsafe { (self.inner.fns.pause)(self.inner.player) };
     }
 
     /// Stop playback.
-    pub fn stop(&mut self) {
-        unsafe { (self.fns.stop)(self.player) };
+    pub fn stop(&self) {
+        unsafe { (self.inner.fns.stop)(self.inner.player) };
     }
 
     /// Seek to a position in milliseconds.
-    pub fn set_time(&mut self, ms: i64) {
-        unsafe { (self.fns.set_time)(self.player, ms) };
+    pub fn set_time(&self, ms: i64) {
+        unsafe { (self.inner.fns.set_time)(self.inner.player, ms) };
     }
 
     /// Current position in milliseconds (-1 when unknown).
     #[must_use]
     pub fn time(&self) -> i64 {
-        unsafe { (self.fns.get_time)(self.player) }
+        unsafe { (self.inner.fns.get_time)(self.inner.player) }
     }
 
     /// Media length in milliseconds (-1 when unknown).
     #[must_use]
     pub fn length(&self) -> i64 {
-        unsafe { (self.fns.get_length)(self.player) }
+        unsafe { (self.inner.fns.get_length)(self.inner.player) }
     }
 
     /// Current player state.
     #[must_use]
     pub fn state(&self) -> VlcState {
-        map_state(unsafe { (self.fns.get_state)(self.player) })
+        map_state(unsafe { (self.inner.fns.get_state)(self.inner.player) })
     }
 
     /// Set the volume (0–100, libVLC's nominal scale).
-    pub fn set_volume(&mut self, percent: i32) {
-        unsafe { (self.fns.set_volume)(self.player, percent.clamp(0, 100)) };
+    pub fn set_volume(&self, percent: i32) {
+        unsafe { (self.inner.fns.set_volume)(self.inner.player, percent.clamp(0, 100)) };
     }
 
     /// The audio tracks as (id, name) pairs.
     #[must_use]
     pub fn audio_tracks(&self) -> Vec<(i32, String)> {
         let mut tracks = Vec::new();
-        if unsafe { (self.fns.get_track_count)(self.player) } <= 0 {
+        if unsafe { (self.inner.fns.get_track_count)(self.inner.player) } <= 0 {
             return tracks;
         }
-        let head = unsafe { (self.fns.get_track_description)(self.player) };
+        let head = unsafe { (self.inner.fns.get_track_description)(self.inner.player) };
         if head.is_null() {
             return tracks;
         }
@@ -406,7 +527,7 @@ impl VlcEngine {
             tracks.push((entry.id, name));
             cursor = entry.next;
         }
-        unsafe { (self.fns.track_description_release)(head) };
+        unsafe { (self.inner.fns.track_description_release)(head) };
         tracks
     }
 
@@ -419,12 +540,13 @@ impl VlcEngine {
     #[must_use]
     pub fn audio_output_devices(&self) -> Vec<(String, String)> {
         let mut pairs = Vec::new();
-        let (Some(enumerate), Some(release)) =
-            (self.fns.audio_output_enum, self.fns.audio_output_release)
-        else {
+        let (Some(enumerate), Some(release)) = (
+            self.inner.fns.audio_output_enum,
+            self.inner.fns.audio_output_release,
+        ) else {
             return pairs;
         };
-        let head = unsafe { enumerate(self.player) };
+        let head = unsafe { enumerate(self.inner.player) };
         if head.is_null() {
             return pairs;
         }
@@ -448,26 +570,124 @@ impl VlcEngine {
     /// "system default" case and is not sent (Python's apply
     /// returns early on empty, leaving a fresh player's
     /// default in charge).
-    pub fn set_audio_output_device(&mut self, device_id: &str) -> bool {
+    pub fn set_audio_output_device(&self, device_id: &str) -> bool {
         if device_id.is_empty() {
             return false;
         }
-        let Some(set) = self.fns.audio_output_set else {
+        let Some(set) = self.inner.fns.audio_output_set else {
             return false;
         };
         let Ok(c_id) = CString::new(device_id) else {
             return false;
         };
-        unsafe { set(self.player, c_id.as_ptr()) == 0 }
+        unsafe { set(self.inner.player, c_id.as_ptr()) == 0 }
     }
 
     /// Select an audio track by id.
-    pub fn set_audio_track(&mut self, id: i32) -> bool {
-        (unsafe { (self.fns.set_track)(self.player, id) }) == 0
+    pub fn set_audio_track(&self, id: i32) -> bool {
+        (unsafe { (self.inner.fns.set_track)(self.inner.player, id) }) == 0
+    }
+
+    /// The current media's decoded/played counters (P03's
+    /// freeze evidence), or `None` when libVLC cannot report
+    /// them — the caller falls back to the position clock.
+    #[must_use]
+    pub fn stats(&self) -> Option<AvCounters> {
+        let (get_media, get_stats) = (self.inner.fns.get_media?, self.inner.fns.media_get_stats?);
+        let media = unsafe { get_media(self.inner.player) };
+        if media.is_null() {
+            return None;
+        }
+        let mut stats = MediaStats::default();
+        if unsafe { get_stats(media, &raw mut stats) } == 0 {
+            return None;
+        }
+        Some(AvCounters {
+            read_bytes: i64::from(stats.read_bytes),
+            decoded_video: i64::from(stats.decoded_video),
+            displayed_pictures: i64::from(stats.displayed_pictures),
+            decoded_audio: i64::from(stats.decoded_audio),
+            played_abuffers: i64::from(stats.played_abuffers),
+        })
+    }
+
+    /// The embedded subtitle (SPU) tracks as (id, name) pairs,
+    /// in libVLC's description order.
+    #[must_use]
+    pub fn subtitle_tracks(&self) -> Vec<(i32, String)> {
+        let mut tracks = Vec::new();
+        let Some(describe) = self.inner.fns.spu_description else {
+            return tracks;
+        };
+        let head = unsafe { describe(self.inner.player) };
+        if head.is_null() {
+            return tracks;
+        }
+        let mut cursor = head;
+        while !cursor.is_null() {
+            let entry = unsafe { &*cursor };
+            let name = if entry.name.is_null() {
+                String::new()
+            } else {
+                unsafe { std::ffi::CStr::from_ptr(entry.name) }
+                    .to_string_lossy()
+                    .into_owned()
+            };
+            tracks.push((entry.id, name));
+            cursor = entry.next;
+        }
+        unsafe { (self.inner.fns.track_description_release)(head) };
+        tracks
+    }
+
+    /// The selected subtitle track id (-1 = Off, -2 when
+    /// libVLC cannot say).
+    #[must_use]
+    pub fn subtitle_track(&self) -> i32 {
+        self.inner
+            .fns
+            .get_spu
+            .map_or(-2, |get| unsafe { get(self.inner.player) })
+    }
+
+    /// The subtitle delay in milliseconds (libVLC reports
+    /// microseconds; Python's sampling clock subtracts
+    /// `delay // 1000` from the media position, P10). Zero
+    /// when libVLC cannot say.
+    #[must_use]
+    pub fn subtitle_delay_ms(&self) -> i64 {
+        self.inner
+            .fns
+            .get_spu_delay
+            .map_or(0, |get| unsafe { get(self.inner.player) / 1000 })
+    }
+
+    /// Select a subtitle track by id (-1 disables rendering).
+    pub fn set_subtitle_track(&self, id: i32) -> bool {
+        let Some(set) = self.inner.fns.set_spu else {
+            return false;
+        };
+        let code = unsafe { set(self.inner.player, id) };
+        code == 0
+    }
+
+    /// Attach a sidecar subtitle file for VLC rendering
+    /// (Python's `add_slave` with the subtitle slave type and
+    /// select = true). `uri` is a `file://` URI.
+    pub fn add_subtitle_slave(&self, uri: &str) -> bool {
+        let Some(add) = self.inner.fns.add_slave else {
+            return false;
+        };
+        let Ok(c_uri) = CString::new(uri) else {
+            return false;
+        };
+        // libvlc_media_slave_type_t: 0 = subtitle.
+        let code = unsafe { add(self.inner.player, 0, c_uri.as_ptr(), true) };
+        code == 0
     }
 }
 
-impl Drop for VlcEngine {
+impl Drop for EngineInner {
     fn drop(&mut self) {
         unsafe {
             (self.fns.player_release)(self.player);
@@ -497,6 +717,32 @@ mod tests {
     }
 
     #[test]
+    fn media_options_carry_the_cache_plan_to_all_four_caches() {
+        let live = super::MediaOptions {
+            cache_ms: 500,
+            live: true,
+        }
+        .option_strings();
+        for name in ["network", "live", "file", "disc"] {
+            assert!(
+                live.contains(&format!(":{name}-caching=500")),
+                "{name} cache missing: {live:?}"
+            );
+        }
+        assert!(live.contains(&":http-reconnect=true".to_string()));
+        assert!(live.contains(&":clock-jitter=1500".to_string()));
+        let vod = super::MediaOptions {
+            cache_ms: 25_000,
+            live: false,
+        }
+        .option_strings();
+        assert!(vod.contains(&":network-caching=25000".to_string()));
+        assert!(vod.contains(&":clock-jitter=0".to_string()));
+        assert!(vod.contains(&":drop-late-frames=0".to_string()));
+        assert!(vod.contains(&":skip-frames=0".to_string()));
+    }
+
+    #[test]
     fn state_mapping_matches_libvlc() {
         assert_eq!(map_state(3), VlcState::Playing);
         assert_eq!(map_state(6), VlcState::Ended);
@@ -510,7 +756,7 @@ mod tests {
         // With libVLC installed this loads; without, it must error,
         // never panic.
         match super::VlcEngine::new() {
-            Ok(mut engine) => {
+            Ok(engine) => {
                 assert_eq!(engine.state(), VlcState::Nothing);
                 engine.stop();
             }

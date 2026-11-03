@@ -75,6 +75,30 @@ pub fn normalize_keys(values: impl IntoIterator<Item = String>) -> Vec<String> {
         .collect()
 }
 
+/// The persisted recent-channels MRU cap (Python keeps 20).
+pub const MAX_RECENT_CHANNELS: usize = 20;
+
+/// Record one played channel in the recent-channels MRU
+/// (Python `_remember_played_channel`, P17): the key moves to
+/// the front, duplicates collapse to the single front entry,
+/// and the list truncates at [`MAX_RECENT_CHANNELS`]. A key
+/// already at the front changes nothing; an empty key records
+/// nothing. A/B/A therefore yields exactly `[A, B]`.
+#[must_use]
+pub fn remember_recent(keys: &[String], key: &str) -> Vec<String> {
+    if key.is_empty() || keys.first().is_some_and(|front| front == key) {
+        return keys.to_vec();
+    }
+    let mut next = vec![key.to_string()];
+    next.extend(
+        keys.iter()
+            .filter(|existing| existing.as_str() != key)
+            .cloned(),
+    );
+    next.truncate(MAX_RECENT_CHANNELS);
+    next
+}
+
 /// The outcome of toggling one channel in a [`FavoriteSet`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Toggle {
@@ -88,15 +112,20 @@ pub enum Toggle {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct FavoriteSet {
     keys: Vec<String>,
+    /// Hash index over `keys` (B19): membership tests during category
+    /// synchronization were O(keys) per channel, which stalls the UI
+    /// thread on large playlists with many favorites. Kept in sync by
+    /// every mutation; equality and storage use `keys` alone.
+    index: std::collections::HashSet<String>,
 }
 
 impl FavoriteSet {
     /// Build a set from stored values, normalized defensively.
     #[must_use]
     pub fn from_stored(values: impl IntoIterator<Item = String>) -> Self {
-        Self {
-            keys: normalize_keys(values),
-        }
+        let keys = normalize_keys(values);
+        let index = keys.iter().cloned().collect();
+        Self { keys, index }
     }
 
     #[must_use]
@@ -117,7 +146,7 @@ impl FavoriteSet {
     #[must_use]
     pub fn is_favorite(&self, channel: &Channel) -> bool {
         let key = channel_key(channel);
-        !key.is_empty() && self.keys.iter().any(|stored| stored == &key)
+        !key.is_empty() && self.index.contains(&key)
     }
 
     /// Add the channel when absent, remove it when present. Toggling the
@@ -129,8 +158,10 @@ impl FavoriteSet {
         }
         if let Some(position) = self.keys.iter().position(|stored| stored == &key) {
             self.keys.remove(position);
+            self.index.remove(&key);
             Toggle::Removed
         } else {
+            self.index.insert(key.clone());
             self.keys.push(key);
             Toggle::Added
         }
@@ -234,6 +265,47 @@ mod tests {
         let bare = channel("http://a\n");
         assert_eq!(set.toggle(&bare), Toggle::Unchanged);
         assert!(set.is_empty());
+    }
+
+    #[test]
+    fn membership_index_stays_in_sync_with_toggles() {
+        // B19 regression: the hash index must agree with the key list
+        // after every toggle, or favorites silently vanish.
+        let mut set = FavoriteSet::from_stored(["Alpha".to_owned(), "Bravo".to_owned()]);
+        let alpha = channel("#EXTINF:-1,Alpha\nu1\n");
+        let bravo = channel("#EXTINF:-1,Bravo\nu2\n");
+        assert!(set.is_favorite(&alpha));
+        assert_eq!(set.toggle(&alpha), Toggle::Removed);
+        assert!(!set.is_favorite(&alpha));
+        assert!(set.is_favorite(&bravo));
+        assert_eq!(set.toggle(&alpha), Toggle::Added);
+        assert!(set.is_favorite(&alpha));
+        assert_eq!(
+            set,
+            FavoriteSet::from_stored(["Bravo".to_owned(), "Alpha".to_owned()])
+        );
+    }
+
+    #[test]
+    fn recent_history_is_a_deduped_twenty_entry_mru() {
+        let keys: Vec<String> = Vec::new();
+        let keys = remember_recent(&keys, "A");
+        let keys = remember_recent(&keys, "B");
+        // A/B/A: A promoted to the front, still a single entry.
+        let keys = remember_recent(&keys, "A");
+        assert_eq!(keys, ["A", "B"]);
+        // Already at the front: no reorder, no growth.
+        assert_eq!(remember_recent(&keys, "A"), ["A", "B"]);
+        // Empty keys record nothing.
+        assert_eq!(remember_recent(&keys, ""), ["A", "B"]);
+        // The cap holds at 20, newest first.
+        let mut keys: Vec<String> = Vec::new();
+        for n in 0..25 {
+            keys = remember_recent(&keys, &format!("K{n}"));
+        }
+        assert_eq!(keys.len(), 20);
+        assert_eq!(keys[0], "K24");
+        assert_eq!(keys[19], "K5");
     }
 
     #[test]

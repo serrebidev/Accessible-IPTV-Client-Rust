@@ -11,6 +11,12 @@ use std::{path::PathBuf, sync::Arc};
 pub enum BrowseEvent {
     Results(SearchResults),
     Recovery(LoadFailure),
+    /// A sources load finished; carries the locations of sources
+    /// whose previous channels were retained after a failure (B12).
+    /// The adapter also reacts by refreshing playlist-header guides.
+    Loaded {
+        stale_sources: Vec<String>,
+    },
 }
 
 /// The UI-neutral outcome of a favorite toggle, ready to announce.
@@ -23,6 +29,7 @@ pub struct FavoriteToggle {
 
 /// Coordinates load/search generations while retaining the last usable playlist.
 #[derive(Default)]
+#[allow(clippy::struct_excessive_bools)] // independent load/search state flags
 pub struct BrowserWorker {
     loader: LoadWorker,
     searcher: SearchWorker,
@@ -35,6 +42,20 @@ pub struct BrowserWorker {
     favorites: FavoriteSet,
     extras: Vec<crate::Channel>,
     raw: Option<Arc<BrowseModel>>,
+    /// How many of the current playlist's tail channels are provider
+    /// extras merged into it (keeps [`Self::all_channels`] exact).
+    playlist_extras: usize,
+    pending_extras: usize,
+    /// Directory holding the plain-source caches (B11).
+    source_cache_dir: Option<PathBuf>,
+    /// A prefill was applied and the final load is still coming.
+    awaiting_final: bool,
+    /// The last load was a multi-source load (vs a single file).
+    last_load_was_sources: bool,
+    /// Sources of the last multi-source load, by location.
+    last_sources: Vec<crate::sources::PlaylistSource>,
+    /// Playlist-header guides by source location (B09).
+    playlist_guides: std::collections::BTreeMap<String, Vec<String>>,
 }
 
 impl BrowserWorker {
@@ -42,22 +63,66 @@ impl BrowserWorker {
         self.cancel_load();
         self.searcher.cancel();
         self.searching = false;
+        self.last_load_was_sources = false;
         self.loader.submit(path);
         self.loading = true;
     }
 
+    /// Where the plain-source download/parsed caches live (B11).
+    pub fn set_source_cache_dir(&mut self, dir: PathBuf) {
+        self.source_cache_dir = Some(dir);
+    }
+
     /// Load several configured sources merged, with scope tags.
     pub fn load_sources(&mut self, sources: Vec<crate::sources::PlaylistSource>) {
+        self.load_sources_mode(sources, false);
+    }
+
+    /// Reload sources bypassing the URL download cache (B13 refresh).
+    pub fn refresh_sources(&mut self, sources: Vec<crate::sources::PlaylistSource>) {
+        self.load_sources_mode(sources, true);
+    }
+
+    fn load_sources_mode(&mut self, sources: Vec<crate::sources::PlaylistSource>, force: bool) {
         self.cancel_load();
         self.searcher.cancel();
         self.searching = false;
-        self.loader.submit_sources(sources);
+        self.last_sources.clone_from(&sources);
+        self.last_load_was_sources = true;
+        self.loader.submit_sources_full(
+            sources,
+            self.source_cache_dir.clone(),
+            Arc::clone(&self.playlist),
+            force,
+        );
         self.loading = true;
+    }
+
+    /// Drop the playlist scope without resubmitting (used after the
+    /// source list changes: a scope naming a removed source must not
+    /// hide the whole catalogue).
+    pub fn reset_scope(&mut self) {
+        self.scope = None;
+    }
+
+    /// Flat playlist-header guide URLs from the last loads (B09).
+    #[must_use]
+    pub fn playlist_guide_urls(&self) -> Vec<String> {
+        let mut flat: Vec<String> = Vec::new();
+        for guides in self.playlist_guides.values() {
+            for guide in guides {
+                if !flat.contains(guide) {
+                    flat.push(guide.clone());
+                }
+            }
+        }
+        flat
     }
 
     /// Returns whether a pending load was cancelled. Existing rows stay usable.
     pub fn cancel_load(&mut self) -> bool {
         self.loader.cancel();
+        self.awaiting_final = false;
         if let Some(replacement) = self.replacement.take() {
             self.searcher.cancel();
             self.searching = false;
@@ -95,14 +160,13 @@ impl BrowserWorker {
         if self.scope.is_none() {
             return categories(self.playlist.channels());
         }
-        let scoped: Vec<crate::Channel> = self
-            .playlist
-            .channels()
-            .iter()
-            .filter(|channel| self.in_scope(channel))
-            .cloned()
-            .collect();
-        categories(&scoped)
+        // B19: borrow, never clone, the scoped channels.
+        crate::categories::categories_from(
+            self.playlist
+                .channels()
+                .iter()
+                .filter(|channel| self.in_scope(channel)),
+        )
     }
 
     /// The active playlist scope id, when scoped to one playlist.
@@ -149,13 +213,35 @@ impl BrowserWorker {
         &self.favorites
     }
 
+    /// The browse model the published search rows index into.
+    /// Extras are merged into it by `apply_model` and promoted
+    /// into `playlist` when their results land, so the model's
+    /// channels ARE the whole catalogue — appending `extras`
+    /// again would double-count every provider channel.
+    fn catalogue(&self) -> &[crate::Channel] {
+        self.playlist.channels()
+    }
+
     /// Every loaded channel (playlist plus provider extras), for
-    /// catalogue builders that scan the whole browse state.
+    /// catalogue builders that scan the whole browse state. The
+    /// playlist model already ends with the extras merged into it;
+    /// they are counted once (B02).
     #[must_use]
     pub fn all_channels(&self) -> Vec<crate::Channel> {
-        let mut out: Vec<crate::Channel> = self.playlist.channels().to_vec();
+        let base = self.playlist.channels();
+        let merged_tail = self.playlist_extras.min(base.len()).min(self.extras.len());
+        let mut out: Vec<crate::Channel> = base[..base.len() - merged_tail].to_vec();
         out.extend(self.extras.iter().cloned());
         out
+    }
+
+    /// The browse model's two halves without merging: the plain
+    /// playlist model (cheap Arc clone) and the provider extras.
+    /// Catalogue builders that filter on a worker thread use this
+    /// instead of paying for a full catalogue clone (B19).
+    #[must_use]
+    pub fn catalogue_parts(&self) -> (Arc<BrowseModel>, Vec<crate::Channel>) {
+        (Arc::clone(&self.playlist), self.extras.clone())
     }
 
     /// The channel at a playlist index in the current projection's source.
@@ -164,12 +250,31 @@ impl BrowserWorker {
         self.playlist.channels().get(playlist_index).cloned()
     }
 
-    /// Favorited channels present in the current playlist (display counts).
+    /// Run `f` over every loaded channel (playlist plus provider
+    /// extras, in `all_channels` order) without cloning the
+    /// catalogue (audit E12 — suffix building over 500,000
+    /// channels must not start by cloning all of them). The
+    /// playlist model's tail IS the current extras (every extras
+    /// change rebuilds the model), so the model slice is the
+    /// catalogue in order.
+    pub fn with_all_channels<R>(&self, f: impl FnOnce(&[crate::Channel]) -> R) -> R {
+        f(self.catalogue())
+    }
+
+    /// Favorited channels present in the current playlist (display
+    /// counts). Scoped to the active playlist scope (B20): the label
+    /// must agree with the visible source.
     #[must_use]
     pub fn favorite_count(&self) -> usize {
-        self.favorites
-            .favorite_indexes(self.playlist.channels())
-            .len()
+        let channels = self.playlist.channels();
+        let indexes = self.favorites.favorite_indexes(channels);
+        if self.scope.is_none() {
+            return indexes.len();
+        }
+        indexes
+            .into_iter()
+            .filter(|&index| self.in_scope(&channels[index]))
+            .count()
     }
 
     #[must_use]
@@ -232,9 +337,41 @@ impl BrowserWorker {
     pub fn poll(&mut self, query: &str) -> Option<BrowseEvent> {
         if let Some(loaded) = self.loader.try_latest() {
             match loaded.outcome {
-                Ok(loaded) => self.filter_loaded(&loaded, query),
+                Ok(model) => {
+                    if loaded.intermediate {
+                        // B11 prefill: show the cached channels now;
+                        // the final result for this load still comes.
+                        self.awaiting_final = true;
+                        self.filter_loaded(&model, query);
+                    } else {
+                        let was_sources = self.last_load_was_sources;
+                        self.awaiting_final = false;
+                        if was_sources {
+                            let fetched: std::collections::BTreeMap<String, Vec<String>> =
+                                loaded.guide_urls.iter().cloned().collect();
+                            let locations: Vec<String> = self
+                                .last_sources
+                                .iter()
+                                .map(|source| source.location().to_string())
+                                .collect();
+                            let (by_source, _) = crate::merge_playlist_header_guides(
+                                &self.playlist_guides,
+                                &fetched,
+                                &locations,
+                            );
+                            self.playlist_guides = by_source;
+                        }
+                        self.filter_loaded(&model, query);
+                        if was_sources {
+                            return Some(BrowseEvent::Loaded {
+                                stale_sources: loaded.stale_sources,
+                            });
+                        }
+                    }
+                }
                 Err(error) => {
                     self.loading = false;
+                    self.awaiting_final = false;
                     return Some(BrowseEvent::Recovery(error));
                 }
             }
@@ -243,7 +380,8 @@ impl BrowserWorker {
             if let Some(replacement) = self.replacement.take() {
                 let previous = std::mem::replace(&mut self.playlist, replacement);
                 std::thread::spawn(move || drop(previous));
-                self.loading = false;
+                self.playlist_extras = self.pending_extras;
+                self.loading = self.awaiting_final;
             }
             self.searching = false;
             BrowseEvent::Results(results)
@@ -260,6 +398,19 @@ impl BrowserWorker {
     /// merge into the browse model without disturbing the active load.
     pub fn add_channels(&mut self, channels: Vec<crate::Channel>, query: &str) {
         self.extras.extend(channels);
+        self.reapply_merged(query);
+    }
+
+    /// A fresh provider load REPLACES the provider channels (B02):
+    /// reloading an unchanged account must not append a second copy,
+    /// and a removed account's channels must disappear. Python
+    /// replaces its catalogue and provider registry on every load.
+    pub fn replace_provider_channels(&mut self, channels: Vec<crate::Channel>, query: &str) {
+        self.extras = channels;
+        self.reapply_merged(query);
+    }
+
+    fn reapply_merged(&mut self, query: &str) {
         if self.loading {
             return;
         }
@@ -289,6 +440,7 @@ impl BrowserWorker {
             self.category.clone(),
             query.to_owned(),
         );
+        self.pending_extras = self.extras.len();
         self.replacement = Some(loaded);
         self.searching = true;
     }
@@ -352,6 +504,23 @@ mod tests {
         match event {
             BrowseEvent::Results(results) => results,
             BrowseEvent::Recovery(error) => panic!("{error:?}"),
+            BrowseEvent::Loaded { .. } => panic!("unexpected Loaded event"),
+        }
+    }
+
+    /// Poll until the Results event, stepping over Loaded notices.
+    fn wait_results(browser: &mut BrowserWorker, query: &str) -> SearchResults {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match browser.poll(query) {
+                Some(BrowseEvent::Results(results)) => return results,
+                Some(BrowseEvent::Recovery(error)) => panic!("{error:?}"),
+                Some(BrowseEvent::Loaded { .. }) => {}
+                None => {
+                    assert!(Instant::now() < deadline, "browse timed out");
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
         }
     }
 
@@ -378,9 +547,9 @@ mod tests {
         let first_id = sources[0].scope_id();
         let mut browser = BrowserWorker::default();
         browser.load_sources(sources);
-        assert_eq!(results(wait(&mut browser, "")).len(), 3);
+        assert_eq!(wait_results(&mut browser, "").len(), 3);
         browser.set_scope(Some(first_id), "");
-        assert_eq!(results(wait(&mut browser, "")).len(), 2);
+        assert_eq!(wait_results(&mut browser, "").len(), 2);
         let groups: Vec<String> = browser
             .categories()
             .iter()
@@ -389,7 +558,115 @@ mod tests {
         assert!(groups.iter().any(|g| g == "News"), "{groups:?}");
         assert!(!groups.iter().any(|g| g == "Sport"), "{groups:?}");
         browser.set_scope(None, "");
-        assert_eq!(results(wait(&mut browser, "")).len(), 3);
+        assert_eq!(wait_results(&mut browser, "").len(), 3);
+    }
+
+    fn provider_channel(name: &str, account: &str) -> crate::Channel {
+        let mut channel = crate::parse_m3u(&format!("#EXTINF:-1,{name}\nhttp://h/live/u/p/1.ts\n"))
+            .into_iter()
+            .next()
+            .unwrap();
+        channel
+            .unknown_attributes
+            .insert("provider-type".to_string(), "xtream".to_string());
+        channel
+            .unknown_attributes
+            .insert("provider-id".to_string(), account.to_string());
+        channel.unknown_attributes.insert(
+            crate::sources::PLAYLIST_ID_ATTRIBUTE.to_string(),
+            account.to_string(),
+        );
+        channel
+    }
+
+    #[test]
+    fn provider_scope_shows_its_channels_and_replacement_never_duplicates() {
+        // B01 + B02 regression: scoping to a provider account lists
+        // its channels; a provider reload replaces instead of
+        // appending; removing the account removes its channels.
+        let mut browser = BrowserWorker::default();
+        browser.load(fixture("local.m3u"));
+        assert_eq!(results(wait(&mut browser, "")).len(), 4);
+        let channels = vec![provider_channel("Prov One", "acct-1")];
+        browser.replace_provider_channels(channels.clone(), "");
+        assert_eq!(wait_results(&mut browser, "").len(), 5);
+        assert_eq!(browser.all_channels().len(), 5);
+        // Reload the unchanged account: still one copy.
+        browser.replace_provider_channels(channels, "");
+        assert_eq!(wait_results(&mut browser, "").len(), 5);
+        assert_eq!(browser.all_channels().len(), 5);
+        // Scope to the account: only its channel remains visible.
+        browser.set_scope(Some("acct-1".to_string()), "");
+        assert_eq!(wait_results(&mut browser, "").len(), 1);
+        browser.set_scope(None, "");
+        assert_eq!(wait_results(&mut browser, "").len(), 5);
+        // Remove the account: its channels disappear everywhere.
+        browser.replace_provider_channels(Vec::new(), "");
+        assert_eq!(wait_results(&mut browser, "").len(), 4);
+        assert_eq!(browser.all_channels().len(), 4);
+    }
+
+    #[test]
+    fn empty_source_list_publishes_an_empty_catalogue() {
+        // B03 regression (core half): loading zero sources is a real
+        // load, not a skip.
+        let mut browser = BrowserWorker::default();
+        browser.load(fixture("local.m3u"));
+        assert_eq!(results(wait(&mut browser, "")).len(), 4);
+        browser.load_sources(Vec::new());
+        let empty = wait_results(&mut browser, "");
+        assert!(empty.is_empty());
+        assert_eq!(browser.all_channels().len(), 0);
+    }
+
+    #[test]
+    fn favorite_count_follows_the_scope() {
+        // B20 regression.
+        let dir = std::env::temp_dir().join("iptv-favcount-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let first = dir.join("first.m3u");
+        let second = dir.join("second.m3u");
+        std::fs::write(&first, "#EXTM3U\n#EXTINF:-1,Alpha\nhttp://a/1\n").unwrap();
+        std::fs::write(&second, "#EXTM3U\n#EXTINF:-1,Beta\nhttp://b/1\n").unwrap();
+        let sources = vec![
+            crate::sources::PlaylistSource::new(first.to_string_lossy()),
+            crate::sources::PlaylistSource::new(second.to_string_lossy()),
+        ];
+        let first_id = sources[0].scope_id();
+        let mut browser = BrowserWorker::default();
+        browser.set_favorites(FavoriteSet::from_stored([
+            "Alpha".to_string(),
+            "Beta".to_string(),
+        ]));
+        browser.load_sources(sources);
+        assert_eq!(wait_results(&mut browser, "").len(), 2);
+        assert_eq!(browser.favorite_count(), 2);
+        browser.set_scope(Some(first_id), "");
+        assert_eq!(wait_results(&mut browser, "").len(), 1);
+        assert_eq!(browser.favorite_count(), 1);
+    }
+
+    #[test]
+    fn with_all_channels_covers_playlist_and_extras_in_order() {
+        let mut browser = BrowserWorker::default();
+        browser.load(fixture("local.m3u"));
+        assert_eq!(results(wait(&mut browser, "")).len(), 4);
+        assert_eq!(browser.with_all_channels(<[crate::Channel]>::len), 4);
+        let extra = crate::Channel {
+            name: "Extra".to_owned(),
+            group: String::new(),
+            url: "http://example.com/extra".to_owned(),
+            tvg_id: String::new(),
+            tvg_name: String::new(),
+            tvg_logo: String::new(),
+            unknown_attributes: std::collections::BTreeMap::new(),
+        };
+        browser.add_channels(vec![extra], "");
+        assert_eq!(results(wait(&mut browser, "")).len(), 5);
+        let names: Vec<String> =
+            browser.with_all_channels(|channels| channels.iter().map(|c| c.name.clone()).collect());
+        assert_eq!(names.last().map(String::as_str), Some("Extra"));
+        assert_eq!(browser.all_channels().len(), 5);
     }
 
     #[test]

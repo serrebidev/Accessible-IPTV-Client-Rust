@@ -116,6 +116,13 @@ impl SearchResults {
         &self.category
     }
 
+    /// The query these rows answer (the EPG search append checks
+    /// it against the guard before adding programme rows).
+    #[must_use]
+    pub fn query(&self) -> &str {
+        &self.query
+    }
+
     /// An unchanged row needs no selection/focus cycling or fresh announcement.
     #[must_use]
     pub fn retains_row(&self, previous: &Self, row: usize) -> bool {

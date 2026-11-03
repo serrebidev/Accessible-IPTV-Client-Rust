@@ -211,6 +211,131 @@ impl Reminder {
     }
 }
 
+/// The next reminder to deliver, one at a time (Python's reminder
+/// poll in `planning_ui.py`): a clone of the first row in stored
+/// order whose lead window has opened, whose programme has not yet
+/// ended, and whose id is not in `seen` (already shown but not yet
+/// acknowledged). Ready rows count as due — Python's `due()` promotes
+/// scheduled rows to ready inside the window — while
+/// [`Reminder::is_due`] only names the scheduled state. The caller
+/// adds the returned id to `seen`, speaks the reminder, then calls
+/// [`acknowledge`]; each reminder is therefore delivered exactly
+/// once even when several fall due together.
+#[must_use]
+pub fn next_pending_delivery<S: std::hash::BuildHasher>(
+    rows: &[Reminder],
+    seen: &std::collections::HashSet<String, S>,
+    now: i64,
+) -> Option<Reminder> {
+    rows.iter()
+        .find(|row| {
+            !seen.contains(&row.id)
+                && matches!(
+                    row.status,
+                    ReminderStatus::Scheduled | ReminderStatus::Ready
+                )
+                && now >= row.start - row.lead * 60
+                && now < row.end
+        })
+        .cloned()
+}
+
+/// Mark one delivered reminder as notified (Python's
+/// `acknowledge`): only a Scheduled or Ready row changes, so a
+/// reminder is never acknowledged twice. Returns whether a row
+/// changed.
+pub fn acknowledge(rows: &mut [Reminder], id: &str) -> bool {
+    let Some(row) = rows.iter_mut().find(|row| row.id == id) else {
+        return false;
+    };
+    if !matches!(
+        row.status,
+        ReminderStatus::Scheduled | ReminderStatus::Ready
+    ) {
+        return false;
+    }
+    row.status = ReminderStatus::Notified;
+    true
+}
+
+/// Edit a reminder's lead time (Python's `ReminderStore.set_lead`):
+/// the lead must be within 0..=120 minutes and the programme must
+/// not have started yet. Editing re-arms the reminder — its status
+/// resets to Scheduled, like Python.
+///
+/// # Errors
+///
+/// Returns an error when the lead is out of range, the row is
+/// missing, or the programme has already started.
+pub fn set_lead(rows: &mut [Reminder], id: &str, lead: i64, now: i64) -> Result<(), &'static str> {
+    if !(0..=120).contains(&lead) {
+        return Err("invalid reminder lead time");
+    }
+    let Some(row) = rows.iter_mut().find(|row| row.id == id) else {
+        return Err("invalid reminder lead time");
+    };
+    if row.start <= now {
+        return Err("invalid reminder lead time");
+    }
+    row.lead = lead;
+    row.status = ReminderStatus::Scheduled;
+    Ok(())
+}
+
+/// The status label Python's Reminders dialog shows for a row
+/// (`planning_ui.py`): a scheduled or ready row past its end reads
+/// Expired; a ready row, or a scheduled row inside its lead window,
+/// reads Pending; notified and expired rows keep their names;
+/// anything else reads Scheduled.
+#[must_use]
+pub fn display_status(reminder: &Reminder, now: i64) -> &'static str {
+    if reminder.end <= now
+        && matches!(
+            reminder.status,
+            ReminderStatus::Scheduled | ReminderStatus::Ready
+        )
+    {
+        return "Expired";
+    }
+    match reminder.status {
+        ReminderStatus::Ready => "Pending",
+        ReminderStatus::Scheduled if now >= reminder.start - reminder.lead * 60 => "Pending",
+        ReminderStatus::Notified => "Notified",
+        ReminderStatus::Expired => "Expired",
+        ReminderStatus::Scheduled => "Scheduled",
+    }
+}
+
+/// Resolve a reminder's channel for Open Channel (port of Python's
+/// `programme_reminders.resolve_channel`): the channel whose
+/// reminder key matches the row's, returned only when exactly one
+/// distinct match exists. Python keys matches by (url, headers);
+/// url distinctness is the practical equivalent here — two entries
+/// sharing a url are the same channel for opening purposes, while
+/// two different urls under one key stay ambiguous and resolve to
+/// nothing.
+#[must_use]
+pub fn find_channel_for_reminder<'a>(
+    row: &Reminder,
+    channels: &'a [Channel],
+) -> Option<&'a Channel> {
+    let mut found: Option<&Channel> = None;
+    let mut seen_urls: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for channel in channels {
+        if channel.url.is_empty() || reminder_channel_key(channel) != row.channel_key {
+            continue;
+        }
+        if !seen_urls.insert(channel.url.as_str()) {
+            continue;
+        }
+        if found.is_some() {
+            return None;
+        }
+        found = Some(channel);
+    }
+    found
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -287,5 +412,126 @@ mod tests {
         let reminder = build_reminder(&channel(), &programme(now + 7200), 5, now).expect("b");
         assert!(!reminder.is_due(now));
         assert!(reminder.is_due(now + 7200 - 300));
+    }
+
+    #[test]
+    fn simultaneous_reminders_deliver_one_at_a_time_exactly_once() {
+        let now = 1_000_000;
+        let chan = channel();
+        // Distinct starts give distinct ids; at the third row's
+        // window opening all three are due together.
+        let mut rows: Vec<Reminder> = [7200, 7260, 7320]
+            .iter()
+            .map(|offset| build_reminder(&chan, &programme(now + offset), 5, now).expect("b"))
+            .collect();
+        let due_now = rows[2].start - 300;
+        let ids: Vec<String> = rows.iter().map(|row| row.id.clone()).collect();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut delivered: Vec<String> = Vec::new();
+        // First delivery: the first row in stored order.
+        let first = next_pending_delivery(&rows, &seen, due_now).expect("first");
+        assert_eq!(first.id, ids[0]);
+        delivered.push(first.id.clone());
+        seen.insert(first.id);
+        // Shown but unacknowledged: the seen set, not the row
+        // status, moves delivery on to the second row.
+        assert_eq!(rows[0].status, ReminderStatus::Scheduled);
+        let second = next_pending_delivery(&rows, &seen, due_now).expect("second");
+        assert_eq!(second.id, ids[1]);
+        delivered.push(second.id.clone());
+        seen.insert(second.id);
+        let third = next_pending_delivery(&rows, &seen, due_now).expect("third");
+        assert_eq!(third.id, ids[2]);
+        delivered.push(third.id.clone());
+        seen.insert(third.id);
+        assert!(next_pending_delivery(&rows, &seen, due_now).is_none());
+        // Each id was delivered exactly once.
+        let unique: std::collections::HashSet<&String> = delivered.iter().collect();
+        assert_eq!(unique.len(), 3);
+        // After acknowledging all three, nothing delivers again,
+        // even with an empty seen set.
+        for id in &ids {
+            assert!(acknowledge(&mut rows, id));
+        }
+        assert!(rows
+            .iter()
+            .all(|row| row.status == ReminderStatus::Notified));
+        assert!(!acknowledge(&mut rows, &ids[0]));
+        let empty: std::collections::HashSet<String> = std::collections::HashSet::new();
+        assert!(next_pending_delivery(&rows, &empty, due_now).is_none());
+    }
+
+    #[test]
+    fn set_lead_edits_future_rows_and_rearms() {
+        let now = 1_000_000;
+        let mut rows = vec![build_reminder(&channel(), &programme(now + 7200), 5, now).expect("b")];
+        let id = rows[0].id.clone();
+        for lead in [0, 30, 120] {
+            rows[0].status = ReminderStatus::Ready;
+            assert!(set_lead(&mut rows, &id, lead, now).is_ok());
+            assert_eq!(rows[0].lead, lead);
+            // Editing re-arms the reminder.
+            assert_eq!(rows[0].status, ReminderStatus::Scheduled);
+        }
+        assert!(set_lead(&mut rows, &id, 121, now).is_err());
+        assert!(set_lead(&mut rows, &id, -1, now).is_err());
+        assert!(set_lead(&mut rows, "no-such-id", 30, now).is_err());
+        // A programme that has already started cannot be edited.
+        let start = rows[0].start;
+        assert!(set_lead(&mut rows, &id, 30, start).is_err());
+        assert!(set_lead(&mut rows, &id, 30, start + 1).is_err());
+    }
+
+    #[test]
+    fn display_status_follows_python_labels() {
+        let now = 1_000_000;
+        let reminder = build_reminder(&channel(), &programme(now + 7200), 5, now).expect("b");
+        // Scheduled, outside the lead window.
+        assert_eq!(display_status(&reminder, now), "Scheduled");
+        // Inside the lead window (start - lead*60).
+        assert_eq!(display_status(&reminder, reminder.start - 300), "Pending");
+        // Past the end while still scheduled.
+        assert_eq!(display_status(&reminder, reminder.end), "Expired");
+        // A ready row reads Pending even before its window, and
+        // Expired once past its end.
+        let mut ready = reminder.clone();
+        ready.status = ReminderStatus::Ready;
+        assert_eq!(display_status(&ready, now), "Pending");
+        assert_eq!(display_status(&ready, reminder.end), "Expired");
+        // Notified and Expired keep their names.
+        let mut notified = reminder.clone();
+        notified.status = ReminderStatus::Notified;
+        assert_eq!(display_status(&notified, now), "Notified");
+        let mut expired = reminder;
+        expired.status = ReminderStatus::Expired;
+        assert_eq!(display_status(&expired, now), "Expired");
+    }
+
+    #[test]
+    fn find_channel_for_reminder_needs_a_unique_url() {
+        let now = 1_000_000;
+        let chan = channel();
+        let row = build_reminder(&chan, &programme(now + 7200), 5, now).expect("b");
+        // A unique match resolves.
+        let one = [chan.clone()];
+        let found = find_channel_for_reminder(&row, &one).expect("found");
+        assert_eq!(found.url, "https://example.com/news");
+        // The same url twice is still one distinct match.
+        let two = [chan.clone(), chan.clone()];
+        let found = find_channel_for_reminder(&row, &two).expect("found");
+        assert_eq!(found.url, "https://example.com/news");
+        // Two channels sharing the key with different urls are
+        // ambiguous: the url is not part of the reminder key, so
+        // only the address changes.
+        let mut other_url = chan.clone();
+        other_url.url = "https://example.com/news-mirror".to_string();
+        assert_eq!(reminder_channel_key(&other_url), row.channel_key);
+        assert!(find_channel_for_reminder(&row, &[chan.clone(), other_url]).is_none());
+        // No matching channel resolves to nothing.
+        let mut unrelated = chan.clone();
+        unrelated.name = "Other Channel".to_string();
+        unrelated.tvg_id = "other.example".to_string();
+        assert!(find_channel_for_reminder(&row, &[unrelated]).is_none());
+        assert!(find_channel_for_reminder(&row, &[]).is_none());
     }
 }

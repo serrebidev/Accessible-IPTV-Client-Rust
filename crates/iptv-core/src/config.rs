@@ -220,6 +220,15 @@ impl Config {
             let list = coerce_string_list(self.values.get(key));
             self.values.insert(key.to_string(), json!(list));
         }
+        // Guide source lists are string lists in both spellings:
+        // Python's `epgs` (the key its manager and backup format
+        // use) and this port's legacy `epg_urls`. Normalizing both
+        // keeps an imported Python backup's guide list intact and
+        // loadable instead of preserved-but-ignored (audit E01).
+        for key in ["epgs", "epg_urls"] {
+            let list = coerce_string_list(self.values.get(key));
+            self.values.insert(key.to_string(), json!(list));
+        }
         for key in ["prefer_audio_description", "shutdown_after_recordings"] {
             let flag = coerce_bool(self.values.get(key), false);
             self.values.insert(key.to_string(), json!(flag));
@@ -294,6 +303,11 @@ impl Config {
     #[must_use]
     pub fn bool_or(&self, key: &str, default: bool) -> bool {
         coerce_bool(self.values.get(key), default)
+    }
+
+    #[must_use]
+    pub fn f64_or(&self, key: &str, default: f64) -> f64 {
+        coerce_f64(self.values.get(key)).unwrap_or(default)
     }
 
     #[must_use]
@@ -422,14 +436,70 @@ pub fn user_config_dir() -> PathBuf {
     PathBuf::from(home).join(".config").join(APP_DATA_DIR_NAME)
 }
 
-/// Read candidates in Python's spirit: the per-user location first, then a
-/// portable copy beside the working directory.
+/// The directory the executable lives in (Python's `get_app_dir`).
+#[must_use]
+pub fn exe_dir() -> Option<PathBuf> {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(Path::to_path_buf))
+}
+
+/// Whether a directory accepts a new file (Python's
+/// `_is_writable_dir`, probed for real: access bits lie for root
+/// and for ACL'd folders).
+#[must_use]
+pub fn dir_writable(dir: &Path) -> bool {
+    if !dir.is_dir() {
+        return false;
+    }
+    let probe = dir.join(format!(".iptvclient-write-probe-{}", std::process::id()));
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+    {
+        Ok(_) => {
+            let _ = fs::remove_file(&probe);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// The write target when no existing config was loaded (Python's
+/// `_config_write_target` with nothing loaded): the portable
+/// location beside the executable when it is writable, then the
+/// working directory, then the per-user directory.
+#[must_use]
+pub fn default_write_target() -> PathBuf {
+    if let Some(dir) = exe_dir() {
+        if dir_writable(&dir) {
+            return dir.join(CONFIG_FILE_NAME);
+        }
+    }
+    if dir_writable(Path::new(".")) {
+        return PathBuf::from(CONFIG_FILE_NAME);
+    }
+    user_config_dir().join(CONFIG_FILE_NAME)
+}
+
+/// Read candidates in Python's order (port of
+/// `get_config_read_candidates`): settings beside the executable
+/// first — this build is portable, like Python's portable build —
+/// then the working directory, then the per-user location. The
+/// loaded location is retained as the save path by `load`'s caller,
+/// so portable settings win *and* persist; `default_write_target`
+/// covers the nothing-loaded case with the writable fallback.
 #[must_use]
 pub fn config_candidates() -> Vec<PathBuf> {
-    vec![
-        user_config_dir().join(CONFIG_FILE_NAME),
-        PathBuf::from(CONFIG_FILE_NAME),
-    ]
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(dir) = exe_dir() {
+        candidates.push(dir.join(CONFIG_FILE_NAME));
+    }
+    candidates.push(PathBuf::from(CONFIG_FILE_NAME));
+    candidates.push(user_config_dir().join(CONFIG_FILE_NAME));
+    candidates.dedup();
+    candidates
 }
 
 #[cfg(test)]
@@ -482,10 +552,66 @@ mod tests {
     }
 
     #[test]
+    fn python_epgs_key_is_normalized_and_round_trips() {
+        // Audit E01: a Python settings backup carries its guide
+        // list under `epgs` only; it must load as a usable string
+        // list and survive a save unchanged in shape.
+        let config = config_from(
+            r#"{"epgs": "https://example.com/guide.xml, /tmp/local.xml.gz", "epg_last_import_epoch": 42}"#,
+        );
+        assert_eq!(
+            config.string_list("epgs"),
+            ["https://example.com/guide.xml", "/tmp/local.xml.gz"]
+        );
+        let reparsed = config_from(&config.to_json_string());
+        assert_eq!(reparsed.string_list("epgs"), config.string_list("epgs"));
+        assert!((reparsed.f64_or("epg_last_import_epoch", 0.0) - 42.0).abs() < 1e-9);
+        assert_eq!(reparsed.string_or("epg_last_sources_hash", ""), "");
+    }
+
+    #[test]
     fn unknown_keys_survive_and_wrong_shape_is_rejected() {
         let config = config_from(r#"{"my_custom_key": {"x": 1}}"#);
         assert_eq!(config.raw()["my_custom_key"], json!({"x": 1}));
         assert!(Config::from_json(json!([1, 2, 3])).is_none());
+    }
+
+    #[test]
+    fn portable_settings_beside_the_executable_come_first() {
+        let candidates = config_candidates();
+        let exe_config = exe_dir().expect("exe dir").join(CONFIG_FILE_NAME);
+        assert_eq!(
+            candidates.first(),
+            Some(&exe_config),
+            "portable settings win over per-user ones: {candidates:?}"
+        );
+        assert!(candidates.contains(&user_config_dir().join(CONFIG_FILE_NAME)));
+        // Whatever loaded first is where saves go: with both copies
+        // present the portable one is the loaded (and saved) path.
+        let dir = std::env::temp_dir().join(format!("iptv-config-portable-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("dir");
+        let portable = dir.join("portable").join(CONFIG_FILE_NAME);
+        let per_user = dir.join("user").join(CONFIG_FILE_NAME);
+        fs::create_dir_all(portable.parent().expect("p")).expect("dir");
+        fs::create_dir_all(per_user.parent().expect("u")).expect("dir");
+        fs::write(&portable, r#"{"language": "es"}"#).expect("write");
+        fs::write(&per_user, r#"{"language": "fr"}"#).expect("write");
+        let loaded = load(&[portable.clone(), per_user.clone()], &per_user);
+        assert_eq!(loaded.path, portable);
+        assert_eq!(loaded.config.string_or("language", "?"), "es");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_target_prefers_a_writable_portable_dir() {
+        // The test binary's own directory is writable, so the
+        // portable target wins; an unwritable executable directory
+        // (read-only install) falls back instead of failing saves.
+        let target = default_write_target();
+        assert_eq!(target, exe_dir().expect("exe dir").join(CONFIG_FILE_NAME));
+        assert!(dir_writable(&std::env::temp_dir()));
+        assert!(!dir_writable(Path::new("/nonexistent-iptv-dir")));
     }
 
     #[test]

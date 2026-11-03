@@ -380,14 +380,33 @@ pub fn render(markdown: &str, language: &str) -> Guide {
     }
 }
 
-/// The guide directory: `IPTV_GUIDE_DIR`, else `docs/help` beside the
-/// executable, else `docs/help` in the working directory (the Python
-/// app resolves against its own tree; these are the Rust equivalents).
+/// The guide directory beside an executable: `<exe dir>/docs/help`
+/// when that folder exists (port of `user_guide.guide_dir`, which
+/// resolves against the installation/bundle directory, never the
+/// working directory).
+#[must_use]
+pub fn exe_relative_guide_dir(exe: &Path) -> Option<PathBuf> {
+    let parent = exe.parent()?;
+    let mut path = parent.to_path_buf();
+    for part in GUIDE_DIR_PARTS {
+        path.push(part);
+    }
+    path.is_dir().then_some(path)
+}
+
+/// The guide directory: `IPTV_GUIDE_DIR`, else `docs/help` beside
+/// the executable, else `docs/help` in the working directory as a
+/// last resort for development checkouts.
 #[must_use]
 pub fn guide_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("IPTV_GUIDE_DIR") {
         if !dir.trim().is_empty() {
             return PathBuf::from(dir);
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe_relative_guide_dir(&exe) {
+            return dir;
         }
     }
     let mut path = PathBuf::new();
@@ -518,6 +537,27 @@ mod tests {
             guide.section_at(second.start).map(|s| &s.topic),
             guide.find("section-2").map(|s| &s.topic)
         );
+    }
+
+    #[test]
+    fn guide_discovery_is_executable_relative_not_cwd() {
+        // S08 regression: guides installed beside the executable
+        // must be found whatever the working directory is.
+        let root = std::env::temp_dir().join(format!("iptv-guide-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let help = root.join("docs").join("help");
+        std::fs::create_dir_all(&help).expect("dirs");
+        std::fs::write(help.join("es.md"), "# Guía {#user-guide}\n\nHola.\n").expect("guide");
+        let exe = root.join("accessible-iptv-client");
+        assert_eq!(exe_relative_guide_dir(&exe), Some(help.clone()));
+        // A different folder without docs/help yields nothing.
+        let bare = root.join("bare").join("app");
+        assert_eq!(exe_relative_guide_dir(&bare), None);
+        // And the installed guide actually loads through the path.
+        let guide = load_guide(Some("es"), Some(&help));
+        assert_eq!(guide.language, "es");
+        assert!(guide.text.contains("Hola."));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

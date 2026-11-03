@@ -427,6 +427,77 @@ impl RecordingEngine {
         }
     }
 
+    /// Stop one recording with escalation (R07): write `q` on stdin,
+    /// wait up to `grace` for a graceful exit, then kill the child and
+    /// reap it. Removes the recording from the active set and returns
+    /// its finish report; `success` is the exit status success, so a
+    /// killed process reports `false`. Returns `None` when `key` is
+    /// not active.
+    pub fn stop_escalating(
+        &mut self,
+        key: &str,
+        grace: std::time::Duration,
+    ) -> Option<RecordingFinished> {
+        if !self.active.contains_key(key) {
+            return None;
+        }
+        self.stop(key);
+        let deadline = std::time::Instant::now() + grace;
+        let mut success: Option<bool> = None;
+        while let Some(active) = self.active.get_mut(key) {
+            match active.child.try_wait() {
+                Ok(Some(status)) => {
+                    success = Some(status.success());
+                    break;
+                }
+                Ok(None) => {}
+                Err(_) => {
+                    success = Some(false);
+                    break;
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let success = match success {
+            Some(success) => success,
+            None => {
+                // Still running past the grace deadline: kill and reap.
+                match self.active.get_mut(key) {
+                    Some(active) => {
+                        let _ = active.child.kill();
+                        match active.child.wait() {
+                            Ok(status) => status.success(),
+                            Err(_) => false,
+                        }
+                    }
+                    None => false,
+                }
+            }
+        };
+        let active = self.active.remove(key)?;
+        Some(RecordingFinished {
+            key: key.to_string(),
+            out_path: active.out_path,
+            success,
+        })
+    }
+
+    /// Stop every active recording with escalation (R07), returning a
+    /// finish report per recording.
+    pub fn shutdown_all(&mut self, grace: std::time::Duration) -> Vec<RecordingFinished> {
+        let keys: Vec<String> = self.active.keys().cloned().collect();
+        let mut finished = Vec::new();
+        for key in keys {
+            if let Some(report) = self.stop_escalating(&key, grace) {
+                finished.push(report);
+            }
+        }
+        finished
+    }
+
     /// Collect recordings whose ffmpeg has exited.
     pub fn poll_finished(&mut self) -> Vec<RecordingFinished> {
         let mut finished = Vec::new();
@@ -475,21 +546,148 @@ pub fn normalize_reserve_mib(value: Option<i64>) -> u64 {
     }
 }
 
-/// Free bytes on the filesystem holding `path`, when the
-/// platform can report it (Unix `df`; `None` elsewhere, which
-/// skips the gate).
+/// Parse portable `df -kP` output: the second line's fourth
+/// whitespace-separated column is the available space in KiB.
+#[must_use]
+pub fn parse_df_kp_avail(text: &str) -> Option<u64> {
+    let line = text.lines().nth(1)?;
+    let kib: u64 = line.split_whitespace().nth(3)?.parse().ok()?;
+    kib.checked_mul(1024)
+}
+
+/// Parse Windows `dir` output: the free space is the integer token
+/// immediately before `bytes free` (thousands separators stripped).
+#[must_use]
+pub fn parse_dir_free_bytes(text: &str) -> Option<u64> {
+    let at = text.rfind("bytes free")?;
+    let token = text[..at].split_whitespace().next_back()?;
+    token.replace(',', "").parse().ok()
+}
+
+/// Free bytes on the filesystem holding `path`, when the platform
+/// can report it: Unix `df` (GNU form first, portable `df -kP`
+/// fallback for macOS and other non-GNU systems), Windows `dir`;
+/// `None` elsewhere.
 #[must_use]
 pub fn free_space_bytes(path: &std::path::Path) -> Option<u64> {
-    if !cfg!(unix) {
-        return None;
+    #[cfg(unix)]
+    {
+        if let Some(output) = std::process::Command::new("df")
+            .args(["-B1", "--output=avail"])
+            .arg(path)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+        {
+            let text = String::from_utf8_lossy(&output.stdout);
+            if let Some(free) = text
+                .lines()
+                .nth(1)
+                .and_then(|line| line.trim().parse::<u64>().ok())
+            {
+                return Some(free);
+            }
+        }
+        let output = std::process::Command::new("df")
+            .arg("-kP")
+            .arg(path)
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let text = String::from_utf8_lossy(&output.stdout);
+        parse_df_kp_avail(&text)
     }
-    let output = std::process::Command::new("df")
-        .args(["-B1", "--output=avail"])
-        .arg(path)
-        .output()
-        .ok()?;
-    let text = String::from_utf8_lossy(&output.stdout);
-    text.lines().nth(1)?.trim().parse().ok()
+    #[cfg(windows)]
+    {
+        let output = std::process::Command::new("cmd")
+            .args(["/C", "dir", "/-C"])
+            .arg(path)
+            .output()
+            .ok()?;
+        let text = String::from_utf8_lossy(&output.stdout);
+        return parse_dir_free_bytes(&text);
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+/// A successful pre-recording destination check (R08): the free
+/// space found and the normalized reserve it was checked against.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StorageCheck {
+    pub free_bytes: u64,
+    pub reserve_mib: u64,
+}
+
+/// Port of Python `recording_storage.check_destination`: create the
+/// destination folder, prove it is writable with a flushed one-byte
+/// probe file, then require at least the normalized reserve of free
+/// space before any stream is opened.
+///
+/// # Errors
+///
+/// Returns a user-facing message when the folder is unavailable or
+/// not writable, when free space cannot be determined, or when free
+/// space is below the reserve.
+pub fn check_destination(dir: &Path, reserve_mib: Option<i64>) -> Result<StorageCheck, String> {
+    let reserve = normalize_reserve_mib(reserve_mib);
+    let probe_result = (|| -> Result<(), std::io::Error> {
+        std::fs::create_dir_all(dir)?;
+        if !dir.is_dir() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotADirectory,
+                "not a directory",
+            ));
+        }
+        let unique = format!(
+            ".iptv-storage-check-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        );
+        let probe_path = dir.join(unique);
+        let mut probe = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&probe_path)?;
+        let write_result = probe.write_all(b"\0").and_then(|()| probe.sync_all());
+        drop(probe);
+        let _ = std::fs::remove_file(&probe_path);
+        write_result
+    })();
+    if let Err(e) = probe_result {
+        return Err(format!(
+            "The recording folder is unavailable or not writable: {e}"
+        ));
+    }
+    let free = free_space_bytes(dir).ok_or_else(|| {
+        "Free space could not be determined: no free-space reading for this destination".to_string()
+    })?;
+    let reserve_bytes = reserve * 1024 * 1024;
+    if free < reserve_bytes {
+        return Err(format!(
+            "Not enough free space to start recording: {} MiB available; at least {} MiB required.",
+            free / (1024 * 1024),
+            reserve
+        ));
+    }
+    Ok(StorageCheck {
+        free_bytes: free,
+        reserve_mib: reserve,
+    })
+}
+
+/// True only when `path` is an existing file with bytes in it (R09):
+/// an exit-zero capture that wrote nothing did not record anything.
+#[must_use]
+pub fn output_has_media(path: &Path) -> bool {
+    std::fs::metadata(path).is_ok_and(|meta| meta.len() > 0)
 }
 
 /// `power.should_shutdown`): the option must be armed, at least one
@@ -558,6 +756,40 @@ pub fn shutdown_computer(system: &str, windows_root: &str) -> Result<Vec<String>
 
 #[cfg(test)]
 mod tests {
+    // R03: same-title downloads never truncate an earlier file; the
+    // reservation walks (2), (3)… past existing files, their .part
+    // staging files, and paths the engine already holds.
+    #[test]
+    fn unique_output_path_suffixes_past_taken_names() {
+        let dir = std::env::temp_dir().join(format!("iptv-unique-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let name = "News - BBC";
+        let first = unique_output_path(&dir, name, "ts", "2026-11-03 19-00", &[]);
+        assert_eq!(
+            first.file_name().unwrap(),
+            "News - BBC - 2026-11-03 19-00.ts"
+        );
+        std::fs::write(&first, b"x").unwrap();
+        let second = unique_output_path(&dir, name, "ts", "2026-11-03 19-00", &[]);
+        assert_eq!(
+            second.file_name().unwrap(),
+            "News - BBC - 2026-11-03 19-00 (2).ts"
+        );
+        // An in-use path is skipped even when nothing is on disk yet.
+        let third = unique_output_path(
+            &dir,
+            name,
+            "ts",
+            "2026-11-03 19-00",
+            std::slice::from_ref(&second),
+        );
+        assert_eq!(
+            third.file_name().unwrap(),
+            "News - BBC - 2026-11-03 19-00 (3).ts"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn reserve_normalization_matches_python() {
         assert_eq!(normalize_reserve_mib(Some(0)), 0);
@@ -662,6 +894,212 @@ mod tests {
         assert_eq!(finished[0].key, "channel");
         assert_eq!(finished[0].out_path, output);
         assert!(!finished[0].success);
+        assert_eq!(engine.active_count(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ----- R08: storage check and free-space parsing -----
+
+    #[test]
+    fn parse_df_kp_avail_reads_fourth_column_of_second_line() {
+        let sample = "Filesystem   1024-blocks      Used Available Capacity Mounted on\n\
+                      /dev/disk3s1   976490576 400000000 12345678    98% /\n";
+        assert_eq!(parse_df_kp_avail(sample), Some(12_345_678 * 1024));
+        assert_eq!(parse_df_kp_avail("only one line\n"), None);
+        assert_eq!(parse_df_kp_avail("a b\n1 2 3 nope\n"), None);
+        assert_eq!(parse_df_kp_avail(""), None);
+    }
+
+    #[test]
+    fn parse_dir_free_bytes_reads_token_before_bytes_free() {
+        let sample = " Volume in drive C is Windows\n\
+                      \n Directory of C:\\Recordings\n\
+                      \n2026/11/03  12:00    <DIR>          .\n\
+                      \n               0 File(s)              0 bytes\n\
+                      \n               2 Dir(s)  53,687,091,200 bytes free\n";
+        assert_eq!(parse_dir_free_bytes(sample), Some(53_687_091_200));
+        let plain = "               1 Dir(s)  987654321 bytes free";
+        assert_eq!(parse_dir_free_bytes(plain), Some(987_654_321));
+        assert_eq!(parse_dir_free_bytes("no free space line"), None);
+        assert_eq!(parse_dir_free_bytes(""), None);
+    }
+
+    #[test]
+    fn check_destination_succeeds_with_zero_reserve() {
+        let dir = std::env::temp_dir().join(format!(
+            "iptv-storage-ok-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        let check = check_destination(&dir, Some(0)).expect("check passes");
+        assert_eq!(check.reserve_mib, 0);
+        assert!(check.free_bytes > 0);
+        assert!(dir.is_dir(), "destination folder was created");
+        // The write probe must clean up after itself.
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .expect("read dir")
+            .filter_map(Result::ok)
+            .collect();
+        assert!(leftovers.is_empty(), "probe left files: {leftovers:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn check_destination_fails_when_reserve_exceeds_free_space() {
+        let dir = std::env::temp_dir().join(format!(
+            "iptv-storage-low-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        let ok = check_destination(&dir, Some(0)).expect("baseline check");
+        // A reserve guaranteed above the measured free space, capped
+        // to the accepted range so normalization keeps it as-is.
+        let too_much = (ok.free_bytes / (1024 * 1024) + 1).min(65536);
+        assert!(
+            too_much * 1024 * 1024 > ok.free_bytes || too_much == 65536,
+            "reserve must exceed free space on this disk"
+        );
+        let err = check_destination(&dir, Some(i64::try_from(too_much).expect("fits")))
+            .expect_err("oversized reserve must fail");
+        assert!(
+            err.contains("Not enough free space to start recording"),
+            "unexpected error: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn check_destination_fails_for_unwritable_path() {
+        // A path whose parent is a regular file cannot be created.
+        let base = std::env::temp_dir().join(format!(
+            "iptv-storage-blocked-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        std::fs::write(&base, b"file").expect("seed file");
+        let err =
+            check_destination(&base.join("child"), Some(0)).expect_err("child of a file must fail");
+        assert!(
+            err.contains("The recording folder is unavailable or not writable"),
+            "unexpected error: {err}"
+        );
+        let _ = std::fs::remove_file(&base);
+    }
+
+    // ----- R09: output has media -----
+
+    #[test]
+    fn output_has_media_cases() {
+        let dir = std::env::temp_dir().join(format!(
+            "iptv-media-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let missing = dir.join("missing.ts");
+        let empty = dir.join("empty.ts");
+        let nonempty = dir.join("nonempty.ts");
+        std::fs::write(&empty, b"").expect("empty");
+        std::fs::write(&nonempty, b"x").expect("nonempty");
+        assert!(!output_has_media(&missing));
+        assert!(!output_has_media(&empty));
+        assert!(output_has_media(&nonempty));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ----- R07: stop escalation -----
+
+    #[cfg(not(windows))]
+    fn stdin_cooperative_command() -> Vec<String> {
+        vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "read x; exit 0".to_string(),
+        ]
+    }
+
+    #[cfg(not(windows))]
+    fn sleeper_command() -> Vec<String> {
+        vec!["sh".to_string(), "-c".to_string(), "sleep 30".to_string()]
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn stop_escalating_cooperative_process_succeeds_quickly() {
+        let dir = std::env::temp_dir().join(format!("iptv-rec-esc-ok-{}", std::process::id()));
+        let output = dir.join("coop.ts");
+        let mut engine = RecordingEngine::new();
+        engine
+            .start("coop", &stdin_cooperative_command(), output.clone())
+            .expect("start");
+        let started = std::time::Instant::now();
+        let finished = engine
+            .stop_escalating("coop", std::time::Duration::from_secs(2))
+            .expect("finished report");
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert_eq!(finished.key, "coop");
+        assert_eq!(finished.out_path, output);
+        assert!(finished.success, "graceful q exit must succeed");
+        assert_eq!(engine.active_count(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn stop_escalating_kills_stdin_ignoring_sleeper_after_grace() {
+        let dir = std::env::temp_dir().join(format!("iptv-rec-esc-kill-{}", std::process::id()));
+        let output = dir.join("sleeper.ts");
+        let mut engine = RecordingEngine::new();
+        engine
+            .start("sleeper", &sleeper_command(), output)
+            .expect("start");
+        let started = std::time::Instant::now();
+        let finished = engine
+            .stop_escalating("sleeper", std::time::Duration::from_millis(200))
+            .expect("finished report");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "kill path took {:?}",
+            started.elapsed()
+        );
+        assert!(!finished.success, "a killed process reports false");
+        assert_eq!(engine.active_count(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn stop_escalating_unknown_key_returns_none() {
+        let mut engine = RecordingEngine::new();
+        assert!(engine
+            .stop_escalating("nope", std::time::Duration::from_millis(10))
+            .is_none());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn shutdown_all_drains_two_sleepers() {
+        let dir = std::env::temp_dir().join(format!("iptv-rec-shutdown-{}", std::process::id()));
+        let mut engine = RecordingEngine::new();
+        engine
+            .start("one", &sleeper_command(), dir.join("one.ts"))
+            .expect("start one");
+        engine
+            .start("two", &sleeper_command(), dir.join("two.ts"))
+            .expect("start two");
+        let started = std::time::Instant::now();
+        let finished = engine.shutdown_all(std::time::Duration::from_millis(200));
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert_eq!(finished.len(), 2);
+        assert!(finished.iter().all(|f| !f.success));
         assert_eq!(engine.active_count(), 0);
         let _ = std::fs::remove_dir_all(&dir);
     }

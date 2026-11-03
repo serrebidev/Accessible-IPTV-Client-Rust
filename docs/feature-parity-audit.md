@@ -1,7 +1,6 @@
 # Feature parity audit: current Python reference versus Rust
 
-Date: 2026-11-03. Status: **open gaps confirmed by source inspection**.
-The Rust port is not feature-complete against this Python reference.
+Date: 2026-11-03. Status: **addressed 2026-11-03** — every entry below carries its fix and regression evidence; the only entries not fully closed are B19 (responsiveness half open), E12 (no scale benchmark), and the recorded limits on E10, P18, R10, R19, S05 and S10. Consolidated record: docs/validation/0063-parity-audit-closure.md. Owner-heard NVDA acceptance remains separate under ADR 0004.
 
 ## Reference and scope
 
@@ -52,6 +51,8 @@ Rust `crates/iptv-core/src/config.rs:42`,
 Check: import a synthetic Python backup containing only `epgs`; open the manager,
 load its guide, edit it and round-trip the settings back to Python.
 
+**Fix:** Landed in the parity integration; regression evidence in docs/validation/batch-epg.md and validation 0063.
+
 ### E02 — Saved guide database is never reopened for reading (high)
 
 The EPG worker writes `epg.db`, but the adapter initializes `epg_store` to `None`
@@ -63,6 +64,8 @@ Rust `crates/iptv-app/src/main.rs:613`, `main.rs:4551`, `main.rs:4574`,
 `crates/iptv-core/src/epg.rs:813`.
 Check: import a guide, restart without network access, then open Channel EPG,
 What's on Now and the selected channel's information panels.
+
+**Fix:** Landed in the parity integration; regression evidence in docs/validation/batch-epg.md and validation 0063.
 
 ### E03 — EPG enable and refresh settings have no adapter behavior (medium)
 
@@ -76,6 +79,8 @@ Rust `crates/iptv-core/src/config.rs:56`, `config.rs:58`,
 Check: disabling EPG prevents automatic work; changed sources refresh; an
 automatic load decision respects the saved interval for an already usable guide.
 
+**Fix:** Landed in the parity integration; regression evidence in docs/validation/batch-epg.md and validation 0063.
+
 ### E04 — One-source or partial imports erase other sources (high)
 
 `Import EPG` loads just the chosen file. Every Rust store import deletes all
@@ -88,6 +93,8 @@ Rust `crates/iptv-app/src/main.rs:4016`,
 `crates/iptv-core/src/epgstore.rs:52`.
 Check: import independent guides A and B; re-import only A, then refresh with B
 unreachable. B's retained schedules must remain available.
+
+**Fix:** Landed in the parity integration; regression evidence in docs/validation/batch-epg.md and validation 0063.
 
 ### E05 — Invalid feeds can be reported as successful guide loads (high)
 
@@ -103,6 +110,8 @@ Rust `crates/iptv-core/src/epg.rs:186`, `epg.rs:263`, `epg.rs:795`, `epg.rs:857`
 Check: supply HTML with HTTP 200, truncated XML and a damaged gzip; retain the
 usable guide, report the failure, and retry transient transfers within bounds.
 
+**Fix:** Landed in the parity integration; regression evidence in docs/validation/batch-epg.md and validation 0063.
+
 ### E06 — Supported XMLTV variants lose programmes or text (medium)
 
 Python accepts `end` as an alternative to `stop`, calculates an end from
@@ -113,6 +122,8 @@ Evidence: Python `playlist.py:839`, `playlist.py:2698`, `playlist.py:2721`;
 Rust `crates/iptv-core/src/epg.rs:212`, `epg.rs:225`, `epg.rs:252`, `epg.rs:263`.
 Check: golden XMLTV fixtures for `end`, minute/second lengths, ISO duration,
 prefixed namespaces and CDATA must retain the same times and text as Python.
+
+**Fix:** Landed in the parity integration; regression evidence in docs/validation/batch-epg.md and validation 0063.
 
 ### E07 — Multi-source programme replacement and deduplication are absent (medium)
 
@@ -125,6 +136,8 @@ Rust `crates/iptv-core/src/epg.rs:47`, `epg.rs:67`,
 `crates/iptv-core/src/epgstore.rs:72`.
 Check: import duplicate slots, an expanded synopsis and a corrected overlapping
 time slot from two sources; compare schedule and now/next with Python.
+
+**Fix:** Landed in the parity integration; regression evidence in docs/validation/batch-epg.md and validation 0063.
 
 ### E08 — EPG rows are missing from main-window search (medium)
 
@@ -140,6 +153,8 @@ Rust `crates/iptv-core/src/search.rs:19`,
 Check: a qualifying channel-name query appends the same bounded guide rows,
 rejects stale search results and keeps their play/record actions working.
 
+**Fix:** Landed in the parity integration; regression evidence in docs/validation/batch-epg.md and validation 0063.
+
 ### E09 — Channel EPG omits descriptions, dates and full upcoming selection (medium)
 
 Rust shows at most 200 entries from one hour ago and selects row zero. It renders
@@ -152,6 +167,8 @@ Check: open a dense seven-day guide with yesterday/today/tomorrow entries; begin
 on the airing programme, distinguish dates, reach later programmes and read each
 description without replacing it with action instructions.
 
+**Fix:** Landed in the parity integration; regression evidence in docs/validation/batch-epg.md and validation 0063.
+
 ### E10 — Main information panel loses now/next context (medium)
 
 Python's highlighted-channel panel includes current title, times and description,
@@ -163,6 +180,8 @@ Rust `crates/iptv-app/src/main.rs:4945` through `main.rs:4982`.
 Check: compare the panel during a current show, a schedule gap and an empty
 description, with a next show present in every case.
 
+**Fix:** Fixed with one deliberate deviation: channels with no guide match keep the existing placeholder text instead of Python's exact wording. See docs/validation/batch-epg.md.
+
 ### E11 — Guide row freshness depends on an unrelated active worker (medium)
 
 Python uses an independent 60-second now-playing timer. Rust refreshes suffixes
@@ -173,6 +192,8 @@ Evidence: Python `main.py:1720` through `main.py:1749`;
 Rust `crates/iptv-app/src/main.rs:743` through `main.rs:777`.
 Check: finish loading, leave every worker idle, cross a programme boundary and
 verify rows update without another search, load or recording.
+
+**Fix:** Landed in the parity integration; regression evidence in docs/validation/batch-epg.md and validation 0063.
 
 ### E12 — Large-guide presentation still runs expensive work on the UI thread (high)
 
@@ -193,6 +214,8 @@ whole-guide in-memory storage limit is also still relevant; see validation 0011.
 
 ## Playlists, providers, favorites and VOD
 
+**Fix:** Fixed (algorithmic): bulk now/next snapshots replace per-channel lookups; no 500k-channel benchmark was run. See docs/validation/batch-epg.md.
+
 ### B01 — Provider playlist scopes hide their channels (high)
 
 The scope picker selects a provider account id, but the browser filters on
@@ -202,6 +225,8 @@ channels. Evidence: Python `main.py:2560`; Rust
 `crates/iptv-core/src/providers.rs:601`, `providers.rs:980`.
 Check: select each Xtream/Stalker account in Playlist view; its channels,
 categories and favorites must remain visible.
+
+**Fix:** Landed in the parity integration; regression evidence in docs/validation/batch-playlists.md and validation 0063.
 
 ### B02 — Provider reloads append duplicates and retain removed accounts (high)
 
@@ -213,12 +238,16 @@ Rust `crates/iptv-app/src/main.rs:1214`,
 Check: save an unchanged provider twice, then remove it; counts stay stable,
 then its channels disappear from every browsing surface.
 
+**Fix:** Landed in the parity integration; regression evidence in docs/validation/batch-playlists.md and validation 0063.
+
 ### B03 — Removing the last plain playlist leaves its channels (high)
 
 Rust `reload_sources` skips loading when the source list is empty. Python
 publishes the resulting empty catalogue. Evidence: Python `main.py:6734`;
 Rust `crates/iptv-app/src/main.rs:7545`.
 Check: remove the only file/URL source and save; channels and categories empty.
+
+**Fix:** Landed in the parity integration; regression evidence in docs/validation/batch-playlists.md and validation 0063.
 
 ### B04 — Editing an account deletes fields absent from the form (high)
 
@@ -230,6 +259,8 @@ existing fields. Evidence: Python `playlist.py:3431`, `playlist.py:3490`,
 Check: import non-default account settings, change only its name, and compare
 every saved field, including credentials and unknown retained settings.
 
+**Fix:** Landed in the parity integration; regression evidence in docs/validation/batch-playlists.md and validation 0063.
+
 ### B05 — Account forms cannot configure all supported provider options (high)
 
 Rust omits optional Stalker username/password, both auto-EPG switches and
@@ -239,6 +270,8 @@ Rust `crates/iptv-app/src/main.rs:7890`.
 Check: configure a credential-requiring portal and an HLS-output Xtream account
 entirely through the application.
 
+**Fix:** Landed in the parity integration; regression evidence in docs/validation/batch-playlists.md and validation 0063.
+
 ### B06 — Provider validation and MAC entry conveniences are missing (medium)
 
 Rust saves blank/untrimmed values without Python's required-field checks,
@@ -247,6 +280,8 @@ MAC action. Evidence: Python `playlist.py:3471`, `playlist.py:3593`;
 Rust `crates/iptv-app/src/main.rs:7921`.
 Check: reject incomplete accounts without closing the form; normalize accepted
 MAC spellings and provide Python's default/random MAC behavior.
+
+**Fix:** Landed in the parity integration; regression evidence in docs/validation/batch-playlists.md and validation 0063.
 
 ### B07 — M3U directives lose stream headers and catch-up fields (high)
 
@@ -258,6 +293,8 @@ Rust `crates/iptv-core/src/lib.rs:104`.
 Check: header-protected playback, recording and casting, plus directive-defined
 catch-up, receive the same user agent, referer, origin, cookies and extra headers.
 
+**Fix:** Landed in the parity integration; regression evidence in docs/validation/batch-playlists.md and validation 0063.
+
 ### B08 — Playlist-wide Dispatcharr and catch-up clock metadata is lost (high)
 
 Python reads `EXTM3U catchup-timezone`, marks channels as Dispatcharr and passes
@@ -267,6 +304,8 @@ Evidence: Python `client_m3u.py:76`, `client_m3u.py:237`;
 Rust `crates/iptv-core/src/lib.rs:104`.
 Check: import a Dispatcharr playlist; preserve its saved buffer and UTC archive
 interpretation, including around daylight-saving transitions.
+
+**Fix:** Landed in the parity integration; regression evidence in docs/validation/batch-playlists.md and validation 0063.
 
 ### B09 — Playlist-linked guide discovery and its opt-out are absent (high)
 
@@ -279,6 +318,8 @@ Python `playlist_headers.py:17`, `main.py:2469`, `main.py:6520`,
 Check: a playlist-linked guide works without manual entry; disabling/removing
 that source stops importing its guide without deleting manually added sources.
 
+**Fix:** Landed in the parity integration; regression evidence in docs/validation/batch-playlists.md and validation 0063.
+
 ### B10 — Imported Xtream favorites lose their stream-id identity (high)
 
 Python extracts `stream-id` from provider stream URLs. Rust tags provider type
@@ -288,6 +329,8 @@ entries lacking an explicit attribute. Evidence: Python `client_m3u.py:269`,
 `favorites.py:57`; Rust `crates/iptv-core/src/providers.rs:980`,
 `crates/iptv-core/src/favorites.rs:39`.
 Check: import Python Xtream favorites, refresh/renew URLs, and retain the marks.
+
+**Fix:** Landed in the parity integration; regression evidence in docs/validation/batch-playlists.md and validation 0063.
 
 ### B11 — Plain playlist cache and parsed-cache prefill are missing (high)
 
@@ -299,6 +342,8 @@ Rust `crates/iptv-core/src/sources.rs:81`, `sources.rs:152`.
 Check: reopen a previously loaded URL offline; unchanged large file/URL sources
 should expose cached entries promptly, then refresh without losing the model.
 
+**Fix:** Landed in the parity integration; regression evidence in docs/validation/batch-playlists.md and validation 0063.
+
 ### B12 — A partial plain-source failure drops usable channels (high)
 
 Rust publishes only successful sources when any source loads. Its prior-model
@@ -307,6 +352,8 @@ Python retains that source's previous channels/session. Evidence: Python
 `main.py:2248`, `main.py:2511`; Rust `crates/iptv-core/src/sources.rs:160`.
 Check: load two sources, take one offline, reload; retain both with a clear
 stale-source message for the failing member.
+
+**Fix:** Landed in the parity integration; regression evidence in docs/validation/batch-playlists.md and validation 0063.
 
 ### B13 — Source manager row actions and friendly names are missing (medium)
 
@@ -320,6 +367,8 @@ Rust `crates/iptv-app/src/main.rs:7595`, `main.rs:7624`, `main.rs:7963`,
 Check: exercise each row action, refresh one source independently and retain
 friendly names after restart.
 
+**Fix:** Landed in the parity integration; regression evidence in docs/validation/batch-playlists.md and validation 0063.
+
 ### B14 — Playlist deletion has no default-No confirmation (medium)
 
 Python names the selected playlist and asks before deletion. Rust removes it
@@ -327,6 +376,8 @@ immediately; saving makes the removal durable. Evidence: Python
 `playlist.py:3328`; Rust `crates/iptv-app/src/main.rs:7770`.
 Check: deletion names the account, defaults to keeping it and preserves all
 credentials when canceled.
+
+**Fix:** Landed in the parity integration; regression evidence in docs/validation/batch-playlists.md and validation 0063.
 
 ### B15 — Stalker top-level tokens are rejected (high)
 
@@ -337,6 +388,8 @@ nested shape in handshake/login responses. Evidence: Python `providers.py:322`,
 Check: a fake portal returning `{"token":"abc"}` supports handshake/login,
 channel loading, account information and link resolution.
 
+**Fix:** Landed in the parity integration; regression evidence in docs/validation/batch-playlists.md and validation 0063.
+
 ### B16 — Query/fragment-bearing provider URLs normalize incorrectly (medium)
 
 Python parses and rebuilds the base URL without query/fragment components before
@@ -345,6 +398,8 @@ appending API paths. Evidence: Python `providers.py:26`;
 Rust `crates/iptv-core/src/providers.rs:37`.
 Check: pasted server, userinfo, `get.php?...` and fragment-bearing variants
 normalize to the intended base and generate valid provider endpoints.
+
+**Fix:** Landed in the parity integration; regression evidence in docs/validation/batch-playlists.md and validation 0063.
 
 ### B17 — VOD ignores scope and reclassifies provider content as M3U (high)
 
@@ -355,6 +410,8 @@ the heuristic after loading provider catalogues. Evidence: Python
 `crates/iptv-core/src/vod.rs:640`.
 Check: select one playlist before entering VOD; only its entries appear, once.
 
+**Fix:** Landed in the parity integration; regression evidence in docs/validation/batch-playlists.md and validation 0063.
+
 ### B18 — Late VOD replies replace newer navigation (medium)
 
 Python rejects stale catalogue/episode generations. Rust jobs/events have no
@@ -364,6 +421,8 @@ Rust `crates/iptv-core/src/vod.rs:590`,
 `crates/iptv-app/src/main.rs:2114`.
 Check: request series A, change group/reload/close, then deliver A's late reply;
 it must not replace the current list or reopen obsolete navigation.
+
+**Fix:** Landed in the parity integration; regression evidence in docs/validation/batch-playlists.md and validation 0063.
 
 ### B19 — Large-playlist navigation still scans and clones on the UI thread (high)
 
@@ -378,6 +437,8 @@ Rust `crates/iptv-core/src/browser.rs:94`, `browser.rs:217`, `browser.rs:261`,
 Check: measure scope/category/favorite/VOD keyboard response at 500,000 channels
 with many favorites. Actual latency was not measured in this audit.
 
+**Fix:** Fixed in part: catalogue clone removed, O(1) favorite membership, VOD filtering off the UI thread. Python's background navigation index was not built and 500k-playlist latency is unmeasured; the responsiveness half of this entry stays open. See docs/validation/batch-playlists.md.
+
 ### B20 — Favorite counts remain stale and ignore scope (medium)
 
 Rust counts favorites across the whole catalogue and rebuilds category labels
@@ -389,6 +450,8 @@ Rust `crates/iptv-core/src/browser.rs:169`,
 Check: toggle favorites from All Channels and switch scopes; the displayed
 count updates immediately and agrees with the visible source.
 
+**Fix:** Landed in the parity integration; regression evidence in docs/validation/batch-playlists.md and validation 0063.
+
 ### B21 — Identical entries within one source are not deduplicated (medium)
 
 Python deduplicates by source scope, name, URL and provider id, while preserving
@@ -398,6 +461,8 @@ Rust `crates/iptv-core/src/sources.rs:160`.
 Check: repeat an entry twice in A and once in B; show one from each source.
 
 ## Playback, audio, subtitles and history
+
+**Fix:** Landed in the parity integration; regression evidence in docs/validation/batch-playlists.md and validation 0063.
 
 ### P01 — Saved/opening/recovery cache settings do not reach VLC (high)
 
@@ -411,6 +476,8 @@ Rust `crates/iptv-core/src/playback.rs:236`,
 Check: capture VLC options for initial live play, saved choices, Dispatcharr,
 stalls and rollovers; preserve the half-second start and unchanged playback rate.
 
+**Fix:** Landed in the parity integration; regression evidence in docs/validation/batch-playback.md and validation 0063.
+
 ### P02 — Closing the player leaves VLC and its buffer lease active (high)
 
 Rust's close handler stops the session and MediaCtrl but does not stop VLC,
@@ -419,6 +486,8 @@ actual engine asynchronously. Evidence: Python `internal_player.py:3328`,
 `internal_player.py:3356`; Rust `crates/iptv-app/src/main.rs:6116`.
 Check: Alt+F4 during VLC playback stops sound, upstream connection, buffer ingest
 and pending reconnect work.
+
+**Fix:** Landed in the parity integration; regression evidence in docs/validation/batch-playback.md and validation 0063.
 
 ### P03 — A frozen stream reporting Playing has no watchdog (high)
 
@@ -430,6 +499,8 @@ frozen presentation. Evidence: Python `internal_player.py:1671`,
 Check: freeze counters/position while Playing remains reported; recover within
 Python's bounds without false stalls for radio artwork or timestamp resets.
 
+**Fix:** Landed in the parity integration; regression evidence in docs/validation/batch-playback.md and validation 0063.
+
 ### P04 — Normal live TS rollovers spend the failure retry budget (high)
 
 Python distinguishes expected Xtream TS endings and reopens after 200 ms through
@@ -440,6 +511,8 @@ ordinary recovery. Evidence: Python `internal_player.py:1176`,
 Check: seven normal short TS segments continue with rollover timing and cache
 without exhausting the ordinary failure budget.
 
+**Fix:** Landed in the parity integration; regression evidence in docs/validation/batch-playback.md and validation 0063.
+
 ### P05 — Direct HLS playback ignores the rendition bitrate cap (medium)
 
 Python resolves HLS masters against the saved cap. Rust reads that cap only in
@@ -447,6 +520,8 @@ the local-buffer path and gives direct VLC playback the original URL. Evidence:
 Python `internal_player.py:1239`; Rust `crates/iptv-app/src/main.rs:5125`,
 `main.rs:6298`.
 Check: buffering off, cap below the highest rendition; select Python's rendition.
+
+**Fix:** Landed in the parity integration; regression evidence in docs/validation/batch-playback.md and validation 0063.
 
 ### P06 — Manual audio choices are not persisted or restored (high)
 
@@ -458,6 +533,8 @@ Rust `crates/iptv-app/src/main.rs:5836`, `main.rs:7010`, `main.rs:7046`.
 Check: choose different tracks for A/B, restart and revisit, then rename A's
 chosen track while retaining its slot; keep the intended selection.
 
+**Fix:** Landed in the parity integration; regression evidence in docs/validation/batch-playback.md and validation 0063.
+
 ### P07 — Late audio-track publication is never retried (medium)
 
 Rust marks tracks ready before its first fetch, so an initially empty track list
@@ -467,6 +544,8 @@ Evidence: Python `internal_player.py:2427`, `internal_player.py:2528`,
 `main.rs:6999`.
 Check: publish tracks two seconds after Playing; populate controls and apply
 the preferred selection.
+
+**Fix:** Landed in the parity integration; regression evidence in docs/validation/batch-playback.md and validation 0063.
 
 ### P08 — Embedded subtitles and VLC sidecar attachment are absent (high)
 
@@ -480,6 +559,8 @@ Rust `crates/iptv-app/src/main.rs:5515`, `main.rs:7302`,
 Check: select/disable/cycle two embedded tracks; attach an SRT and verify both
 VLC-rendered subtitles and spoken cues.
 
+**Fix:** Landed in the parity integration; regression evidence in docs/validation/batch-playback.md and validation 0063.
+
 ### P09 — Subtitle loading blocks the UI and lacks buffer/stale guards (medium)
 
 Python parses/indexes on a generation-guarded worker and refuses external files
@@ -490,6 +571,8 @@ Rust `crates/iptv-app/src/main.rs:7323`.
 Check: load a large subtitle file while navigating, switch playback before
 delivery, and test buffered playback; remain responsive and reject stale work.
 
+**Fix:** Landed in the parity integration; regression evidence in docs/validation/batch-playback.md and validation 0063.
+
 ### P10 — One-second polling skips short subtitle cues (high)
 
 Python samples cues every 150 ms; Rust samples display/speech every second.
@@ -497,6 +580,8 @@ A cue entirely between samples is never presented. Evidence: Python
 `internal_player.py:2695`; Rust `crates/iptv-app/src/main.rs:6007`,
 `main.rs:6036`, `main.rs:7478`.
 Check: a cue spanning 200–650 ms between one-second ticks displays and speaks.
+
+**Fix:** Landed in the parity integration; regression evidence in docs/validation/batch-playback.md and validation 0063.
 
 ### P11 — Subtitle review reads future cues and cannot traverse shown history (medium)
 
@@ -509,6 +594,8 @@ Rust `crates/iptv-app/src/main.rs:3027`, `main.rs:7233`.
 Check: repeated Previous walks backward; Next stops at the latest shown cue;
 review starts empty and retains shown text during gaps.
 
+**Fix:** Landed in the parity integration; regression evidence in docs/validation/batch-playback.md and validation 0063.
+
 ### P12 — Player subtitle review bypasses the selected speech backend (medium)
 
 Despite validation 0055's shared-route claim, player `announce_cue` calls the
@@ -517,6 +604,8 @@ manager/sink. Evidence: Python `internal_player.py:2795`;
 Rust `crates/iptv-app/src/main.rs:7251`.
 Check: select application voice, disable automatic speech, invoke player
 Current/Previous/Next; hear exactly one result through that voice.
+
+**Fix:** Landed in the parity integration; regression evidence in docs/validation/batch-playback.md and validation 0063.
 
 ### P13 — Player shortcut actions and volume steps differ (medium)
 
@@ -528,6 +617,8 @@ Rust `crates/iptv-app/src/main.rs:7193`.
 Check: compare defaults and remapped equivalents, including arrows inside the
 focused track choice.
 
+**Fix:** Landed in the parity integration; regression evidence in docs/validation/batch-playback.md and validation 0063.
+
 ### P14 — Stop leaves the sleep deadline and fade active (medium)
 
 Python manual Stop cancels the timer and restores fade gain. Rust `player_stop`
@@ -536,6 +627,8 @@ Python `internal_player.py:894`; Rust `crates/iptv-app/src/main.rs:6797`.
 Check: Stop during a sleep fade, play another channel and cross the old deadline;
 the new stream must retain its volume and continue playing.
 
+**Fix:** Landed in the parity integration; regression evidence in docs/validation/batch-playback.md and validation 0063.
+
 ### P15 — Saved VOD positions resume without the choice dialog (medium)
 
 Python offers Resume, Beginning and Cancel before switching playback. Rust
@@ -543,6 +636,8 @@ always supplies the saved position. Evidence: Python `internal_player.py:3058`,
 `resume_dialogs.py:13`; Rust `crates/iptv-app/src/main.rs:5017`.
 Check: all three choices work; Cancel retains the current stream and Beginning
 clears the selected bookmark.
+
+**Fix:** Landed in the parity integration; regression evidence in docs/validation/batch-playback.md and validation 0063.
 
 ### P16 — A failed resume seek can overwrite the useful checkpoint (high)
 
@@ -554,6 +649,8 @@ then checkpoints every second without confirmation. Evidence: Python
 Check: reject the initial seek; preserve the prior bookmark and report failure
 instead of deleting/replacing it through the early-position rule.
 
+**Fix:** Landed in the parity integration; regression evidence in docs/validation/batch-playback.md and validation 0063.
+
 ### P17 — Recent/previous channels lose persisted stable history (medium)
 
 Python persists a stable-key 20-entry MRU and resolves current catalogue entries.
@@ -564,6 +661,8 @@ and updates a separate Previous slot on just one play route. Evidence: Python
 Check: A/B/A creates two history rows; restart retains them; renewed URLs resolve
 fresh entries; repeated Previous toggles A/B across provider and recent routes.
 
+**Fix:** Landed in the parity integration; regression evidence in docs/validation/batch-playback.md and validation 0063.
+
 ### P18 — Blocking VLC open/stop operations run on the UI thread (high)
 
 Python serializes transport work through `VLCControl` and tears down in a worker.
@@ -573,6 +672,8 @@ Rust `crates/iptv-app/src/main.rs:5125`, `main.rs:5273`, `main.rs:6809`,
 `crates/iptv-vlc/src/lib.rs:316`, `lib.rs:355`.
 Check: inject slow open/stop operations; maintain keyboard response and ordered
 provider handoff. No real-world latency measurement is claimed here.
+
+**Fix:** Fixed with one residual: the VLC engine's final release at app exit still runs on the UI thread (the handle is created once and never replaced). See docs/validation/batch-playback.md.
 
 ### P19 — Player menu labels and fullscreen behavior are incomplete (low)
 
@@ -585,6 +686,8 @@ Python `internal_player.py:547`, `internal_player.py:2293`,
 Check: remap commands and inspect labels; enter fullscreen, inspect state/name,
 then exit with Esc.
 
+**Fix:** Landed in the parity integration; regression evidence in docs/validation/batch-playback.md and validation 0063.
+
 ### P20 — Elapsed playback/debounce timing depends on the wall clock (medium)
 
 Python uses monotonic time for launch debounce, recovery and sleep. Rust passes
@@ -594,6 +697,8 @@ Rust `crates/iptv-app/src/main.rs:4997`,
 `crates/iptv-core/src/playback.rs:453`.
 Check: move wall time forward/backward during playback; retries, sleep and
 same-stream debounce retain elapsed-time semantics.
+
+**Fix:** Landed in the parity integration; regression evidence in docs/validation/batch-playback.md and validation 0063.
 
 ### P21 — Imported Python playback bookmarks are not consumed (high)
 
@@ -608,6 +713,8 @@ and offer its saved position without losing source identity or credentials.
 
 ## Recording, DVR, catch-up, downloads and reminders
 
+**Fix:** Landed in the parity integration; regression evidence in docs/validation/batch-playback.md and validation 0063.
+
 ### R01 — Work created after idle does not restart its polling timer (high)
 
 Rust stops the completion timer when idle. Adding reminders/DVR jobs or using
@@ -618,6 +725,8 @@ Rust `crates/iptv-app/src/main.rs:762`, `main.rs:3903`, `main.rs:4602`,
 `main.rs:4620`, `main.rs:4728`.
 Check: after all loaders settle, create the first reminder, job and menu
 recording; each fires/completes without an unrelated action restarting polling.
+
+**Fix:** Landed in the parity integration; regression evidence in docs/validation/batch-recording.md and validation 0063.
 
 ### R02 — Catch-up downloads copy manifests instead of capturing media (high)
 
@@ -630,6 +739,8 @@ Rust `crates/iptv-app/src/main.rs:8926`,
 Check: download a completed HLS programme and verify playable programme media,
 not a manifest under a media extension.
 
+**Fix:** Landed in the parity integration; regression evidence in docs/validation/batch-recording.md and validation 0063.
+
 ### R03 — Same-title downloads overwrite existing recordings (high)
 
 Rust names files only from sanitized title plus `.ts` and uses `File::create`.
@@ -641,6 +752,8 @@ Rust `crates/iptv-app/src/main.rs:8935`,
 Check: download two programmes named News and repeat one request; preserve
 earlier files and refuse duplicate active captures.
 
+**Fix:** Landed in the parity integration; regression evidence in docs/validation/batch-recording.md and validation 0063.
+
 ### R04 — Archive downloads ignore output format and schedule padding (medium)
 
 Rust requests exact programme start/stop and always writes `.ts`. Python applies
@@ -649,6 +762,8 @@ Python `main.py:8232`, `main.py:8299`, `main.py:8427`;
 Rust `crates/iptv-app/src/main.rs:8878`, `main.rs:8936`.
 Check: select MP4 or audio output with nonzero padding; verify requested window,
 extension and actual container/audio contents.
+
+**Fix:** Landed in the parity integration; regression evidence in docs/validation/batch-recording.md and validation 0063.
 
 ### R05 — Failed transfers leave partial final files and lack recovery (high)
 
@@ -662,6 +777,8 @@ Rust `crates/iptv-core/src/downloads.rs:103`, `downloads.rs:109`,
 Check: interrupted reads, 503 and clean early EOF yield honest retry/failure
 outcomes without a misleading completed file.
 
+**Fix:** Landed in the parity integration; regression evidence in docs/validation/batch-recording.md and validation 0063.
+
 ### R06 — Downloads is a static snapshot with ambiguous cancellation (medium)
 
 Rust builds window rows once; polling updates stored rows without rerendering.
@@ -673,6 +790,8 @@ Rust `crates/iptv-app/src/main.rs:8956`, `main.rs:8981`, `main.rs:9024`,
 Check: leave Downloads open through progress/completion; cancel one selected
 request while another waits, then start a third without reviving canceled work.
 
+**Fix:** Landed in the parity integration; regression evidence in docs/validation/batch-recording.md and validation 0063.
+
 ### R07 — Exit does not finalize recording children; stop cannot escalate (high)
 
 Rust main close cancels browsing/buffers/timer but never stops or waits for
@@ -683,6 +802,8 @@ Rust `crates/iptv-app/src/main.rs:682`,
 `crates/iptv-core/src/recording.rs:421`.
 Check: exit during direct/buffered capture, including ffmpeg ignoring stdin;
 leave no orphan provider connection and persist the interrupted job outcome.
+
+**Fix:** Landed in the parity integration; regression evidence in docs/validation/batch-recording.md and validation 0063.
 
 ### R08 — Storage reserve is bypassed on Windows; writeability is unchecked (high)
 
@@ -697,6 +818,8 @@ Check: low-space, unknown-space and unwritable Windows destinations refuse
 capture before opening upstream. Validations 0030/0034 overstate this gate's
 platform coverage.
 
+**Fix:** Landed in the parity integration; regression evidence in docs/validation/batch-recording.md and validation 0063.
+
 ### R09 — Empty exit-zero recordings are reported as saved (high)
 
 Rust trusts ffmpeg exit status and marks DVR completion before measuring output;
@@ -705,6 +828,8 @@ Nothing was recorded. Evidence: Python `client_recording.py:18`,
 `client_recording.py:77`; Rust `crates/iptv-core/src/recording.rs:436`,
 `crates/iptv-app/src/main.rs:1865`, `main.rs:1878`.
 Check: exit-zero/no-file and zero-byte captures never become Completed/saved.
+
+**Fix:** Landed in the parity integration; regression evidence in docs/validation/batch-recording.md and validation 0063.
 
 ### R10 — Recording does not use the heard/preferred audio track (medium)
 
@@ -715,6 +840,8 @@ passes it into capture. Evidence: Python `main.py:3690`, `main.py:3780`,
 Check: choose audio description and capture manually, by DVR and from catch-up;
 audio-only output contains that track and video output defaults to it.
 
+**Fix:** Fixed with one bound: the preferred-audio probe is capped at 6 s where Python allows 20 s. See docs/validation/batch-recording.md.
+
 ### R11 — Separate radio/video recording presets are unused (medium)
 
 Rust captures through legacy `recording_format` despite storing audio/video
@@ -724,6 +851,8 @@ Rust `crates/iptv-core/src/config.rs:64`,
 `crates/iptv-app/src/main.rs:1390`, `main.rs:3855`, `main.rs:4621`.
 Check: keep different radio/TV presets across manual, scheduled and archive work.
 
+**Fix:** Landed in the parity integration; regression evidence in docs/validation/batch-recording.md and validation 0063.
+
 ### R12 — Simultaneous reminders are marked delivered without all being spoken (high)
 
 Rust marks every due row Notified but announces only the first string. Python
@@ -731,6 +860,8 @@ acknowledges one delivered reminder at a time. Evidence: Python
 `planning_ui.py:199`, `planning_ui.py:220`;
 Rust `crates/iptv-app/src/main.rs:1331`, `main.rs:1350`.
 Check: three simultaneous reminders each deliver exactly once.
+
+**Fix:** Landed in the parity integration; regression evidence in docs/validation/batch-recording.md and validation 0063.
 
 ### R13 — Reminder lead editing, state and delivery actions are missing (medium)
 
@@ -742,6 +873,8 @@ Rust `crates/iptv-app/src/main.rs:4604`, `main.rs:8528`.
 Check: create/edit zero- and 30-minute leads, inspect Notified/Expired states,
 clear reminders and open the uniquely resolved notified channel.
 
+**Fix:** Landed in the parity integration; regression evidence in docs/validation/batch-recording.md and validation 0063.
+
 ### R14 — Channel context scheduling/reminding targets the wrong programme (medium)
 
 Rust schedules the airing programme immediately instead of opening Python's
@@ -751,6 +884,8 @@ reminder builder rejects as already started. Evidence: Python `main.py:2768`,
 `main.rs:4734`, `crates/iptv-core/src/reminders.rs:115`.
 Check: Schedule opens upcoming programme choices; Reminder operates on a future
 programme rather than submitting an impossible current-programme request.
+
+**Fix:** Landed in the parity integration; regression evidence in docs/validation/batch-recording.md and validation 0063.
 
 ### R15 — Duplicate schedules and creation-time overlap confirmation are absent (medium)
 
@@ -762,6 +897,8 @@ asks before overlaps. Start-time connection conflict handling in validations
 Check: scheduling one programme twice creates one job; overlaps get Python's
 explicit confirmation before adding work.
 
+**Fix:** Landed in the parity integration; regression evidence in docs/validation/batch-recording.md and validation 0063.
+
 ### R16 — Recurrence cannot be authored through the GUI (medium)
 
 Rust job construction hardcodes `repeat: "none"`; Python exposes Daily, Weekly
@@ -771,6 +908,8 @@ Evidence: Python `main.py:9329`, `dialogs_misc.py:1100`;
 Rust `crates/iptv-app/src/main.rs:4648`, `main.rs:4821`.
 Check: create daily/weekly jobs and observe following occurrences; Series follows
 matching guide episodes once the previously recorded scanning gap is closed.
+
+**Fix:** Landed in the parity integration; regression evidence in docs/validation/batch-recording.md and validation 0063.
 
 ### R17 — Shutdown arming/cancel/revalidation differs (high)
 
@@ -783,12 +922,16 @@ Rust `crates/iptv-app/src/main.rs:1860`, `main.rs:1901`, `main.rs:3836`,
 Check: arming after an old completed capture must not immediately shut down;
 cancel clears the saved option, and explicit rearming allows a new countdown.
 
+**Fix:** Landed in the parity integration; regression evidence in docs/validation/batch-recording.md and validation 0063.
+
 ### R18 — Stop Recording loses the single-active-recording fallback (low)
 
 Rust requires the selected channel to be recording. Python stops the sole
 active recording even after selection moves, and handles zero/multiple cases.
 Evidence: Python `main.py:3857`; Rust `crates/iptv-app/src/main.rs:3786`.
 Check: record A, select B, invoke Stop Recording; stop A as Python does.
+
+**Fix:** Landed in the parity integration; regression evidence in docs/validation/batch-recording.md and validation 0063.
 
 ### R19 — Scheduled Recordings omits fields and keyboard batch operations (low)
 
@@ -800,6 +943,8 @@ Delete and context cancel/delete. Evidence: Python `main.py:9013`,
 Check: retain a later selected job on refresh, inspect format/end time and
 remove selected completed jobs through the keyboard.
 
+**Fix:** Fixed with one omission: Python's right-click menu was not ported; buttons and keyboard (Ctrl+A, Delete) cover the actions. See docs/validation/batch-recording.md.
+
 ### R20 — Catch-up browsing omits dates, descriptions and return behavior (medium)
 
 Rust shows only clock/title rows and Play/Download/Close buttons, without
@@ -810,6 +955,8 @@ selection after player close. Evidence: Python `dialogs_misc.py:473`,
 Rust `crates/iptv-app/src/main.rs:8805`, `main.rs:8829`.
 Check: distinguish same-time episodes on different dates, read descriptions,
 activate through Enter/context menu and return to the played programme.
+
+**Fix:** Landed in the parity integration; regression evidence in docs/validation/batch-recording.md and validation 0063.
 
 ### R21 — Buffered recording contains an overlapping mutable borrow (high)
 
@@ -826,6 +973,8 @@ store/release its lease without panic and without an extra provider connection.
 
 ## Platform integration, casting, localization and help
 
+**Fix:** Landed in the parity integration; regression evidence in docs/validation/batch-recording.md and validation 0063.
+
 ### S01 — Single-instance handover and restore are absent (high)
 
 Python locks per user and sends a second launch to the existing window. Rust
@@ -834,6 +983,8 @@ and provider connections. Evidence: Python `main.py:9417`,
 `single_instance.py:58`; Rust `crates/iptv-app/src/main.rs:37`.
 Check: launch again while minimized to tray; restore the original window without
 another scheduler, and handle an unresponsive existing instance clearly.
+
+**Fix:** Landed in the parity integration; regression evidence in docs/validation/batch-platform.md and validation 0063.
 
 ### S02 — Portable settings lookup ignores the executable directory (high)
 
@@ -847,6 +998,8 @@ Check: launch through Explorer/a shortcut with another working directory and
 both config copies present; portable settings win and persist, with a working
 fallback when the portable directory is unwritable.
 
+**Fix:** Landed in the parity integration; regression evidence in docs/validation/batch-platform.md and validation 0063.
+
 ### S03 — Header-bearing casts advertise an unreachable loopback URL (high)
 
 The app proxies streams needing headers, but the proxy binds and advertises
@@ -856,6 +1009,8 @@ Rust `crates/iptv-app/src/main.rs:2214`,
 `crates/iptv-core/src/proxy.rs:40`.
 Check: cast protected HLS/TS to another host; the advertised URL and rewritten
 segments are reachable there and preserve required headers.
+
+**Fix:** Landed in the parity integration; regression evidence in docs/validation/batch-platform.md and validation 0063.
 
 ### S04 — Casting guesses MIME from an opaque proxy URL (medium)
 
@@ -867,6 +1022,8 @@ retains the probed MIME independently of the playback URL. Evidence: Python
 Check: inspect UPnP/Roku requests for protected HLS/TS; preserve the original
 media format in renderer metadata.
 
+**Fix:** Landed in the parity integration; regression evidence in docs/validation/batch-platform.md and validation 0063.
+
 ### S05 — Logs and copied diagnostics are placeholders (medium)
 
 Python opens actual logs and copies operational details plus a redacted,
@@ -876,6 +1033,8 @@ sink/tracing dependency is configured in the Rust crates. Evidence: Python
 `main.py:4173`; Rust `crates/iptv-app/src/main.rs:3962`.
 Check: trigger a harmless synthetic media/guide error; expose its real log,
 copy redacted useful diagnostics and report clipboard failure.
+
+**Fix:** Fixed with one deviation: logs live in the config directory's logs folder on all platforms. See docs/validation/batch-platform.md.
 
 ### S06 — UI translation bypasses and language activation remain (medium)
 
@@ -890,6 +1049,8 @@ containing names/counts translate, interpolating after lookup. Changing language
 affects new dialogs immediately. Missing bundled resources are a separate known
 limit below, not a reason to declare these call sites translated.
 
+**Fix:** Landed in the parity integration; regression evidence in docs/validation/batch-platform.md and validation 0063.
+
 ### S07 — Automatic update checks run only at startup (medium)
 
 Python schedules startup and hourly checks. Rust calls its automatic check only
@@ -897,6 +1058,8 @@ at startup; toggling the option only changes configuration. Evidence: Python
 `main.py:1235`; Rust `crates/iptv-app/src/main.rs:4404`, `main.rs:3934`.
 Check: start a session with automatic updates enabled; subsequent hourly checks
 occur, and disabling the option suppresses them.
+
+**Fix:** Landed in the parity integration; regression evidence in docs/validation/batch-platform.md and validation 0063.
 
 ### S08 — External help discovery depends on the working directory (low)
 
@@ -907,6 +1070,8 @@ Rust `crates/iptv-core/src/guide.rs:383`.
 Check: install translated guides beside the executable, launch elsewhere and
 open the appropriate guide through F1 instead of embedded English fallback.
 
+**Fix:** Landed in the parity integration; regression evidence in docs/validation/batch-platform.md and validation 0063.
+
 ### S09 — What's New has no localized notes/history path (low)
 
 Python localizes recent notes and supports older-history expansion. Rust inserts
@@ -916,6 +1081,8 @@ Rust `crates/iptv-app/src/main.rs:9309`,
 `crates/iptv-core/src/i18n.rs:542`.
 Check: show notes for the running Rust version, translated recent entries and
 keyboard-reachable older history.
+
+**Fix:** Landed in the parity integration; regression evidence in docs/validation/batch-platform.md and validation 0063.
 
 ### S10 — Context-sensitive F1 help stops at the main controls (medium)
 
@@ -1015,3 +1182,6 @@ code fences; matching reference revisions; only the four intended documentation
 files changed; Python tracked files unchanged. Whitespace checks include the new,
 untracked audit file. The separate Rust 2021 borrow probe passed as described in
 R21. No application build or full-suite pass is claimed.
+
+**Fix:** Fixed with a recorded limit: wxdragon exposes no API to identify an open menu's highlighted item, so F1 from an open menu falls back to the last focused control's topic. See docs/validation/batch-platform.md.
+

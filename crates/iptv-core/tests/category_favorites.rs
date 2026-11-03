@@ -24,7 +24,7 @@ fn wait(browser: &mut BrowserWorker, query: &str) -> SearchResults {
         match browser.poll(query) {
             Some(BrowseEvent::Results(results)) => return results,
             Some(BrowseEvent::Recovery(error)) => panic!("unexpected recovery: {error:?}"),
-            None => {
+            Some(BrowseEvent::Loaded { .. }) | None => {
                 assert!(Instant::now() < deadline, "browse timed out");
                 std::thread::sleep(Duration::from_millis(1));
             }
@@ -168,7 +168,7 @@ fn failed_load_keeps_the_active_category_projection() {
         match browser.poll("") {
             Some(BrowseEvent::Recovery(_)) => break true,
             Some(BrowseEvent::Results(_)) => break false,
-            None => {
+            Some(BrowseEvent::Loaded { .. }) | None => {
                 assert!(Instant::now() < deadline, "browse timed out");
                 std::thread::sleep(Duration::from_millis(1));
             }
