@@ -6956,18 +6956,19 @@ fn poll_fallback_state(player: &Rc<RefCell<PlayerState>>, persist: &Persist, sta
                 }
             }
             MediaState::Stopped => {
-                if !matches!(
+                let confirmed = matches!(
                     state.session.state(),
                     SessionState::Playing | SessionState::Paused
-                ) {
-                    return;
-                }
+                );
                 let (position, length) = (win.media.tell(), win.media.length());
                 let near_end = length > 0 && position >= length - 1500;
-                let event = if near_end {
-                    EngineEvent::Ended
-                } else {
-                    EngineEvent::Stalled
+                // The withholding decision itself lives in the
+                // core (fallback_stop) so it carries a regression
+                // test; this arm only executes its verdict.
+                let event = match iptv_core::playback::fallback_stop(confirmed, near_end) {
+                    iptv_core::playback::FallbackStop::Withhold => return,
+                    iptv_core::playback::FallbackStop::Ended => EngineEvent::Ended,
+                    iptv_core::playback::FallbackStop::Stalled => EngineEvent::Stalled,
                 };
                 let action = state.session.on_event(event, now_ms());
                 drop(state);
