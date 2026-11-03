@@ -53,7 +53,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .with_style(TextCtrlStyle::ProcessEnter)
             .build();
         search.set_accessibility_label("Search channels");
-        search.set_accessibility_description("Type to filter channel names within the active category. Tab or Enter moves to Channels; Shift+Tab returns to Categories.");
         // Keep the label immediately before the list for native MSW accessible naming.
         let label = StaticText::builder(&panel).with_label("Channels").build();
         let list = ListCtrl::builder(&panel)
@@ -205,9 +204,6 @@ fn scope_controls(panel: Panel) -> (StaticText, Choice) {
         .build();
     let choice = Choice::builder(&panel).build();
     choice.set_accessibility_label("Playlist view");
-    choice.set_accessibility_description(
-        "Choose one playlist or All playlists. Categories and Channels show only the chosen playlist.",
-    );
     choice.append("All playlists");
     choice.set_selection(0);
     (label, choice)
@@ -233,7 +229,6 @@ fn category_controls(panel: Panel) -> (StaticText, TreeCtrl) {
         .with_style(TreeCtrlStyle::HideRoot)
         .build();
     category.set_accessibility_label("Categories");
-    category.set_accessibility_description("Choose All Channels, Favorites, or a playlist group. Tab moves to Search; Shift+Tab returns to Playlist view.");
     if let Some(root) = category.add_root("Categories", None, None) {
         category.append_item(&root, "All Channels", None, None);
         category.append_item(&root, "Favorites", None, None);
@@ -735,7 +730,7 @@ fn bind_completion(wiring: &Wiring, controls: Controls) {
             }
             Some(BrowseEvent::Recovery(error)) => {
                 status.set_label(error.message());
-                list.set_accessibility_description(error.message());
+                list.set_accessibility_description("");
             }
             None => {}
         }
@@ -839,6 +834,21 @@ fn bind_actions(_frame: Frame, wiring: &Wiring, controls: Controls) {
     // Only an explicit user action moves keyboard focus. A late completion can
     // update item state but never interrupt a new editing session in Search.
     search.on_text_enter(move |_| list.set_focus());
+    // Entering Search selects the whole query by default, so
+    // typing replaces it; Ctrl+A selects all explicitly and is
+    // consumed, like a native edit field.
+    search.bind_internal(EventType::SET_FOCUS, move |event| {
+        search.select_all();
+        event.skip(true);
+    });
+    search.bind_internal(EventType::KEY_DOWN, move |event| {
+        if key_event_label(event).as_deref() == Some("Ctrl+A") {
+            search.select_all();
+            event.skip(false);
+        } else {
+            event.skip(true);
+        }
+    });
 
     let category_browser = Rc::clone(&browser);
     let category_timer = Rc::clone(&timer);
@@ -1960,12 +1970,8 @@ fn build_vod_window() -> (Frame, ListBox, ListBox, Button, Button, Status) {
     let panel = Panel::builder(&frame).build();
     let groups = ListBox::builder(&panel).build();
     groups.set_accessibility_label("VOD groups");
-    groups.set_accessibility_description("Choose a movie or series group. Tab moves to Items.");
     let items = ListBox::builder(&panel).build();
     items.set_accessibility_label("VOD items");
-    items.set_accessibility_description(
-        "Choose a movie or series. Play / Open plays a movie or opens a series.",
-    );
     let play = Button::builder(&panel).with_label("&Play / Open").build();
     play.set_accessibility_label("Play or open selected item");
     let back = Button::builder(&panel).with_label("&Back").build();
@@ -2267,9 +2273,6 @@ fn ensure_cast_ui(
     let panel = Panel::builder(&frame).build();
     let devices = ListBox::builder(&panel).build();
     devices.set_accessibility_label("Cast devices");
-    devices.set_accessibility_description(
-        "Choose a device. Play sends the selected channel to it; Stop ends the cast.",
-    );
     let play = Button::builder(&panel).with_label("&Play").build();
     play.set_accessibility_label("Play on device");
     let stop = Button::builder(&panel).with_label("&Stop").build();
@@ -4424,7 +4427,6 @@ fn ensure_guide_ui(slot: &Rc<RefCell<Option<GuideUi>>>) -> GuideUi {
     let panel = Panel::builder(&frame).build();
     let toc = ListBox::builder(&panel).build();
     toc.set_accessibility_label("Table of contents");
-    toc.set_accessibility_description("Choose a section to read it in the guide text.");
     let body = TextCtrl::builder(&panel)
         .with_style(TextCtrlStyle::ReadOnly | TextCtrlStyle::MultiLine)
         .build();
@@ -5406,9 +5408,6 @@ fn ensure_player_window(player: &Rc<RefCell<PlayerState>>, persist: &Persist, st
         .with_label("Load &subtitles…")
         .build();
     subs.set_accessibility_label("Load subtitles");
-    subs.set_accessibility_description(
-        "Load an SRT, WebVTT or ASS subtitle file for this playback. When Speak subtitles is on in settings, cues are announced as they play.",
-    );
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     sizer.add(&media, 1, SizerFlag::Expand | SizerFlag::All, 4);
     sizer.add(&seek, 0, SizerFlag::Expand | SizerFlag::All, 4);
@@ -8101,9 +8100,6 @@ fn whats_on_layout(
         .with_style(TextCtrlStyle::ProcessEnter)
         .build();
     filter.set_accessibility_label("Filter programs");
-    filter.set_accessibility_description(
-        "Type to filter programmes by title or channel name. Enter moves to the programme list.",
-    );
     let count_label = StaticText::builder(&panel).with_label("0 programs").build();
     let play = Button::builder(&panel).with_label("&Play").build();
     let schedule = Button::builder(&panel)
@@ -9108,19 +9104,24 @@ where
 {
     let wiring = clone_wiring(wiring);
     control.bind_internal(EventType::KEY_DOWN, move |event| {
-        dispatch_main_hotkey(&wiring, controls, status, event);
-        event.skip(true);
+        // A matched hotkey is consumed: skipping it would let the
+        // focused control ALSO process the key, so Ctrl+Up/Down
+        // moved the list/tree selection while changing volume.
+        let handled = dispatch_main_hotkey(&wiring, controls, status, event);
+        event.skip(!handled);
     });
 }
 
+/// Returns whether the key matched a configured main-window
+/// action (and was therefore consumed).
 fn dispatch_main_hotkey(
     wiring: &Wiring,
     controls: Controls,
     status: Status,
     event: wxdragon::event::Event,
-) {
+) -> bool {
     let Some(label) = key_event_label(event) else {
-        return;
+        return false;
     };
     let config = serde_json::Value::Object(wiring.persist.config.borrow().raw().clone());
     let keys = iptv_core::shortcuts::effective(&config, "main");
@@ -9141,6 +9142,7 @@ fn dispatch_main_hotkey(
                 player_set_volume(&player, value);
                 status.set_label(&format!("Volume {value} percent."));
             }
+            true
         }
         Some("record") => {
             if let Some(channel) = selected_channel(&wiring.browser, &wiring.model, controls.list) {
@@ -9154,8 +9156,9 @@ fn dispatch_main_hotkey(
             } else {
                 status.set_label("Select a channel to record first.");
             }
+            true
         }
-        _ => {}
+        _ => false,
     }
 }
 
@@ -9498,9 +9501,11 @@ fn publish_results(
         list.refresh_items(0, count - 1);
     }
     // Search/category completions update visible status without repeating a
-    // live announcement already made for the deliberate action.
+    // live announcement already made for the deliberate action. The
+    // message is status text only: as the list's accessible
+    // description NVDA would re-read it on every focus entry.
     status.set_silent(&message);
-    list.set_accessibility_description(&message);
+    list.set_accessibility_description("");
     std::thread::spawn(move || drop(previous));
 }
 
