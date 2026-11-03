@@ -1,5 +1,13 @@
 # GUI parity audit: Python client vs Rust client (2026-11-01)
 
+**Current status, 2026-11-03:** this is a historical surface inventory.
+Its closure statements below do not establish full behavior parity.
+The [current feature parity audit](feature-parity-audit.md) compares
+Python v1.150.58 with Rust v0.4.4 and records gaps behind implemented
+menus and controls, including evidence that supersedes several claims
+below. Use that ledger for outstanding work; retain this record for
+the original alignment program and its historical evidence.
+
 Brandon's direction: the Rust GUI should be the Python GUI, UI-wise.
 The Python app's `client_ui.py` (`_build_ui`), `main.py`, and
 `internal_player.py` are the spec. This audit inventories both sides

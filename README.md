@@ -1,39 +1,42 @@
 # Accessible-IPTV-Client-Rust
 
-Rust port of Accessible-IPTV-Client. Feature-complete at v0.2.0 with a
-graphical interface and user experience matching the Python client.
-The Python app remains the shipping product; this port is the Rust
-successor, released in parallel.
+Rust port of Accessible-IPTV-Client, released in parallel while the
+Python app remains the shipping product. The port has a wxDragon
+desktop interface and core implementations, but the
+[current feature parity audit](docs/feature-parity-audit.md) records
+remaining behavior gaps against Python v1.150.58. The Rust port is
+not yet feature-complete against that reference.
 
 ## What it does
 
 - Browse playlists from local files, remote URLs, Xtream Codes and
   Stalker Portal accounts, with a Playlist view scope, a Categories
   tree, favorites and a channel context menu.
-- Built-in player driven by libVLC when VLC is installed (system
-  media control as fallback), plus external players (VLC, MPC,
+- Built-in player driven by libVLC (bundled in release packages;
+  system media control as fallback), plus external players (VLC, MPC,
   MPC-BE, Kodi, Winamp, Foobar2000, MPV, SMPlayer, Totem, custom).
-  Seek and volume sliders, audio track selection with per-channel
-  memory and preferred-track rules, sidecar subtitles with
+  Seek and volume sliders, audio track selection and preferred-track
+  rules, sidecar subtitles with
   screen-reader speech, resume positions and a play history.
-- Programme guide from XMLTV files and URLs, stored in a local
+- Programme guide from XMLTV files and URLs, mirrored into a local
   SQLite database: episode descriptions, What's on Now, per-channel
   guide, reminders and catch-up playback and downloads.
 - Recording: manual and scheduled recordings (DVR) with padding,
-  ten format presets, a configurable minimum-free-space reserve,
+  ten format presets, a minimum-free-space setting (Windows
+  enforcement remains a gap),
   and shutdown-after-recordings with a 60-second countdown.
   Scheduled Stalker recordings resolve a fresh stream link at
   their start time and retry until their window closes.
-- Casting to UPnP/DLNA renderers, Roku players and Sonos speakers,
-  with a local proxy for channels whose streams need custom
-  headers.
+- Casting to UPnP/DLNA renderers and Roku players. Header-protected
+  casting has proxy gaps; other Caster protocols remain incomplete.
 - Provider playlists are cached on disk for six hours, with the
   cached copy used (and announced) when a portal is unreachable.
-- Check for Updates downloads the new package, verifies its
-  SHA-256 and opens it for install.
+- Check for Updates uses ship-shape to verify minisign signatures;
+  Windows/Linux self-install and relaunch, while macOS opens the
+  verified disk image for manual installation.
 - Full menus (File, Player, View, Options, Recordings, Help), a
-  keyboard shortcuts editor, per-control F1 help, and gettext
-  translations.
+  keyboard shortcuts editor, per-control F1 help on main controls,
+  and gettext support. Bundled translation resources remain incomplete.
 
 ## Crates
 
@@ -76,15 +79,18 @@ with `cargo run -p iptv-app`.
 
 Tagged versions build on Windows, Linux and macOS and publish
 platform packages plus an `update-manifest.json` (see
-`.github/workflows/release.yml` and `PACKAGING.md`). Latest
-release: v0.2.0.
+`.github/workflows/release.yml` and `PACKAGING.md`).
 
 ## Evidence
 
 Design and parity records live under `docs/`:
 
-- [the GUI parity audit](docs/gui-parity-audit.md), closed out by
-  its 2026-11-01 verification update.
+- [the current feature parity audit](docs/feature-parity-audit.md):
+  source-linked gaps across major features and smaller behaviors,
+  with focused acceptance cases and evidence limits.
+- [the historical GUI parity audit](docs/gui-parity-audit.md):
+  the original surface inventory and its implementation updates.
+  Those updates do not close the newer behavior gaps.
 - [the replacement-gate pack](docs/validation/0033-replacement-gate-pack.md):
   the evidence ledger for v0.2.0 readiness, including the
   owner-heard NVDA checklist (issue #86) whose pass remains the

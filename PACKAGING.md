@@ -29,12 +29,15 @@ data files at runtime:
   works with no VLC install; a system VLC is only a fallback.
   Added 2026-11-02 after the v0.3.2 package shipped without it
   and the built-in player could not start (validation 0048);
-- `docs/help/*.md` — guide translations as they land (the app
-  prefers the on-disk file for the resolved language and falls back
-  to the embedded English guide);
-- `locale/<lang>/LC_MESSAGES/iptvclient.mo` and
-  `release_notes.mo` — the gettext catalogues, shared with the
-  Python product, which the i18n engine loads unchanged;
+- `docs/help/*.md` — currently English only. Translated guides remain
+  to be ported. Executable-relative discovery also has a gap when
+  the working directory differs (audit S08);
+- gettext expects `locale/<lang>/LC_MESSAGES/iptvclient.mo` and
+  `release_notes.mo`, compatible with the Python catalogues. The
+  current Rust tree has no compiled catalogues, and release staging
+  does not copy a locale directory. This is a packaging gap, not a
+  shipped translation set; see the
+  [feature parity audit](docs/feature-parity-audit.md#previously-documented-limits-still-relevant);
 - `update-manifest.json` — the updater manifest asset, uploaded as
   a separate release asset next to the archive, with fields:
   `version`, `asset_filename`, `download_url`, `sha256` (of the
