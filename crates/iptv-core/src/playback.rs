@@ -477,6 +477,9 @@ pub enum SessionState {
     Paused,
     Ended,
     Failed(String),
+    /// The reconnect budget or the startup deadline ran out
+    /// (Python's "Stream lost").
+    Lost,
 }
 
 /// Events the engine side feeds the session.
@@ -493,20 +496,60 @@ pub enum EngineEvent {
 pub enum EngineAction {
     None,
     Load(PlaybackRequest),
-    Reconnect(PlaybackRequest),
+    /// Reload after `delay_ms`; the caller guards execution with
+    /// the session generation so a superseded retry never fires.
+    Reconnect(PlaybackRequest, i64),
     Stop,
 }
 
-const MAX_RECONNECTS: u32 = 3;
+/// Reconnect attempts per channel choice (Python
+/// `_max_reconnect_attempts`).
+pub const MAX_RECONNECTS: u32 = 6;
+/// No-playback deadline from the moment a channel is chosen;
+/// retries never extend it (Python `_first_play_deadline_seconds`).
+pub const STARTUP_DEADLINE_MS: i64 = 30_000;
+/// Silence this long after a (re)start counts as "no media
+/// received" and earns a reconnect (Python
+/// `_first_start_buffer_timeout_seconds`).
+const FIRST_START_TIMEOUT_MS: i64 = 25_000;
+/// Post-start buffering this long earns a reconnect (Python's
+/// prolonged-buffering restart).
+const STALL_LIMIT_MS: i64 = 10_000;
+/// Quiet this long resets the reconnect budget (Python
+/// `_reconnect_reset_window`).
+const BUDGET_RESET_MS: i64 = 120_000;
 
-/// The playback session: owns the current request, reconnect policy for
-/// live streams, and volume (2% fine / 5% coarse steps, as in Python).
+/// Backoff before reconnect `attempt` (1-based), Python's table:
+/// 0.4, 2, 4, 8, 8, 8 seconds.
+#[must_use]
+pub fn reconnect_delay_ms(attempt: u32) -> i64 {
+    if attempt <= 1 {
+        400
+    } else {
+        (1000 * 2_i64.pow(attempt - 1)).min(8000)
+    }
+}
+
+/// The playback session: owns the current request, the bounded
+/// recovery policy (six reconnects under one 30-second startup
+/// deadline, Python's internal-player rules), and volume (2% fine
+/// / 5% coarse steps, as in Python). Time is injected (`now_ms`)
+/// so tests drive it with fake clocks. Every `play` and `stop`
+/// bumps the generation; delayed work carries the generation it
+/// was scheduled under and must not fire once it has moved on.
 #[derive(Debug)]
 pub struct PlaybackSession {
     state: SessionState,
     current: Option<PlaybackRequest>,
-    reconnects: u32,
+    attempts: u32,
     volume: i32,
+    generation: u64,
+    chosen_ms: i64,
+    started_ms: i64,
+    last_attempt_ms: Option<i64>,
+    played: bool,
+    last_error: Option<String>,
+    stall_since_ms: Option<i64>,
 }
 
 impl Default for PlaybackSession {
@@ -521,22 +564,50 @@ impl PlaybackSession {
         Self {
             state: SessionState::Idle,
             current: None,
-            reconnects: 0,
+            attempts: 0,
             volume: 100,
+            generation: 0,
+            chosen_ms: 0,
+            started_ms: 0,
+            last_attempt_ms: None,
+            played: false,
+            last_error: None,
+            stall_since_ms: None,
         }
     }
 
-    pub fn play(&mut self, request: PlaybackRequest) -> EngineAction {
+    pub fn play(&mut self, request: PlaybackRequest, now_ms: i64) -> EngineAction {
+        self.generation += 1;
         self.current = Some(request.clone());
-        self.reconnects = 0;
+        self.attempts = 0;
+        self.chosen_ms = now_ms;
+        self.started_ms = now_ms;
+        self.last_attempt_ms = None;
+        self.played = false;
+        self.last_error = None;
+        self.stall_since_ms = None;
         self.state = SessionState::Opening;
         EngineAction::Load(request)
     }
 
     pub fn stop(&mut self) -> EngineAction {
+        self.generation += 1;
         self.current = None;
         self.state = SessionState::Idle;
         EngineAction::Stop
+    }
+
+    /// The current generation; delayed callbacks compare against
+    /// it and drop themselves when it has moved on.
+    #[must_use]
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Reconnect attempts spent on the current request.
+    #[must_use]
+    pub const fn attempts(&self) -> u32 {
+        self.attempts
     }
 
     pub fn toggle_pause(&mut self) {
@@ -547,36 +618,119 @@ impl PlaybackSession {
         }
     }
 
-    pub fn on_event(&mut self, event: EngineEvent) -> EngineAction {
+    /// Engine buffering on/off (post-start prolonged buffering
+    /// earns a reconnect through `on_tick`).
+    pub fn note_buffering(&mut self, buffering: bool, now_ms: i64) {
+        if !self.played {
+            return;
+        }
+        if buffering {
+            if self.stall_since_ms.is_none() {
+                self.stall_since_ms = Some(now_ms);
+            }
+        } else {
+            self.stall_since_ms = None;
+        }
+    }
+
+    pub fn on_event(&mut self, event: EngineEvent, now_ms: i64) -> EngineAction {
         match event {
             EngineEvent::Started => {
-                self.state = SessionState::Playing;
-                self.reconnects = 0;
-                EngineAction::None
-            }
-            EngineEvent::Stalled => {
-                if let (true, Some(request)) = (
-                    self.current.as_ref().is_some_and(|r| r.live),
-                    self.current.clone(),
-                ) {
-                    if self.reconnects < MAX_RECONNECTS {
-                        self.reconnects += 1;
-                        self.state = SessionState::Opening;
-                        return EngineAction::Reconnect(request);
-                    }
+                if self.current.is_none() {
+                    return EngineAction::None; // stale engine callback
                 }
-                self.state = SessionState::Failed("Playback stalled.".to_string());
-                EngineAction::Stop
-            }
-            EngineEvent::Ended => {
-                self.state = SessionState::Ended;
+                self.state = SessionState::Playing;
+                self.played = true;
+                self.stall_since_ms = None;
                 EngineAction::None
             }
-            EngineEvent::Error(message) => {
-                self.state = SessionState::Failed(message);
-                EngineAction::Stop
+            EngineEvent::Stalled => self.recover(now_ms, "stream stopped unexpectedly"),
+            EngineEvent::Ended => {
+                if self.current.as_ref().is_some_and(|r| r.live) {
+                    self.recover(now_ms, "stream ended unexpectedly")
+                } else {
+                    self.state = SessionState::Ended;
+                    EngineAction::None
+                }
+            }
+            EngineEvent::Error(message) => self.recover(now_ms, &message),
+        }
+    }
+
+    /// Periodic drive (the desktop tick): the startup deadline,
+    /// the no-media timeout, and prolonged post-start buffering.
+    pub fn on_tick(&mut self, now_ms: i64) -> EngineAction {
+        if self.current.is_none() {
+            return EngineAction::None;
+        }
+        if !self.played && self.state == SessionState::Opening {
+            if now_ms - self.chosen_ms >= STARTUP_DEADLINE_MS {
+                return self.give_up();
+            }
+            if now_ms - self.started_ms >= FIRST_START_TIMEOUT_MS {
+                return self.recover(now_ms, "no media received");
             }
         }
+        if self.state == SessionState::Playing {
+            if let Some(since) = self.stall_since_ms {
+                if now_ms - since >= STALL_LIMIT_MS {
+                    return self.recover(now_ms, "prolonged buffering");
+                }
+            }
+        }
+        EngineAction::None
+    }
+
+    /// One bounded recovery step, shared by every failure trigger:
+    /// the startup deadline is never extended, the budget resets
+    /// only after two quiet minutes, and giving up is final.
+    fn recover(&mut self, now_ms: i64, reason: &str) -> EngineAction {
+        let Some(request) = self.current.clone() else {
+            return EngineAction::None;
+        };
+        self.last_error = Some(reason.to_string());
+        if !self.played && now_ms - self.chosen_ms >= STARTUP_DEADLINE_MS {
+            return self.give_up();
+        }
+        if let Some(last) = self.last_attempt_ms {
+            if now_ms - last >= BUDGET_RESET_MS {
+                self.attempts = 0;
+            }
+        }
+        if self.attempts >= MAX_RECONNECTS {
+            return self.give_up();
+        }
+        self.attempts += 1;
+        self.last_attempt_ms = Some(now_ms);
+        let delay = reconnect_delay_ms(self.attempts);
+        self.started_ms = now_ms + delay;
+        self.stall_since_ms = None;
+        self.state = SessionState::Opening;
+        EngineAction::Reconnect(request, delay)
+    }
+
+    fn give_up(&mut self) -> EngineAction {
+        self.state = SessionState::Lost;
+        EngineAction::Stop
+    }
+
+    /// The long form of a give-up (Python's Stream Lost dialog
+    /// text), for the status details surface.
+    #[must_use]
+    pub fn lost_report(&self) -> Option<String> {
+        if self.state != SessionState::Lost {
+            return None;
+        }
+        let mut text = format!(
+            "Stream disconnected after {} retries. The stream may be offline or experiencing issues.",
+            self.attempts
+        );
+        if let Some(error) = &self.last_error {
+            use std::fmt::Write as _;
+            let _ = write!(text, "\n\nLast error: {error}");
+        }
+        text.push_str("\n\nPlease try another channel or try again later.");
+        Some(text)
     }
 
     #[must_use]
@@ -617,6 +771,7 @@ impl PlaybackSession {
             SessionState::Paused => "Paused.".to_string(),
             SessionState::Ended => "Playback ended.".to_string(),
             SessionState::Failed(message) => format!("Playback failed: {message}"),
+            SessionState::Lost => "Stream lost".to_string(),
         }
     }
 }
@@ -784,35 +939,139 @@ mod tests {
     }
 
     #[test]
-    fn session_reconnects_live_then_fails_and_never_reconnects_vod() {
+    fn session_reconnects_then_loses_and_vod_ends() {
         let mut session = PlaybackSession::new();
         let request = PlaybackRequest::for_channel(&channel("http://live"), None);
         assert!(request.live);
-        assert!(matches!(session.play(request), EngineAction::Load(_)));
-        session.on_event(EngineEvent::Started);
+        assert!(matches!(session.play(request, 0), EngineAction::Load(_)));
+        session.on_event(EngineEvent::Started, 100);
+        let mut now = 1_000;
         for _ in 0..MAX_RECONNECTS {
+            now += 5_000;
             assert!(matches!(
-                session.on_event(EngineEvent::Stalled),
-                EngineAction::Reconnect(_)
+                session.on_event(EngineEvent::Stalled, now),
+                EngineAction::Reconnect(_, _)
             ));
         }
         assert!(matches!(
-            session.on_event(EngineEvent::Stalled),
+            session.on_event(EngineEvent::Stalled, now + 5_000),
             EngineAction::Stop
         ));
-        assert!(matches!(session.state(), SessionState::Failed(_)));
+        assert_eq!(session.state(), &SessionState::Lost);
+        assert_eq!(session.announcement(), "Stream lost");
+        let report = session.lost_report().expect("report");
+        assert!(report.contains("Stream disconnected after 6 retries."));
+        assert!(report.contains("Last error: stream stopped unexpectedly"));
         assert_eq!(session.adjust_volume(5), 100);
         assert_eq!(session.adjust_volume(-250), 0);
 
         let mut vod = PlaybackSession::new();
         let movie = PlaybackRequest::for_channel(&channel("http://x/movie/1.mp4"), None);
         assert!(!movie.live);
-        vod.play(movie);
-        vod.on_event(EngineEvent::Started);
+        vod.play(movie, 0);
+        vod.on_event(EngineEvent::Started, 100);
         assert!(matches!(
-            vod.on_event(EngineEvent::Stalled),
-            EngineAction::Stop
+            vod.on_event(EngineEvent::Ended, 200),
+            EngineAction::None
         ));
+        assert_eq!(vod.state(), &SessionState::Ended);
+    }
+
+    #[test]
+    fn playing_is_reported_only_after_engine_confirmation() {
+        let mut session = PlaybackSession::new();
+        let request = PlaybackRequest::for_channel(&channel("http://live"), None);
+        session.play(request, 0);
+        assert_eq!(session.state(), &SessionState::Opening);
+        assert!(session.announcement().starts_with("Opening"));
+        session.on_event(EngineEvent::Started, 500);
+        assert_eq!(session.state(), &SessionState::Playing);
+        assert!(session.announcement().starts_with("Playing"));
+        // A stale Started after Stop must not resurrect playback.
+        session.stop();
+        session.on_event(EngineEvent::Started, 600);
+        assert_eq!(session.state(), &SessionState::Idle);
+    }
+
+    #[test]
+    fn startup_deadline_is_shared_and_retries_do_not_extend_it() {
+        let mut session = PlaybackSession::new();
+        let request = PlaybackRequest::for_channel(&channel("http://live"), None);
+        session.play(request, 0);
+        // Errors at 5-second intervals consume the shared budget.
+        for step in 1..=4 {
+            assert!(matches!(
+                session.on_event(EngineEvent::Error("boom".to_string()), step * 5_000),
+                EngineAction::Reconnect(_, _)
+            ));
+        }
+        assert_eq!(session.attempts(), 4);
+        // At 30 s from the choice the session gives up even though
+        // two attempts remain: retries never reset the deadline.
+        assert!(matches!(session.on_tick(30_000), EngineAction::Stop));
+        assert_eq!(session.state(), &SessionState::Lost);
+        assert!(session
+            .lost_report()
+            .expect("report")
+            .contains("Last error: boom"));
+    }
+
+    #[test]
+    fn no_media_timeout_reconnects_then_the_deadline_loses() {
+        let mut session = PlaybackSession::new();
+        let request = PlaybackRequest::for_channel(&channel("http://live"), None);
+        session.play(request, 0);
+        assert!(matches!(session.on_tick(24_999), EngineAction::None));
+        assert!(matches!(
+            session.on_tick(25_000),
+            EngineAction::Reconnect(_, 400)
+        ));
+        assert!(matches!(session.on_tick(30_000), EngineAction::Stop));
+        assert_eq!(session.state(), &SessionState::Lost);
+    }
+
+    #[test]
+    fn stop_and_supersede_bump_the_generation() {
+        let mut session = PlaybackSession::new();
+        let request = PlaybackRequest::for_channel(&channel("http://live"), None);
+        session.play(request.clone(), 0);
+        let first = session.generation();
+        session.play(request, 1_000);
+        assert!(session.generation() > first);
+        let second = session.generation();
+        session.stop();
+        assert!(session.generation() > second);
+    }
+
+    #[test]
+    fn reconnect_backoff_matches_python() {
+        let delays: Vec<i64> = (1..=6).map(reconnect_delay_ms).collect();
+        assert_eq!(delays, vec![400, 2_000, 4_000, 8_000, 8_000, 8_000]);
+    }
+
+    #[test]
+    fn prolonged_buffering_reconnects_and_quiet_resets_the_budget() {
+        let mut session = PlaybackSession::new();
+        let request = PlaybackRequest::for_channel(&channel("http://live"), None);
+        session.play(request, 0);
+        session.on_event(EngineEvent::Started, 100);
+        session.note_buffering(true, 1_000);
+        assert!(matches!(session.on_tick(10_999), EngineAction::None));
+        assert!(matches!(
+            session.on_tick(11_000),
+            EngineAction::Reconnect(_, _)
+        ));
+        session.on_event(EngineEvent::Started, 12_000);
+        // Two quiet minutes between failures reset the budget.
+        let mut now = 12_000;
+        for _ in 0..MAX_RECONNECTS + 2 {
+            now += BUDGET_RESET_MS + 1_000;
+            session.on_event(EngineEvent::Started, now);
+            assert!(matches!(
+                session.on_event(EngineEvent::Stalled, now + 10),
+                EngineAction::Reconnect(_, _)
+            ));
+        }
     }
 
     #[test]

@@ -403,6 +403,14 @@ struct Wiring {
 }
 
 /// Built-in player window state, created lazily on first use.
+/// Which engine owns the current session's loads.
+#[derive(Clone, Copy, Default, Eq, PartialEq)]
+enum ActiveEngine {
+    #[default]
+    Fallback,
+    Vlc,
+}
+
 struct PlayerState {
     session: PlaybackSession,
     gate: LaunchGate,
@@ -422,6 +430,12 @@ struct PlayerState {
     last_label_cue: Option<usize>,
     current_channel: Option<Channel>,
     pending_resume_ms: Option<i64>,
+    /// A scheduled reconnect: (session generation, due ms,
+    /// request). The generation guard keeps a superseded or
+    /// stopped retry from ever firing.
+    pending_reconnect: Option<(u64, i64, PlaybackRequest)>,
+    /// Which engine the current request was loaded into.
+    engine: ActiveEngine,
     subtitle_cues: Vec<Cue>,
     last_spoken_cue: Option<usize>,
     history: Vec<Channel>,
@@ -448,6 +462,8 @@ impl Default for PlayerState {
             last_label_cue: None,
             current_channel: None,
             pending_resume_ms: None,
+            pending_reconnect: None,
+            engine: ActiveEngine::Fallback,
             subtitle_cues: Vec::new(),
             last_spoken_cue: None,
             history: Vec::new(),
@@ -4320,9 +4336,10 @@ fn play_builtin(
     let mut state = player.borrow_mut();
     state.current_channel = Some(channel.clone());
     state.pending_resume_ms = request.resume_ms;
+    state.pending_reconnect = None;
     state.subtitle_cues.clear();
     state.last_spoken_cue = None;
-    let action = state.session.play(request);
+    let action = state.session.play(request, now_ms());
     let Some(win) = state.window.clone() else {
         return;
     };
@@ -4345,6 +4362,11 @@ fn play_builtin(
             None => false,
         };
         let via_vlc = vlc_started;
+        state.engine = if via_vlc {
+            ActiveEngine::Vlc
+        } else {
+            ActiveEngine::Fallback
+        };
         if via_vlc {
             state.vlc_active = true;
             state.vlc_tracks_ready = false;
@@ -4374,6 +4396,118 @@ fn play_builtin(
             ));
         }
     }
+}
+
+/// File a session action away: a reconnect is scheduled under
+/// the session's current generation; a stop settles the session.
+fn store_session_action(
+    player: &Rc<RefCell<PlayerState>>,
+    persist: &Persist,
+    status: Status,
+    action: EngineAction,
+) {
+    match action {
+        EngineAction::Reconnect(request, delay) => {
+            let mut state = player.borrow_mut();
+            state.pending_reconnect = Some((state.session.generation(), now_ms() + delay, request));
+        }
+        EngineAction::Stop => settle_session(player, persist, status),
+        _ => {}
+    }
+}
+
+/// Settle a session that asked to stop: silence the engines, and
+/// when the stream was lost say so at top priority with the long
+/// report in the status details.
+fn settle_session(player: &Rc<RefCell<PlayerState>>, persist: &Persist, status: Status) {
+    let lost_report = {
+        let mut state = player.borrow_mut();
+        state.pending_reconnect = None;
+        if state.vlc_active {
+            if let Some(engine) = &mut state.vlc {
+                engine.stop();
+            }
+            state.vlc_active = false;
+        }
+        if let Some(win) = &state.window {
+            win.media.stop();
+        }
+        state.session.lost_report()
+    };
+    if let Some(report) = lost_report {
+        player_status(status, persist, "Stream lost", 1);
+        // Python shows the long form in its Stream Lost dialog.
+        let frame = player.borrow().window.as_ref().map(|win| win.frame);
+        if let Some(frame) = frame {
+            let _ = MessageDialog::builder(&frame, &report, "Stream Lost")
+                .with_style(MessageDialogStyle::OK)
+                .build()
+                .show_modal();
+        }
+    }
+}
+
+/// (Re)load a request into the engine that owns the current
+/// session. False when no engine accepted the load.
+fn engine_load(player: &Rc<RefCell<PlayerState>>, request: &PlaybackRequest) -> bool {
+    let mut state = player.borrow_mut();
+    if state.engine == ActiveEngine::Vlc {
+        match &mut state.vlc {
+            Some(engine) => {
+                let ok = engine.play_url(&request.url, &request.headers).is_ok();
+                if ok {
+                    state.vlc_active = true;
+                    state.vlc_tracks_ready = false;
+                }
+                ok
+            }
+            None => false,
+        }
+    } else {
+        match &state.window {
+            Some(win) => {
+                win.media.load_uri(&request.url);
+                win.media.play();
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+/// One recovery drive from the player tick: fire a due reconnect
+/// (generation-checked, so a stopped or superseded retry can
+/// never reactivate an old attempt), then let the session's own
+/// clock run (startup deadline, no-media timeout, prolonged
+/// buffering).
+fn drive_session(player: &Rc<RefCell<PlayerState>>, persist: &Persist, status: Status) {
+    let due = {
+        let mut state = player.borrow_mut();
+        match state.pending_reconnect.take() {
+            Some((generation, due_ms, request)) => {
+                if generation != state.session.generation() {
+                    None // superseded or stopped: drop it
+                } else if now_ms() >= due_ms {
+                    Some(request)
+                } else {
+                    state.pending_reconnect = Some((generation, due_ms, request));
+                    None
+                }
+            }
+            None => None,
+        }
+    };
+    if let Some(request) = due {
+        if !engine_load(player, &request) {
+            let action = player.borrow_mut().session.on_event(
+                EngineEvent::Error("could not restart playback".to_string()),
+                now_ms(),
+            );
+            store_session_action(player, persist, status, action);
+        }
+    }
+    let action = player.borrow_mut().session.on_tick(now_ms());
+    store_session_action(player, persist, status, action);
 }
 
 /// The built-in player window's widgets.
@@ -5039,6 +5173,7 @@ fn player_tick(player: &Rc<RefCell<PlayerState>>, persist: &Persist, status: Sta
     checkpoint_resume(player, persist);
     speak_subtitle_cue(player, persist, status);
     poll_vlc_state(player, persist, status);
+    drive_session(player, persist, status);
     drive_sleep_timer(player, persist, status);
     update_player_chrome(player);
 }
@@ -5111,7 +5246,7 @@ fn wire_player_events(
     let loaded_persist = persist.clone();
     media.on_loaded(move |_| {
         let mut state = loaded_player.borrow_mut();
-        state.session.on_event(EngineEvent::Started);
+        state.session.on_event(EngineEvent::Started, now_ms());
         let resume_ms = state.pending_resume_ms.take();
         if let (Some(win), Some(ms)) = (state.window.clone(), resume_ms) {
             win.media.seek(ms, SeekMode::FromStart);
@@ -5121,21 +5256,20 @@ fn wire_player_events(
     let stopped_player = Rc::clone(player);
     let stopped_persist = persist.clone();
     media.on_stop(move |_| {
-        let mut state = stopped_player.borrow_mut();
-        let near_end = state.window.as_ref().is_some_and(|win| {
-            win.media.length() > 0 && win.media.tell() >= win.media.length() - 1500
-        });
-        let event = if near_end {
-            EngineEvent::Ended
-        } else {
-            EngineEvent::Stalled
+        let action = {
+            let mut state = stopped_player.borrow_mut();
+            let near_end = state.window.as_ref().is_some_and(|win| {
+                win.media.length() > 0 && win.media.tell() >= win.media.length() - 1500
+            });
+            let event = if near_end {
+                EngineEvent::Ended
+            } else {
+                EngineEvent::Stalled
+            };
+            state.session.on_event(event, now_ms())
         };
-        if let EngineAction::Reconnect(request) = state.session.on_event(event) {
-            if let Some(win) = &state.window {
-                win.media.load_uri(&request.url);
-                win.media.play();
-            }
-        }
+        store_session_action(&stopped_player, &stopped_persist, status, action);
+        let state = stopped_player.borrow();
         player_status(status, &stopped_persist, &state.session.announcement(), 3);
     });
     let close_player = Rc::clone(player);
@@ -5232,6 +5366,7 @@ fn buffers_of(player: &Rc<RefCell<PlayerState>>) -> Option<Rc<RefCell<buffer::Bu
 /// (a buffer transition is about to replace the stream).
 fn stop_engines_keep_window(player: &Rc<RefCell<PlayerState>>) {
     let mut state = player.borrow_mut();
+    state.pending_reconnect = None;
     state.session.stop();
     if state.vlc_active {
         if let Some(engine) = &mut state.vlc {
@@ -5309,7 +5444,11 @@ fn buffer_intercept(
     stop_engines_keep_window(player);
     player_status(status, persist, "Buffering...", 3);
     let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
-    buffers.borrow_mut().pending = Some(std::sync::Arc::clone(&slot));
+    {
+        let mut registry = buffers.borrow_mut();
+        registry.pending = Some(std::sync::Arc::clone(&slot));
+        registry.pending_generation = player.borrow().session.generation();
+    }
     let url = channel.url.clone();
     let headers = request.headers.clone();
     let channel = channel.clone();
@@ -5384,6 +5523,14 @@ fn deliver_buffer_pending(player: &Rc<RefCell<PlayerState>>, persist: &Persist, 
         return;
     };
     buffers.borrow_mut().pending = None;
+    // A start the user has since stopped or superseded delivers
+    // nothing: no playback, no failure dialog.
+    if buffers.borrow().pending_generation != player.borrow().session.generation() {
+        if let buffer::BufferOutcome::Ready { session, lease, .. } = outcome {
+            session.release(lease);
+        }
+        return;
+    }
     match outcome {
         buffer::BufferOutcome::Failed => {
             let frame = player.borrow().window.as_ref().map(|win| win.frame);
@@ -5811,8 +5958,12 @@ fn player_stop(player: &Rc<RefCell<PlayerState>>, persist: &Persist, status: Sta
     if let Some(buffers) = buffers_of(player) {
         buffers.borrow_mut().release_current();
     }
+    if let Some(buffers) = buffers_of(player) {
+        buffers.borrow_mut().pending = None;
+    }
     checkpoint_resume(player, persist);
     let mut state = player.borrow_mut();
+    state.pending_reconnect = None;
     state.session.stop();
     if state.vlc_active {
         if let Some(engine) = &mut state.vlc {
@@ -5870,6 +6021,16 @@ fn poll_vlc_state(player: &Rc<RefCell<PlayerState>>, persist: &Persist, status: 
         };
         match engine.state() {
             iptv_vlc::VlcState::Playing => {
+                state.session.note_buffering(false, now_ms());
+                if !matches!(
+                    state.session.state(),
+                    SessionState::Playing | SessionState::Paused
+                ) {
+                    // Playing is reported only on the engine's own
+                    // confirmation, never at load time.
+                    state.session.on_event(EngineEvent::Started, now_ms());
+                    player_status(status, persist, &state.session.announcement(), 3);
+                }
                 if let Some(ms) = state.pending_resume_ms.take() {
                     if let Some(engine) = &mut state.vlc {
                         engine.set_time(ms);
@@ -5880,6 +6041,9 @@ fn poll_vlc_state(player: &Rc<RefCell<PlayerState>>, persist: &Persist, status: 
                     setup_tracks = true;
                 }
             }
+            iptv_vlc::VlcState::Buffering => {
+                state.session.note_buffering(true, now_ms());
+            }
             iptv_vlc::VlcState::Ended | iptv_vlc::VlcState::Error => {
                 let ended = engine.state() == iptv_vlc::VlcState::Ended;
                 let (position, length) = (engine.time(), engine.length());
@@ -5889,17 +6053,13 @@ fn poll_vlc_state(player: &Rc<RefCell<PlayerState>>, persist: &Persist, status: 
                 } else {
                     EngineEvent::Stalled
                 };
-                let action = state.session.on_event(event);
+                let action = state.session.on_event(event, now_ms());
                 state.vlc_active = false;
-                if let EngineAction::Reconnect(request) = action {
-                    if let Some(engine) = &mut state.vlc {
-                        if engine.play_url(&request.url, &request.headers).is_ok() {
-                            state.vlc_active = true;
-                            state.vlc_tracks_ready = false;
-                        }
-                    }
-                }
+                drop(state);
+                store_session_action(player, persist, status, action);
+                let state = player.borrow();
                 player_status(status, persist, &state.session.announcement(), 3);
+                return;
             }
             _ => {}
         }
