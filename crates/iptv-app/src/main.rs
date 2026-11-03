@@ -77,8 +77,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let model = Rc::new(RefCell::new(SearchResults::default()));
         let rows = Rc::clone(&model);
+        let suffixes: Rc<EpgSuffixes> =
+            Rc::new(RefCell::new((0, 0, std::collections::HashMap::new())));
+        let suffixes_for_text = Rc::clone(&suffixes);
         assert!(list.set_virtual_text_callback(move |index, column| {
-            channel_text(&rows.borrow(), index, column)
+            channel_text(&rows.borrow(), &suffixes_for_text.borrow(), index, column)
         }));
         list.set_item_count(0);
 
@@ -112,7 +115,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             status,
         };
         let controls_for_layout = controls_all;
-        bind_browser(frame, controls_all, model);
+        bind_browser(frame, controls_all, model, suffixes);
         layout_main(
             frame,
             panel,
@@ -348,6 +351,13 @@ struct Controls {
     status: Status,
 }
 
+/// Now/next suffixes for channel rows, keyed by playlist index:
+/// (built-at epoch, playlist identity, suffix per index). Rebuilt
+/// when the guide lands, the playlist changes, or the data ages
+/// past five minutes — the Python design, where the row itself
+/// reads "{name} — {now} — Next: {next}".
+type EpgSuffixes = RefCell<(i64, usize, std::collections::HashMap<usize, String>)>;
+
 #[derive(Clone)]
 struct Wiring {
     browser: Rc<RefCell<BrowserWorker>>,
@@ -357,6 +367,7 @@ struct Wiring {
     persist: Persist,
     player: Rc<RefCell<PlayerState>>,
     epg: Rc<RefCell<Option<(EpgGuide, GuideIndexes)>>>,
+    epg_suffixes: Rc<EpgSuffixes>,
     epg_store: Rc<RefCell<Option<iptv_core::epgstore::EpgStore>>>,
     epg_worker: Rc<EpgWorker>,
     epg_pending: Rc<std::cell::Cell<bool>>,
@@ -538,7 +549,12 @@ impl Persist {
     }
 }
 
-fn bind_browser(frame: Frame, controls: Controls, model: Rc<RefCell<SearchResults>>) {
+fn bind_browser(
+    frame: Frame,
+    controls: Controls,
+    model: Rc<RefCell<SearchResults>>,
+    suffixes: Rc<EpgSuffixes>,
+) {
     let candidates = config::config_candidates();
     let loaded = config::load(&candidates, &candidates[0]);
     if !loaded.config.bool_or("show_channel_url", true) {
@@ -563,6 +579,7 @@ fn bind_browser(frame: Frame, controls: Controls, model: Rc<RefCell<SearchResult
         },
         player: Rc::new(RefCell::new(PlayerState::default())),
         epg: Rc::new(RefCell::new(None)),
+        epg_suffixes: suffixes,
         epg_store: Rc::new(RefCell::new(None)),
         epg_worker: Rc::new(EpgWorker::new()),
         epg_pending: Rc::new(std::cell::Cell::new(false)),
@@ -686,6 +703,20 @@ fn bind_completion(wiring: &Wiring, controls: Controls) {
             dispatch_epg_load(&completed, urls);
         }
         poll_epg(&completed, status);
+        {
+            let stale = {
+                let slot = completed.epg_suffixes.borrow();
+                slot.1 != completed.model.borrow().playlist_ptr()
+                    || (completed.epg.borrow().is_some() && now_epoch() - slot.0 > 300)
+            };
+            if stale {
+                refresh_epg_suffixes(&completed);
+                let count = list.get_item_count();
+                if count > 0 {
+                    list.refresh_items(0, i64::from(count) - 1);
+                }
+            }
+        }
         poll_providers(&completed, controls);
         poll_recordings(&completed, status);
         poll_vod(&completed, status);
@@ -1196,6 +1227,7 @@ fn poll_epg(wiring: &Wiring, status: Status) {
                 let counts = (guide.channels.len(), guide.programme_count());
                 let indexes = GuideIndexes::build(&guide.channels);
                 *wiring.epg.borrow_mut() = Some((guide, indexes));
+                wiring.epg_suffixes.borrow_mut().0 = 0;
                 status.set_label(&format!(
                     "Guide loaded: {} channels, {} programmes.{store_note}",
                     counts.0, counts.1
@@ -2049,6 +2081,7 @@ fn clone_wiring(wiring: &Wiring) -> Wiring {
         model: Rc::clone(&wiring.model),
         player: Rc::clone(&wiring.player),
         epg: Rc::clone(&wiring.epg),
+        epg_suffixes: Rc::clone(&wiring.epg_suffixes),
         epg_store: Rc::clone(&wiring.epg_store),
         epg_worker: Rc::clone(&wiring.epg_worker),
         epg_pending: Rc::clone(&wiring.epg_pending),
@@ -4077,7 +4110,7 @@ fn bind_playback(
     episode_description: TextCtrl,
     stream_url: TextCtrl,
 ) {
-    bind_epg_highlight(wiring, list, status, episode_description, stream_url);
+    bind_epg_highlight(wiring, list, episode_description, stream_url);
     let wiring = clone_wiring(wiring);
     list.on_item_activated(move |_| activate_channel(&wiring, list, status));
 }
@@ -4129,12 +4162,13 @@ fn activate_channel(wiring: &Wiring, list: ListCtrl, status: Status) {
     play_channel(&wiring.player, &wiring.persist, &channel, status);
 }
 
-/// Moving through Channels announces the highlighted channel's now/next
-/// programme from the loaded guide, when it has one.
+/// Moving through Channels fills the highlighted channel's info
+/// panels (stream URL, episode description) silently — Python
+/// never speaks the guide on selection; the channel row itself
+/// carries the now/next after the channel name.
 fn bind_epg_highlight(
     wiring: &Wiring,
     list: ListCtrl,
-    status: Status,
     episode_description: TextCtrl,
     stream_url: TextCtrl,
 ) {
@@ -4152,39 +4186,21 @@ fn bind_epg_highlight(
             return;
         };
         stream_url.set_value(&channel.url);
-        let guard = epg.borrow();
-        let Some((guide, indexes)) = guard.as_ref() else {
-            episode_description.set_value("");
-            return;
+        let current = {
+            let guard = epg.borrow();
+            guard.as_ref().and_then(|(guide, indexes)| {
+                let known: std::collections::HashSet<String> =
+                    guide.channels.iter().map(|c| c.id.to_lowercase()).collect();
+                match_guide_channel(&channel, indexes, Some(&known))
+                    .and_then(|id| guide.now_next(&id, now_epoch()).0)
+            })
         };
-        let known: std::collections::HashSet<String> =
-            guide.channels.iter().map(|c| c.id.to_lowercase()).collect();
-        let Some(guide_id) = match_guide_channel(&channel, indexes, Some(&known)) else {
-            status.set_label("No guide information for this channel.");
-            return;
-        };
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(0));
-        let (current, next) = guide.now_next(&guide_id, now);
-        let description_text = match &current {
+        let text = match &current {
             Some(p) if !p.description.is_empty() => p.description.clone(),
             Some(p) => p.title.clone(),
-            None => String::new(),
+            None => "No description available for this programme.".to_owned(),
         };
-        episode_description.set_value(&description_text);
-        let mut parts: Vec<String> = Vec::new();
-        if let Some(p) = current {
-            parts.push(format!("Now: {} until {}.", p.title, local_hhmm(p.stop)));
-        }
-        if let Some(p) = next {
-            parts.push(format!("Next: {} at {}.", p.title, local_hhmm(p.start)));
-        }
-        if parts.is_empty() {
-            status.set_label("No guide information for this channel.");
-        } else {
-            status.set_label(&parts.join(" "));
-        }
+        episode_description.set_value(&text);
     });
 }
 
@@ -4354,7 +4370,7 @@ fn play_builtin(
     if !state.vlc_active {
         if let Some(error) = &state.vlc_error {
             status.set_label(&format!(
-                "libVLC is not available ({error}); the basic player is being used and many streams will not play. The official package bundles libVLC."
+                "libVLC is not available ({error}); basic player in use, many streams will not play."
             ));
         }
     }
@@ -8144,21 +8160,78 @@ fn publish_results(
     std::thread::spawn(move || drop(previous));
 }
 
-fn channel_text(model: &SearchResults, index: i64, column: i32) -> String {
+fn channel_text(
+    model: &SearchResults,
+    suffixes: &(i64, usize, std::collections::HashMap<usize, String>),
+    index: i64,
+    column: i32,
+) -> String {
     if column != 0 {
         return String::new();
     }
-    usize::try_from(index)
-        .ok()
-        .and_then(|index| model.channel(index))
-        .map_or_else(String::new, |channel| {
-            if channel.name.is_empty() {
-                // Stream URLs can contain credentials; never use them as row labels.
-                "Unnamed channel".to_owned()
-            } else {
-                channel.name.clone()
+    let Some(row) = usize::try_from(index).ok() else {
+        return String::new();
+    };
+    let Some(channel) = model.channel(row) else {
+        return String::new();
+    };
+    let name = if channel.name.is_empty() {
+        // Stream URLs can contain credentials; never use them as row labels.
+        "Unnamed channel".to_owned()
+    } else {
+        channel.name.clone()
+    };
+    // Python's row: the channel name first, the guide after it —
+    // "Name — Now title (HH:MM–HH:MM) — Next: title (HH:MM)".
+    match model
+        .playlist_index(row)
+        .and_then(|index| suffixes.2.get(&index))
+    {
+        Some(suffix) => format!("{name}{suffix}"),
+        None => name,
+    }
+}
+
+/// One channel's row suffix from its now/next programmes
+/// (Python's `_programme_label` shapes).
+fn epg_suffix(current: Option<&Programme>, next: Option<&Programme>) -> String {
+    use std::fmt::Write as _;
+    let mut suffix = String::new();
+    if let Some(p) = current {
+        let _ = write!(
+            suffix,
+            " — {} ({}–{})",
+            p.title,
+            local_hhmm(p.start),
+            local_hhmm(p.stop)
+        );
+    }
+    if let Some(p) = next {
+        let _ = write!(suffix, " — Next: {} ({})", p.title, local_hhmm(p.start));
+    }
+    suffix
+}
+
+/// Rebuild the row suffixes for the current playlist + guide.
+fn refresh_epg_suffixes(wiring: &Wiring) {
+    let now = now_epoch();
+    let playlist_ptr = wiring.model.borrow().playlist_ptr();
+    let mut map = std::collections::HashMap::new();
+    if let Some((guide, indexes)) = wiring.epg.borrow().as_ref() {
+        let known: std::collections::HashSet<String> =
+            guide.channels.iter().map(|c| c.id.to_lowercase()).collect();
+        for (index, channel) in wiring.browser.borrow().all_channels().iter().enumerate() {
+            let Some(guide_id) = match_guide_channel(channel, indexes, Some(&known)) else {
+                continue;
+            };
+            let (current, next) = guide.now_next(&guide_id, now);
+            let suffix = epg_suffix(current.as_ref(), next.as_ref());
+            if !suffix.is_empty() {
+                map.insert(index, suffix);
             }
-        })
+        }
+    }
+    *wiring.epg_suffixes.borrow_mut() = (now, playlist_ptr, map);
 }
 
 #[cfg(test)]
@@ -8167,13 +8240,69 @@ mod tests {
     use iptv_core::{search::SearchWorker, BrowseModel};
     use std::sync::Arc;
 
+    fn no_suffixes() -> (i64, usize, std::collections::HashMap<usize, String>) {
+        (0, 0, std::collections::HashMap::new())
+    }
+
     #[test]
     fn empty_list_has_no_placeholder_or_stale_accessible_rows() {
         let model = SearchResults::default();
+        let suffixes = no_suffixes();
         for index in [-1, 0, 1, i64::MAX] {
-            assert_eq!(channel_text(&model, index, 0), "");
-            assert_eq!(channel_text(&model, index, 1), "");
+            assert_eq!(channel_text(&model, &suffixes, index, 0), "");
+            assert_eq!(channel_text(&model, &suffixes, index, 1), "");
         }
+    }
+
+    #[test]
+    fn row_text_says_the_guide_after_the_channel_name() {
+        let mut suffixes = no_suffixes();
+        suffixes.2.insert(
+            0,
+            " — News Hour (18:00–19:00) — Next: Movie (19:00)".to_owned(),
+        );
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../iptv-core/tests/fixtures/local.m3u");
+        let worker = SearchWorker::default();
+        worker.submit(
+            Arc::new(BrowseModel::open_local(&path).unwrap()),
+            String::new(),
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let model = loop {
+            if let Some(result) = worker.try_latest() {
+                break result;
+            }
+            assert!(std::time::Instant::now() < deadline, "search timed out");
+            std::thread::yield_now();
+        };
+        assert_eq!(
+            channel_text(&model, &suffixes, 0, 0),
+            "ABC East HD — News Hour (18:00–19:00) — Next: Movie (19:00)"
+        );
+        // A channel without guide data keeps the bare name.
+        assert_eq!(channel_text(&model, &suffixes, 1, 0), "映画, HD");
+    }
+
+    #[test]
+    fn suffix_shape_matches_python() {
+        let now = Programme {
+            channel_id: "c".to_owned(),
+            title: "News Hour".to_owned(),
+            description: String::new(),
+            start: 0,
+            stop: 3600,
+        };
+        let next = Programme {
+            title: "Movie".to_owned(),
+            start: 3600,
+            stop: 7200,
+            ..now.clone()
+        };
+        let suffix = epg_suffix(Some(&now), Some(&next));
+        assert!(suffix.starts_with(" — News Hour ("), "{suffix}");
+        assert!(suffix.contains(" — Next: Movie ("), "{suffix}");
+        assert_eq!(epg_suffix(None, None), "");
     }
 
     #[test]
@@ -8193,13 +8322,17 @@ mod tests {
             assert!(std::time::Instant::now() < deadline, "search timed out");
             std::thread::yield_now();
         };
-        assert_eq!(channel_text(&model, 0, 0), "ABC East HD");
-        assert_eq!(channel_text(&model, 1, 0), "映画, HD");
-        assert_eq!(channel_text(&model, 2, 0), "Bob's Burgers, Season 1");
-        assert_eq!(channel_text(&model, 3, 0), "Unnamed channel");
-        assert_eq!(channel_text(&model, 4, 0), "");
-        assert_eq!(channel_text(&model, -1, 0), "");
-        assert_eq!(channel_text(&model, 0, 1), "");
+        let suffixes = no_suffixes();
+        assert_eq!(channel_text(&model, &suffixes, 0, 0), "ABC East HD");
+        assert_eq!(channel_text(&model, &suffixes, 1, 0), "映画, HD");
+        assert_eq!(
+            channel_text(&model, &suffixes, 2, 0),
+            "Bob's Burgers, Season 1"
+        );
+        assert_eq!(channel_text(&model, &suffixes, 3, 0), "Unnamed channel");
+        assert_eq!(channel_text(&model, &suffixes, 4, 0), "");
+        assert_eq!(channel_text(&model, &suffixes, -1, 0), "");
+        assert_eq!(channel_text(&model, &suffixes, 0, 1), "");
     }
 
     #[test]

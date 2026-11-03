@@ -9,7 +9,9 @@ use std::path::Path;
 
 fn sign_file(path: &Path) -> Result<(), String> {
     let key = std::env::var("MINISIGN_KEY").map_err(|_| "MINISIGN_KEY is not set".to_string())?;
-    let password = std::env::var("MINISIGN_PASSWORD").ok();
+    let password = std::env::var("MINISIGN_PASSWORD")
+        .ok()
+        .filter(|value| !value.is_empty());
     let boxed =
         minisign::SecretKeyBox::from_string(&key).map_err(|e| format!("MINISIGN_KEY: {e}"))?;
     let key = match password {
