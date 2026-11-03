@@ -1006,7 +1006,7 @@ The app proxies streams needing headers, but the proxy binds and advertises
 `127.0.0.1`; a TV connects to itself. Python selects/binds a LAN address.
 Evidence: Python `stream_proxy.py:1304`;
 Rust `crates/iptv-app/src/main.rs:2214`,
-`crates/iptv-core/src/proxy.rs:40`.
+`crates/iptv-core/src/proxy.rs:49`.
 Check: cast protected HLS/TS to another host; the advertised URL and rewritten
 segments are reachable there and preserve required headers.
 
@@ -1017,7 +1017,7 @@ segments are reachable there and preserve required headers.
 Rust turns a stream into `/s/<hash>`, then infers format from that path. UPnP
 falls back to `audio/mpeg`; Roku to `video/mp4`, losing HLS/TS metadata. Python
 retains the probed MIME independently of the playback URL. Evidence: Python
-`casting.py:1006`; Rust `crates/iptv-core/src/proxy.rs:78`,
+`casting.py:1006`; Rust `crates/iptv-core/src/proxy.rs:126`,
 `crates/iptv-core/src/cast.rs:875`.
 Check: inspect UPnP/Roku requests for protected HLS/TS; preserve the original
 media format in renderer metadata.
