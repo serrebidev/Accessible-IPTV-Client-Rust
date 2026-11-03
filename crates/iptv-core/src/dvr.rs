@@ -403,6 +403,56 @@ impl DvrSchedule {
         true
     }
 
+    /// Change a job's repeat rule (port of Python `dvr.set_repeat`):
+    /// only `daily`, `weekly` and `series` are accepted, and the job
+    /// must exist. Persists on success.
+    pub fn set_repeat(&mut self, job_id: &str, repeat: &str) -> bool {
+        if !matches!(repeat, "daily" | "weekly" | "series") {
+            return false;
+        }
+        let Some(job) = self.jobs.iter_mut().find(|j| j.id == job_id) else {
+            return false;
+        };
+        job.repeat = repeat.to_string();
+        self.save();
+        true
+    }
+
+    /// The id of the first non-done job that duplicates `candidate`
+    /// (port of Python `_find_duplicate_scheduled_job`): same channel
+    /// identity (see [`job_channel_key`]) and the same programme
+    /// `start_at`/`end_at` strings.
+    #[must_use]
+    pub fn find_duplicate(&self, candidate: &DvrJob) -> Option<String> {
+        let candidate_key = job_channel_key(candidate);
+        if candidate_key.is_empty() {
+            return None;
+        }
+        self.jobs
+            .iter()
+            .filter(|job| !DONE_STATUSES.contains(&job.status.as_str()))
+            .find(|job| {
+                job_channel_key(job) == candidate_key
+                    && job.start_at == candidate.start_at
+                    && job.end_at == candidate.end_at
+            })
+            .map(|job| job.id.clone())
+    }
+
+    /// Ids of non-done jobs whose padded record windows overlap
+    /// `candidate`'s (the creation-time overlap check in Python's
+    /// `_schedule_program_recording`). Touching windows
+    /// (`end == start`) do not overlap.
+    #[must_use]
+    pub fn overlapping(&self, candidate: &DvrJob) -> Vec<String> {
+        self.jobs
+            .iter()
+            .filter(|job| !DONE_STATUSES.contains(&job.status.as_str()))
+            .filter(|job| job.start_ts < candidate.stop_ts && candidate.start_ts < job.stop_ts)
+            .map(|job| job.id.clone())
+            .collect()
+    }
+
     /// Hold a due job while the caller checks provider capacity
     /// for it: ticks skip held jobs entirely until released.
     pub fn hold_job(&mut self, job_id: &str) {
@@ -755,6 +805,123 @@ pub fn schedule_path(config_file: &Path) -> PathBuf {
     config_file.parent().map_or_else(
         || PathBuf::from("scheduled_recordings.json"),
         |p| p.join("scheduled_recordings.json"),
+    )
+}
+
+/// A channel snapshot value as text: strings as themselves, numbers
+/// and booleans in their JSON spelling, anything else empty.
+fn snapshot_text(value: Option<&serde_json::Value>) -> String {
+    match value {
+        Some(serde_json::Value::String(text)) => text.clone(),
+        Some(serde_json::Value::Number(number)) => number.to_string(),
+        Some(serde_json::Value::Bool(flag)) => flag.to_string(),
+        _ => String::new(),
+    }
+}
+
+/// The first non-empty snapshot value among `keys`, in order.
+fn snapshot_first(channel: &serde_json::Value, keys: &[&str]) -> String {
+    for key in keys {
+        let text = snapshot_text(channel.get(key));
+        if !text.is_empty() {
+            return text;
+        }
+    }
+    String::new()
+}
+
+/// A copy of `value` with every object's keys in sorted order, so
+/// its compact JSON serialization is the `sort_keys` spelling
+/// regardless of the map's insertion order.
+fn sorted_json_value(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            let mut sorted = serde_json::Map::new();
+            for key in keys {
+                sorted.insert(key.clone(), sorted_json_value(&map[key]));
+            }
+            serde_json::Value::Object(sorted)
+        }
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.iter().map(sorted_json_value).collect())
+        }
+        other => other.clone(),
+    }
+}
+
+fn sorted_json_compact(value: &serde_json::Value) -> String {
+    serde_json::to_string(&sorted_json_value(value)).unwrap_or_default()
+}
+
+/// Stable identity for a job's channel (port of Python
+/// `_channel_record_key` over the job's channel snapshot): the
+/// non-empty parts joined with `|`, in order — provider type,
+/// provider id, stream id, URL, provider data, name. The resolved
+/// stream URL can change per resolve; the provider parts are what
+/// make the identity stable.
+#[must_use]
+pub fn job_channel_key(job: &DvrJob) -> String {
+    let channel = &job.channel;
+    let provider_data = match channel.get("provider-data") {
+        Some(serde_json::Value::String(text)) => text.clone(),
+        Some(serde_json::Value::Null) | None => String::new(),
+        Some(value) => sorted_json_compact(value),
+    };
+    let parts = [
+        snapshot_first(channel, &["provider-type"]),
+        snapshot_first(channel, &["provider-id"]),
+        snapshot_first(channel, &["stream-id", "stream_id"]),
+        snapshot_first(channel, &["url"]),
+        provider_data,
+        snapshot_first(channel, &["name", "tvg-name", "tvg_name"]),
+    ];
+    parts
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
+/// Whether a series rule's title matches a programme title (the
+/// series scan's comparison in Python's `_refresh_series_recordings`):
+/// trimmed, case-insensitive equality; an empty side never matches.
+#[must_use]
+pub fn series_title_matches(rule_title: &str, programme_title: &str) -> bool {
+    let rule = rule_title.trim();
+    let programme = programme_title.trim();
+    !rule.is_empty() && !programme.is_empty() && rule.to_lowercase() == programme.to_lowercase()
+}
+
+/// Format a padded-window timestamp in local time for a row label.
+#[allow(clippy::cast_possible_truncation)] // schedule times are whole seconds
+fn local_row_time(ts: f64) -> String {
+    chrono::Local
+        .timestamp_opt(ts as i64, 0)
+        .single()
+        .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+        .unwrap_or_default()
+}
+
+/// One-line label for a Scheduled Recordings row: the full padded
+/// record window, title, channel, status and format label — every
+/// column Python's Scheduled Recordings dialog shows, on one line
+/// for the list control.
+#[must_use]
+pub fn job_row_label(job: &DvrJob) -> String {
+    let format_label = crate::recording::RECORDING_FORMATS
+        .iter()
+        .find(|entry| entry.0 == job.format)
+        .map_or(job.format.as_str(), |entry| entry.1);
+    format!(
+        "{} - {} | {} | {} | {} | {}",
+        local_row_time(job.start_ts),
+        local_row_time(job.stop_ts),
+        job.title,
+        job.channel_name,
+        job.status,
+        format_label
     )
 }
 
@@ -1218,6 +1385,163 @@ mod tests {
         assert_eq!(job.status, STATUS_MISSED);
         assert_eq!(job.wait_reason, "busy");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn job_with_channel(snapshot: serde_json::Value) -> DvrJob {
+        let chan = channel();
+        let mut job = build_job(&spec(&chan, "Show", 1000, 4600, 0, 0), 0.0).expect("j");
+        job.channel = snapshot;
+        job
+    }
+
+    #[test]
+    fn set_repeat_accepts_known_rules_and_persists() {
+        let dir = std::env::temp_dir().join(format!("iptv-dvr-repeat-{}", std::process::id()));
+        let path = dir.join("scheduled_recordings.json");
+        let mut schedule = DvrSchedule::load(path.clone(), 0.0);
+        let chan = channel();
+        let job = build_job(&spec(&chan, "Show", 100, 200, 0, 0), 0.0).expect("j");
+        let id = job.id.clone();
+        schedule.add_job(job);
+        for repeat in ["daily", "weekly", "series"] {
+            assert!(schedule.set_repeat(&id, repeat));
+            assert_eq!(schedule.get(&id).expect("job").repeat, repeat);
+        }
+        // The last setting is persisted, not just in memory.
+        let reloaded = DvrSchedule::load(path, 0.0);
+        assert_eq!(reloaded.get(&id).expect("job").repeat, "series");
+        // Anything else, and unknown ids, are refused.
+        assert!(!schedule.set_repeat(&id, "none"));
+        assert!(!schedule.set_repeat(&id, "bogus"));
+        assert!(!schedule.set_repeat(&id, ""));
+        assert!(!schedule.set_repeat("no-such-job", "daily"));
+        assert_eq!(schedule.get(&id).expect("job").repeat, "series");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn job_channel_key_orders_parts_and_applies_fallbacks() {
+        // Full snapshot: parts in order, provider-data object as
+        // compact JSON with sorted keys (recursively).
+        let job = job_with_channel(serde_json::json!({
+            "provider-type": "stalker",
+            "provider-id": "portal-1",
+            "stream-id": "42",
+            "url": "http://example.com/live",
+            "provider-data": {"b": 1, "a": {"d": 4, "c": 3}},
+            "name": "News",
+        }));
+        assert_eq!(
+            job_channel_key(&job),
+            "stalker|portal-1|42|http://example.com/live|{\"a\":{\"c\":3,\"d\":4},\"b\":1}|News"
+        );
+        // stream_id fallback, tvg-name name fallback, string
+        // provider-data as itself.
+        let job = job_with_channel(serde_json::json!({
+            "provider-type": "xtream",
+            "stream_id": "7",
+            "url": "http://example.com/s",
+            "provider-data": "raw-data",
+            "tvg-name": "TVG News",
+        }));
+        assert_eq!(
+            job_channel_key(&job),
+            "xtream|7|http://example.com/s|raw-data|TVG News"
+        );
+        // tvg_name is the last name fallback; empty parts are skipped.
+        let job = job_with_channel(serde_json::json!({
+            "url": "http://example.com/only",
+            "name": "",
+            "tvg_name": "Last Resort",
+        }));
+        assert_eq!(job_channel_key(&job), "http://example.com/only|Last Resort");
+        // An empty snapshot has no identity.
+        let job = job_with_channel(serde_json::json!({}));
+        assert_eq!(job_channel_key(&job), "");
+    }
+
+    #[test]
+    fn find_duplicate_needs_same_channel_and_window() {
+        let dir = std::env::temp_dir().join(format!("iptv-dvr-dup-{}", std::process::id()));
+        let path = dir.join("scheduled_recordings.json");
+        let mut schedule = DvrSchedule::load(path, 0.0);
+        let chan = channel();
+        let existing = build_job(&spec(&chan, "Show", 1000, 4600, 0, 0), 0.0).expect("j");
+        let existing_id = existing.id.clone();
+        schedule.add_job(existing);
+        // Same channel and programme window (built later, so a
+        // different id) duplicates the stored job.
+        let candidate = build_job(&spec(&chan, "Show", 1000, 4600, 0, 0), 1.0).expect("j");
+        assert_ne!(candidate.id, existing_id);
+        assert_eq!(
+            schedule.find_duplicate(&candidate),
+            Some(existing_id.clone())
+        );
+        // A different end time is not a duplicate.
+        let other_end = build_job(&spec(&chan, "Show", 1000, 5000, 0, 0), 2.0).expect("j");
+        assert_eq!(schedule.find_duplicate(&other_end), None);
+        // A done job no longer counts as a duplicate.
+        assert!(schedule.cancel_job(&existing_id));
+        assert_eq!(schedule.find_duplicate(&candidate), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn overlapping_uses_padded_windows_and_skips_done() {
+        let dir = std::env::temp_dir().join(format!("iptv-dvr-overlap-{}", std::process::id()));
+        let path = dir.join("scheduled_recordings.json");
+        let mut schedule = DvrSchedule::load(path, 0.0);
+        let chan = channel();
+        let existing = build_job(&spec(&chan, "Show", 1000, 2000, 0, 0), 0.0).expect("j");
+        let existing_id = existing.id.clone();
+        schedule.add_job(existing);
+        // Touching windows (candidate starts exactly at the stored
+        // stop) do not overlap.
+        let touching = build_job(&spec(&chan, "Next", 2000, 3000, 0, 0), 0.0).expect("j");
+        assert!(schedule.overlapping(&touching).is_empty());
+        // A partial overlap does.
+        let partial = build_job(&spec(&chan, "Partial", 1500, 2500, 0, 0), 0.0).expect("j");
+        assert_eq!(schedule.overlapping(&partial), vec![existing_id.clone()]);
+        // Done jobs are excluded.
+        assert!(schedule.cancel_job(&existing_id));
+        assert!(schedule.overlapping(&partial).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn series_title_matches_is_trimmed_and_case_insensitive() {
+        assert!(series_title_matches("News", "news"));
+        assert!(series_title_matches("  Evening News ", "evening news"));
+        assert!(series_title_matches("Café Report", "CAFÉ REPORT"));
+        assert!(!series_title_matches("News", "News Extra"));
+        assert!(!series_title_matches("", "News"));
+        assert!(!series_title_matches("News", "  "));
+        assert!(!series_title_matches("", ""));
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn job_row_label_shows_padded_window_and_format_label() {
+        let chan = channel();
+        // Programme 1000-4600 with 2/5 padding: window 880-4900.
+        let job = build_job(&spec(&chan, "Show", 1000, 4600, 2, 5), 0.0).expect("j");
+        let fmt_local = |ts: f64| {
+            chrono::Local
+                .timestamp_opt(ts as i64, 0)
+                .single()
+                .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+                .unwrap_or_default()
+        };
+        let expected = format!(
+            "{} - {} | Show | News | scheduled | Provider quality (copy, MKV)",
+            fmt_local(880.0),
+            fmt_local(4900.0)
+        );
+        assert_eq!(job_row_label(&job), expected);
+        // An unknown format key falls back to the raw key.
+        let mut job = job;
+        job.format = "bogus_fmt".to_string();
+        assert!(job_row_label(&job).ends_with("| bogus_fmt"));
     }
 
     #[test]
