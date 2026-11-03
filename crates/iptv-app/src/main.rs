@@ -23,6 +23,7 @@ use iptv_core::{
     reminders::{normalize_reminders, Reminder, ReminderStatus},
     search::SearchResults,
     sources::PlaylistSource,
+    speech::{CueRoute, CueSpeech, DevicePolicy, SpeechBackend},
     subtitles::{active as active_cue, load_cues, Cue},
     vod::{VodCatalog, VodEvent, VodItem, VodKind, VodWorker},
     Channel,
@@ -439,6 +440,10 @@ struct PlayerState {
     subtitle_cues: Vec<Cue>,
     last_spoken_cue: Option<usize>,
     history: Vec<Channel>,
+    /// The application voice (Windows SAPI) and the cue routing
+    /// state for subtitle speech (issues #131/#132).
+    app_voice: iptv_sapi::AppVoice,
+    cue_speech: CueSpeech,
 }
 
 impl Default for PlayerState {
@@ -467,6 +472,8 @@ impl Default for PlayerState {
             subtitle_cues: Vec::new(),
             last_spoken_cue: None,
             history: Vec::new(),
+            app_voice: iptv_sapi::AppVoice::new(""),
+            cue_speech: CueSpeech::new(SpeechBackend::ScreenReader, false),
         }
     }
 }
@@ -639,6 +646,7 @@ fn bind_browser(
         timer: Rc::clone(&wiring.timer),
     });
     *wiring.reminders.borrow_mut() = wiring.persist.reminders();
+    init_speech(&wiring.player, &wiring.persist, controls.status);
     if wiring.dvr.borrow().pending_count() > 0 {
         assert!(wiring.timer.start(50, false));
     }
@@ -665,6 +673,7 @@ fn bind_main_close(frame: Frame, wiring: &Wiring) {
     let timer = Rc::clone(&wiring.timer);
     let close_persist = wiring.persist.clone();
     let close_buffers = Rc::clone(&wiring.buffers);
+    let close_player = Rc::clone(&wiring.player);
     frame.bind_internal(EventType::CLOSE_WINDOW, move |event| {
         if close_persist
             .config
@@ -677,6 +686,7 @@ fn bind_main_close(frame: Frame, wiring: &Wiring) {
         }
         browser.borrow_mut().cancel();
         close_buffers.borrow_mut().close_all();
+        close_player.borrow_mut().app_voice.close();
         timer.stop();
         event.skip(true);
     });
@@ -2332,6 +2342,13 @@ pub const ABOUT: i32 = 5194;
 pub const READ_PREVIOUS_SUBTITLE: i32 = 5187;
 pub const REVIEW_SUBTITLES: i32 = 5188;
 pub const SUBTITLE_CAPABILITIES: i32 = 5189;
+pub const SPEECH_BACKEND_SR: i32 = 5240;
+pub const SPEECH_BACKEND_AV: i32 = 5241;
+pub const APP_VOICE_VOLUME: i32 = 5242;
+pub const APP_VOICE_OUTPUT: i32 = 5243;
+pub const APP_VOICE_RATE: i32 = 5244;
+pub const DEVICE_POLICY_PAUSE: i32 = 5245;
+pub const DEVICE_POLICY_DEFAULT: i32 = 5246;
 pub const REC_START: i32 = 5201;
 pub const REC_STOP: i32 = 5202;
 pub const REC_STOP_ALL: i32 = 5203;
@@ -2718,13 +2735,15 @@ fn menu_read_previous_subtitle(wiring: &Wiring, status: Status) {
         return;
     }
     let position = position_length(&player).0;
-    match player
+    let text = player
         .subtitle_cues
         .iter()
         .rev()
         .find(|cue| cue.end <= position)
-    {
-        Some(cue) => status.set_label(&cue.text),
+        .map(|cue| cue.text.clone());
+    drop(player);
+    match text {
+        Some(text) => speak_cue_text(&wiring.player, &wiring.persist, status, &text),
         None => status.set_label("No previous subtitle."),
     }
 }
@@ -2754,9 +2773,292 @@ fn open_review_subtitles(wiring: &Wiring, status: Status) {
     frame.show(true);
 }
 
+/// Switch the subtitle speech backend (Python `_set_subtitle_backend`):
+/// the application voice is refused where SAPI does not exist;
+/// every accepted switch stops the application voice and saves.
+fn set_speech_backend(wiring: &Wiring, frame: Frame, status: Status, backend: SpeechBackend) {
+    {
+        let mut state = wiring.player.borrow_mut();
+        if !state.cue_speech.set_backend(backend) {
+            drop(state);
+            let _ = MessageDialog::builder(
+                &frame,
+                "The application voice is only available on Windows with SAPI.",
+                "Subtitle Speech",
+            )
+            .with_style(MessageDialogStyle::OK)
+            .build()
+            .show_modal();
+            return;
+        }
+        state.app_voice.stop();
+    }
+    wiring.persist.set_and_save(
+        "subtitle_speech_backend",
+        serde_json::json!(match backend {
+            SpeechBackend::AppVoice => "app_tts",
+            SpeechBackend::ScreenReader => "screen_reader",
+        }),
+    );
+    status.set_label(match backend {
+        SpeechBackend::AppVoice => "Subtitle speech will use the application voice.",
+        SpeechBackend::ScreenReader => "Subtitle speech will use your screen reader.",
+    });
+}
+
+/// Switch the device-loss policy (Python `_set_app_tts_device_policy`).
+fn set_device_policy(wiring: &Wiring, status: Status, policy: DevicePolicy) {
+    wiring.persist.set_and_save(
+        "subtitle_app_device_policy",
+        serde_json::json!(match policy {
+            DevicePolicy::Pause => "pause",
+            DevicePolicy::Default => "default",
+        }),
+    );
+    let mut note = None;
+    {
+        let mut state = wiring.player.borrow_mut();
+        state.app_voice.stop();
+        if state.cue_speech.backend() == SpeechBackend::AppVoice
+            && !state.app_voice.validate_output(policy)
+        {
+            note = state.cue_speech.note_device_lost();
+        }
+    }
+    if let Some(text) = note {
+        live_region::announce_with_priority(status.label, text, live_region::Priority::High);
+    }
+    status.set_label(match policy {
+        DevicePolicy::Pause => {
+            "If the output device disappears, subtitle speech pauses until it returns."
+        }
+        DevicePolicy::Default => {
+            "If the output device disappears, the application voice falls back to the system default."
+        }
+    });
+}
+
+/// A modal slider prompt (Python's volume/speed dialogs):
+/// caption, slider, OK/Cancel; the chosen value on OK.
+fn slider_dialog(
+    frame: Frame,
+    title: &str,
+    caption: &str,
+    min: i32,
+    max: i32,
+    value: i32,
+) -> Option<i32> {
+    let dialog = Dialog::builder(&frame, &tr(title))
+        .with_size(380, 190)
+        .build();
+    dialog.set_accessibility_label(&tr(title));
+    let panel = Panel::builder(&dialog).build();
+    let label = StaticText::builder(&panel).with_label(&tr(caption)).build();
+    label.set_accessibility_label(&tr(caption));
+    let slider = Slider::builder(&panel).build();
+    slider.set_range(min, max);
+    slider.set_value(value);
+    slider.set_accessibility_label(&tr(caption));
+    let chosen = Rc::new(std::cell::Cell::new(None::<i32>));
+    let ok = Button::builder(&panel).with_label("&OK").build();
+    ok.set_accessibility_label("OK");
+    let cancel = Button::builder(&panel).with_label("&Cancel").build();
+    cancel.set_accessibility_label("Cancel");
+    let sizer = BoxSizer::builder(Orientation::Vertical).build();
+    sizer.add(&label, 0, SizerFlag::All, 8);
+    sizer.add(&slider, 0, SizerFlag::Expand | SizerFlag::All, 8);
+    let buttons = BoxSizer::builder(Orientation::Horizontal).build();
+    buttons.add(&ok, 0, SizerFlag::All, 4);
+    buttons.add(&cancel, 0, SizerFlag::All, 4);
+    sizer.add_sizer(&buttons, 0, SizerFlag::Expand, 0);
+    panel.set_sizer(sizer, true);
+    let chosen_ok = Rc::clone(&chosen);
+    let dialog_ok = dialog;
+    ok.on_click(move |_| {
+        chosen_ok.set(Some(slider.get_value()));
+        dialog_ok.end_modal(ID_OK);
+    });
+    let dialog_cancel = dialog;
+    cancel.on_click(move |_| {
+        dialog_cancel.end_modal(ID_CANCEL);
+    });
+    if dialog.show_modal() == ID_OK {
+        chosen.get()
+    } else {
+        None
+    }
+}
+
+/// Options > Subtitle Speech > Application voice volume...
+fn app_voice_volume_dialog(wiring: &Wiring, frame: Frame) {
+    let current = {
+        let state = wiring.player.borrow();
+        if !state.app_voice.available() {
+            return;
+        }
+        state.app_voice.volume()
+    };
+    if let Some(level) = slider_dialog(
+        frame,
+        "Application voice volume",
+        "Volume:",
+        0,
+        100,
+        current,
+    ) {
+        let mut state = wiring.player.borrow_mut();
+        if state.app_voice.set_volume(level) {
+            drop(state);
+            wiring
+                .persist
+                .set_and_save("subtitle_app_volume", serde_json::json!(level));
+        }
+    }
+}
+
+/// Options > Subtitle Speech > Application voice speed...
+fn app_voice_rate_dialog(wiring: &Wiring, frame: Frame) {
+    let current = {
+        let state = wiring.player.borrow();
+        if !state.app_voice.available() {
+            return;
+        }
+        state.app_voice.rate()
+    };
+    if let Some(rate) = slider_dialog(
+        frame,
+        "Application voice speed",
+        "Speech speed (-10 to 10; 0 is normal):",
+        -10,
+        10,
+        current,
+    ) {
+        let mut state = wiring.player.borrow_mut();
+        if state.app_voice.set_rate(rate) {
+            let applied = state.app_voice.rate();
+            drop(state);
+            wiring
+                .persist
+                .set_and_save("subtitle_app_rate", serde_json::json!(applied));
+        } else {
+            drop(state);
+            let _ = MessageDialog::builder(
+                &frame,
+                "Could not change the application voice speed.",
+                "Subtitle Speech",
+            )
+            .with_style(MessageDialogStyle::OK)
+            .build()
+            .show_modal();
+        }
+    }
+}
+
+/// Options > Subtitle Speech > Application voice output...
+/// (Python `_choose_app_tts_output`): preview the choice with a
+/// spoken sample while cues are suppressed; keep it only on Yes,
+/// restoring the exact prior choice otherwise.
+fn app_voice_output_dialog(wiring: &Wiring, frame: Frame, status: Status) {
+    let (previous, outputs) = {
+        let mut state = wiring.player.borrow_mut();
+        if !state.app_voice.available() {
+            return;
+        }
+        (
+            state.app_voice.selected_output().to_string(),
+            state.app_voice.list_outputs(),
+        )
+    };
+    // Duplicate friendly names stay separate choices, numbered
+    // the way Python numbers them.
+    let mut labels: Vec<String> = vec![tr("System default")];
+    for (index, (_, name)) in outputs.iter().enumerate() {
+        let mut label = name.clone();
+        if outputs.iter().filter(|(_, n)| n == name).count() > 1 {
+            label = format!("{name} ({})", index + 1);
+        }
+        labels.push(label);
+    }
+    let identities: Vec<String> = std::iter::once(String::new())
+        .chain(outputs.iter().map(|(id, _)| id.clone()))
+        .collect();
+    let dialog = SingleChoiceDialog::builder(
+        &frame,
+        &tr("Output device for the application voice:"),
+        &tr("Application voice output"),
+        &labels.iter().map(String::as_str).collect::<Vec<_>>(),
+    )
+    .build();
+    if let Some(position) = identities.iter().position(|id| id == &previous) {
+        dialog.set_selection(i32::try_from(position).unwrap_or(0));
+    }
+    if dialog.show_modal() != ID_OK {
+        return;
+    }
+    let selection = usize::try_from(dialog.get_selection()).unwrap_or(usize::MAX);
+    let Some(choice) = identities.get(selection).cloned() else {
+        return;
+    };
+    let name = labels.get(selection).cloned().unwrap_or_default();
+    let policy = iptv_core::speech::device_policy(&wiring.persist.config.borrow());
+    let mut keep = false;
+    {
+        let mut state = wiring.player.borrow_mut();
+        state.cue_speech.set_preview_active(true);
+        let selected = state.app_voice.set_output(&choice, policy);
+        if !selected {
+            drop(state);
+            let _ = MessageDialog::builder(
+                &frame,
+                "Could not select that output device.",
+                "Subtitle Speech",
+            )
+            .with_style(MessageDialogStyle::OK)
+            .build()
+            .show_modal();
+        } else if state
+            .app_voice
+            .speak("This is the application voice.", policy)
+            != iptv_core::speech::AppSpeakResult::Spoken
+        {
+            drop(state);
+            let _ = MessageDialog::builder(&frame, "Subtitle speech failed.", "Subtitle Speech")
+                .with_style(MessageDialogStyle::OK)
+                .build()
+                .show_modal();
+        } else {
+            drop(state);
+            keep = MessageDialog::builder(
+                &frame,
+                &format!("Keep this output device?\n{name}"),
+                "Subtitle Speech",
+            )
+            .with_style(MessageDialogStyle::YesNo)
+            .build()
+            .show_modal()
+                == ID_YES;
+        }
+    }
+    let mut state = wiring.player.borrow_mut();
+    state.app_voice.stop();
+    if keep {
+        let selected = state.app_voice.selected_output().to_string();
+        state.cue_speech.note_route_healthy();
+        state.cue_speech.set_preview_active(false);
+        drop(state);
+        wiring
+            .persist
+            .set_and_save("subtitle_app_output", serde_json::json!(selected));
+        status.set_label(&format!("Application voice output: {name}"));
+    } else {
+        state.app_voice.set_output(&previous, policy);
+        state.cue_speech.set_preview_active(false);
+    }
+}
+
 /// Options > Subtitle Speech > Subtitle capabilities...
 fn show_subtitle_capabilities(frame: Frame, status: Status) {
-    let text = "Subtitle support in this build:\n\n- The built-in player shows sidecar subtitle files (SRT, WebVTT, ASS/SSA) loaded with Load Subtitles.\n- Speak subtitles announces each cue through your screen reader when it appears.\n- Read current subtitle and Read previous subtitle speak on demand from the Options > Subtitle Speech menu.\n- External players handle subtitles themselves; their support varies by player.";
+    let text = "Subtitle support in this build:\n\n- The built-in player shows sidecar subtitle files (SRT, WebVTT, ASS/SSA) loaded with Load Subtitles.\n- Speak subtitles reads each cue aloud when it appears, either through your screen reader or through the application voice. On Windows the application voice uses SAPI; if its output device disappears, speech pauses until the device returns, or falls back to the system default, per the device policy.\n- Read current subtitle and Read previous subtitle speak on demand from the Options > Subtitle Speech menu.\n- External players handle subtitles themselves; their support varies by player.";
     let dialog = MessageDialog::builder(&frame, text, "Subtitle Capabilities")
         .with_style(MessageDialogStyle::OK)
         .build();
@@ -2824,8 +3126,84 @@ fn prompt_min_free_space(wiring: &Wiring, frame: Frame, status: Status) {
     ));
 }
 
+/// The application-voice items of the Subtitle Speech menu:
+/// volume, output, speed, and the device-loss policy radios.
+/// All are enabled only where SAPI exists.
+fn add_app_voice_items(menu: &Menu, config: &Config, app_available: bool) {
+    menu_add(
+        menu,
+        APP_VOICE_VOLUME,
+        "Application voice volume...",
+        "",
+        ItemKind::Normal,
+    );
+    menu_add(
+        menu,
+        APP_VOICE_OUTPUT,
+        "Application voice output...",
+        "",
+        ItemKind::Normal,
+    );
+    menu_add(
+        menu,
+        APP_VOICE_RATE,
+        "Application voice speed...",
+        "",
+        ItemKind::Normal,
+    );
+    let policy = iptv_core::speech::device_policy(config);
+    menu_add(
+        menu,
+        DEVICE_POLICY_PAUSE,
+        "On device loss: pause until the device returns",
+        "",
+        ItemKind::Radio,
+    );
+    menu_add(
+        menu,
+        DEVICE_POLICY_DEFAULT,
+        "On device loss: use the system default",
+        "",
+        ItemKind::Radio,
+    );
+    menu.check_item(DEVICE_POLICY_PAUSE, policy == DevicePolicy::Pause);
+    menu.check_item(DEVICE_POLICY_DEFAULT, policy == DevicePolicy::Default);
+    for id in [
+        APP_VOICE_VOLUME,
+        APP_VOICE_OUTPUT,
+        APP_VOICE_RATE,
+        DEVICE_POLICY_PAUSE,
+        DEVICE_POLICY_DEFAULT,
+    ] {
+        menu.enable_item(id, app_available);
+    }
+}
+
 fn build_speech_menu(config: &Config) -> Menu {
     let speech_sub = Menu::builder().build();
+    // Backend choice first (Python's order): exactly one backend
+    // speaks each cue. The application-voice items are enabled
+    // only where SAPI exists.
+    let app_available = iptv_sapi::platform_available();
+    let backend = iptv_core::speech::speech_backend(config);
+    menu_add(
+        &speech_sub,
+        SPEECH_BACKEND_SR,
+        "Speak through screen reader",
+        "",
+        ItemKind::Radio,
+    );
+    menu_add(
+        &speech_sub,
+        SPEECH_BACKEND_AV,
+        "Speak through application voice",
+        "",
+        ItemKind::Radio,
+    );
+    speech_sub.check_item(SPEECH_BACKEND_SR, backend == SpeechBackend::ScreenReader);
+    speech_sub.check_item(SPEECH_BACKEND_AV, backend == SpeechBackend::AppVoice);
+    speech_sub.enable_item(SPEECH_BACKEND_AV, app_available);
+    speech_sub.append_separator();
     menu_add(
         &speech_sub,
         SPEAK_SUBTITLES,
@@ -2855,6 +3233,8 @@ fn build_speech_menu(config: &Config) -> Menu {
         "",
         ItemKind::Normal,
     );
+    speech_sub.append_separator();
+    add_app_voice_items(&speech_sub, config, app_available);
     speech_sub.append_separator();
     menu_add(
         &speech_sub,
@@ -3280,8 +3660,23 @@ fn bind_menu_option_actions(frame: Frame, wiring: &Wiring, controls: Controls) {
                 flip("auto_check_updates");
             }
             SPEAK_SUBTITLES => {
-                flip("speak_subtitles");
+                let next = flip("speak_subtitles");
+                if !next {
+                    // Off stops application-owned speech at once.
+                    wiring.player.borrow_mut().app_voice.stop();
+                }
             }
+            SPEECH_BACKEND_SR => {
+                set_speech_backend(&wiring, frame, status, SpeechBackend::ScreenReader);
+            }
+            SPEECH_BACKEND_AV => {
+                set_speech_backend(&wiring, frame, status, SpeechBackend::AppVoice);
+            }
+            APP_VOICE_VOLUME => app_voice_volume_dialog(&wiring, frame),
+            APP_VOICE_OUTPUT => app_voice_output_dialog(&wiring, frame, status),
+            APP_VOICE_RATE => app_voice_rate_dialog(&wiring, frame),
+            DEVICE_POLICY_PAUSE => set_device_policy(&wiring, status, DevicePolicy::Pause),
+            DEVICE_POLICY_DEFAULT => set_device_policy(&wiring, status, DevicePolicy::Default),
             PREFERRED_AUDIO => open_audio_prefs(&wiring, status),
             KEYBOARD_SHORTCUTS => open_shortcuts_editor(&wiring, status),
             WHATS_NEW => open_whats_new(status),
@@ -3581,12 +3976,14 @@ fn menu_read_current_subtitle(wiring: &Wiring, status: Status) {
         return;
     }
     let position = position_length(&player).0;
-    match player
+    let text = player
         .subtitle_cues
         .iter()
         .find(|cue| cue.start <= position && position < cue.end)
-    {
-        Some(cue) => status.set_label(&cue.text),
+        .map(|cue| cue.text.clone());
+    drop(player);
+    match text {
+        Some(text) => speak_cue_text(&wiring.player, &wiring.persist, status, &text),
         None => status.set_label("No subtitle is showing."),
     }
 }
@@ -4337,6 +4734,8 @@ fn play_builtin(
     state.current_channel = Some(channel.clone());
     state.pending_resume_ms = request.resume_ms;
     state.pending_reconnect = None;
+    // A channel change discards the old programme's spoken cue.
+    state.app_voice.stop();
     state.subtitle_cues.clear();
     state.last_spoken_cue = None;
     let action = state.session.play(request, now_ms());
@@ -4829,6 +5228,9 @@ fn dispatch_player_menu(
         PM_SPEAK_SUBS => {
             let next = !persist.config.borrow().bool_or("speak_subtitles", false);
             persist.set_and_save("speak_subtitles", serde_json::json!(next));
+            if !next {
+                player.borrow_mut().app_voice.stop();
+            }
             if let Some(menu) = playback_menu(player) {
                 menu.check_item(PM_SPEAK_SUBS, next);
             }
@@ -5172,6 +5574,7 @@ fn player_tick(player: &Rc<RefCell<PlayerState>>, persist: &Persist, status: Sta
     poll_buffer(player, persist, status);
     checkpoint_resume(player, persist);
     speak_subtitle_cue(player, persist, status);
+    drive_speech_watchdog(player, persist, status);
     poll_vlc_state(player, persist, status);
     drive_session(player, persist, status);
     drive_sleep_timer(player, persist, status);
@@ -5367,6 +5770,7 @@ fn buffers_of(player: &Rc<RefCell<PlayerState>>) -> Option<Rc<RefCell<buffer::Bu
 fn stop_engines_keep_window(player: &Rc<RefCell<PlayerState>>) {
     let mut state = player.borrow_mut();
     state.pending_reconnect = None;
+    state.app_voice.stop();
     state.session.stop();
     if state.vlc_active {
         if let Some(engine) = &mut state.vlc {
@@ -5964,6 +6368,7 @@ fn player_stop(player: &Rc<RefCell<PlayerState>>, persist: &Persist, status: Sta
     checkpoint_resume(player, persist);
     let mut state = player.borrow_mut();
     state.pending_reconnect = None;
+    state.app_voice.stop();
     state.session.stop();
     if state.vlc_active {
         if let Some(engine) = &mut state.vlc {
@@ -5982,6 +6387,9 @@ fn player_stop(player: &Rc<RefCell<PlayerState>>, persist: &Persist, status: Sta
 /// the `MediaCtrl`).
 fn player_seek_to(player: &Rc<RefCell<PlayerState>>, target_ms: i64) {
     let mut state = player.borrow_mut();
+    // A seek discards the cue being spoken: stale words from the
+    // old position never finish (issue #131).
+    state.app_voice.stop();
     if state.vlc_active {
         if let Some(engine) = &mut state.vlc {
             engine.set_time(target_ms);
@@ -6448,6 +6856,123 @@ fn position_length(state: &PlayerState) -> (i64, i64) {
     }
 }
 
+/// Startup speech setup (Python's backend construction): build
+/// the cue router from the configured backend, apply the saved
+/// application-voice volume, rate and output, and persist a
+/// legacy output name that migrated to a token ID.
+fn init_speech(player: &Rc<RefCell<PlayerState>>, persist: &Persist, status: Status) {
+    let (backend, policy, saved_output, volume, rate) = {
+        let config = persist.config.borrow();
+        (
+            iptv_core::speech::speech_backend(&config),
+            iptv_core::speech::device_policy(&config),
+            config.string_or("subtitle_app_output", ""),
+            config
+                .value("subtitle_app_volume")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(100),
+            config
+                .value("subtitle_app_rate")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0),
+        )
+    };
+    let mut note = None;
+    let mut migrated = None;
+    {
+        let mut state = player.borrow_mut();
+        let available = state.app_voice.available();
+        state.cue_speech = CueSpeech::new(backend, available);
+        if available {
+            state
+                .app_voice
+                .set_volume(i32::try_from(volume).unwrap_or(100));
+            state.app_voice.set_rate(i32::try_from(rate).unwrap_or(0));
+            if !saved_output.is_empty() {
+                if !state.app_voice.set_output(&saved_output, policy) {
+                    if backend == SpeechBackend::AppVoice {
+                        note = state.cue_speech.note_device_lost();
+                    }
+                } else if state.app_voice.selected_output() != saved_output {
+                    migrated = Some(state.app_voice.selected_output().to_string());
+                }
+            }
+        }
+    }
+    if let Some(selected) = migrated {
+        persist.set_and_save("subtitle_app_output", serde_json::json!(selected));
+    }
+    if let Some(text) = note {
+        live_region::announce_with_priority(status.label, text, live_region::Priority::High);
+    }
+}
+
+/// Speak one cue's text through the selected backend (automatic
+/// cues and manual review share this path, as in Python): exactly
+/// one backend per cue; an application-voice failure is reported
+/// through the screen reader once per stretch, ungated by the
+/// announcement level.
+fn speak_cue_text(
+    player: &Rc<RefCell<PlayerState>>,
+    persist: &Persist,
+    status: Status,
+    text: &str,
+) {
+    enum Act {
+        ScreenReader(String),
+        Note(Option<&'static str>),
+        Suppressed,
+    }
+    let act = {
+        let mut state = player.borrow_mut();
+        match state.cue_speech.route(text) {
+            CueRoute::ScreenReader(text) => Act::ScreenReader(text),
+            CueRoute::AppVoice(text) => {
+                let policy = iptv_core::speech::device_policy(&persist.config.borrow());
+                let result = state.app_voice.speak(&text, policy);
+                Act::Note(state.cue_speech.note_app_result(result))
+            }
+            CueRoute::Suppressed => Act::Suppressed,
+        }
+    };
+    match act {
+        Act::ScreenReader(text) => {
+            live_region::announce_with_priority(status.label, &text, live_region::Priority::Medium);
+        }
+        Act::Note(Some(text)) => {
+            live_region::announce_with_priority(status.label, text, live_region::Priority::High);
+        }
+        _ => {}
+    }
+}
+
+/// The device watchdog (Python's 500 ms output poll, on this
+/// app's player tick): while a subtitled session plays through
+/// the application voice, a vanished output pauses speech (or
+/// falls back, per policy) and is reported once through the
+/// screen reader.
+fn drive_speech_watchdog(player: &Rc<RefCell<PlayerState>>, persist: &Persist, status: Status) {
+    let note = {
+        let mut state = player.borrow_mut();
+        if state.cue_speech.backend() != SpeechBackend::AppVoice
+            || state.session.current().is_none()
+            || state.subtitle_cues.is_empty()
+        {
+            return;
+        }
+        let policy = iptv_core::speech::device_policy(&persist.config.borrow());
+        if state.app_voice.validate_output(policy) {
+            state.cue_speech.note_route_healthy();
+            None
+        } else {
+            state.cue_speech.note_device_lost()
+        }
+    };
+    if let Some(text) = note {
+        live_region::announce_with_priority(status.label, text, live_region::Priority::High);
+    }
+}
+
 fn speak_subtitle_cue(player: &Rc<RefCell<PlayerState>>, persist: &Persist, status: Status) {
     if !persist.config.borrow().bool_or("speak_subtitles", false) {
         return;
@@ -6460,13 +6985,18 @@ fn speak_subtitle_cue(player: &Rc<RefCell<PlayerState>>, persist: &Persist, stat
     if state.subtitle_cues.is_empty() {
         return;
     }
-    let current = active_cue(&state.subtitle_cues, position);
-    if current != state.last_spoken_cue {
-        state.last_spoken_cue = current;
-        if let Some(index) = current {
-            let text = state.subtitle_cues[index].text.clone();
-            live_region::announce_with_priority(status.label, &text, live_region::Priority::Medium);
+    let text = {
+        let current = active_cue(&state.subtitle_cues, position);
+        if current == state.last_spoken_cue {
+            None
+        } else {
+            state.last_spoken_cue = current;
+            current.map(|index| state.subtitle_cues[index].text.clone())
         }
+    };
+    drop(state);
+    if let Some(text) = text {
+        speak_cue_text(player, persist, status, &text);
     }
 }
 

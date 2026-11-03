@@ -877,6 +877,7 @@ version = "0.4.1"
 dependencies = [
  "chrono",
  "iptv-core",
+ "iptv-sapi",
  "iptv-vlc",
  "live-region",
  "serde_json",
@@ -905,6 +906,13 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "ureq",
+]
+
+[[package]]
+name = "iptv-sapi"
+version = "0.4.1"
+dependencies = [
+ "iptv-core",
 ]
 
 [[package]]

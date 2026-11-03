@@ -1,0 +1,10 @@
+[package]
+name = "iptv-sapi"
+version = "0.4.1"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Windows SAPI application voice for subtitle speech (Python app_tts.py port); unavailable elsewhere."
+
+[dependencies]
+iptv-core = { path = "../iptv-core" }
