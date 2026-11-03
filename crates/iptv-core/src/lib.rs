@@ -18,6 +18,7 @@ pub mod guide;
 pub mod i18n;
 pub mod instance;
 pub mod loading;
+pub mod navindex;
 pub mod playback;
 pub mod providers;
 pub mod proxy;

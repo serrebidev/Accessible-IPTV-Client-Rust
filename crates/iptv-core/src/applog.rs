@@ -21,7 +21,7 @@ use std::sync::Mutex;
 
 /// The log file name, shared with the Python app.
 pub const LOG_FILE_NAME: &str = "iptvclient_epg_debug.log";
-/// The subfolder (inside the config directory) holding the log.
+/// The subfolder holding the log (Python's `LOG_DIR_NAME`).
 pub const LOG_DIR_NAME: &str = "logs";
 /// Copy diagnostics include at most this much log tail (128 KiB).
 pub const DIAGNOSTIC_TAIL_BYTES: u64 = 128 * 1024;
@@ -29,10 +29,18 @@ pub const DIAGNOSTIC_TAIL_BYTES: u64 = 128 * 1024;
 /// rotating handler), keeping one backup.
 pub const MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
 
-/// The folder Open Logs opens and the log lives in.
+/// The folder Open Logs opens and the log lives in. Python's
+/// `get_logs_dir` law (audit S05): the config directory on Windows,
+/// the system temp directory everywhere else — a portable or
+/// read-only install location must never be able to silence the
+/// log, and tech-support instructions name one place per platform.
 #[must_use]
 pub fn logs_dir(config_dir: &Path) -> PathBuf {
-    config_dir.join(LOG_DIR_NAME)
+    if cfg!(windows) {
+        config_dir.join(LOG_DIR_NAME)
+    } else {
+        std::env::temp_dir().join(LOG_DIR_NAME)
+    }
 }
 
 /// The log file path inside `config_dir`'s logs folder.
@@ -325,6 +333,20 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("dir");
         dir
+    }
+
+    #[test]
+    fn logs_dir_follows_pythons_platform_law() {
+        // S05: Windows keeps logs under the config directory; every
+        // other platform uses the system temp directory.
+        let config = Path::new("/some/config");
+        let dir = logs_dir(config);
+        if cfg!(windows) {
+            assert_eq!(dir, config.join(LOG_DIR_NAME));
+        } else {
+            assert_eq!(dir, std::env::temp_dir().join(LOG_DIR_NAME));
+        }
+        assert_eq!(log_path(config), dir.join(LOG_FILE_NAME));
     }
 
     #[test]

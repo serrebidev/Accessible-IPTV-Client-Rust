@@ -1,6 +1,6 @@
 # Feature parity audit: current Python reference versus Rust
 
-Date: 2026-11-03. Status: **addressed 2026-11-03** — every entry below carries its fix and regression evidence; the only entries not fully closed are B19 (responsiveness half open), E12 (no scale benchmark), and the recorded limits on E10, P18, R10, R19, S05 and S10. Consolidated record: docs/validation/0063-parity-audit-closure.md. Owner-heard NVDA acceptance remains separate under ADR 0004.
+Date: 2026-11-03. Status: **closed 2026-11-03** — every entry below carries its fix and regression evidence, and all 85 findings are fully closed: the consolidated record is docs/validation/0063-parity-audit-closure.md, and the eight entries that closed with partials there (B19, E12, E10, P18, R10, R19, S05, S10) were completed the same day in docs/validation/0064-finish-parity-completion.md. Owner-heard NVDA acceptance remains separate under ADR 0004.
 
 ## Reference and scope
 
@@ -180,7 +180,7 @@ Rust `crates/iptv-app/src/main.rs:4945` through `main.rs:4982`.
 Check: compare the panel during a current show, a schedule gap and an empty
 description, with a next show present in every case.
 
-**Fix:** Fixed with one deliberate deviation: channels with no guide match keep the existing placeholder text instead of Python's exact wording. See docs/validation/batch-epg.md.
+**Fix:** Fixed. Completed 2026-11-03: channels with no guide match now leave the panel empty, Python's exact behavior. See docs/validation/batch-epg.md and docs/validation/0064-finish-parity-completion.md.
 
 ### E11 — Guide row freshness depends on an unrelated active worker (medium)
 
@@ -214,7 +214,7 @@ whole-guide in-memory storage limit is also still relevant; see validation 0011.
 
 ## Playlists, providers, favorites and VOD
 
-**Fix:** Fixed (algorithmic): bulk now/next snapshots replace per-channel lookups; no 500k-channel benchmark was run. See docs/validation/batch-epg.md.
+**Fix:** Fixed. Completed 2026-11-03: the 500k-channel benchmark was run and recorded, and it exposed that every refresh re-matched the whole catalogue (~40 s at scale); guide matches are now cached per playlist+guide pair (Python's program-match cache), cutting the recurring refresh to 68 ms. See docs/validation/batch-epg.md and docs/validation/0064-finish-parity-completion.md.
 
 ### B01 — Provider playlist scopes hide their channels (high)
 
@@ -437,7 +437,7 @@ Rust `crates/iptv-core/src/browser.rs:94`, `browser.rs:217`, `browser.rs:261`,
 Check: measure scope/category/favorite/VOD keyboard response at 500,000 channels
 with many favorites. Actual latency was not measured in this audit.
 
-**Fix:** Fixed in part: catalogue clone removed, O(1) favorite membership, VOD filtering off the UI thread. Python's background navigation index was not built and 500k-playlist latency is unmeasured; the responsiveness half of this entry stays open. See docs/validation/batch-playlists.md.
+**Fix:** Fixed. Completed 2026-11-03: Python's background navigation index is built (core navindex, background warm-up, scan fallback) and 500k-playlist timings are measured and recorded. See docs/validation/batch-playlists.md and docs/validation/0064-finish-parity-completion.md.
 
 ### B20 — Favorite counts remain stale and ignore scope (medium)
 
@@ -673,7 +673,7 @@ Rust `crates/iptv-app/src/main.rs:5125`, `main.rs:5273`, `main.rs:6809`,
 Check: inject slow open/stop operations; maintain keyboard response and ordered
 provider handoff. No real-world latency measurement is claimed here.
 
-**Fix:** Fixed with one residual: the VLC engine's final release at app exit still runs on the UI thread (the handle is created once and never replaced). See docs/validation/batch-playback.md.
+**Fix:** Fixed. Completed 2026-11-03: at exit the engine and ops channel move to a detached cleanup thread, so the final libvlc release no longer runs on the UI thread. See docs/validation/batch-playback.md and docs/validation/0064-finish-parity-completion.md.
 
 ### P19 — Player menu labels and fullscreen behavior are incomplete (low)
 
@@ -840,7 +840,7 @@ passes it into capture. Evidence: Python `main.py:3690`, `main.py:3780`,
 Check: choose audio description and capture manually, by DVR and from catch-up;
 audio-only output contains that track and video output defaults to it.
 
-**Fix:** Fixed with one bound: the preferred-audio probe is capped at 6 s where Python allows 20 s. See docs/validation/batch-recording.md.
+**Fix:** Fixed. Completed 2026-11-03: the probe budget is Python's 20 s (ffmpeg's own 10 s rw_timeout still bounds a stalled probe). See docs/validation/batch-recording.md and docs/validation/0064-finish-parity-completion.md.
 
 ### R11 — Separate radio/video recording presets are unused (medium)
 
@@ -943,7 +943,7 @@ Delete and context cancel/delete. Evidence: Python `main.py:9013`,
 Check: retain a later selected job on refresh, inspect format/end time and
 remove selected completed jobs through the keyboard.
 
-**Fix:** Fixed with one omission: Python's right-click menu was not ported; buttons and keyboard (Ctrl+A, Delete) cover the actions. See docs/validation/batch-recording.md.
+**Fix:** Fixed. Completed 2026-11-03: Python's right-click menu is ported (Refresh; Cancel; Delete with the Del label), sharing the buttons' code paths. See docs/validation/batch-recording.md and docs/validation/0064-finish-parity-completion.md.
 
 ### R20 — Catch-up browsing omits dates, descriptions and return behavior (medium)
 
@@ -1034,7 +1034,7 @@ sink/tracing dependency is configured in the Rust crates. Evidence: Python
 Check: trigger a harmless synthetic media/guide error; expose its real log,
 copy redacted useful diagnostics and report clipboard failure.
 
-**Fix:** Fixed with one deviation: logs live in the config directory's logs folder on all platforms. See docs/validation/batch-platform.md.
+**Fix:** Fixed. Completed 2026-11-03: the log folder follows Python's get_logs_dir law exactly (config dir on Windows, system temp elsewhere), with a regression test. See docs/validation/batch-platform.md and docs/validation/0064-finish-parity-completion.md.
 
 ### S06 — UI translation bypasses and language activation remain (medium)
 
@@ -1183,5 +1183,5 @@ files changed; Python tracked files unchanged. Whitespace checks include the new
 untracked audit file. The separate Rust 2021 borrow probe passed as described in
 R21. No application build or full-suite pass is claimed.
 
-**Fix:** Fixed with a recorded limit: wxdragon exposes no API to identify an open menu's highlighted item, so F1 from an open menu falls back to the last focused control's topic. See docs/validation/batch-platform.md.
+**Fix:** Fixed. Completed 2026-11-03: the recorded limit was wrong — wxdragon 0.9.24 exposes MENU_HIGHLIGHT with the item id; highlights now route F1 to the highlighted item's topic. See docs/validation/batch-platform.md and docs/validation/0064-finish-parity-completion.md.
 

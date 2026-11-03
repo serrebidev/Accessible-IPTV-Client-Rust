@@ -56,6 +56,16 @@ pub struct BrowserWorker {
     last_sources: Vec<crate::sources::PlaylistSource>,
     /// Playlist-header guides by source location (B09).
     playlist_guides: std::collections::BTreeMap<String, Vec<String>>,
+    /// The background navigation index (B19, port of Python's
+    /// `PlaylistIndex` warm-up): built on a worker thread after a
+    /// model is applied, installed only for the exact model it was
+    /// built from, and every projection falls back to scanning while
+    /// it is absent or stale.
+    nav_index: Option<Arc<crate::navindex::NavIndex>>,
+    nav_index_model: Option<Arc<BrowseModel>>,
+    nav_index_building: Option<Arc<BrowseModel>>,
+    nav_index_rx:
+        Option<std::sync::mpsc::Receiver<(Arc<BrowseModel>, Arc<crate::navindex::NavIndex>)>>,
 }
 
 impl BrowserWorker {
@@ -160,6 +170,24 @@ impl BrowserWorker {
         if self.scope.is_none() {
             return categories(self.playlist.channels());
         }
+        // B19: with the navigation index installed for this model,
+        // the scoped group list comes from its first-appearance
+        // group table instead of a full catalogue scan.
+        if let (Some(scope), Some(index)) = (&self.scope, self.nav_index_for(&self.playlist)) {
+            let mut list = vec![Category::All, Category::Favorites];
+            let mut seen = std::collections::HashSet::new();
+            for raw in index.scope_group_names(scope) {
+                let name = if raw.is_empty() {
+                    crate::categories::UNCATEGORIZED
+                } else {
+                    raw
+                };
+                if seen.insert(name.to_owned()) {
+                    list.push(Category::Group(name.to_owned()));
+                }
+            }
+            return list;
+        }
         // B19: borrow, never clone, the scoped channels.
         crate::categories::categories_from(
             self.playlist
@@ -198,14 +226,84 @@ impl BrowserWorker {
     }
 
     /// Drop rows whose channel is outside the playlist scope.
-    /// `channels` is the slice the rows index into.
-    fn scoped_rows(&self, channels: &[crate::Channel], rows: Vec<usize>) -> Vec<usize> {
-        if self.scope.is_none() {
+    /// `model` is the model the rows index into; when the
+    /// navigation index was built from it, membership is a binary
+    /// search per row instead of a scan of channel attributes (B19).
+    fn scoped_rows(&self, model: &Arc<BrowseModel>, rows: Vec<usize>) -> Vec<usize> {
+        let Some(scope) = &self.scope else {
             return rows;
+        };
+        if let Some(nav) = self.nav_index_for(model) {
+            return rows
+                .into_iter()
+                .filter(|&index| nav.in_scope(scope, index))
+                .collect();
         }
+        let channels = model.channels();
         rows.into_iter()
             .filter(|&index| channels.get(index).is_some_and(|c| self.in_scope(c)))
             .collect()
+    }
+
+    /// The navigation index installed for exactly `model`, if any.
+    fn nav_index_for(&self, model: &Arc<BrowseModel>) -> Option<Arc<crate::navindex::NavIndex>> {
+        match (&self.nav_index, &self.nav_index_model) {
+            (Some(index), Some(indexed)) if Arc::ptr_eq(indexed, model) => Some(Arc::clone(index)),
+            _ => None,
+        }
+    }
+
+    /// Warm the navigation index for `model` on a background thread
+    /// (Python's `_warm_playlist_index_background`): projections
+    /// keep using the scan path until `poll` installs the result,
+    /// and a build for a superseded model is discarded on arrival.
+    fn request_nav_index(&mut self, model: &Arc<BrowseModel>) {
+        if self.nav_index_for(model).is_some() {
+            return;
+        }
+        if self
+            .nav_index_building
+            .as_ref()
+            .is_some_and(|building| Arc::ptr_eq(building, model))
+        {
+            return;
+        }
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let build_model = Arc::clone(model);
+        std::thread::spawn(move || {
+            let index = crate::navindex::NavIndex::build(build_model.channels());
+            let _ = sender.send((build_model, Arc::new(index)));
+        });
+        self.nav_index_building = Some(Arc::clone(model));
+        self.nav_index_rx = Some(receiver);
+    }
+
+    /// Install a finished navigation index whose model is still
+    /// current (the published playlist or the pending replacement).
+    fn pump_nav_index(&mut self) {
+        let Some(receiver) = &self.nav_index_rx else {
+            return;
+        };
+        match receiver.try_recv() {
+            Ok((model, index)) => {
+                let current = Arc::ptr_eq(&model, &self.playlist)
+                    || self
+                        .replacement
+                        .as_ref()
+                        .is_some_and(|pending| Arc::ptr_eq(&model, pending));
+                if current {
+                    self.nav_index = Some(index);
+                    self.nav_index_model = Some(model);
+                }
+                self.nav_index_building = None;
+                self.nav_index_rx = None;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.nav_index_building = None;
+                self.nav_index_rx = None;
+            }
+        }
     }
 
     #[must_use]
@@ -268,8 +366,14 @@ impl BrowserWorker {
     pub fn favorite_count(&self) -> usize {
         let channels = self.playlist.channels();
         let indexes = self.favorites.favorite_indexes(channels);
-        if self.scope.is_none() {
+        let Some(scope) = &self.scope else {
             return indexes.len();
+        };
+        if let Some(index) = self.nav_index_for(&self.playlist) {
+            return indexes
+                .into_iter()
+                .filter(|&position| index.in_scope(scope, position))
+                .count();
         }
         indexes
             .into_iter()
@@ -320,21 +424,20 @@ impl BrowserWorker {
 
     /// Submit the current category scope of the last usable playlist.
     fn submit_current(&mut self, query: String) {
+        let model = Arc::clone(&self.playlist);
         let scope = self.scoped_rows(
-            self.playlist.channels(),
-            category_rows(self.playlist.channels(), &self.category, &self.favorites),
+            &model,
+            category_rows(model.channels(), &self.category, &self.favorites),
         );
-        self.searcher.submit_scoped(
-            Arc::clone(&self.playlist),
-            scope,
-            self.category.clone(),
-            query,
-        );
+        let nav_index = self.nav_index_for(&model);
+        self.searcher
+            .submit_scoped(model, scope, self.category.clone(), query, nav_index);
         self.searching = true;
     }
 
     /// Poll from the UI thread; never reads, parses or scans channels here.
     pub fn poll(&mut self, query: &str) -> Option<BrowseEvent> {
+        self.pump_nav_index();
         if let Some(loaded) = self.loader.try_latest() {
             match loaded.outcome {
                 Ok(model) => {
@@ -391,7 +494,7 @@ impl BrowserWorker {
     fn filter_loaded(&mut self, loaded: &Arc<BrowseModel>, query: &str) {
         self.raw = Some(Arc::clone(loaded));
         let merged = merged_with_extras(loaded, &self.extras);
-        self.apply_model(merged, query);
+        self.apply_model(&merged, query);
     }
 
     /// Channels arriving outside the playlist load (provider accounts)
@@ -419,10 +522,10 @@ impl BrowserWorker {
             .clone()
             .unwrap_or_else(|| Arc::new(BrowseModel::default()));
         let merged = merged_with_extras(&base, &self.extras);
-        self.apply_model(merged, query);
+        self.apply_model(&merged, query);
     }
 
-    fn apply_model(&mut self, loaded: Arc<BrowseModel>, query: &str) {
+    fn apply_model(&mut self, loaded: &Arc<BrowseModel>, query: &str) {
         // A group that vanished from the replacement cannot stay active;
         // the sentinels always exist. Favorites survive by stable key.
         if matches!(self.category, Category::Group(_))
@@ -431,18 +534,21 @@ impl BrowserWorker {
             self.category = Category::All;
         }
         let scope = self.scoped_rows(
-            loaded.channels(),
+            loaded,
             category_rows(loaded.channels(), &self.category, &self.favorites),
         );
+        let nav_index = self.nav_index_for(loaded);
         self.searcher.submit_scoped(
-            Arc::clone(&loaded),
+            Arc::clone(loaded),
             scope,
             self.category.clone(),
             query.to_owned(),
+            nav_index,
         );
         self.pending_extras = self.extras.len();
-        self.replacement = Some(loaded);
+        self.replacement = Some(Arc::clone(loaded));
         self.searching = true;
+        self.request_nav_index(loaded);
     }
 
     #[must_use]
@@ -604,6 +710,47 @@ mod tests {
         browser.replace_provider_channels(Vec::new(), "");
         assert_eq!(wait_results(&mut browser, "").len(), 4);
         assert_eq!(browser.all_channels().len(), 4);
+    }
+
+    #[test]
+    fn nav_index_projections_match_the_scan_path() {
+        // B19 regression: once the background navigation index
+        // installs, scoped categories, rows and favorite counts must
+        // agree exactly with the scan path they replace.
+        let mut browser = BrowserWorker::default();
+        browser.load(fixture("local.m3u"));
+        assert_eq!(results(wait(&mut browser, "")).len(), 4);
+        browser.replace_provider_channels(
+            vec![
+                provider_channel("Prov One", "acct-1"),
+                provider_channel("Prov Two", "acct-2"),
+            ],
+            "",
+        );
+        assert_eq!(wait_results(&mut browser, "").len(), 6);
+        browser.set_scope(Some("acct-1".to_string()), "");
+        assert_eq!(wait_results(&mut browser, "").len(), 1);
+        // Scan-path answers (the index for the published model has
+        // not been pumped yet, and each answer below is taken before
+        // the install on purpose).
+        let scan_categories = browser.categories();
+        assert!(browser.toggle_favorite(4, "").is_some());
+        let scan_count = browser.favorite_count();
+        assert_eq!(scan_count, 1);
+        // Wait for the background build to land and install.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while browser.nav_index_for(&browser.playlist).is_none() {
+            browser.pump_nav_index();
+            assert!(Instant::now() < deadline, "nav index never installed");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(browser.categories(), scan_categories);
+        assert_eq!(browser.favorite_count(), scan_count);
+        browser.set_scope(Some("acct-1".to_string()), "");
+        assert_eq!(wait_results(&mut browser, "").len(), 1);
+        // A scoped search through the index names the same rows.
+        browser.search("prov".to_string());
+        assert_eq!(wait_results(&mut browser, "prov").len(), 1);
     }
 
     #[test]
