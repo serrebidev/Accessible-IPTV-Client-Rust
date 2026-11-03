@@ -361,6 +361,7 @@ struct Wiring {
     epg_store: Rc<RefCell<Option<iptv_core::epgstore::EpgStore>>>,
     epg_worker: Rc<EpgWorker>,
     epg_pending: Rc<std::cell::Cell<bool>>,
+    epg_deferred: Rc<std::cell::Cell<bool>>,
     reminders: Rc<RefCell<Vec<Reminder>>>,
     provider_worker: Rc<ProviderWorker>,
     provider_pending: Rc<std::cell::Cell<bool>>,
@@ -569,6 +570,7 @@ fn bind_browser(frame: Frame, controls: Controls, model: Rc<RefCell<SearchResult
         epg_store: Rc::new(RefCell::new(None)),
         epg_worker: Rc::new(EpgWorker::new()),
         epg_pending: Rc::new(std::cell::Cell::new(false)),
+        epg_deferred: Rc::new(std::cell::Cell::new(false)),
         reminders: Rc::new(RefCell::new(Vec::new())),
         provider_worker: Rc::new(ProviderWorker::new()),
         provider_pending: Rc::new(std::cell::Cell::new(false)),
@@ -614,8 +616,8 @@ fn bind_browser(frame: Frame, controls: Controls, model: Rc<RefCell<SearchResult
     if wiring.dvr.borrow().pending_count() > 0 {
         assert!(wiring.timer.start(50, false));
     }
-    reload_epg(&wiring);
     reload_sources(&wiring);
+    reload_epg(&wiring);
     fill_scope_choices(&wiring, controls.scope_choice);
     bind_completion(&wiring, controls);
     build_menu(frame, &wiring, controls);
@@ -661,10 +663,21 @@ fn bind_completion(wiring: &Wiring, controls: Controls) {
     let category = controls.category;
     let completed_timer = Rc::downgrade(&wiring.timer);
     let completed = wiring.clone();
+    let loading_noted = Rc::new(std::cell::Cell::new(false));
     wiring.timer.on_tick(move |_| {
+        if completed.browser.borrow().is_busy()
+            && completed.model.borrow().is_empty()
+            && !loading_noted.get()
+        {
+            // The list's initial text claims no playlist is loaded;
+            // while a load is actually in flight, say so instead.
+            list.set_accessibility_description("Loading playlist...");
+            loading_noted.set(true);
+        }
         let event = completed.browser.borrow_mut().poll(&search.get_value());
         match event {
             Some(BrowseEvent::Results(results)) => {
+                loading_noted.set(false);
                 publish_results(list, status, &completed.model, results);
                 sync_category_control(category, &completed.categories, &completed.browser);
             }
@@ -673,6 +686,11 @@ fn bind_completion(wiring: &Wiring, controls: Controls) {
                 list.set_accessibility_description(error.message());
             }
             None => {}
+        }
+        if completed.epg_deferred.get() && !completed.browser.borrow().is_busy() {
+            completed.epg_deferred.set(false);
+            let urls = completed.persist.config.borrow().string_list("epg_urls");
+            dispatch_epg_load(&completed, urls);
         }
         poll_epg(&completed, status);
         poll_providers(&completed, controls);
@@ -1135,9 +1153,7 @@ fn poll_providers(wiring: &Wiring, controls: Controls) {
                     assert!(wiring.timer.start(50, false));
                 }
                 if !epg_urls.is_empty() {
-                    wiring.epg_worker.load(epg_urls);
-                    wiring.epg_pending.set(true);
-                    assert!(wiring.timer.start(50, false));
+                    dispatch_epg_load(wiring, epg_urls);
                 }
                 for failure in failures {
                     status.set_label(&failure);
@@ -1185,10 +1201,9 @@ fn poll_epg(wiring: &Wiring, status: Status) {
     if let Some(result) = wiring.epg_worker.try_recv() {
         wiring.epg_pending.set(false);
         match result {
-            Ok(guide) => {
+            Ok((guide, store_note)) => {
                 let counts = (guide.channels.len(), guide.programme_count());
                 let indexes = GuideIndexes::build(&guide.channels);
-                let store_note = mirror_guide_to_store(wiring, &guide);
                 *wiring.epg.borrow_mut() = Some((guide, indexes));
                 status.set_label(&format!(
                     "Guide loaded: {} channels, {} programmes.{store_note}",
@@ -2046,6 +2061,7 @@ fn clone_wiring(wiring: &Wiring) -> Wiring {
         epg_store: Rc::clone(&wiring.epg_store),
         epg_worker: Rc::clone(&wiring.epg_worker),
         epg_pending: Rc::clone(&wiring.epg_pending),
+        epg_deferred: Rc::clone(&wiring.epg_deferred),
         reminders: Rc::clone(&wiring.reminders),
         provider_worker: Rc::clone(&wiring.provider_worker),
         provider_pending: Rc::clone(&wiring.provider_pending),
@@ -3290,9 +3306,7 @@ fn menu_import_epg(wiring: &Wiring, frame: Frame, status: Status) {
             .persist
             .set_and_save("epg_urls", serde_json::json!(urls));
     }
-    wiring.epg_worker.load(vec![path]);
-    wiring.epg_pending.set(true);
-    assert!(wiring.timer.start(50, false));
+    dispatch_epg_load(wiring, vec![path]);
     status.set_label("Importing EPG data...");
 }
 
@@ -3823,23 +3837,6 @@ fn store_programmes(wiring: &Wiring, channel: &Channel) -> Vec<Programme> {
         }
     }
     Vec::new()
-}
-
-/// Mirror a freshly loaded guide into the `SQLite` store beside
-/// the config; returns a status suffix when the import fails.
-fn mirror_guide_to_store(wiring: &Wiring, guide: &EpgGuide) -> String {
-    let path = iptv_core::config::user_config_dir().join("epg.db");
-    let mut guard = wiring.epg_store.borrow_mut();
-    if guard.is_none() {
-        match iptv_core::epgstore::EpgStore::open(&path) {
-            Ok(store) => *guard = Some(store),
-            Err(error) => return format!(" Guide database unavailable: {error}"),
-        }
-    }
-    match guard.as_mut().map(|store| store.import_guide(guide)) {
-        Some(Ok(_)) | None => String::new(),
-        Some(Err(error)) => format!(" Guide database import failed: {error}"),
-    }
 }
 
 /// The programme airing now on a channel, when the guide has one.
@@ -6406,13 +6403,38 @@ fn reload_sources(wiring: &Wiring) {
 }
 
 /// Reload the guide from the configured EPG URLs.
+/// Where the guide's `SQLite` mirror lives.
+fn epg_store_path() -> std::path::PathBuf {
+    iptv_core::config::user_config_dir().join("epg.db")
+}
+
+/// Start a guide load now (the worker also mirrors the guide to
+/// the store on its own thread).
+fn dispatch_epg_load(wiring: &Wiring, epg_urls: Vec<String>) {
+    if epg_urls.is_empty() {
+        return;
+    }
+    wiring.epg_worker.load(epg_urls, Some(epg_store_path()));
+    wiring.epg_pending.set(true);
+    assert!(wiring.timer.start(50, false));
+}
+
+/// Reload the guide from the configured EPG URLs. While a playlist
+/// load is running, the guide waits: at real-world scale the guide
+/// is hundreds of MB and racing it starved the playlist download
+/// and parse, so channels appeared minutes late (validation 0049).
+/// The completion tick dispatches the deferred load the moment the
+/// browser settles.
 fn reload_epg(wiring: &Wiring) {
     let epg_urls = wiring.persist.config.borrow().string_list("epg_urls");
-    if !epg_urls.is_empty() {
-        wiring.epg_worker.load(epg_urls);
-        wiring.epg_pending.set(true);
-        assert!(wiring.timer.start(50, false));
+    if epg_urls.is_empty() {
+        return;
     }
+    if wiring.browser.borrow().is_busy() {
+        wiring.epg_deferred.set(true);
+        return;
+    }
+    dispatch_epg_load(wiring, epg_urls);
 }
 
 /// Display name for one `playlists` config entry in the manager.
