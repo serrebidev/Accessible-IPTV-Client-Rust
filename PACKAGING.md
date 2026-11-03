@@ -23,6 +23,12 @@ One archive per platform, mirroring where the app looks for its
 data files at runtime:
 
 - the `iptv-app` binary;
+- the bundled libVLC runtime beside the binary (the platform
+  `libvlc` library, its core library, and a `plugins/` folder):
+  the built-in player loads the bundled copy first, so playback
+  works with no VLC install; a system VLC is only a fallback.
+  Added 2026-11-02 after the v0.3.2 package shipped without it
+  and the built-in player could not start (validation 0048);
 - `docs/help/*.md` — guide translations as they land (the app
   prefers the on-disk file for the resolved language and falls back
   to the embedded English guide);

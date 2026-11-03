@@ -56,6 +56,12 @@ jobs:
         with:
           components: rustfmt, clippy
 
+      # The Linux binary gets an $ORIGIN rpath so the libVLC copy
+      # bundled beside it in the package is found at runtime.
+      - name: Set rpath for bundled libVLC (Linux)
+        if: runner.os == 'Linux'
+        run: echo 'RUSTFLAGS=-C link-args=-Wl,-rpath,$ORIGIN' >> "$GITHUB_ENV"
+
       - name: Gates
         run: |
           cargo fmt --all --check
@@ -64,6 +70,42 @@ jobs:
 
       - name: Build
         run: cargo build --release -p iptv-app
+
+      # Bundle the libVLC runtime beside the binary so the built-in
+      # player works with no VLC install (PACKAGING.md). The app
+      # loads the bundled copy first on every platform.
+      - name: Bundle libVLC (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $index = (Invoke-WebRequest -UseBasicParsing "https://download.videolan.org/pub/videolan/vlc/").Content
+          $ver = ([regex]::Matches($index, 'href="([0-9]+\.[0-9]+\.[0-9]+)/"') | ForEach-Object { [version]$_.Groups[1].Value } | Sort-Object -Descending | Select-Object -First 1).ToString()
+          Write-Host "Bundling libVLC from VLC $ver"
+          Invoke-WebRequest -UseBasicParsing "https://download.videolan.org/pub/videolan/vlc/$ver/win64/vlc-$ver-win64.zip" -OutFile vlc.zip
+          Expand-Archive vlc.zip -DestinationPath vlc-dist
+          New-Item -ItemType Directory -Force bundle | Out-Null
+          Copy-Item "vlc-dist/vlc-$ver/libvlc.dll", "vlc-dist/vlc-$ver/libvlccore.dll" bundle
+          Copy-Item "vlc-dist/vlc-$ver/plugins" "bundle/plugins" -Recurse
+
+      - name: Bundle libVLC (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get install -y libvlc5 libvlccore9 vlc-plugin-base
+          mkdir -p bundle/plugins
+          cp -a /usr/lib/x86_64-linux-gnu/libvlc.so.5* /usr/lib/x86_64-linux-gnu/libvlccore.so.9* bundle/
+          cp -a /usr/lib/x86_64-linux-gnu/vlc/plugins/. bundle/plugins/
+
+      - name: Bundle libVLC (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          ver="$(curl -s https://download.videolan.org/pub/videolan/vlc/ | sed -n 's/.*href="\([0-9][0-9.]*\)\/".*/\1/p' | sort -V | tail -1)"
+          echo "Bundling libVLC from VLC $ver"
+          curl -sL -o vlc.dmg "https://download.videolan.org/pub/videolan/vlc/$ver/macosx/vlc-$ver-arm64.dmg"
+          hdiutil attach vlc.dmg -nobrowse -mountpoint /tmp/vlcapp
+          mkdir -p bundle/plugins
+          cp -a /tmp/vlcapp/VLC.app/Contents/MacOS/lib/libvlc*.dylib /tmp/vlcapp/VLC.app/Contents/MacOS/lib/libvlccore*.dylib bundle/
+          cp -a /tmp/vlcapp/VLC.app/Contents/MacOS/plugins/. bundle/plugins/
+          hdiutil detach /tmp/vlcapp
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
@@ -74,6 +116,8 @@ jobs:
           New-Item -ItemType Directory -Force $stage | Out-Null
           Copy-Item "target/release/${{ matrix.binary }}" $stage
           Copy-Item "docs/help" "$stage/docs/help" -Recurse
+          Copy-Item "bundle/libvlc.dll", "bundle/libvlccore.dll" $stage
+          Copy-Item "bundle/plugins" "$stage/plugins" -Recurse
           Compress-Archive -Path $stage -DestinationPath "$stage.zip"
 
       - name: Package (Linux/macOS)
@@ -84,6 +128,7 @@ jobs:
           mkdir -p "$stage/docs"
           cp "target/release/${{ matrix.binary }}" "$stage/"
           cp -R docs/help "$stage/docs/help"
+          cp -a bundle/. "$stage/"
           tar -czf "$stage.tar.gz" "$stage"
 
       - name: Upload package

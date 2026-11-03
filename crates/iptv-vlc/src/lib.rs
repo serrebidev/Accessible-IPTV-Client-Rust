@@ -100,20 +100,42 @@ unsafe fn c_string(ptr: *const c_char) -> String {
         .into_owned()
 }
 
-/// Candidate library names per platform, most specific first.
-fn library_candidates() -> Vec<&'static str> {
-    if cfg!(windows) {
-        vec!["libvlc.dll"]
+/// The directory the running executable lives in, when known.
+/// Release packages bundle libVLC there (see PACKAGING.md).
+fn exe_dir() -> Option<std::path::PathBuf> {
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(std::path::Path::to_path_buf))
+}
+
+/// Candidate library paths, most specific first. A copy bundled
+/// beside the executable wins over any system install, so the
+/// shipped packages play without VLC being installed.
+fn library_candidates() -> Vec<String> {
+    candidates_from(exe_dir().as_deref())
+}
+
+fn candidates_from(dir: Option<&std::path::Path>) -> Vec<String> {
+    let names: &[&str] = if cfg!(windows) {
+        &["libvlc.dll"]
     } else if cfg!(target_os = "macos") {
-        vec![
-            "libvlc.dylib",
-            "/Applications/VLC.app/Contents/MacOS/lib/libvlc.dylib",
-            "/opt/homebrew/lib/libvlc.dylib",
-            "/usr/local/lib/libvlc.dylib",
-        ]
+        &["libvlc.dylib"]
     } else {
-        vec!["libvlc.so.5", "libvlc.so"]
+        &["libvlc.so.5", "libvlc.so"]
+    };
+    let mut out: Vec<String> = Vec::new();
+    if let Some(dir) = dir {
+        for name in names {
+            out.push(dir.join(name).to_string_lossy().into_owned());
+        }
     }
+    out.extend(names.iter().map(|name| (*name).to_string()));
+    if cfg!(target_os = "macos") {
+        out.push("/Applications/VLC.app/Contents/MacOS/lib/libvlc.dylib".to_string());
+        out.push("/opt/homebrew/lib/libvlc.dylib".to_string());
+        out.push("/usr/local/lib/libvlc.dylib".to_string());
+    }
+    out
 }
 
 /// Whether a libVLC library can be loaded on this machine.
@@ -125,7 +147,7 @@ pub fn is_available() -> bool {
 fn load_library() -> Result<Library, String> {
     let mut last = String::new();
     for name in library_candidates() {
-        match unsafe { Library::new(name) } {
+        match unsafe { Library::new(&name) } {
             Ok(lib) => return Ok(lib),
             Err(error) => last = format!("{name}: {error}"),
         }
@@ -186,7 +208,26 @@ impl VlcEngine {
             };
         }
         let new_instance: NewFn = sym!(b"libvlc_new", NewFn);
-        let instance = unsafe { new_instance(0, std::ptr::null()) };
+        // Point libVLC at the plugins bundled beside the executable
+        // when the package shipped them; a system VLC finds its own.
+        let plugin_arg = exe_dir()
+            .map(|dir| dir.join("plugins"))
+            .filter(|dir| dir.is_dir())
+            .and_then(|dir| {
+                std::ffi::CString::new(format!("--plugin-path={}", dir.to_string_lossy())).ok()
+            });
+        let arg_ptrs: Vec<*const std::ffi::c_char> =
+            plugin_arg.iter().map(|arg| arg.as_ptr()).collect();
+        let instance = unsafe {
+            new_instance(
+                i32::try_from(arg_ptrs.len()).unwrap_or(0),
+                if arg_ptrs.is_empty() {
+                    std::ptr::null()
+                } else {
+                    arg_ptrs.as_ptr()
+                },
+            )
+        };
         if instance.is_null() {
             return Err("libVLC instance creation failed.".to_string());
         }
@@ -437,7 +478,23 @@ impl Drop for VlcEngine {
 
 #[cfg(test)]
 mod tests {
-    use super::{map_state, VlcState};
+    use super::{candidates_from, map_state, VlcState};
+
+    #[test]
+    fn bundled_copy_beside_the_exe_wins() {
+        let dir = std::path::Path::new("/opt/app");
+        let candidates = candidates_from(Some(dir));
+        let first = &candidates[0];
+        assert!(first.starts_with("/opt/app"), "{first}");
+        assert!(
+            first.ends_with("libvlc.dll")
+                || first.ends_with("libvlc.dylib")
+                || first.ends_with("libvlc.so.5"),
+            "{first}"
+        );
+        // And the bare system name stays as a fallback.
+        assert!(candidates.iter().any(|c| !c.contains('/')));
+    }
 
     #[test]
     fn state_mapping_matches_libvlc() {

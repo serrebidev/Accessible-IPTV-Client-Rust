@@ -403,6 +403,7 @@ struct PlayerState {
     vlc_active: bool,
     vlc_tracks_ready: bool,
     vlc_track_ids: Vec<i32>,
+    vlc_error: Option<String>,
     shared: Option<PlayerShared>,
     desired_track: Option<String>,
     track_menu_ids: Vec<i32>,
@@ -427,6 +428,7 @@ impl Default for PlayerState {
             vlc: None,
             vlc_active: false,
             vlc_tracks_ready: false,
+            vlc_error: None,
             vlc_track_ids: Vec::new(),
             shared: None,
             desired_track: None,
@@ -4373,7 +4375,13 @@ fn play_builtin(
     if let EngineAction::Load(load) = action {
         state.vlc_active = false;
         if state.vlc.is_none() {
-            state.vlc = iptv_vlc::VlcEngine::new().ok();
+            match iptv_vlc::VlcEngine::new() {
+                Ok(engine) => {
+                    state.vlc = Some(engine);
+                    state.vlc_error = None;
+                }
+                Err(error) => state.vlc_error = Some(error),
+            }
             if let Some(engine) = &mut state.vlc {
                 engine.set_window_handle(win.media.get_handle() as usize);
             }
@@ -4405,6 +4413,13 @@ fn play_builtin(
         win.frame.show(true);
     }
     player_status(status, persist, &state.session.announcement(), 3);
+    if !state.vlc_active {
+        if let Some(error) = &state.vlc_error {
+            status.set_label(&format!(
+                "libVLC is not available ({error}); the basic player is being used and many streams will not play. The official package bundles libVLC."
+            ));
+        }
+    }
 }
 
 /// The built-in player window's widgets.
