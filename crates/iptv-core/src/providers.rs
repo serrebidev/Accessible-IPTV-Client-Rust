@@ -905,7 +905,15 @@ pub enum ProviderEvent {
         /// The resolved URL or the failure message.
         result: ProviderResult<String>,
     },
-    Account(ProviderResult<String>),
+    Account {
+        /// The formatted account report for display.
+        report: ProviderResult<String>,
+        /// The account's declared connection limit, when the
+        /// payload carried one (issue #134's capacity cache).
+        max_connections: Option<i64>,
+        /// The account the fetch was for.
+        provider_id: String,
+    },
 }
 
 enum Client {
@@ -1147,17 +1155,27 @@ impl ProviderWorker {
                         ProviderEvent::Resolved { request, result }
                     }
                     ProviderJob::Account { provider_id } => {
-                        let result = match clients.get(&provider_id) {
+                        let (report, max_connections) = match clients.get(&provider_id) {
                             Some((account, client)) => {
                                 let payload = match client {
                                     Client::Xtream(c) => c.account_info(),
                                     Client::Stalker(c) => c.account_info(now_epoch()),
                                 };
-                                payload.map(|p| format_account_report(account, &p, now_epoch()))
+                                match payload {
+                                    Ok(p) => (
+                                        Ok(format_account_report(account, &p, now_epoch())),
+                                        max_connections_in(&p),
+                                    ),
+                                    Err(e) => (Err(e), None),
+                                }
                             }
-                            None => Err("Unknown provider account".to_string()),
+                            None => (Err("Unknown provider account".to_string()), None),
                         };
-                        ProviderEvent::Account(result)
+                        ProviderEvent::Account {
+                            report,
+                            max_connections,
+                            provider_id,
+                        }
                     }
                 };
                 if event_sender.send(event).is_err() {
@@ -1433,6 +1451,79 @@ fn expiry_lines(value: Option<&Value>, now: i64) -> Vec<String> {
         lines.push(format!("Days since expiry: {}", (now - ts) / 86_400));
     }
     lines
+}
+
+/// The account's declared connection limit from an account-info
+/// payload (`user_info.max_connections`, string or number).
+/// `None` when the provider does not declare one — callers must
+/// not assume a capacity they were never told (issue #134).
+#[must_use]
+pub fn max_connections_in(payload: &Value) -> Option<i64> {
+    let raw = payload.get("user_info")?.get("max_connections")?;
+    match raw {
+        Value::Number(n) => n.as_i64(),
+        Value::String(s) => s.trim().parse::<i64>().ok(),
+        _ => None,
+    }
+    .filter(|limit| *limit > 0)
+}
+
+/// The identity of a provider account for connection accounting:
+/// same host and same username means the same account (the rule
+/// `account_info.py` uses).
+#[must_use]
+pub fn account_key(base_url: &str, username: &str) -> String {
+    format!("{}|{}", host_of(base_url).to_lowercase(), username)
+}
+
+impl ProviderAccount {
+    /// This account's connection-accounting key.
+    #[must_use]
+    pub fn account_key(&self) -> String {
+        match self {
+            Self::Xtream(cfg) => account_key(&cfg.base_url, &cfg.username),
+            Self::Stalker(cfg) => account_key(&cfg.base_url, &cfg.mac),
+        }
+    }
+}
+
+/// The connection-accounting key of the account a channel
+/// belongs to, when it can be determined: an explicit provider
+/// id on the channel wins; otherwise an Xtream live URL that
+/// sits on an account's host and carries its username as a path
+/// segment identifies the account. `None` means the channel's
+/// account is unknown and no capacity may be assumed for it.
+#[must_use]
+pub fn channel_account_key(
+    channel: &crate::Channel,
+    accounts: &[ProviderAccount],
+) -> Option<String> {
+    if let Some(provider_id) = channel.unknown_attributes.get("provider-id") {
+        if let Some(account) = accounts
+            .iter()
+            .find(|a| a.provider_id().as_deref() == Some(provider_id.as_str()))
+        {
+            return Some(account.account_key());
+        }
+    }
+    let url = channel.url.trim();
+    if url.is_empty() {
+        return None;
+    }
+    let host = host_of(url).to_lowercase();
+    let segments: Vec<&str> = url.split('/').collect();
+    for account in accounts {
+        let ProviderAccount::Xtream(cfg) = account else {
+            continue;
+        };
+        if host_of(&cfg.base_url).to_lowercase() == host
+            && !cfg.username.is_empty()
+            && segments.iter().any(|seg| *seg == cfg.username)
+        {
+            return Some(account.account_key());
+        }
+    }
+    None
 }
 
 fn xtream_report(payload: &Value, now: i64) -> Vec<String> {
@@ -1753,5 +1844,63 @@ mod tests {
             }
         }
         assert_eq!(ids, vec![41, 42, 43]);
+    }
+
+    fn bare_channel(name: &str, url: &str) -> crate::Channel {
+        crate::Channel {
+            name: name.to_string(),
+            group: String::new(),
+            url: url.to_string(),
+            tvg_id: String::new(),
+            tvg_name: String::new(),
+            tvg_logo: String::new(),
+            unknown_attributes: std::collections::BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn max_connections_reads_strings_and_numbers() {
+        let payload = serde_json::json!({"user_info": {"max_connections": "2"}});
+        assert_eq!(max_connections_in(&payload), Some(2));
+        let payload = serde_json::json!({"user_info": {"max_connections": 1}});
+        assert_eq!(max_connections_in(&payload), Some(1));
+        // Undeclared or useless limits are never assumed.
+        assert_eq!(
+            max_connections_in(&serde_json::json!({"user_info": {}})),
+            None
+        );
+        let payload = serde_json::json!({"user_info": {"max_connections": "0"}});
+        assert_eq!(max_connections_in(&payload), None);
+        assert_eq!(max_connections_in(&serde_json::json!({})), None);
+    }
+
+    #[test]
+    fn channel_account_key_matches_by_id_then_url() {
+        let account = ProviderAccount::Xtream(XtreamConfig {
+            base_url: "http://panel.example.com:8080".to_string(),
+            username: "alice".to_string(),
+            provider_id: Some("prov-1".to_string()),
+            ..XtreamConfig::default()
+        });
+        let accounts = vec![account];
+        let mut by_id = bare_channel("A", "");
+        by_id
+            .unknown_attributes
+            .insert("provider-id".to_string(), "prov-1".to_string());
+        assert_eq!(
+            channel_account_key(&by_id, &accounts),
+            Some("panel.example.com:8080|alice".to_string())
+        );
+        let by_url = bare_channel("B", "http://panel.example.com:8080/alice/pass/123.ts");
+        assert_eq!(
+            channel_account_key(&by_url, &accounts),
+            Some("panel.example.com:8080|alice".to_string())
+        );
+        // A different host, or the same host without the
+        // account's username, belongs to no known account.
+        let foreign = bare_channel("C", "http://other.example.com/alice/pass/123.ts");
+        assert_eq!(channel_account_key(&foreign, &accounts), None);
+        let no_user = bare_channel("D", "http://panel.example.com:8080/bob/pass/123.ts");
+        assert_eq!(channel_account_key(&no_user, &accounts), None);
     }
 }
