@@ -959,16 +959,19 @@ mod tests {
         // A reserve guaranteed above the measured free space, capped
         // to the accepted range so normalization keeps it as-is.
         let too_much = (ok.free_bytes / (1024 * 1024) + 1).min(65536);
-        assert!(
-            too_much * 1024 * 1024 > ok.free_bytes || too_much == 65536,
-            "reserve must exceed free space on this disk"
-        );
-        let err = check_destination(&dir, Some(i64::try_from(too_much).expect("fits")))
-            .expect_err("oversized reserve must fail");
-        assert!(
-            err.contains("Not enough free space to start recording"),
-            "unexpected error: {err}"
-        );
+        if too_much * 1024 * 1024 > ok.free_bytes {
+            let err = check_destination(&dir, Some(i64::try_from(too_much).expect("fits")))
+                .expect_err("oversized reserve must fail");
+            assert!(
+                err.contains("Not enough free space to start recording"),
+                "unexpected error: {err}"
+            );
+        } else {
+            // This disk holds more than the largest accepted reserve
+            // (CI runners do), so no permitted reserve can exceed the
+            // free space: the maximum reserve must pass instead.
+            check_destination(&dir, Some(65536)).expect("max reserve fits this disk");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
