@@ -23,7 +23,33 @@ struct Route {
 type Routes = Arc<Mutex<HashMap<String, Route>>>;
 type SegmentCache = Arc<Mutex<HashMap<String, (String, Vec<u8>)>>>;
 
-/// A running proxy server on an ephemeral loopback port.
+/// The primary LAN IPv4 address of this machine, if one can be
+/// found (port of `StreamProxy._get_local_ip`'s connected-socket
+/// method): a UDP socket "connected" to a public address reveals
+/// the source address the OS would route from, without sending
+/// anything. Loopback and unspecified results do not count.
+#[must_use]
+pub fn lan_ip() -> Option<std::net::IpAddr> {
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("8.8.8.8:80").ok()?;
+    let addr = socket.local_addr().ok()?.ip();
+    if addr.is_loopback() || addr.is_unspecified() {
+        None
+    } else {
+        Some(addr)
+    }
+}
+
+/// The host the proxy binds and advertises: the LAN address when
+/// one exists (a cast target on another host must be able to reach
+/// the proxy — a loopback URL points the TV at itself), else
+/// loopback for same-machine use.
+#[must_use]
+pub fn advertised_host(lan: Option<std::net::IpAddr>) -> String {
+    lan.map_or_else(|| "127.0.0.1".to_string(), |ip| ip.to_string())
+}
+
+/// A running proxy server on an ephemeral port.
 pub struct ProxyServer {
     base: String,
     routes: Routes,
@@ -32,18 +58,27 @@ pub struct ProxyServer {
 }
 
 impl ProxyServer {
-    /// Start the proxy on 127.0.0.1 with an ephemeral port.
+    /// Start the proxy on the LAN address (falling back to
+    /// loopback) with an ephemeral port.
     ///
     /// # Errors
     /// Returns the OS error text when the listener cannot bind.
     pub fn start() -> Result<Self, String> {
-        let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
+        Self::start_on(&advertised_host(lan_ip()))
+    }
+
+    /// Start the proxy on a specific host with an ephemeral port.
+    ///
+    /// # Errors
+    /// Returns the OS error text when the listener cannot bind.
+    pub fn start_on(host: &str) -> Result<Self, String> {
+        let listener = TcpListener::bind((host, 0)).map_err(|e| e.to_string())?;
         listener.set_nonblocking(true).map_err(|e| e.to_string())?;
         let port = listener.local_addr().map_err(|e| e.to_string())?.port();
         let routes: Routes = Arc::new(Mutex::new(HashMap::new()));
         let cache: SegmentCache = Arc::new(Mutex::new(HashMap::new()));
         let stop = Arc::new(AtomicBool::new(false));
-        let base = format!("http://127.0.0.1:{port}");
+        let base = format!("http://{host}:{port}");
         let thread_routes = Arc::clone(&routes);
         let thread_cache = Arc::clone(&cache);
         let thread_stop = Arc::clone(&stop);
@@ -388,6 +423,36 @@ mod tests {
     }
 
     #[test]
+    fn advertised_host_prefers_the_lan_address() {
+        use super::{advertised_host, lan_ip};
+        let lan: std::net::IpAddr = "192.168.1.20".parse().expect("ip");
+        assert_eq!(advertised_host(Some(lan)), "192.168.1.20");
+        assert_eq!(advertised_host(None), "127.0.0.1");
+        // Whatever this machine reports, it is never loopback.
+        if let Some(ip) = lan_ip() {
+            assert!(!ip.is_loopback());
+        }
+    }
+
+    #[test]
+    fn proxy_binds_and_advertises_the_given_host() {
+        // A non-loopback bind address stands in for the LAN address:
+        // the advertised base and the stream URLs handed to a cast
+        // target must carry it, not 127.0.0.1 (the S03 regression:
+        // the TV connected to itself).
+        let host = super::lan_ip().map_or_else(|| "127.0.0.1".to_string(), |ip| ip.to_string());
+        let proxy = ProxyServer::start_on(&host).unwrap();
+        assert!(
+            proxy.base_url().starts_with(&format!("http://{host}:")),
+            "{}",
+            proxy.base_url()
+        );
+        let url = proxy.url_for("http://example.com/seg.ts", &[]);
+        assert!(url.starts_with(&format!("http://{host}:")), "{url}");
+        assert!(url.contains("/s/"));
+    }
+
+    #[test]
     fn proxy_serves_registered_stream() {
         // Upstream: one-shot server returning fixed bytes.
         let upstream = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -399,7 +464,11 @@ mod tests {
                 let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: video/mp2t\r\nContent-Length: 5\r\n\r\nHELLO");
             }
         });
-        let proxy = ProxyServer::start().unwrap();
+        // Serving is exercised over loopback; the LAN binding that
+        // start() picks since S03 is covered by the S03 tests, and a
+        // sandbox without a routable LAN address cannot fetch its own
+        // advertised address.
+        let proxy = ProxyServer::start_on("127.0.0.1").unwrap();
         let url = proxy.url_for(
             &format!("http://{upstream_addr}/seg.ts"),
             &[("User-Agent".to_string(), "test".to_string())],

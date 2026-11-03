@@ -69,14 +69,40 @@ pub fn roku_mime(url: &str) -> String {
         return "application/vnd.apple.mpegurl".to_string();
     }
     if let Some(mime) = mime_by_extension(&path) {
-        if mime == "audio/x-wav" {
-            return "audio/wav".to_string();
-        }
-        if mime.starts_with("audio/") {
-            return mime.to_string();
-        }
+        return roku_mime_for_media(mime);
     }
     "video/mp4".to_string()
+}
+
+/// Roku's label for a known media type: HLS stays HLS, WAV takes
+/// Roku's spelling, other audio passes through, and everything
+/// else is presented as MP4 (the non-audio tail of `roku_mime`).
+#[must_use]
+pub fn roku_mime_for_media(mime: &str) -> String {
+    if mime == "application/vnd.apple.mpegurl" {
+        return mime.to_string();
+    }
+    if mime == "audio/x-wav" {
+        return "audio/wav".to_string();
+    }
+    if mime.starts_with("audio/") {
+        return mime.to_string();
+    }
+    "video/mp4".to_string()
+}
+
+/// The MIME a cast actually uses: the media type probed from the
+/// original stream, carried independently of the playback URL
+/// (port of `casting.py`'s probe-then-play split). The playback URL
+/// may be an opaque proxy path (`/s/<hash>`) that says nothing
+/// about the format; only without a probed type do we guess from
+/// the URL itself.
+#[must_use]
+pub fn effective_mime(probed: Option<&str>, url: &str) -> String {
+    match probed {
+        Some(mime) if !mime.is_empty() => mime.to_string(),
+        _ => guess_mime(url),
+    }
 }
 
 /// A video id from a `YouTube` URL, when present (port of `youtube_id`):
@@ -830,6 +856,9 @@ pub enum CastJob {
         device: CastDevice,
         url: String,
         title: String,
+        /// The media type probed from the original stream, when the
+        /// playback URL is an opaque proxy URL (S04).
+        mime: Option<String>,
     },
     Stop {
         device: CastDevice,
@@ -870,10 +899,15 @@ impl CastWorker {
                         devices.extend(roku_discover(4));
                         CastEvent::Devices(devices)
                     }
-                    CastJob::Play { device, url, title } => {
+                    CastJob::Play {
+                        device,
+                        url,
+                        title,
+                        mime,
+                    } => {
                         let result = match device.kind {
                             CastKind::Upnp => {
-                                let mime = guess_mime(&url);
+                                let mime = effective_mime(mime.as_deref(), &url);
                                 let played = if is_sonos(&device) {
                                     let didl = sonos_didl(&title, &url, &mime);
                                     upnp_play_with_didl(&device.control_url, &url, &didl)
@@ -883,7 +917,9 @@ impl CastWorker {
                                 played.map(|()| device.name.clone())
                             }
                             CastKind::Roku => {
-                                let mime = roku_mime(&url);
+                                let mime = mime
+                                    .as_deref()
+                                    .map_or_else(|| roku_mime(&url), roku_mime_for_media);
                                 roku_play(&device.control_url, &url, &mime, &title)
                                     .map(|()| device.name.clone())
                             }
@@ -913,8 +949,16 @@ impl CastWorker {
         let _ = self.jobs.send(CastJob::Discover);
     }
 
-    pub fn play(&self, device: CastDevice, url: String, title: String) {
-        let _ = self.jobs.send(CastJob::Play { device, url, title });
+    /// Queue a cast. `mime` is the media type probed from the
+    /// original stream; pass it whenever `url` is a proxy URL, whose
+    /// opaque path cannot reveal the format.
+    pub fn play(&self, device: CastDevice, url: String, title: String, mime: Option<String>) {
+        let _ = self.jobs.send(CastJob::Play {
+            device,
+            url,
+            title,
+            mime,
+        });
     }
 
     pub fn stop(&self, device: CastDevice) {
@@ -966,6 +1010,37 @@ mod tests {
         );
         assert_eq!(roku_mime("http://x/song.wav"), "audio/wav");
         assert_eq!(roku_mime("http://x/movie.mkv"), "video/mp4");
+    }
+
+    #[test]
+    fn probed_mime_survives_the_opaque_proxy_url() {
+        // S04 regression: the proxy path `/s/<hash>` has no format
+        // in it; guessing from it lost HLS/TS metadata (UPnP fell
+        // back to audio/mpeg, Roku to video/mp4).
+        let proxy_url = "http://192.168.1.20:8080/s/0123456789abcdef0123";
+        let hls = effective_mime(Some("application/vnd.apple.mpegurl"), proxy_url);
+        assert_eq!(hls, "application/vnd.apple.mpegurl");
+        assert_eq!(roku_mime_for_media(&hls), "application/vnd.apple.mpegurl");
+        let ts = effective_mime(Some("video/mp2t"), proxy_url);
+        assert_eq!(ts, "video/mp2t");
+        // Without a probed type the URL guess is the fallback, and
+        // Roku's label for a probed type matches guessing from the
+        // original URL.
+        assert_eq!(effective_mime(None, proxy_url), "audio/mpeg");
+        assert_eq!(effective_mime(Some(""), proxy_url), "audio/mpeg");
+        for original in [
+            "http://x/list.m3u8",
+            "http://x/movie.mkv",
+            "http://x/song.wav",
+            "http://x/song.mp3",
+            "http://x/movie.mp4?tok=1",
+        ] {
+            assert_eq!(
+                roku_mime_for_media(&guess_mime(original)),
+                roku_mime(original),
+                "{original}"
+            );
+        }
     }
 
     #[test]

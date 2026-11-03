@@ -1,5 +1,6 @@
 //! wx-free domain types and playlist behavior for the Rust port.
 
+pub mod applog;
 pub mod audiotracks;
 pub mod browser;
 pub mod cache;
@@ -14,6 +15,7 @@ pub mod epgstore;
 pub mod favorites;
 pub mod guide;
 pub mod i18n;
+pub mod instance;
 pub mod loading;
 pub mod playback;
 pub mod providers;
