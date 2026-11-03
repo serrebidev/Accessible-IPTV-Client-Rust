@@ -607,7 +607,7 @@ pub fn free_space_bytes(path: &std::path::Path) -> Option<u64> {
             .output()
             .ok()?;
         let text = String::from_utf8_lossy(&output.stdout);
-        return parse_dir_free_bytes(&text);
+        parse_dir_free_bytes(&text)
     }
     #[cfg(not(any(unix, windows)))]
     {
