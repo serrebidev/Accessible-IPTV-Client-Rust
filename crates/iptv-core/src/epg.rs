@@ -757,11 +757,14 @@ pub fn match_guide_channel<S: std::hash::BuildHasher>(
 // ---------------------------------------------------------------------------
 
 enum EpgJob {
-    Fetch(Vec<String>),
+    Fetch {
+        sources: Vec<String>,
+        store: Option<std::path::PathBuf>,
+    },
 }
 
 enum EpgEvent {
-    Loaded(Box<EpgGuide>),
+    Loaded(Box<EpgGuide>, String),
     Failed(String),
 }
 
@@ -783,7 +786,7 @@ impl EpgWorker {
         let (job_sender, job_receiver) = std::sync::mpsc::channel::<EpgJob>();
         let (event_sender, event_receiver) = std::sync::mpsc::channel::<EpgEvent>();
         std::thread::spawn(move || {
-            while let Ok(EpgJob::Fetch(sources)) = job_receiver.recv() {
+            while let Ok(EpgJob::Fetch { sources, store }) = job_receiver.recv() {
                 let mut merged = EpgGuide::default();
                 let mut loaded = 0_usize;
                 let mut first_error = String::new();
@@ -801,7 +804,24 @@ impl EpgWorker {
                     }
                 }
                 let event = if loaded > 0 {
-                    EpgEvent::Loaded(Box::new(merged))
+                    // Mirror to the SQLite store HERE, on the worker
+                    // thread: at real-world scale (800k+ programmes)
+                    // the import takes seconds, and doing it on the
+                    // UI tick froze the whole window (validation 0049).
+                    let mut note = String::new();
+                    if let Some(path) = &store {
+                        match crate::epgstore::EpgStore::open(path) {
+                            Ok(mut store) => {
+                                if let Err(error) = store.import_guide(&merged) {
+                                    note = format!(" Guide database import failed: {error}");
+                                }
+                            }
+                            Err(error) => {
+                                note = format!(" Guide database unavailable: {error}");
+                            }
+                        }
+                    }
+                    EpgEvent::Loaded(Box::new(merged), note)
                 } else {
                     EpgEvent::Failed(first_error)
                 };
@@ -816,17 +836,19 @@ impl EpgWorker {
         }
     }
 
-    /// Fetch and parse the given guide sources (URLs or file paths).
-    pub fn load(&self, sources: Vec<String>) {
-        let _ = self.jobs.send(EpgJob::Fetch(sources));
+    /// Fetch and parse the given guide sources (URLs or file paths),
+    /// then mirror the merged guide into the `SQLite` store at `store`
+    /// (when given) on this worker's thread.
+    pub fn load(&self, sources: Vec<String>, store: Option<std::path::PathBuf>) {
+        let _ = self.jobs.send(EpgJob::Fetch { sources, store });
     }
 
     /// The next finished load, when one is waiting.
     #[must_use]
-    pub fn try_recv(&self) -> Option<Result<EpgGuide, String>> {
+    pub fn try_recv(&self) -> Option<Result<(EpgGuide, String), String>> {
         let events = self.events.lock().ok()?;
         match events.try_recv().ok()? {
-            EpgEvent::Loaded(guide) => Some(Ok(*guide)),
+            EpgEvent::Loaded(guide, note) => Some(Ok((*guide, note))),
             EpgEvent::Failed(error) => Some(Err(error)),
         }
     }
@@ -847,6 +869,41 @@ fn fetch_epg_source(source: &str) -> Result<EpgGuide, String> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn worker_mirrors_the_guide_to_the_store_on_its_own_thread() {
+        let dir = std::env::temp_dir().join(format!("iptv-epg-worker-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let xml = dir.join("guide.xml");
+        std::fs::write(
+            &xml,
+            "<?xml version=\"1.0\"?><tv><channel id=\"c1\"><display-name>One</display-name></channel><programme channel=\"c1\" start=\"20261101180000 +0000\" stop=\"20261101190000 +0000\"><title>Show</title></programme></tv>",
+        )
+        .unwrap();
+        let store_path = dir.join("epg.db");
+        let worker = EpgWorker::new();
+        worker.load(
+            vec![xml.to_string_lossy().into_owned()],
+            Some(store_path.clone()),
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let outcome = loop {
+            if let Some(result) = worker.try_recv() {
+                break result;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "worker never delivered"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        };
+        let (guide, note) = outcome.unwrap();
+        assert_eq!(guide.programme_count(), 1);
+        assert!(note.is_empty(), "{note}");
+        let store = crate::epgstore::EpgStore::open(&store_path).unwrap();
+        assert_eq!(store.counts().unwrap(), (1, 1));
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn http_guide_over_ureq_default_cap_loads() {
