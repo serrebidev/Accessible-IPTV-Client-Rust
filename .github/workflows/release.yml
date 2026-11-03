@@ -101,8 +101,9 @@ jobs:
         run: |
           ver="$(curl -s https://download.videolan.org/pub/videolan/vlc/ | sed -n 's/.*href="\([0-9][0-9.]*\)\/".*/\1/p' | sort -V | tail -1)"
           echo "Bundling libVLC from VLC $ver"
-          curl -sL -o vlc.dmg "https://download.videolan.org/pub/videolan/vlc/$ver/macosx/vlc-$ver-arm64.dmg"
-          hdiutil attach vlc.dmg -nobrowse -mountpoint /tmp/vlcapp
+          mkdir -p vlc-src
+          curl -sL -o vlc-src/vlc.dmg "https://download.videolan.org/pub/videolan/vlc/$ver/macosx/vlc-$ver-arm64.dmg"
+          hdiutil attach vlc-src/vlc.dmg -nobrowse -mountpoint /tmp/vlcapp
           mkdir -p bundle/plugins
           cp -a /tmp/vlcapp/VLC.app/Contents/MacOS/lib/libvlc*.dylib /tmp/vlcapp/VLC.app/Contents/MacOS/lib/libvlccore*.dylib bundle/
           cp -a /tmp/vlcapp/VLC.app/Contents/MacOS/plugins/. bundle/plugins/
