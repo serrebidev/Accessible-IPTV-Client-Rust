@@ -873,7 +873,7 @@ checksum = "791930b43c0d5973160d90a8f3894509f2b273430f5c5c73b668636d0287c5c0"
 
 [[package]]
 name = "iptv-app"
-version = "0.4.7"
+version = "0.4.8"
 dependencies = [
  "chrono",
  "iptv-core",
@@ -889,7 +889,7 @@ dependencies = [
 
 [[package]]
 name = "iptv-core"
-version = "0.4.7"
+version = "0.4.8"
 dependencies = [
  "aes",
  "base64 0.22.1",
@@ -910,21 +910,21 @@ dependencies = [
 
 [[package]]
 name = "iptv-sapi"
-version = "0.4.7"
+version = "0.4.8"
 dependencies = [
  "iptv-core",
 ]
 
 [[package]]
 name = "iptv-signer"
-version = "0.4.7"
+version = "0.4.8"
 dependencies = [
  "minisign",
 ]
 
 [[package]]
 name = "iptv-vlc"
-version = "0.4.7"
+version = "0.4.8"
 dependencies = [
  "iptv-core",
  "libloading",
