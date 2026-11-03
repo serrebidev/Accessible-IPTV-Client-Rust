@@ -104,6 +104,13 @@ impl SearchResults {
         self.rows.get(row).copied()
     }
 
+    /// Identity of the underlying playlist, for caches keyed to it
+    /// (a new playlist invalidates them even at the same row count).
+    #[must_use]
+    pub fn playlist_ptr(&self) -> usize {
+        Arc::as_ptr(&self.playlist) as usize
+    }
+
     #[must_use]
     pub fn category(&self) -> &crate::categories::Category {
         &self.category
