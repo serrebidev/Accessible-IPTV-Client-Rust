@@ -482,6 +482,35 @@ pub enum SessionState {
     Lost,
 }
 
+/// What a fallback (wxMediaCtrl) Stopped report means for the
+/// session (issues #129, #137). `MediaCtrl` reports Stopped
+/// while a healthy stream is still loading, so before playback
+/// has been confirmed the report is withheld from the session
+/// — failed starts belong to the startup deadline, not to a
+/// stop classification. After confirmation a stop is real:
+/// Ended near the end of the item, Stalled otherwise.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FallbackStop {
+    /// Do not feed this report to the session.
+    Withhold,
+    /// The item played to (near) its end.
+    Ended,
+    /// Playback stopped early.
+    Stalled,
+}
+
+/// Classify a fallback Stopped report. `confirmed` is whether
+/// the session has reached Playing or Paused; `near_end` is
+/// whether the position is within the end margin of the item.
+#[must_use]
+pub fn fallback_stop(confirmed: bool, near_end: bool) -> FallbackStop {
+    match (confirmed, near_end) {
+        (false, _) => FallbackStop::Withhold,
+        (true, true) => FallbackStop::Ended,
+        (true, false) => FallbackStop::Stalled,
+    }
+}
+
 /// Events the engine side feeds the session.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum EngineEvent {
@@ -1084,6 +1113,20 @@ mod tests {
         assert_eq!(entries["k"].title, "Show", "title captured at checkpoint");
         resume_checkpoint(&mut entries, "k", "Show", 3_590_000, 3_600_000, 200);
         assert!(entries.is_empty(), "inside end window removes");
+    }
+
+    #[test]
+    fn fallback_stop_withholds_until_playback_is_confirmed() {
+        use super::{fallback_stop, FallbackStop};
+        // The withholding guard (issues #129, #137): a Stopped
+        // report before confirmation — even at the very end of
+        // the item's reported length — must not reach the
+        // session. Inverting this assertion is the regression
+        // this test exists to catch.
+        assert_eq!(fallback_stop(false, false), FallbackStop::Withhold);
+        assert_eq!(fallback_stop(false, true), FallbackStop::Withhold);
+        assert_eq!(fallback_stop(true, true), FallbackStop::Ended);
+        assert_eq!(fallback_stop(true, false), FallbackStop::Stalled);
     }
 
     #[test]
