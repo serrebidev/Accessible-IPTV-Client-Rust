@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use sha2::{Digest, Sha256};
+use ureq::ResponseExt;
 
 const MAX_SEGMENT_CACHE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_SEGMENTS: usize = 64;
@@ -169,9 +170,17 @@ fn handle_connection(
     }
     let request = String::from_utf8_lossy(&buffer).into_owned();
     let mut parts = request.split_whitespace();
-    let (Some("GET"), Some(path)) = (parts.next(), parts.next()) else {
+    let (Some(method), Some(path)) = (parts.next(), parts.next()) else {
         respond(&mut stream, 405, "text/plain", b"method not allowed");
         return;
+    };
+    let head = match method {
+        "GET" => false,
+        "HEAD" => true,
+        _ => {
+            respond(&mut stream, 405, "text/plain", b"method not allowed");
+            return;
+        }
     };
     let range = request.lines().find_map(|line| {
         line.to_ascii_lowercase()
@@ -187,18 +196,28 @@ fn handle_connection(
         respond(&mut stream, 404, "text/plain", b"unknown stream");
         return;
     };
-    serve(&mut stream, &route, range.as_deref(), routes, cache, base);
+    serve(
+        &mut stream,
+        &route,
+        range.as_deref(),
+        head,
+        routes,
+        cache,
+        base,
+    );
 }
 
+#[allow(clippy::too_many_lines)] // one request path: cache, fetch, playlist, headers, stream
 fn serve(
     stream: &mut std::net::TcpStream,
     route: &Route,
     range: Option<&str>,
+    head: bool,
     routes: &Routes,
     cache: &SegmentCache,
     base: &str,
 ) {
-    if range.is_none() && is_segment_url(&route.url) {
+    if !head && range.is_none() && is_segment_url(&route.url) {
         if let Some((content_type, bytes)) = cache
             .lock()
             .ok()
@@ -208,9 +227,20 @@ fn serve(
             return;
         }
     }
-    let mut request = ureq::get(&route.url);
+    let mut request = if head {
+        ureq::head(&route.url)
+    } else {
+        ureq::get(&route.url)
+    };
+    let mut has_user_agent = false;
     for (name, value) in &route.headers {
+        if name.eq_ignore_ascii_case("user-agent") {
+            has_user_agent = true;
+        }
         request = request.header(name.as_str(), value.as_str());
+    }
+    if !has_user_agent {
+        request = request.header("User-Agent", crate::recording::DEFAULT_UPSTREAM_USER_AGENT);
     }
     if let Some(range) = range {
         request = request.header("Range", range);
@@ -218,7 +248,11 @@ fn serve(
     let mut response = match request.call() {
         Ok(response) => response,
         Err(ureq::Error::StatusCode(code)) => {
-            respond(stream, code, "text/plain", b"upstream error");
+            if head {
+                respond_headers_only(stream, code);
+            } else {
+                respond(stream, code, "text/plain", b"upstream error");
+            }
             return;
         }
         Err(_) => {
@@ -227,35 +261,62 @@ fn serve(
         }
     };
     let status = response.status().as_u16();
+    let final_url = response.get_uri().to_string();
     let content_type = response
         .headers()
         .get("content-type")
         .and_then(|value| value.to_str().ok())
         .unwrap_or("application/octet-stream")
         .to_string();
-    let is_playlist = content_type.contains("mpegurl")
-        || route
-            .url
-            .split('?')
-            .next()
-            .is_some_and(|p| p.to_ascii_lowercase().ends_with(".m3u8"));
-    if is_playlist {
+    let content_type_lower = content_type.to_ascii_lowercase();
+    let path_lower = final_url
+        .split('?')
+        .next()
+        .unwrap_or(final_url.as_str())
+        .to_ascii_lowercase();
+    // path_lower is already lowercased, so these suffix checks are case-insensitive.
+    #[allow(clippy::case_sensitive_file_extension_comparisons)]
+    let is_playlist = content_type_lower.contains("mpegurl")
+        || path_lower.ends_with(".m3u8")
+        || path_lower.ends_with(".m3u");
+    if is_playlist && !head {
         let mut text = String::new();
         let read = response.body_mut().as_reader().read_to_string(&mut text);
         if read.is_ok() {
-            let rewritten = rewrite_playlist(&text, &route.url, base, routes, &route.headers);
+            let rewritten = rewrite_playlist(&text, &final_url, base, routes, &route.headers);
             respond(stream, status, &content_type, rewritten.as_bytes());
             return;
         }
     }
     // Stream through, accumulating small segment bodies for the cache.
-    let segment = range.is_none() && is_segment_url(&route.url);
-    let mut head =
-        format!("HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nConnection: close\r\n\r\n");
-    if stream.write_all(head.as_bytes()).is_err() {
+    let segment = !head && range.is_none() && is_segment_url(&route.url);
+    let mut head_text =
+        format!("HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nConnection: close\r\n");
+    for name in [
+        "Content-Length",
+        "Content-Range",
+        "Accept-Ranges",
+        "Last-Modified",
+        "ETag",
+    ] {
+        if let Some(value) = response
+            .headers()
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+        {
+            head_text.push_str(name);
+            head_text.push_str(": ");
+            head_text.push_str(value);
+            head_text.push_str("\r\n");
+        }
+    }
+    head_text.push_str("\r\n");
+    if stream.write_all(head_text.as_bytes()).is_err() {
         return;
     }
-    head.clear();
+    if head {
+        return;
+    }
     let mut reader = response.body_mut().as_reader();
     let mut buffer = vec![0_u8; 65536];
     let mut captured: Vec<u8> = Vec::new();
@@ -280,6 +341,11 @@ fn serve(
             }
         }
     }
+}
+
+fn respond_headers_only(stream: &mut std::net::TcpStream, status: u16) {
+    let head = format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    let _ = stream.write_all(head.as_bytes());
 }
 
 fn respond(stream: &mut std::net::TcpStream, status: u16, content_type: &str, body: &[u8]) {
@@ -387,7 +453,52 @@ mod tests {
     use super::{absolutize, rewrite_playlist, ProxyServer, Routes};
     use std::collections::HashMap;
     use std::io::{Read, Write};
-    use std::sync::{Arc, Mutex};
+    use std::sync::{mpsc, Arc, Mutex};
+    use std::time::Duration;
+
+    use crate::recording::DEFAULT_UPSTREAM_USER_AGENT;
+
+    fn raw_exchange(url: &str, method: &str, headers: &[(&str, &str)]) -> (String, Vec<u8>) {
+        let rest = url.strip_prefix("http://").expect("http url");
+        let (authority, path) = rest
+            .split_once('/')
+            .map_or_else(|| (rest, "/".to_string()), |(a, p)| (a, format!("/{p}")));
+        let mut stream = std::net::TcpStream::connect(authority).expect("connect proxy");
+        let mut request = format!("{method} {path} HTTP/1.1\r\nHost: {authority}\r\n");
+        for (name, value) in headers {
+            request.push_str(name);
+            request.push_str(": ");
+            request.push_str(value);
+            request.push_str("\r\n");
+        }
+        request.push_str("Connection: close\r\n\r\n");
+        stream.write_all(request.as_bytes()).expect("send request");
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).expect("read response");
+        let split = response
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .map_or(response.len(), |index| index + 4);
+        (
+            String::from_utf8_lossy(&response[..split]).into_owned(),
+            response[split..].to_vec(),
+        )
+    }
+
+    fn capture_upstream(response: &'static [u8]) -> (std::net::SocketAddr, mpsc::Receiver<String>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buffer = [0_u8; 4096];
+                let n = stream.read(&mut buffer).unwrap_or(0);
+                let _ = tx.send(String::from_utf8_lossy(&buffer[..n]).into_owned());
+                let _ = stream.write_all(response);
+            }
+        });
+        (addr, rx)
+    }
 
     #[test]
     fn absolutize_resolves_relative_entries() {
@@ -476,5 +587,166 @@ mod tests {
         let mut response = ureq::get(&url).call().unwrap();
         let body = response.body_mut().read_to_string().unwrap();
         assert_eq!(body, "HELLO");
+    }
+
+    #[test]
+    fn head_is_forwarded_with_headers_and_no_body() {
+        let (addr, requests) = capture_upstream(
+            b"HTTP/1.1 200 OK\r\nContent-Type: video/mp2t\r\nContent-Length: 1234\r\nAccept-Ranges: bytes\r\n\r\n",
+        );
+        let proxy = ProxyServer::start_on("127.0.0.1").unwrap();
+        let url = proxy.url_for(&format!("http://{addr}/movie.ts"), &[]);
+        let (head, body) = raw_exchange(&url, "HEAD", &[]);
+        let request = requests.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(request.starts_with("HEAD /movie.ts "), "{request}");
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        let lower = head.to_ascii_lowercase();
+        assert!(lower.contains("content-length: 1234"), "{head}");
+        assert!(lower.contains("accept-ranges: bytes"), "{head}");
+        assert!(body.is_empty(), "{body:?}");
+    }
+
+    #[test]
+    fn redirected_playlist_resolves_against_final_url() {
+        let original = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let original_addr = original.local_addr().unwrap();
+        let final_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let final_addr = final_listener.local_addr().unwrap();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = original.accept() {
+                let mut buffer = [0_u8; 2048];
+                let _ = stream.read(&mut buffer);
+                let response = format!(
+                    "HTTP/1.1 302 Found\r\nLocation: http://{final_addr}/live/list.m3u8\r\nContent-Length: 0\r\n\r\n"
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        std::thread::spawn(move || {
+            for _ in 0..2 {
+                let Ok((mut stream, _)) = final_listener.accept() else {
+                    return;
+                };
+                let mut buffer = [0_u8; 4096];
+                let n = stream.read(&mut buffer).unwrap_or(0);
+                let request = String::from_utf8_lossy(&buffer[..n]).into_owned();
+                if request.starts_with("GET /live/list.m3u8 ") {
+                    let body = b"#EXTM3U\nseg1.ts\n";
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.apple.mpegurl\r\nContent-Length: {}\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(head.as_bytes());
+                    let _ = stream.write_all(body);
+                } else {
+                    let _ = tx.send(request);
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: video/mp2t\r\nContent-Length: 3\r\n\r\nSEG",
+                    );
+                }
+            }
+        });
+        let proxy = ProxyServer::start_on("127.0.0.1").unwrap();
+        let url = proxy.url_for(&format!("http://{original_addr}/start.m3u8"), &[]);
+        let mut response = ureq::get(&url).call().unwrap();
+        let text = response.body_mut().read_to_string().unwrap();
+        let segment_url = text
+            .lines()
+            .find(|line| {
+                let line = line.trim();
+                !line.is_empty() && !line.starts_with('#')
+            })
+            .expect("rewritten segment");
+        assert!(segment_url.starts_with(proxy.base_url()), "{text}");
+        let mut segment = ureq::get(segment_url).call().unwrap();
+        let body = segment.body_mut().read_to_string().unwrap();
+        assert_eq!(body, "SEG");
+        let request = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(request.starts_with("GET /live/seg1.ts "), "{request}");
+    }
+
+    #[test]
+    fn range_headers_reach_client_and_range_reaches_upstream() {
+        let (addr, requests) = capture_upstream(
+            b"HTTP/1.1 206 Partial Content\r\nContent-Type: video/mp2t\r\nContent-Length: 3\r\nContent-Range: bytes 0-2/10\r\nAccept-Ranges: bytes\r\nLast-Modified: Wed, 21 Oct 2015 07:28:00 GMT\r\nETag: \"abc\"\r\n\r\nSEG",
+        );
+        let proxy = ProxyServer::start_on("127.0.0.1").unwrap();
+        let url = proxy.url_for(&format!("http://{addr}/seg.ts"), &[]);
+        let (head, body) = raw_exchange(&url, "GET", &[("Range", "bytes=0-2")]);
+        let request = requests.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(
+            request.to_ascii_lowercase().contains("range: bytes=0-2"),
+            "{request}"
+        );
+        assert!(head.starts_with("HTTP/1.1 206"), "{head}");
+        let lower = head.to_ascii_lowercase();
+        for expected in [
+            "content-type: video/mp2t",
+            "content-length: 3",
+            "content-range: bytes 0-2/10",
+            "accept-ranges: bytes",
+            "last-modified: wed, 21 oct 2015 07:28:00 gmt",
+            "etag: \"abc\"",
+        ] {
+            assert!(lower.contains(expected), "missing {expected}: {head}");
+        }
+        assert_eq!(body.as_slice(), b"SEG");
+    }
+
+    #[test]
+    fn uppercase_playlist_mime_is_rewritten() {
+        let (addr, _requests) = capture_upstream(
+            b"HTTP/1.1 200 OK\r\nContent-Type: APPLICATION/X-MPEGURL\r\nContent-Length: 16\r\n\r\n#EXTM3U\nseg1.ts\n",
+        );
+        let proxy = ProxyServer::start_on("127.0.0.1").unwrap();
+        let url = proxy.url_for(&format!("http://{addr}/list"), &[]);
+        let mut response = ureq::get(&url).call().unwrap();
+        let text = response.body_mut().read_to_string().unwrap();
+        assert!(text.contains("/s/"), "{text}");
+        assert!(!text.lines().any(|line| line.trim() == "seg1.ts"), "{text}");
+        assert!(
+            text.lines().any(|line| line.starts_with(proxy.base_url())),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn default_user_agent_reaches_upstream() {
+        let (addr, requests) = capture_upstream(
+            b"HTTP/1.1 200 OK\r\nContent-Type: video/mp2t\r\nContent-Length: 0\r\n\r\n",
+        );
+        let proxy = ProxyServer::start_on("127.0.0.1").unwrap();
+        let url = proxy.url_for(&format!("http://{addr}/seg.ts"), &[]);
+        let _ = ureq::get(&url).call().unwrap();
+        let request = requests.recv_timeout(Duration::from_secs(5)).unwrap();
+        let expected = format!(
+            "user-agent: {}",
+            DEFAULT_UPSTREAM_USER_AGENT.to_ascii_lowercase()
+        );
+        assert!(
+            request.to_ascii_lowercase().contains(&expected),
+            "{request}"
+        );
+    }
+
+    #[test]
+    fn caller_supplied_user_agent_is_preserved() {
+        let (addr, requests) = capture_upstream(
+            b"HTTP/1.1 200 OK\r\nContent-Type: video/mp2t\r\nContent-Length: 0\r\n\r\n",
+        );
+        let proxy = ProxyServer::start_on("127.0.0.1").unwrap();
+        let url = proxy.url_for(
+            &format!("http://{addr}/seg.ts"),
+            &[("User-Agent".to_string(), "Caller-UA".to_string())],
+        );
+        let _ = ureq::get(&url).call().unwrap();
+        let request = requests.recv_timeout(Duration::from_secs(5)).unwrap();
+        let lower = request.to_ascii_lowercase();
+        assert!(lower.contains("user-agent: caller-ua"), "{request}");
+        assert!(
+            !lower.contains(&DEFAULT_UPSTREAM_USER_AGENT.to_ascii_lowercase()),
+            "{request}"
+        );
     }
 }
