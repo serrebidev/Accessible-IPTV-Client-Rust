@@ -452,6 +452,24 @@ struct Wiring {
     download_worker: Rc<iptv_core::downloads::DownloadWorker>,
     downloads: Rc<RefCell<Vec<DownloadRow>>>,
     downloads_active: Rc<std::cell::Cell<bool>>,
+    /// The open Downloads window, refreshed live by the
+    /// download poll (audit R06).
+    downloads_ui: Rc<RefCell<Option<DownloadsUi>>>,
+    /// Next download request id (per-request progress/cancel,
+    /// audit R06).
+    next_download_id: Rc<std::cell::Cell<u64>>,
+    /// Reminders shown this session but not yet acknowledged
+    /// (audit R12: delivery is one at a time).
+    reminder_seen: Rc<RefCell<std::collections::HashSet<String>>>,
+    /// A reminder delivery window is currently open; the next
+    /// due reminder waits for it (audit R12).
+    reminder_window_open: Rc<std::cell::Cell<bool>>,
+    /// Catch-up captures staged under a `.part` path, by
+    /// recording key, with the final path they earn on a clean
+    /// finish (audit R05).
+    staged_downloads: Rc<RefCell<std::collections::HashMap<String, StagedDownload>>>,
+    /// Last series-rule scan time, seconds (audit R16).
+    series_last_scan: Rc<std::cell::Cell<f64>>,
     account_text: Rc<RefCell<Option<TextCtrl>>>,
     buffers: Rc<RefCell<buffer::BufferRegistry>>,
 }
@@ -783,6 +801,7 @@ impl Persist {
     }
 }
 
+#[allow(clippy::too_many_lines)] // grew with the batch wiring (R01/R06 state)
 fn bind_browser(
     frame: Frame,
     controls: Controls,
@@ -862,6 +881,12 @@ fn bind_browser(
         download_worker: Rc::new(iptv_core::downloads::DownloadWorker::default()),
         downloads: Rc::new(RefCell::new(Vec::new())),
         downloads_active: Rc::new(std::cell::Cell::new(false)),
+        downloads_ui: Rc::new(RefCell::new(None)),
+        next_download_id: Rc::new(std::cell::Cell::new(1)),
+        reminder_seen: Rc::new(RefCell::new(std::collections::HashSet::new())),
+        reminder_window_open: Rc::new(std::cell::Cell::new(false)),
+        staged_downloads: Rc::new(RefCell::new(std::collections::HashMap::new())),
+        series_last_scan: Rc::new(std::cell::Cell::new(0.0)),
         account_text: Rc::new(RefCell::new(None)),
         buffers: Rc::new(RefCell::new(buffer::BufferRegistry::default())),
     };
@@ -876,7 +901,13 @@ fn bind_browser(
     });
     *wiring.reminders.borrow_mut() = wiring.persist.reminders();
     init_speech(&wiring.player, &wiring.persist, controls.status);
-    if wiring.dvr.borrow().pending_count() > 0 {
+    if wiring.dvr.borrow().pending_count() > 0
+        || wiring
+            .reminders
+            .borrow()
+            .iter()
+            .any(|r| r.status == ReminderStatus::Scheduled)
+    {
         assert!(wiring.timer.start(50, false));
     }
     reload_sources(&wiring);
@@ -897,13 +928,18 @@ fn bind_browser(
 
 /// The main window's close behavior: minimize-to-tray hides
 /// instead of closing; a real close cancels browsing, closes
-/// every live buffer session and stops the tick timer.
+/// every live buffer session, finalizes running recordings
+/// (audit R07: graceful `q` first, escalating to a kill, so no
+/// orphan ffmpeg keeps a provider connection) and stops the
+/// tick timer.
 fn bind_main_close(frame: Frame, wiring: &Wiring) {
     let browser = Rc::clone(&wiring.browser);
     let timer = Rc::clone(&wiring.timer);
     let close_persist = wiring.persist.clone();
     let close_buffers = Rc::clone(&wiring.buffers);
     let close_player = Rc::clone(&wiring.player);
+    let close_recordings = Rc::clone(&wiring.recordings);
+    let close_dvr = Rc::clone(&wiring.dvr);
     frame.bind_internal(EventType::CLOSE_WINDOW, move |event| {
         if close_persist
             .config
@@ -915,6 +951,27 @@ fn bind_main_close(frame: Frame, wiring: &Wiring) {
             return;
         }
         browser.borrow_mut().cancel();
+        let finished = close_recordings
+            .borrow_mut()
+            .shutdown_all(std::time::Duration::from_secs(3));
+        if !finished.is_empty() {
+            let now = now_seconds();
+            let mut dvr = close_dvr.borrow_mut();
+            for report in &finished {
+                if let Some(job_id) = report.key.strip_prefix("dvr:") {
+                    // Python's exit path: the job outcome is
+                    // persisted as interrupted, never a success.
+                    dvr.mark_finished(
+                        job_id,
+                        false,
+                        &report.out_path.to_string_lossy(),
+                        "Stopped because the app exited.",
+                        now,
+                    );
+                }
+            }
+            dvr.save();
+        }
         close_buffers.borrow_mut().close_all();
         close_player.borrow_mut().app_voice.close();
         timer.stop();
@@ -945,6 +1002,14 @@ fn bind_epg_timer(frame: Frame, wiring: &Wiring, controls: Controls) {
         }
     });
     let _ = wiring.epg_timer.start(60_000, false);
+}
+
+/// Restart the completion poll when new work appears after the
+/// timer stopped itself idle (audit R01): creating a reminder, a
+/// DVR job or a menu recording must not depend on some unrelated
+/// action to revive polling.
+fn ensure_polling(wiring: &Wiring) {
+    let _ = wiring.timer.start(50, false);
 }
 
 fn bind_completion(wiring: &Wiring, controls: Controls) {
@@ -1646,18 +1711,8 @@ fn poll_epg(wiring: &Wiring, status: Status) {
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(0));
     let mut changed = false;
-    let mut fired: Vec<String> = Vec::new();
     for reminder in wiring.reminders.borrow_mut().iter_mut() {
-        if reminder.is_due(now) {
-            reminder.status = ReminderStatus::Notified;
-            changed = true;
-            fired.push(format!(
-                "Reminder: {} on {} starts at {}.",
-                reminder.title,
-                reminder.channel,
-                local_hhmm(reminder.start)
-            ));
-        } else if reminder.is_expired(now) {
+        if reminder.is_expired(now) {
             reminder.status = ReminderStatus::Expired;
             changed = true;
         }
@@ -1666,9 +1721,107 @@ fn poll_epg(wiring: &Wiring, status: Status) {
         let rows = wiring.reminders.borrow().clone();
         wiring.persist.save_reminders(&rows);
     }
-    if let Some(first) = fired.first() {
-        status.set_label(first);
+    // The seen set tracks only live rows (Python prunes it the
+    // same way), so a deleted reminder's id cannot suppress a
+    // future delivery.
+    {
+        let ids: std::collections::HashSet<String> = wiring
+            .reminders
+            .borrow()
+            .iter()
+            .map(|r| r.id.clone())
+            .collect();
+        wiring
+            .reminder_seen
+            .borrow_mut()
+            .retain(|id| ids.contains(id));
     }
+    // Audit R12: deliver ONE due reminder at a time. It is
+    // marked Notified only when its window is answered; the
+    // next simultaneous reminder waits for a later tick
+    // instead of being silently marked delivered.
+    if !wiring.reminder_window_open.get() {
+        let due = {
+            let rows = wiring.reminders.borrow();
+            let seen = wiring.reminder_seen.borrow();
+            iptv_core::reminders::next_pending_delivery(&rows, &seen, now)
+        };
+        if let Some(reminder) = due {
+            wiring
+                .reminder_seen
+                .borrow_mut()
+                .insert(reminder.id.clone());
+            open_reminder_window(wiring, status, &reminder);
+        }
+    }
+}
+
+/// Mark one reminder delivered and persist (Python's
+/// `acknowledge`, called when the delivery window is answered).
+fn acknowledge_reminder(wiring: &Wiring, id: &str) {
+    let mut rows = wiring.reminders.borrow_mut();
+    if iptv_core::reminders::acknowledge(&mut rows, id) {
+        let saved = rows.clone();
+        drop(rows);
+        wiring.persist.save_reminders(&saved);
+    }
+}
+
+/// The reminder delivery window (audit R12/R13): one reminder,
+/// with Open Channel resolving the uniquely matching channel
+/// (Python's delivery dialog).
+fn open_reminder_window(wiring: &Wiring, status: Status, reminder: &Reminder) {
+    wiring.reminder_window_open.set(true);
+    let frame = Frame::builder()
+        .with_title("Programme Reminder")
+        .with_size(Size::new(480, 260))
+        .build();
+    frame.set_accessibility_label("Programme Reminder");
+    let panel = Panel::builder(&frame).build();
+    let title = if reminder.title.is_empty() {
+        "(No title)"
+    } else {
+        &reminder.title
+    };
+    let starts = chrono::TimeZone::timestamp_opt(&chrono::Local, reminder.start, 0)
+        .single()
+        .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+        .unwrap_or_default();
+    let text = StaticText::builder(&panel)
+        .with_label(&format!("{title}\n{}\nStarts: {starts}", reminder.channel))
+        .build();
+    text.set_accessibility_label("Reminder details");
+    let open_button = Button::builder(&panel).with_label("&Open Channel").build();
+    let close_button = Button::builder(&panel).with_label("&Close").build();
+    let sizer = BoxSizer::builder(Orientation::Vertical).build();
+    sizer.add(&text, 0, SizerFlag::All, 8);
+    sizer.add(&open_button, 0, SizerFlag::Expand | SizerFlag::All, 4);
+    sizer.add(&close_button, 0, SizerFlag::Expand | SizerFlag::All, 4);
+    panel.set_sizer(sizer, true);
+    let reminder_id = reminder.id.clone();
+    let reminder_open = reminder.clone();
+    let wiring_o = clone_wiring(wiring);
+    open_button.on_click(move |_| {
+        acknowledge_reminder(&wiring_o, &reminder_id);
+        wiring_o.reminder_window_open.set(false);
+        frame.hide();
+        let channels = wiring_o.browser.borrow().all_channels();
+        match iptv_core::reminders::find_channel_for_reminder(&reminder_open, &channels) {
+            Some(channel) => {
+                let channel = channel.clone();
+                play_channel(&wiring_o.player, &wiring_o.persist, &channel, status);
+            }
+            None => status.set_label("Channel not found."),
+        }
+    });
+    let wiring_c = clone_wiring(wiring);
+    let reminder_id_c = reminder.id.clone();
+    close_button.on_click(move |_| {
+        acknowledge_reminder(&wiring_c, &reminder_id_c);
+        wiring_c.reminder_window_open.set(false);
+        frame.hide();
+    });
+    frame.show(true);
 }
 
 /// Guide indexes from the store alone (after a restart, before
@@ -1845,13 +1998,300 @@ fn selected_channel(wiring: &Wiring, list: ListCtrl) -> Option<Channel> {
     wiring.browser.borrow().channel(index)
 }
 
-/// Start or stop a manual recording of the channel.
+/// The identity a channel keeps its remembered audio track
+/// under (Python `_channel_audio_key`): its display name,
+/// case-folded — deliberately not the stream URL.
+fn channel_audio_key(channel: &Channel) -> String {
+    let name = if !channel.name.trim().is_empty() {
+        channel.name.as_str()
+    } else if !channel.tvg_name.trim().is_empty() {
+        channel.tvg_name.as_str()
+    } else {
+        channel.tvg_id.as_str()
+    };
+    name.trim().to_lowercase()
+}
+
+/// The media kind the channel's own metadata states (port of
+/// Python `media_hint_from_attributes`): `Some(true)` audio,
+/// `Some(false)` video, `None` unstated. Group names are never
+/// consulted, like the reference.
+fn channel_media_is_audio(channel: &Channel) -> Option<bool> {
+    let get = |key: &str| {
+        channel
+            .unknown_attributes
+            .get(key)
+            .map_or("", String::as_str)
+            .trim()
+            .to_lowercase()
+    };
+    match get("radio").as_str() {
+        "true" | "1" | "yes" => return Some(true),
+        "false" | "0" | "no" => return Some(false),
+        _ => {}
+    }
+    for key in [
+        "media-type",
+        "mediatype",
+        "media_type",
+        "stream-type",
+        "streamtype",
+        "tvg-type",
+        "tvgtype",
+    ] {
+        match get(key).as_str() {
+            "audio" | "radio" | "music" => return Some(true),
+            "video" | "tv" | "television" => return Some(false),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Python `resolve_recording_format` for one media kind: audio
+/// streams take the audio preset (clamped to an audio format);
+/// everything else takes the video preset as configured.
+fn resolve_format_for_media(persist: &Persist, audio: bool) -> String {
+    let config = persist.config.borrow();
+    if audio {
+        let pref = config.string_or("recording_format_audio", "audio_mp3_v0");
+        if recording::format_kind(&pref) == "audio" {
+            pref
+        } else {
+            "audio_mp3_v0".to_string()
+        }
+    } else {
+        config.string_or(
+            "recording_format_video",
+            recording::DEFAULT_RECORDING_FORMAT,
+        )
+    }
+}
+
+/// The recording format for a channel across every entry point
+/// (audit R11): manual, scheduled and archive recordings all
+/// classify the channel the same way and use the per-media
+/// preset; unclassified channels keep the video preset.
+fn recording_format_for_channel(persist: &Persist, channel: &Channel) -> String {
+    resolve_format_for_media(persist, channel_media_is_audio(channel) == Some(true))
+}
+
+/// Python `remap_format_for_media` at capture start: a stream
+/// positively identified as audio-only never records with a
+/// video preset; anything else keeps the requested format.
+fn remap_format_for_media(persist: &Persist, channel: &Channel, format: &str) -> String {
+    if channel_media_is_audio(channel) == Some(true) && recording::format_kind(format) == "video" {
+        resolve_format_for_media(persist, true)
+    } else {
+        format.to_string()
+    }
+}
+
+/// How a recording of a channel picks its audio track (port of
+/// Python `_recording_audio_intent`): the playing track when the
+/// built-in player is showing this channel (the caller's
+/// witness), otherwise the remembered track name/slot, the
+/// audio-description preference and the preferred-track list.
+/// `None` leaves the choice to ffmpeg.
+struct AudioIntent {
+    keywords: Vec<String>,
+    fallback_index: Option<i64>,
+    prefer_ad: bool,
+}
+
+fn recording_audio_intent(
+    persist: &Persist,
+    channel: &Channel,
+    witness: Option<(i64, String)>,
+) -> Option<AudioIntent> {
+    if let Some((index, name)) = witness {
+        let described = iptv_core::audiotracks::names_audio_description(&name);
+        let mut keywords = Vec::new();
+        if described {
+            keywords.push("audio description".to_string());
+        }
+        if !name.trim().is_empty() {
+            keywords.push(name);
+        }
+        return Some(AudioIntent {
+            keywords,
+            fallback_index: Some(index),
+            prefer_ad: described,
+        });
+    }
+    let key = channel_audio_key(channel);
+    let config = persist.config.borrow();
+    let remembered = config
+        .value("channel_audio_tracks")
+        .and_then(|v| v.get(&key))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    let fallback = config
+        .value("channel_audio_track_indices")
+        .and_then(|v| v.get(&key))
+        .and_then(serde_json::Value::as_i64)
+        .filter(|index| (0..64).contains(index));
+    let prefer_ad = config.bool_or("prefer_audio_description", false);
+    let keywords = iptv_core::audiotracks::ordered_preference_keywords(
+        remembered.as_deref(),
+        prefer_ad,
+        Some(&config.string_or("last_audio_track", "")),
+        &config.string_list("preferred_audio_tracks"),
+    );
+    if keywords.is_empty() && fallback.is_none() {
+        return None;
+    }
+    Some(AudioIntent {
+        keywords,
+        fallback_index: fallback,
+        prefer_ad,
+    })
+}
+
+/// The audio track the built-in player is currently hearing for
+/// this channel, as (audio-stream position, track name) — the
+/// R10 witness. Only the libVLC engine reports its tracks.
+fn player_audio_witness(
+    player: &Rc<RefCell<PlayerState>>,
+    channel: &Channel,
+) -> Option<(i64, String)> {
+    let state = player.borrow();
+    let current = state.current_channel.as_ref()?;
+    if channel_audio_key(current) != channel_audio_key(channel) || state.session.current().is_none()
+    {
+        return None;
+    }
+    let engine = state.vlc.as_ref()?;
+    let tracks = engine.audio_tracks();
+    let window = state.window.as_ref()?;
+    let selection = i64::from(window.tracks.get_selection().unwrap_or(0));
+    let (_, name) = tracks.get(usize::try_from(selection).ok()?)?;
+    Some((selection, name.clone()))
+}
+
+/// One probed audio stream's label, in the words the core
+/// keyword engine matches (port of `audio_stream_label`).
+fn audio_stream_label(position: usize, language: &str, described: bool) -> String {
+    use std::fmt::Write as _;
+    let mut label = format!("Track {}", position + 1);
+    if !language.is_empty() {
+        let _ = write!(label, " - [{language}]");
+    }
+    if described {
+        label.push_str(" - audio description");
+    }
+    label
+}
+
+/// Parse the audio stream labels out of an `ffmpeg -i` report
+/// (port of `parse_audio_streams`' label shape).
+fn parse_audio_stream_labels(report: &str) -> Vec<String> {
+    let mut labels = Vec::new();
+    for line in report.lines() {
+        let Some(stream_at) = line.find("Stream #") else {
+            continue;
+        };
+        let rest = &line[stream_at + "Stream #".len()..];
+        let Some(audio_at) = rest.find(": Audio:") else {
+            continue;
+        };
+        let head = &rest[..audio_at];
+        let language = head
+            .rfind('(')
+            .and_then(|open| head[open + 1..].strip_suffix(')').map(str::to_string))
+            .unwrap_or_default();
+        let tail = &rest[audio_at + ": Audio:".len()..].to_lowercase();
+        let described = tail.contains("descript") || tail.contains("visual impaired");
+        labels.push(audio_stream_label(labels.len(), &language, described));
+    }
+    labels
+}
+
+/// Ask a stream which audio tracks it carries, with a plain
+/// `ffmpeg -i` probe like Python's (audit R10). Runs on a
+/// helper thread with a bounded wait; empty when the stream
+/// cannot answer — the caller then keeps ffmpeg's own pick.
+fn probe_audio_labels(url: &str, headers: &iptv_core::playback::StreamHeaders) -> Vec<String> {
+    let (clean_url, _) = iptv_core::playback::split_stream_modifiers(url);
+    let mut cmd: Vec<String> = vec![
+        "ffmpeg".to_string(),
+        "-hide_banner".to_string(),
+        "-nostdin".to_string(),
+        "-rw_timeout".to_string(),
+        "10000000".to_string(),
+        "-analyzeduration".to_string(),
+        "3000000".to_string(),
+    ];
+    let lower = clean_url.to_lowercase();
+    if lower.starts_with("http://") || lower.starts_with("https://") {
+        cmd.extend(recording::header_input_args(headers));
+    }
+    cmd.push("-i".to_string());
+    cmd.push(clean_url);
+    let (sender, receiver) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        let report = std::process::Command::new(&cmd[0])
+            .args(&cmd[1..])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .map(|out| String::from_utf8_lossy(&out.stderr).into_owned())
+            .unwrap_or_default();
+        let _ = sender.send(report);
+    });
+    // Shorter than Python's 20 s: this runs on the UI thread at
+    // record start, and a stream that has not described itself
+    // in 6 s is not worth freezing the interface for; ffmpeg's
+    // own rw_timeout bounds the abandoned probe thread.
+    receiver
+        .recv_timeout(std::time::Duration::from_secs(6))
+        .map(|report| parse_audio_stream_labels(&report))
+        .unwrap_or_default()
+}
+
+/// The (track, track count) a recording keeps, or (None, 0) to
+/// leave the choice to ffmpeg (port of `_recording_audio_choice`).
+fn recording_audio_choice(
+    persist: &Persist,
+    channel: &Channel,
+    probe_url: &str,
+    headers: &iptv_core::playback::StreamHeaders,
+    witness: Option<(i64, String)>,
+) -> (Option<i64>, i64) {
+    let Some(intent) = recording_audio_intent(persist, channel, witness) else {
+        return (None, 0);
+    };
+    let labels = probe_audio_labels(probe_url, headers);
+    if labels.is_empty() {
+        return (None, 0);
+    }
+    let pairs: Vec<(i64, String)> = labels
+        .iter()
+        .enumerate()
+        .map(|(index, label)| (i64::try_from(index).unwrap_or(0), label.clone()))
+        .collect();
+    match iptv_core::audiotracks::select_preferred_audio_track(
+        &pairs,
+        &intent.keywords,
+        intent.fallback_index,
+        intent.prefer_ad,
+    ) {
+        Some(index) => (Some(index), i64::try_from(labels.len()).unwrap_or(0)),
+        None => (None, 0),
+    }
+}
+
+/// Start or stop a manual recording of the channel. `player`,
+/// when the caller has it, witnesses the heard audio track
+/// (audit R10).
 fn toggle_recording(
     recordings: &Rc<RefCell<RecordingEngine>>,
     buffers: &Rc<RefCell<buffer::BufferRegistry>>,
     persist: &Persist,
     channel: &Channel,
     status: Status,
+    player: Option<&Rc<RefCell<PlayerState>>>,
 ) {
     let key = channel_key(channel);
     if recordings.borrow().is_recording(&key) {
@@ -1864,10 +2304,8 @@ fn toggle_recording(
         status.set_label("This channel's stream link must be resolved before recording.");
         return;
     }
-    let format = persist
-        .config
-        .borrow()
-        .string_or("recording_format", "provider_mkv");
+    let format = recording_format_for_channel(persist, channel);
+    let witness = player.and_then(|player| player_audio_witness(player, channel));
     match start_recording(
         recordings,
         buffers,
@@ -1876,6 +2314,7 @@ fn toggle_recording(
         channel,
         &format,
         &channel.name.clone(),
+        witness,
     ) {
         Ok(path) => status.set_label(&format!(
             "Recording {} to {}.",
@@ -1887,6 +2326,9 @@ fn toggle_recording(
 }
 
 /// Spawn ffmpeg for one recording; returns the output path.
+/// `witness` is the audio track the built-in player is hearing
+/// for this channel, when a caller has it (audit R10).
+#[allow(clippy::too_many_arguments)] // channel, programme context and the audio witness
 fn start_recording(
     recordings: &Rc<RefCell<RecordingEngine>>,
     buffers: &Rc<RefCell<buffer::BufferRegistry>>,
@@ -1895,24 +2337,23 @@ fn start_recording(
     channel: &Channel,
     format: &str,
     display_name: &str,
+    witness: Option<(i64, String)>,
 ) -> Result<PathBuf, String> {
     let dir = recordings_dir(persist);
-    let reserve_mib = recording::normalize_reserve_mib(
-        persist
-            .config
-            .borrow()
-            .value("recording_min_free_mib")
-            .and_then(serde_json::Value::as_i64),
-    );
-    if let Some(free) = recording::free_space_bytes(&dir) {
-        if free < reserve_mib * 1024 * 1024 {
-            return Err(format!(
-                "Not enough free space to record ({} MB free, {} MiB must stay free).",
-                free / (1024 * 1024),
-                reserve_mib
-            ));
-        }
-    }
+    // Audit R08: Python's pre-start destination check on every
+    // platform — the folder must exist, accept a real write,
+    // and hold at least the configured reserve; unknown free
+    // space refuses instead of silently skipping the gate.
+    let reserve = persist
+        .config
+        .borrow()
+        .value("recording_min_free_mib")
+        .and_then(serde_json::Value::as_i64);
+    recording::check_destination(&dir, reserve)?;
+    // Audit R11: an audio-only stream never records with a
+    // video preset, whatever entry point asked.
+    let format = &remap_format_for_media(persist, channel, format);
+    let format = format.as_str();
     let stamp = chrono::Local::now().format("%Y-%m-%d %H-%M-%S").to_string();
     let in_use = recordings.borrow().in_use_paths();
     let out = recording::unique_output_path(
@@ -1929,23 +2370,19 @@ fn start_recording(
     // provider connection (Python's recording_input).
     let mut input_url = clean_url.clone();
     let mut input_headers = headers.clone();
-    if let Some(session) = buffers.borrow_mut().find(&channel.url, &headers) {
-        if let Ok(lease) = session.acquire() {
-            match session.cursor(0.0, true) {
-                Ok((view_url, _)) => {
-                    input_url = view_url;
-                    input_headers = iptv_core::playback::StreamHeaders::default();
-                    buffers
-                        .borrow_mut()
-                        .recording_leases
-                        .insert(key.to_string(), (session, lease));
-                }
-                Err(_) => {
-                    session.release(lease);
-                }
-            }
-        }
+    // One borrow, one operation (audit R21: the old shape held the
+    // find() borrow across a second borrow_mut and panicked).
+    if let Some(view_url) = buffers
+        .borrow_mut()
+        .recording_view(key, &channel.url, &headers)
+    {
+        input_url = view_url;
+        input_headers = iptv_core::playback::StreamHeaders::default();
     }
+    // Audit R10: record the heard/preferred audio track, not
+    // ffmpeg's default, when anything asks for a track.
+    let (audio_track, audio_track_count) =
+        recording_audio_choice(persist, channel, &input_url, &input_headers, witness);
     let cmd = recording::ffmpeg_command(
         "ffmpeg",
         &input_url,
@@ -1954,6 +2391,8 @@ fn start_recording(
         &input_headers,
         &recording::FfmpegOptions {
             show_stats: true,
+            audio_track,
+            audio_track_count,
             ..recording::FfmpegOptions::default()
         },
     );
@@ -2051,6 +2490,7 @@ fn record_dvr_channel(
         channel,
         &job.format.clone(),
         &display,
+        None,
     ) {
         Ok(_) => status.set_label(&format!("Recording {display}.")),
         Err(error) => {
@@ -2325,6 +2765,33 @@ fn run_dvr_actions(wiring: &Wiring, status: Status, now: f64, actions: Vec<DvrAc
     }
 }
 
+/// Parse the media duration out of an `ffmpeg -i` report
+/// ("Duration: 01:02:03.50"), for the catch-up short-capture
+/// check (audit R05).
+fn parse_ffmpeg_duration(report: &str) -> Option<f64> {
+    let at = report.find("Duration: ")? + "Duration: ".len();
+    let text = report[at..].split(',').next()?.trim();
+    let mut parts = text.split(':');
+    let hours: f64 = parts.next()?.parse().ok()?;
+    let minutes: f64 = parts.next()?.parse().ok()?;
+    let seconds: f64 = parts.next()?.parse().ok()?;
+    Some(hours * 3600.0 + minutes * 60.0 + seconds)
+}
+
+/// The duration of the media in a finished capture file, when
+/// ffmpeg can read it back.
+fn media_duration_seconds(path: &std::path::Path) -> Option<f64> {
+    let output = std::process::Command::new("ffmpeg")
+        .args(["-hide_banner", "-nostdin", "-i"])
+        .arg(path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .ok()?;
+    parse_ffmpeg_duration(&String::from_utf8_lossy(&output.stderr))
+}
+
 /// Per-tick recording housekeeping: collect finishes, run the DVR
 /// state machine (every 10 s, like the reference poll), and apply the
 /// shutdown-after-recordings gate.
@@ -2333,6 +2800,15 @@ fn poll_recordings(wiring: &Wiring, status: Status) {
     for finished in wiring.recordings.borrow_mut().poll_finished() {
         release_recording_lease(&wiring.buffers, &finished.key);
         wiring.recorded.set(true);
+        // Audit R09: ffmpeg exiting 0 is not a recording — an
+        // empty or missing output is "Nothing was recorded",
+        // never a saved success, for manual and DVR alike.
+        let produced = recording::output_has_media(&finished.out_path);
+        let success = finished.success && produced;
+        if let Some(staged) = wiring.staged_downloads.borrow_mut().remove(&finished.key) {
+            finish_staged_download(wiring, status, &finished.key, staged, &finished, produced);
+            continue;
+        }
         let name = finished
             .out_path
             .file_name()
@@ -2340,21 +2816,28 @@ fn poll_recordings(wiring: &Wiring, status: Status) {
             .unwrap_or("")
             .to_string();
         if let Some(job_id) = finished.key.strip_prefix("dvr:") {
+            let message = if finished.success && !produced {
+                "Nothing was recorded: the stream ended before it wrote anything."
+            } else {
+                ""
+            };
             wiring.dvr.borrow_mut().mark_finished(
                 job_id,
-                finished.success,
+                success,
                 &finished.out_path.to_string_lossy(),
-                "",
+                message,
                 now,
             );
         }
-        if finished.success {
+        if success {
             let size = std::fs::metadata(&finished.out_path).map_or(0, |m| m.len());
             status.set_label(&format!(
                 "Recording saved: {name} ({}.{} MB)",
                 size / 1_000_000,
                 (size % 1_000_000) / 100_000
             ));
+        } else if finished.success {
+            status.set_label("Nothing was recorded: the stream ended before it wrote anything.");
         } else {
             status.set_label(&format!("Recording failed: {name}"));
         }
@@ -2362,6 +2845,9 @@ fn poll_recordings(wiring: &Wiring, status: Status) {
     if now - wiring.last_dvr_tick.get() >= 10.0 {
         wiring.last_dvr_tick.set(now);
         run_dvr_tick(wiring, status, now);
+        if now - wiring.series_last_scan.get() >= 3600.0 {
+            run_series_scan(wiring);
+        }
     }
 
     let armed = wiring
@@ -2378,7 +2864,61 @@ fn poll_recordings(wiring: &Wiring, status: Status) {
         )
     {
         wiring.shutdown_attempted.set(true);
-        open_shutdown_countdown(status);
+        open_shutdown_countdown(wiring, status);
+    }
+}
+
+/// Fill series rules from the guide (audit R16; Python
+/// `_refresh_series_recordings`): for every non-canceled series
+/// job, add one job per matching future episode the guide
+/// holds for its channel (same title, case-insensitive),
+/// skipping episodes already scheduled. Runs hourly and
+/// whenever a series rule is newly authored.
+fn run_series_scan(wiring: &Wiring) {
+    let now = now_seconds();
+    wiring.series_last_scan.set(now);
+    let rules: Vec<iptv_core::dvr::DvrJob> = wiring
+        .dvr
+        .borrow()
+        .jobs()
+        .iter()
+        .filter(|job| job.repeat == "series" && job.status != iptv_core::dvr::STATUS_CANCELED)
+        .cloned()
+        .collect();
+    if rules.is_empty() {
+        return;
+    }
+    let mut added = false;
+    for rule in &rules {
+        let channel = channel_from_snapshot(&rule.channel);
+        for programme in store_programmes(wiring, &channel) {
+            if programme.start <= now_epoch()
+                || !iptv_core::dvr::series_title_matches(&rule.title, &programme.title)
+            {
+                continue;
+            }
+            let spec = iptv_core::dvr::NewJob {
+                channel: &channel,
+                programme_title: &programme.title,
+                programme_start: programme.start,
+                programme_stop: programme.stop,
+                format: &rule.format,
+                pre_padding_minutes: rule.pre_padding_minutes,
+                post_padding_minutes: rule.post_padding_minutes,
+                repeat: "none",
+            };
+            let Ok(job) = iptv_core::dvr::build_job(&spec, now) else {
+                continue;
+            };
+            let mut dvr = wiring.dvr.borrow_mut();
+            if dvr.find_duplicate(&job).is_none() {
+                dvr.add_job(job);
+                added = true;
+            }
+        }
+    }
+    if added {
+        wiring.dvr.borrow_mut().save();
     }
 }
 
@@ -2925,6 +3465,12 @@ fn clone_wiring(wiring: &Wiring) -> Wiring {
         download_worker: Rc::clone(&wiring.download_worker),
         downloads: Rc::clone(&wiring.downloads),
         downloads_active: Rc::clone(&wiring.downloads_active),
+        downloads_ui: Rc::clone(&wiring.downloads_ui),
+        next_download_id: Rc::clone(&wiring.next_download_id),
+        reminder_seen: Rc::clone(&wiring.reminder_seen),
+        reminder_window_open: Rc::clone(&wiring.reminder_window_open),
+        staged_downloads: Rc::clone(&wiring.staged_downloads),
+        series_last_scan: Rc::clone(&wiring.series_last_scan),
         account_text: Rc::clone(&wiring.account_text),
         buffers: Rc::clone(&wiring.buffers),
     }
@@ -3851,9 +4397,14 @@ fn show_recording_storage(wiring: &Wiring, frame: Frame, status: Status) {
             .value("recording_min_free_mib")
             .and_then(serde_json::Value::as_i64),
     );
-    let free_text = match recording::free_space_bytes(&dir) {
-        Some(free) => format!("{} MB free", free / (1024 * 1024)),
-        None => "free space unavailable".to_string(),
+    // R08: report the same gate recordings face — a probed, writable
+    // folder with known free space — not a platform-skippable check.
+    let free_text = match recording::check_destination(
+        &dir,
+        Some(i64::try_from(reserve).unwrap_or(i64::MAX)),
+    ) {
+        Ok(check) => format!("{} MB free", check.free_bytes / (1024 * 1024)),
+        Err(error) => error,
     };
     let text = format!(
         "Recordings folder: {}\nSpace: {free_text}\nMinimum free space before a recording starts: {reserve} MiB",
@@ -4256,6 +4807,7 @@ fn bind_menu_actions(frame: Frame, wiring: &Wiring, controls: Controls) {
 
 /// Recordings menu dispatch. Returns true when the id belonged
 /// to the Recordings menu.
+#[allow(clippy::too_many_lines)] // grew with R17/R18 recording actions
 fn menu_recordings_action(
     id: i32,
     wiring: &Wiring,
@@ -4273,23 +4825,43 @@ fn menu_recordings_action(
                     &wiring.persist,
                     &channel,
                     status,
+                    Some(&wiring.player),
                 );
             } else {
                 status.set_label("Select a channel to record first.");
             }
         }
         REC_STOP => {
-            if let Some(channel) = selected_channel(wiring, list) {
-                let key = channel_key(&channel);
-                if wiring.recordings.borrow().is_recording(&key) {
-                    wiring.recordings.borrow_mut().stop(&key);
-                    release_recording_lease(&wiring.buffers, &key);
-                    status.set_label(&format!("Stopping recording of {}.", channel.name));
-                } else {
-                    status.set_label("That channel is not recording.");
+            // Python's stop: the selected channel's recording
+            // first; otherwise the single-active-recording
+            // fallback (audit R18) — exactly one active recording
+            // stops even after the selection moved; none says so;
+            // several stop all, like Python's fallback.
+            let selected_key =
+                selected_channel(wiring, list).map(|channel| channel_key(&channel));
+            if let Some(key) = &selected_key {
+                if wiring.recordings.borrow().is_recording(key) {
+                    wiring.recordings.borrow_mut().stop(key);
+                    release_recording_lease(&wiring.buffers, key);
+                    status.set_label("Stopping recording.");
+                    return true;
                 }
-            } else {
-                status.set_label("Select a channel first.");
+            }
+            let keys = wiring.recordings.borrow().active_keys();
+            match keys.len() {
+                0 => status.set_label("No recordings are currently active."),
+                1 => {
+                    wiring.recordings.borrow_mut().stop(&keys[0]);
+                    release_recording_lease(&wiring.buffers, &keys[0]);
+                    status.set_label("Stopping recording.");
+                }
+                count => {
+                    for key in &keys {
+                        wiring.recordings.borrow_mut().stop(key);
+                        release_recording_lease(&wiring.buffers, key);
+                    }
+                    status.set_label(&format!("Stopping {count} recordings."));
+                }
             }
         }
         REC_STOP_ALL => {
@@ -4335,6 +4907,15 @@ fn menu_recordings_action(
                 .borrow()
                 .bool_or("shutdown_after_recordings", false);
             persist.set_and_save("shutdown_after_recordings", serde_json::json!(next));
+            // Audit R17, mirroring Python's arming: the recorded
+            // flag restarts at arming — work already finished
+            // before arming must not trigger a shutdown; work
+            // running or queued at arming is what we wait for.
+            wiring.shutdown_attempted.set(false);
+            wiring.recorded.set(
+                next && (wiring.recordings.borrow().active_count() > 0
+                    || wiring.dvr.borrow().pending_count() > 0),
+            );
             status.set_label(if next {
                 "The computer will shut down when recordings finish."
             } else {
@@ -4349,6 +4930,17 @@ fn menu_recordings_action(
                 wiring
                     .persist
                     .set_and_save("recording_format", serde_json::json!(format_id));
+                // R11: the menu choice also updates the per-media preset
+                // of its own kind, so radio and TV keep separate formats
+                // like Python's presets.
+                let key = if recording::format_kind(format_id) == "audio" {
+                    "recording_format_audio"
+                } else {
+                    "recording_format_video"
+                };
+                wiring
+                    .persist
+                    .set_and_save(key, serde_json::json!(format_id));
                 status.set_label(&format!("Recording format: {label}."));
             }
         }
@@ -5100,15 +5692,58 @@ fn current_programme(wiring: &Wiring, channel: &Channel) -> Option<Programme> {
     guide_now_next(wiring, channel)?.current
 }
 
-/// Add a reminder for a programme (5-minute lead from the context
-/// menu; the Reminders dialog in G6 offers lead choices).
-fn add_reminder(wiring: &Wiring, channel: &Channel, programme: &Programme, status: Status) {
+/// Ask for a reminder lead time in minutes (Python's
+/// `NumberEntryDialog`, 0–120; audit R13). None when cancelled
+/// or the entry is not a whole number in range.
+fn prompt_lead_minutes(frame: Frame, current: i64) -> Option<i64> {
+    let dialog = TextEntryDialog::builder(
+        &frame,
+        "Notify before the programme starts (minutes):",
+        "Programme Reminders",
+    )
+    .with_default_value(&current.to_string())
+    .build();
+    if dialog.show_modal() != ID_OK {
+        return None;
+    }
+    dialog
+        .get_value()
+        .unwrap_or_default()
+        .trim()
+        .parse::<i64>()
+        .ok()
+        .filter(|value| (0..=120).contains(value))
+}
+
+/// Add a reminder for a programme, asking the lead time first
+/// (audit R13: creation offers the 0–120 minute choice, not a
+/// fixed five minutes). Creating work restarts the poll (R01).
+fn add_reminder(
+    wiring: &Wiring,
+    frame: Frame,
+    channel: &Channel,
+    programme: &Programme,
+    status: Status,
+) {
     let now = now_epoch();
-    match iptv_core::reminders::build_reminder(channel, programme, 5, now) {
+    // Validate before opening the prompt, like Python: a
+    // started programme gets the explanation, not a dialog.
+    if iptv_core::reminders::build_reminder(channel, programme, 5, now).is_err() {
+        status.set_label("Reminders can only be set for programmes that have not started.");
+        return;
+    }
+    let Some(lead) = prompt_lead_minutes(frame, 5) else {
+        return;
+    };
+    match iptv_core::reminders::build_reminder(channel, programme, lead, now) {
         Ok(reminder) => {
+            // A (re)created reminder is unseen: it must deliver
+            // even if an earlier twin was already shown.
+            wiring.reminder_seen.borrow_mut().remove(&reminder.id);
             wiring.reminders.borrow_mut().push(reminder);
             let rows = wiring.reminders.borrow().clone();
             wiring.persist.save_reminders(&rows);
+            ensure_polling(wiring);
             status.set_label(&format!(
                 "Reminder set for {} at {}.",
                 programme.title,
@@ -5121,13 +5756,21 @@ fn add_reminder(wiring: &Wiring, channel: &Channel, programme: &Programme, statu
     }
 }
 
-/// Schedule a DVR recording for a programme window.
-fn add_dvr_job(wiring: &Wiring, channel: &Channel, programme: &Programme, status: Status) {
-    let format = wiring
-        .persist
-        .config
-        .borrow()
-        .string_or("recording_format", "provider_mkv");
+/// Schedule a DVR recording for a programme window, with
+/// Python's creation-time checks (audit R15): an exact
+/// duplicate is refused (or takes the requested repeat), and
+/// overlaps ask first. `repeat` is "none", "daily", "weekly"
+/// or "series" (audit R16 authoring). Creating work restarts
+/// the poll (R01).
+fn add_dvr_job(
+    wiring: &Wiring,
+    frame: Frame,
+    channel: &Channel,
+    programme: &Programme,
+    status: Status,
+    repeat: &str,
+) {
+    let format = recording_format_for_channel(&wiring.persist, channel);
     let spec = iptv_core::dvr::NewJob {
         channel,
         programme_title: &programme.title,
@@ -5148,21 +5791,63 @@ fn add_dvr_job(wiring: &Wiring, channel: &Channel, programme: &Programme, status
             .value("recording_post_padding_minutes")
             .and_then(serde_json::Value::as_i64)
             .unwrap_or(2),
-        repeat: "none",
+        repeat,
     };
-    match iptv_core::dvr::build_job(&spec, now_seconds()) {
-        Ok(job) => {
-            let mut dvr = wiring.dvr.borrow_mut();
-            dvr.add_job(job);
-            dvr.save();
-            status.set_label(&format!(
-                "Recording scheduled: {} at {}.",
-                programme.title,
-                local_hhmm(programme.start)
-            ));
+    let job = match iptv_core::dvr::build_job(&spec, now_seconds()) {
+        Ok(job) => job,
+        Err(error) => {
+            status.set_label(&error);
+            return;
         }
-        Err(error) => status.set_label(&error),
+    };
+    if job.stop_ts <= now_seconds() {
+        status.set_label("This programme has already ended.");
+        return;
     }
+    {
+        let mut dvr = wiring.dvr.borrow_mut();
+        if let Some(duplicate_id) = dvr.find_duplicate(&job) {
+            if repeat != "none" && dvr.set_repeat(&duplicate_id, repeat) {
+                dvr.save();
+                status.set_label("Recording updated to repeat.");
+            } else {
+                status.set_label("This programme is already scheduled to record.");
+            }
+            return;
+        }
+        let overlaps = dvr.overlapping(&job);
+        if !overlaps.is_empty() {
+            drop(dvr);
+            let answer = MessageDialog::builder(
+                &frame,
+                &format!(
+                    "This recording overlaps {} other scheduled recording(s). Schedule it anyway?",
+                    overlaps.len()
+                ),
+                "Recording Conflict",
+            )
+            .with_style(MessageDialogStyle::YesNo)
+            .build()
+            .show_modal();
+            if answer != ID_YES {
+                return;
+            }
+        }
+    }
+    let mut dvr = wiring.dvr.borrow_mut();
+    dvr.add_job(job);
+    dvr.save();
+    drop(dvr);
+    if repeat == "series" {
+        // Fill the new rule from the guide on the next tick.
+        wiring.series_last_scan.set(0.0);
+    }
+    ensure_polling(wiring);
+    status.set_label(&format!(
+        "Recording scheduled: {} at {}.",
+        programme.title,
+        local_hhmm(programme.start)
+    ));
 }
 
 /// The Channels right-click menu (Python's channel context menu):
@@ -5219,30 +5904,33 @@ fn bind_context_menu(frame: Frame, wiring: &Wiring, controls: Controls) {
                     &wiring_menu.persist,
                     &channel,
                     status,
+                    Some(&wiring_menu.player),
                 );
                 assert!(wiring_menu.timer.start(50, false));
             }
             // On an EPG search row, Reminder and Schedule act on
-            // the row's own programme (Python's EPG-row menu); on
-            // a channel row they act on the current programme.
+            // the row's own programme (Python's EPG-row menu —
+            // the user already picked that programme). On a plain
+            // channel row they open the upcoming-programme
+            // chooser instead (audit R14): the airing programme
+            // is never the target, since a reminder for it is
+            // impossible by construction.
             CTX_REMINDER => {
                 let row_programme = selected_row(list)
                     .and_then(|row| row_epg(&wiring_menu, row))
                     .map(|epg_row| epg_row.programme);
-                match row_programme.or_else(|| current_programme(&wiring_menu, &channel)) {
+                match row_programme {
                     Some(programme) => add_reminder(&wiring_menu, &channel, &programme, status),
-                    None => status.set_label("No current programme to set a reminder for."),
+                    None => open_channel_epg(&wiring_menu, &channel, status),
                 }
             }
             CTX_SCHEDULE => {
                 let row_programme = selected_row(list)
                     .and_then(|row| row_epg(&wiring_menu, row))
                     .map(|epg_row| epg_row.programme);
-                match row_programme.or_else(|| current_programme(&wiring_menu, &channel)) {
+                match row_programme {
                     Some(programme) => add_dvr_job(&wiring_menu, &channel, &programme, status),
-                    None => {
-                        status.set_label("No current programme to schedule a recording for.");
-                    }
+                    None => open_channel_epg(&wiring_menu, &channel, status),
                 }
             }
             CTX_EPG => open_channel_epg(&wiring_menu, &channel, status),
@@ -5320,6 +6008,7 @@ fn bind_epg_description(
     });
 }
 
+#[allow(clippy::too_many_lines)] // grew with R16 repeat buttons
 fn open_channel_epg(wiring: &Wiring, channel: &Channel, main_status: Status) {
     let now = now_epoch();
     // Python's Channel EPG query: from the programme on air now
@@ -5390,7 +6079,7 @@ fn open_channel_epg(wiring: &Wiring, channel: &Channel, main_status: Status) {
             .borrow()
             .get(usize::try_from(index).unwrap_or(usize::MAX))
         {
-            add_reminder(&wiring_r, &channel_r, programme, status);
+            add_reminder(&wiring_r, frame, &channel_r, programme, status);
         }
     });
     let wiring_s = clone_wiring(wiring);
@@ -5404,9 +6093,32 @@ fn open_channel_epg(wiring: &Wiring, channel: &Channel, main_status: Status) {
             .borrow()
             .get(usize::try_from(index).unwrap_or(usize::MAX))
         {
-            add_dvr_job(&wiring_s, &channel_s, programme, status);
+            add_dvr_job(&wiring_s, frame, &channel_s, programme, status, "none");
         }
     });
+    // R16: recurrence authoring from programme rows — Record Daily,
+    // Weekly and Series, like Python's programme context menu.
+    for (label, repeat) in [
+        ("Record &Daily", "daily"),
+        ("Record &Weekly", "weekly"),
+        ("Record &Series", "series"),
+    ] {
+        let button = Button::builder(&panel).with_label(label).build();
+        let wiring_rep = clone_wiring(wiring);
+        let programmes_rep = Rc::clone(&programmes);
+        let channel_rep = channel.clone();
+        button.on_click(move |_| {
+            let Some(index) = list.get_selection() else {
+                return;
+            };
+            if let Some(programme) = programmes_rep
+                .borrow()
+                .get(usize::try_from(index).unwrap_or(usize::MAX))
+            {
+                add_dvr_job(&wiring_rep, frame, &channel_rep, programme, status, repeat);
+            }
+        });
+    }
     let all_reminders_button = Button::builder(&panel).with_label("Remin&ders...").build();
     let all_scheduled_button = Button::builder(&panel)
         .with_label("S&cheduled Recordings...")
@@ -6681,6 +7393,7 @@ fn dispatch_player_menu(
                     persist,
                     channel,
                     status,
+                    Some(player),
                 );
                 assert!(shared.timer.start(50, false));
             }
@@ -7315,6 +8028,7 @@ fn wire_player_events(
             &record_persist,
             channel,
             status,
+            Some(&record_player),
         );
         assert!(shared.timer.start(50, false));
     });
@@ -8641,6 +9355,7 @@ fn dispatch_player_key(
                     persist,
                     channel,
                     status,
+                    Some(player),
                 );
                 assert!(shared.timer.start(50, false));
             }
@@ -10462,10 +11177,40 @@ fn open_epg_manager(wiring: &Wiring, status: Status) {
 /// One download tracked by the adapter (worker events arrive in
 /// start order; the first unfinished row is the active one).
 struct DownloadRow {
+    /// Worker request id; 0 for rows driven by an ffmpeg
+    /// catch-up capture instead of the download worker.
+    id: u64,
+    /// The catch-up identity (channel + programme window):
+    /// a second request for the same programme is refused
+    /// while one is active (audit R03).
+    key: String,
     name: String,
     destination: String,
     progress: String,
     done: bool,
+}
+
+/// One in-flight ffmpeg catch-up capture: everything needed to
+/// finalize it (rename the staged `.part` on a clean, complete
+/// finish) or retry it once when it comes up short (audit R05).
+struct StagedDownload {
+    final_path: PathBuf,
+    channel: Channel,
+    programme: Programme,
+    url: String,
+    attempts: u32,
+    /// The user cancelled this capture: its finish removes the
+    /// staged file and never retries (audit R06).
+    cancelled: bool,
+}
+
+/// The Downloads window's handles, kept so the poll can refresh
+/// its rows live (audit R06).
+#[derive(Clone)]
+struct DownloadsUi {
+    frame: Frame,
+    list: ListBox,
+    dstatus: Status,
 }
 
 /// Build a simple list dialog shell: frame, panel, list, status.
@@ -10577,7 +11322,7 @@ fn wire_whats_on_buttons(
             .copied();
         if let Some((channel, programme)) = row_index.and_then(|i| rows_s.borrow().get(i).cloned())
         {
-            add_dvr_job(&wiring_s, &channel, &programme, status);
+            add_dvr_job(&wiring_s, frame, &channel, &programme, status, "none");
         }
     });
     close.on_click(move |_| frame.hide());
@@ -10967,48 +11712,124 @@ fn open_recent_channels(wiring: &Wiring, status: Status) {
     frame.show(true);
 }
 
-/// The Reminders dialog: stored reminders with Delete.
+/// The Reminders dialog (audit R13): rows carry time, title,
+/// channel, delivery status and lead; the lead is editable,
+/// and Clear All / Refresh / Open Channel are offered like
+/// Python's. Selection survives a refresh by reminder id.
+#[allow(clippy::too_many_lines)] // R13 dialog: lead editing, clear-all, status column
 fn open_reminders_dialog(wiring: &Wiring, main_status: Status) {
     let (frame, panel, list, dstatus) = list_dialog("Reminders", "Reminders");
     let render = |wiring: &Wiring, list: ListBox, dstatus: Status| {
+        let selected_id = list.get_selection().and_then(|index| {
+            wiring
+                .reminders
+                .borrow()
+                .get(usize::try_from(index).unwrap_or(usize::MAX))
+                .map(|r| r.id.clone())
+        });
+        let now = now_epoch();
         let rows = wiring.reminders.borrow();
         let labels: Vec<String> = rows
             .iter()
             .map(|r| {
+                let stamp = chrono::TimeZone::timestamp_opt(&chrono::Local, r.start, 0)
+                    .single()
+                    .map_or_else(
+                        || "Unknown time".to_string(),
+                        |dt| dt.format("%Y-%m-%d %H:%M").to_string(),
+                    );
+                let title = if r.title.is_empty() {
+                    "(No title)"
+                } else {
+                    &r.title
+                };
                 format!(
-                    "{} {} — {} ({} min before)",
-                    local_hhmm(r.start),
-                    r.title,
+                    "{} {} — {} — {} — {} min before",
+                    stamp,
+                    title,
                     r.channel,
+                    iptv_core::reminders::display_status(r, now),
                     r.lead
                 )
             })
             .collect();
         list.set_items(&labels.iter().map(String::as_str).collect::<Vec<_>>());
-        dstatus.set_label(&format!("{} reminders.", rows.len()));
+        if let Some(id) = &selected_id {
+            if let Some(index) = rows.iter().position(|r| &r.id == id) {
+                list.set_selection(u32::try_from(index).unwrap_or(0), true);
+            }
+        }
+        let count_text = if rows.is_empty() {
+            "No reminders.".to_string()
+        } else {
+            format!("{} reminders.", rows.len())
+        };
+        dstatus.set_label(&count_text);
     };
     render(wiring, list, dstatus);
     if wiring.reminders.borrow().is_empty() {
         main_status.set_label("No reminders set.");
     }
+    let edit = Button::builder(&panel)
+        .with_label("Set &Reminder...")
+        .build();
     let delete = Button::builder(&panel).with_label("&Delete").build();
+    let clear = Button::builder(&panel)
+        .with_label("Clear &All Reminders")
+        .build();
+    let refresh = Button::builder(&panel).with_label("&Refresh").build();
     let close = Button::builder(&panel).with_label("&Close").build();
+    let selected_reminder = move |wiring: &Wiring| -> Option<Reminder> {
+        let index = usize::try_from(list.get_selection()?).ok()?;
+        wiring.reminders.borrow().get(index).cloned()
+    };
+    let wiring_e = clone_wiring(wiring);
+    edit.on_click(move |_| {
+        let Some(reminder) = selected_reminder(&wiring_e) else {
+            dstatus.set_label("Choose a reminder to edit first.");
+            return;
+        };
+        if reminder.start <= now_epoch() {
+            dstatus.set_label("That programme has already started.");
+            return;
+        }
+        let Some(lead) = prompt_lead_minutes(frame, reminder.lead) else {
+            return;
+        };
+        let now = now_epoch();
+        let mut rows = wiring_e.reminders.borrow_mut();
+        if iptv_core::reminders::set_lead(&mut rows, &reminder.id, lead, now).is_ok() {
+            let saved = rows.clone();
+            drop(rows);
+            wiring_e.persist.save_reminders(&saved);
+            // Editing re-arms delivery, like Python.
+            wiring_e.reminder_seen.borrow_mut().remove(&reminder.id);
+            render(&wiring_e, list, dstatus);
+        } else {
+            dstatus.set_label("That reminder can no longer be edited.");
+        }
+    });
     let wiring_d = clone_wiring(wiring);
     delete.on_click(move |_| {
-        let Some(index) = list.get_selection() else {
+        let Some(reminder) = selected_reminder(&wiring_d) else {
             dstatus.set_label("Choose a reminder to delete first.");
             return;
         };
-        let index = usize::try_from(index).unwrap_or(usize::MAX);
         let mut rows = wiring_d.reminders.borrow_mut();
-        if index < rows.len() {
-            rows.remove(index);
-            let saved = rows.clone();
-            drop(rows);
-            wiring_d.persist.save_reminders(&saved);
-            render(&wiring_d, list, dstatus);
-        }
+        rows.retain(|r| r.id != reminder.id);
+        let saved = rows.clone();
+        drop(rows);
+        wiring_d.persist.save_reminders(&saved);
+        render(&wiring_d, list, dstatus);
     });
+    let wiring_a = clone_wiring(wiring);
+    clear.on_click(move |_| {
+        wiring_a.reminders.borrow_mut().clear();
+        wiring_a.persist.save_reminders(&[]);
+        render(&wiring_a, list, dstatus);
+    });
+    let wiring_r = clone_wiring(wiring);
+    refresh.on_click(move |_| render(&wiring_r, list, dstatus));
     close.on_click(move |_| frame.hide());
     frame.show(true);
 }
@@ -11125,32 +11946,130 @@ fn open_conflict_dialog(wiring: &Wiring, job: &iptv_core::dvr::DvrJob, main_stat
     frame.show(true);
 }
 
-/// Render the Scheduled Recordings list (waiting jobs carry
-/// their conflict reason in the row).
-fn render_scheduled_jobs(wiring: &Wiring, list: ListBox, dstatus: Status) {
+/// The job ids behind the Scheduled Recordings list's
+/// selected rows, in row order.
+fn selected_job_ids(wiring: &Wiring, list: ListCtrl) -> Vec<String> {
     let dvr = wiring.dvr.borrow();
-    let labels: Vec<String> = dvr
-        .jobs()
-        .iter()
-        .map(|job| {
-            let base = format!(
-                "{} {} — {} [{}]",
-                job.start_at, job.title, job.channel_name, job.status
-            );
-            if job.status == iptv_core::dvr::STATUS_WAITING && !job.wait_reason.is_empty() {
-                format!("{base}: {}", job.wait_reason)
-            } else {
-                base
-            }
-        })
-        .collect();
-    list.set_items(&labels.iter().map(String::as_str).collect::<Vec<_>>());
+    let mut ids = Vec::new();
+    let mut item: i64 = -1;
+    loop {
+        let next = list.get_next_item(item, ListNextItemFlag::All, ListItemState::Selected);
+        if next < 0 {
+            break;
+        }
+        if let Some(job) = dvr.jobs().get(usize::try_from(next).unwrap_or(usize::MAX)) {
+            ids.push(job.id.clone());
+        }
+        item = i64::from(next);
+    }
+    ids
+}
+
+/// Render the Scheduled Recordings rows (audit R19): Python's
+/// columns — the full padded window, title, channel, status
+/// and format — with the selection preserved by job id across
+/// the rebuild (waiting jobs carry their conflict reason in
+/// the status column).
+#[allow(clippy::cast_possible_truncation)] // epoch seconds to i64 for local stamps
+fn render_scheduled_jobs(wiring: &Wiring, list: ListCtrl, dstatus: Status) {
+    let selected = selected_job_ids(wiring, list);
+    let dvr = wiring.dvr.borrow();
+    list.delete_all_items();
+    let stamp = |ts: f64| {
+        chrono::TimeZone::timestamp_opt(&chrono::Local, ts as i64, 0)
+            .single()
+            .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+            .unwrap_or_default()
+    };
+    for (index, job) in dvr.jobs().iter().enumerate() {
+        let row = i64::try_from(index).unwrap_or(0);
+        let window = format!("{} - {}", stamp(job.start_ts), stamp(job.stop_ts));
+        list.insert_item(row, &window, None);
+        let title = if job.title.is_empty() {
+            job.channel_name.clone()
+        } else {
+            job.title.clone()
+        };
+        list.set_item_text_by_column(row, 1, &title);
+        list.set_item_text_by_column(row, 2, &job.channel_name);
+        let status = if job.status == iptv_core::dvr::STATUS_WAITING && !job.wait_reason.is_empty()
+        {
+            format!("{}: {}", job.status, job.wait_reason)
+        } else {
+            job.status.clone()
+        };
+        list.set_item_text_by_column(row, 3, &status);
+        let format_label = iptv_core::recording::RECORDING_FORMATS
+            .iter()
+            .find(|entry| entry.0 == job.format)
+            .map_or(job.format.as_str(), |entry| entry.1);
+        list.set_item_text_by_column(row, 4, format_label);
+        if selected.contains(&job.id) {
+            list.set_item_state(row, ListItemState::Selected, ListItemState::Selected);
+        }
+    }
     dstatus.set_label(&format!("{} scheduled recordings.", dvr.jobs().len()));
 }
 
-/// The Scheduled Recordings dialog: DVR jobs with Cancel.
+/// Delete every selected finished job (the Delete button and
+/// the Delete key share this; audit R19).
+fn delete_selected_finished_jobs(wiring: &Wiring, list: ListCtrl, dstatus: Status) {
+    let ids = selected_job_ids(wiring, list);
+    if ids.is_empty() {
+        dstatus.set_label("Choose a finished recording to delete first.");
+        return;
+    }
+    let mut removed = 0;
+    {
+        let mut dvr = wiring.dvr.borrow_mut();
+        for id in &ids {
+            if dvr.remove_job(id) {
+                removed += 1;
+            }
+        }
+        if removed > 0 {
+            dvr.save();
+        }
+    }
+    if removed == 0 {
+        dstatus.set_label("Only finished recordings can be deleted.");
+    }
+    render_scheduled_jobs(wiring, list, dstatus);
+}
+
+/// The Scheduled Recordings dialog (audit R19): a multi-select
+/// report list with Python's columns, Ctrl+A / Delete keyboard
+/// batch operations, and selection-preserving refreshes.
+#[allow(clippy::too_many_lines)] // R19 dialog: report list, keyboard actions
 fn open_scheduled_dialog(wiring: &Wiring, main_status: Status) {
-    let (frame, panel, list, dstatus) = list_dialog("Scheduled Recordings", "Scheduled recordings");
+    let frame = Frame::builder()
+        .with_title("Scheduled Recordings")
+        .with_size(Size::new(850, 430))
+        .build();
+    frame.set_accessibility_label("Scheduled Recordings");
+    let panel = Panel::builder(&frame).build();
+    let list = ListCtrl::builder(&panel)
+        .with_style(ListCtrlStyle::Report)
+        .build();
+    list.set_accessibility_label("Scheduled recordings");
+    list.insert_column(0, "Time", ListColumnFormat::Left, 210);
+    list.insert_column(1, "Title", ListColumnFormat::Left, 230);
+    list.insert_column(2, "Channel", ListColumnFormat::Left, 180);
+    list.insert_column(3, "Status", ListColumnFormat::Left, 110);
+    list.insert_column(4, "Format", ListColumnFormat::Left, 120);
+    let status_label = StaticText::builder(&panel)
+        .with_label("Dialog status")
+        .build();
+    let details = TextCtrl::builder(&panel)
+        .with_style(TextCtrlStyle::ReadOnly | TextCtrlStyle::MultiLine)
+        .with_value("No items yet.")
+        .build();
+    details.set_accessibility_label("Dialog status");
+    let dstatus = Status {
+        label: status_label,
+        details,
+        bar: None,
+    };
     let render = render_scheduled_jobs;
     render(wiring, list, dstatus);
     if wiring.dvr.borrow().jobs().is_empty() {
@@ -11168,43 +12087,34 @@ fn open_scheduled_dialog(wiring: &Wiring, main_status: Status) {
     let close = Button::builder(&panel).with_label("&Close").build();
     let wiring_c = clone_wiring(wiring);
     cancel_job.on_click(move |_| {
-        let Some(index) = list.get_selection() else {
+        let Some(id) = selected_job_ids(&wiring_c, list).into_iter().next() else {
             dstatus.set_label("Choose a recording to cancel first.");
             return;
         };
-        let index = usize::try_from(index).unwrap_or(usize::MAX);
-        let id = wiring_c
-            .dvr
-            .borrow()
-            .jobs()
-            .get(index)
-            .map(|job| job.id.clone());
-        if let Some(id) = id {
-            let mut dvr = wiring_c.dvr.borrow_mut();
-            if dvr.cancel_job(&id) {
-                dvr.save();
-                drop(dvr);
-                // Stop the capture too: a canceled job leaves the
-                // Recording state, so the scheduler will never
-                // emit its Stop action — an in-flight or running
-                // capture must be halted here (issue #130).
-                wiring_c.recordings.borrow_mut().stop(&format!("dvr:{id}"));
-                wiring_c.dvr_resolve.borrow_mut().remove(&id);
-                wiring_c.pending_resolves.borrow_mut().retain(
-                    |_, pending| !matches!(pending, PendingResolve::Dvr(job) if job == &id),
-                );
-                render(&wiring_c, list, dstatus);
-            }
+        let mut dvr = wiring_c.dvr.borrow_mut();
+        if dvr.cancel_job(&id) {
+            dvr.save();
+            drop(dvr);
+            // Stop the capture too: a canceled job leaves the
+            // Recording state, so the scheduler will never
+            // emit its Stop action — an in-flight or running
+            // capture must be halted here (issue #130).
+            wiring_c.recordings.borrow_mut().stop(&format!("dvr:{id}"));
+            wiring_c.dvr_resolve.borrow_mut().remove(&id);
+            wiring_c
+                .pending_resolves
+                .borrow_mut()
+                .retain(|_, pending| !matches!(pending, PendingResolve::Dvr(job) if job == &id));
+            render(&wiring_c, list, dstatus);
         }
     });
     let wiring_x = clone_wiring(wiring);
     resolve_conflict.on_click(move |_| {
-        let Some(index) = list.get_selection() else {
+        let Some(id) = selected_job_ids(&wiring_x, list).into_iter().next() else {
             dstatus.set_label("Choose a waiting recording first.");
             return;
         };
-        let index = usize::try_from(index).unwrap_or(usize::MAX);
-        let job = wiring_x.dvr.borrow().jobs().get(index).cloned();
+        let job = wiring_x.dvr.borrow().get(&id).cloned();
         match job {
             Some(job) if job.status == iptv_core::dvr::STATUS_WAITING => {
                 open_conflict_dialog(&wiring_x, &job, main_status);
@@ -11216,28 +12126,31 @@ fn open_scheduled_dialog(wiring: &Wiring, main_status: Status) {
     });
     let wiring_d = clone_wiring(wiring);
     delete_job.on_click(move |_| {
-        let Some(index) = list.get_selection() else {
-            dstatus.set_label("Choose a finished recording to delete first.");
-            return;
-        };
-        let index = usize::try_from(index).unwrap_or(usize::MAX);
-        let id = wiring_d
-            .dvr
-            .borrow()
-            .jobs()
-            .get(index)
-            .map(|job| job.id.clone());
-        if let Some(id) = id {
-            if wiring_d.dvr.borrow_mut().remove_job(&id) {
-                render(&wiring_d, list, dstatus);
-            } else {
-                dstatus.set_label("Only finished recordings can be deleted.");
-            }
-        }
+        delete_selected_finished_jobs(&wiring_d, list, dstatus);
     });
     let wiring_r = clone_wiring(wiring);
     refresh.on_click(move |_| {
         render(&wiring_r, list, dstatus);
+    });
+    // Keyboard batch operations (Python's list keys): Ctrl+A
+    // selects every row; Delete removes the selected finished
+    // jobs. Matched keys are consumed.
+    let wiring_k = clone_wiring(wiring);
+    list.bind_internal(EventType::KEY_DOWN, move |event| {
+        if key_event_label(event) == Some("Ctrl+A".to_string()) {
+            let count = list.get_item_count();
+            for row in 0..i64::from(count) {
+                list.set_item_state(row, ListItemState::Selected, ListItemState::Selected);
+            }
+            event.skip(false);
+            return;
+        }
+        if event.get_key_code() == Some(127) {
+            delete_selected_finished_jobs(&wiring_k, list, dstatus);
+            event.skip(false);
+            return;
+        }
+        event.skip(true);
     });
     close.on_click(move |_| frame.hide());
     frame.show(true);
@@ -11245,6 +12158,7 @@ fn open_scheduled_dialog(wiring: &Wiring, main_status: Status) {
 
 /// The Catch-up dialog for one channel: past programmes with Play
 /// and Download.
+#[allow(clippy::too_many_lines)] // R20 dialog: descriptions, activation, context menu
 fn open_catchup_dialog(wiring: &Wiring, channel: &Channel, main_status: Status) {
     if !iptv_core::catchup::channel_has_catchup(channel) {
         main_status.set_label("This channel does not provide catch-up streaming.");
@@ -11265,46 +12179,102 @@ fn open_catchup_dialog(wiring: &Wiring, channel: &Channel, main_status: Status) 
         &format!("Catch-up — {}", channel.name),
         "Catch-up programmes",
     );
+    // Audit R20: rows carry the DATE as well as the clock, so
+    // same-time episodes on different days are distinguishable.
     let labels: Vec<String> = programmes
         .iter()
-        .map(|p| format!("{}-{} {}", local_hhmm(p.start), local_hhmm(p.stop), p.title))
+        .map(|p| {
+            let day = chrono::TimeZone::timestamp_opt(&chrono::Local, p.start, 0)
+                .single()
+                .map(|dt| dt.format("%Y-%m-%d").to_string())
+                .unwrap_or_default();
+            format!(
+                "{} {}-{} {}",
+                day,
+                local_hhmm(p.start),
+                local_hhmm(p.stop),
+                p.title
+            )
+        })
         .collect();
     list.set_items(&labels.iter().map(String::as_str).collect::<Vec<_>>());
     list.set_selection(0, true);
     dstatus.set_label(&format!("{} catch-up programmes.", programmes.len()));
+    let programmes = Rc::new(RefCell::new(programmes));
+    // The selected programme's description is readable in the
+    // details text (audit R20), starting with the first row.
+    let describe = |programmes: &Rc<RefCell<Vec<Programme>>>, list: ListBox, dstatus: Status| {
+        let index = usize::try_from(list.get_selection().unwrap_or(0)).unwrap_or(0);
+        if let Some(programme) = programmes.borrow().get(index) {
+            let text = if programme.description.trim().is_empty() {
+                "No description for this programme.".to_string()
+            } else {
+                programme.description.clone()
+            };
+            dstatus.details.set_value(&text);
+        }
+    };
+    describe(&programmes, list, dstatus);
+    let programmes_sel = Rc::clone(&programmes);
+    list.bind_internal(EventType::COMMAND_LISTBOX_SELECTED, move |_| {
+        describe(&programmes_sel, list, dstatus);
+    });
     let play = Button::builder(&panel).with_label("&Play").build();
     let download = Button::builder(&panel).with_label("&Download").build();
     let close = Button::builder(&panel).with_label("&Close").build();
-    let programmes = Rc::new(RefCell::new(programmes));
+    let selected_programme = move |programmes: &Rc<RefCell<Vec<Programme>>>| -> Option<Programme> {
+        let index = usize::try_from(list.get_selection()?).ok()?;
+        programmes.borrow().get(index).cloned()
+    };
     let wiring_p = clone_wiring(wiring);
     let programmes_p = Rc::clone(&programmes);
     let channel_p = channel.clone();
     play.on_click(move |_| {
-        let Some(index) = list.get_selection() else {
-            return;
-        };
-        if let Some(programme) = programmes_p
-            .borrow()
-            .get(usize::try_from(index).unwrap_or(usize::MAX))
-        {
-            play_catchup_for(&wiring_p, &channel_p, programme, main_status);
+        if let Some(programme) = selected_programme(&programmes_p) {
+            // The dialog stays open with its selection in
+            // place, so closing the player returns to the
+            // played programme (audit R20).
+            play_catchup_for(&wiring_p, &channel_p, &programme, main_status);
+        }
+    });
+    // Enter (double-click) activates the row, like Python.
+    let wiring_a = clone_wiring(wiring);
+    let programmes_a = Rc::clone(&programmes);
+    let channel_a = channel.clone();
+    list.bind_internal(EventType::COMMAND_LISTBOX_DOUBLECLICKED, move |_| {
+        if let Some(programme) = selected_programme(&programmes_a) {
+            play_catchup_for(&wiring_a, &channel_a, &programme, main_status);
         }
     });
     let wiring_d = clone_wiring(wiring);
     let programmes_d = Rc::clone(&programmes);
     let channel_d = channel.clone();
     download.on_click(move |_| {
-        let Some(index) = list.get_selection() else {
-            return;
-        };
-        let Some(programme) = programmes_d
-            .borrow()
-            .get(usize::try_from(index).unwrap_or(usize::MAX))
-            .cloned()
-        else {
+        let Some(programme) = selected_programme(&programmes_d) else {
             return;
         };
         start_catchup_download(&wiring_d, &channel_d, &programme, dstatus);
+    });
+    // The Apps-key context menu mirrors the buttons.
+    list.bind_internal(EventType::CONTEXT_MENU, move |_| {
+        let mut menu = Menu::builder()
+            .append_item(9901, "Play", "")
+            .append_item(9902, "Download", "")
+            .build();
+        list.popup_menu(&mut menu, None);
+    });
+    let wiring_f = clone_wiring(wiring);
+    let programmes_f = Rc::clone(&programmes);
+    let channel_f = channel.clone();
+    frame.on_menu(move |event| {
+        let Some(programme) = selected_programme(&programmes_f) else {
+            return;
+        };
+        match event.get_id() {
+            9901 => play_catchup_for(&wiring_f, &channel_f, &programme, main_status),
+            9902 => start_catchup_download(&wiring_f, &channel_f, &programme, dstatus),
+            _ => {}
+        }
     });
     close.on_click(move |_| frame.hide());
     frame.show(true);
@@ -11364,8 +12334,39 @@ fn start_catchup_download(
     }
 }
 
+/// The identity of one catch-up download (audit R03): the
+/// channel plus the programme window, like Python's hashed
+/// recorder key. A second request for the same programme is
+/// refused while one is active.
+fn catchup_download_key(channel: &Channel, programme: &Programme) -> String {
+    format!(
+        "catchup:{}:{}:{}",
+        channel_key(channel),
+        programme.start,
+        programme.stop
+    )
+}
+
+/// The programme window widened by the configured schedule
+/// padding (audit R04; Python `_padded_catchup_window`).
+fn padded_window(wiring: &Wiring, programme: &Programme) -> (i64, i64) {
+    let config = wiring.persist.config.borrow();
+    let pre = config
+        .value("recording_pre_padding_minutes")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(0)
+        .max(0);
+    let post = config
+        .value("recording_post_padding_minutes")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(2)
+        .max(0);
+    (programme.start - pre * 60, programme.stop + post * 60)
+}
+
 /// Start a catch-up download once its URL is known (directly, or
 /// after a portal resolution).
+#[allow(clippy::too_many_lines)] // R02-R05 staged download flow
 fn begin_catchup_download(
     wiring: &Wiring,
     channel: &Channel,
@@ -11373,51 +12374,322 @@ fn begin_catchup_download(
     url: String,
     status: Status,
 ) {
+    // Audit R08: the destination check gates downloads too —
+    // before any provider connection is opened.
     let dir = recordings_dir(&wiring.persist);
-    let _ = std::fs::create_dir_all(&dir);
-    let name = iptv_core::recording::sanitize_filename(&programme.title);
-    let destination = dir.join(format!("{name}.ts"));
-    wiring
-        .download_worker
-        .start(iptv_core::downloads::DownloadRequest {
-            url,
-            headers: iptv_core::downloads::channel_headers(channel),
-            destination: destination.clone(),
-        });
-    wiring.downloads.borrow_mut().push(DownloadRow {
-        name: programme.title.clone(),
-        destination: destination.display().to_string(),
-        progress: "Starting...".to_string(),
-        done: false,
-    });
+    let reserve = wiring
+        .persist
+        .config
+        .borrow()
+        .value("recording_min_free_mib")
+        .and_then(serde_json::Value::as_i64);
+    if let Err(error) = recording::check_destination(&dir, reserve) {
+        status.set_label(&error);
+        return;
+    }
+    // Audit R03: refuse a duplicate active capture of the same
+    // programme instead of overwriting its output.
+    let key = catchup_download_key(channel, programme);
+    let duplicate = wiring.recordings.borrow().is_recording(&key)
+        || wiring
+            .downloads
+            .borrow()
+            .iter()
+            .any(|row| !row.done && row.key == key);
+    if duplicate {
+        status.set_label("This catch-up programme is already downloading.");
+        return;
+    }
+    // Audit R04: ask the provider for the padded window,
+    // falling back to the programme-exact URL the caller
+    // resolved when the padded one cannot be built.
+    let (padded_start, padded_stop) = padded_window(wiring, programme);
+    let now = now_epoch();
+    let url = match iptv_core::catchup::resolve_show_url(channel, padded_start, padded_stop, now) {
+        Ok(
+            iptv_core::catchup::ShowResolution::Catchup(padded)
+            | iptv_core::catchup::ShowResolution::Live(padded),
+        ) => padded,
+        _ => url,
+    };
+    // Naming (R03): title - channel, stamped with the airtime
+    // to the minute, collision-free against disk and in-flight
+    // work. The extension follows the recording preset (R04).
+    let format = recording_format_for_channel(&wiring.persist, channel);
+    let extension = recording::format_extension(&format);
+    let display_name = format!("{} - {}", programme.title, channel.name);
+    let stamp = chrono::TimeZone::timestamp_opt(&chrono::Local, programme.start, 0)
+        .single()
+        .map(|dt| dt.format("%Y-%m-%d %H-%M").to_string())
+        .unwrap_or_default();
+    let mut in_use = wiring.recordings.borrow().in_use_paths();
+    in_use.extend(
+        wiring
+            .downloads
+            .borrow()
+            .iter()
+            .filter(|row| !row.done)
+            .map(|row| PathBuf::from(&row.destination)),
+    );
+    let destination =
+        recording::unique_output_path(&dir, &display_name, extension, &stamp, &in_use);
+    match iptv_core::downloads::archive_plan(&url, None) {
+        // Audit R02: a playlist is not media — capture it with
+        // ffmpeg for the finite window instead of saving the
+        // manifest text under a media extension.
+        iptv_core::downloads::ArchivePlan::FfmpegCapture => {
+            let staged = StagedDownload {
+                final_path: destination.clone(),
+                channel: channel.clone(),
+                programme: programme.clone(),
+                url,
+                attempts: 1,
+                cancelled: false,
+            };
+            wiring.downloads.borrow_mut().push(DownloadRow {
+                id: 0,
+                key: key.clone(),
+                name: programme.title.clone(),
+                destination: destination.display().to_string(),
+                progress: "Capturing...".to_string(),
+                done: false,
+            });
+            if let Err(error) = launch_staged_capture(wiring, &key, staged) {
+                let mut rows = wiring.downloads.borrow_mut();
+                if let Some(row) = rows.iter_mut().find(|row| row.key == key) {
+                    row.progress = format!("Failed: {error}");
+                    row.done = true;
+                }
+                status.set_label(&error);
+                return;
+            }
+        }
+        iptv_core::downloads::ArchivePlan::Direct => {
+            let id = wiring.next_download_id.get();
+            wiring.next_download_id.set(id + 1);
+            wiring
+                .download_worker
+                .start(iptv_core::downloads::DownloadRequest {
+                    id,
+                    url,
+                    headers: iptv_core::downloads::channel_headers(channel),
+                    destination: destination.clone(),
+                });
+            wiring.downloads.borrow_mut().push(DownloadRow {
+                id,
+                key,
+                name: programme.title.clone(),
+                destination: destination.display().to_string(),
+                progress: "Starting...".to_string(),
+                done: false,
+            });
+        }
+    }
     wiring.downloads_active.set(true);
     assert!(wiring.timer.start(50, false));
     status.set_label(&format!("Downloading {}...", programme.title));
 }
 
-/// View > Show Downloads: tracked downloads with progress.
+/// Launch (or relaunch) one staged ffmpeg catch-up capture:
+/// the media lands in a `.part` sibling and only earns the
+/// final name on a clean, complete finish (audit R05).
+fn launch_staged_capture(wiring: &Wiring, key: &str, staged: StagedDownload) -> Result<(), String> {
+    let format = recording_format_for_channel(&wiring.persist, &staged.channel);
+    let extension = recording::format_extension(&format);
+    let part = iptv_core::downloads::part_path(&staged.final_path);
+    let (padded_start, padded_stop) = padded_window(wiring, &staged.programme);
+    let headers = iptv_core::playback::StreamHeaders::for_channel(&staged.channel);
+    let witness = player_audio_witness(&wiring.player, &staged.channel);
+    let (audio_track, audio_track_count) = recording_audio_choice(
+        &wiring.persist,
+        &staged.channel,
+        &staged.url,
+        &headers,
+        witness,
+    );
+    let cmd = recording::ffmpeg_command(
+        "ffmpeg",
+        &staged.url,
+        &part.to_string_lossy(),
+        &format,
+        &headers,
+        &recording::FfmpegOptions {
+            duration_seconds: Some(f64::from(
+                i32::try_from(padded_stop - padded_start).unwrap_or(0),
+            )),
+            force_format: recording::format_muxer(extension).map(str::to_string),
+            show_stats: true,
+            audio_track,
+            audio_track_count,
+            ..recording::FfmpegOptions::default()
+        },
+    );
+    wiring.recordings.borrow_mut().start(key, &cmd, part)?;
+    wiring
+        .staged_downloads
+        .borrow_mut()
+        .insert(key.to_string(), staged);
+    Ok(())
+}
+
+/// Finalize one staged catch-up capture (audit R05): a clean
+/// finish with the whole programme renames the `.part` into
+/// place; a short or failed capture retries once, then fails
+/// honestly with no misleading completed file left behind.
+fn finish_staged_download(
+    wiring: &Wiring,
+    status: Status,
+    key: &str,
+    staged: StagedDownload,
+    finished: &recording::RecordingFinished,
+    produced: bool,
+) {
+    let expected =
+        f64::from(i32::try_from(staged.programme.stop - staged.programme.start).unwrap_or(0));
+    let truncated = finished.success
+        && produced
+        && media_duration_seconds(&finished.out_path).is_some_and(|actual| actual < expected * 0.9);
+    let complete = !staged.cancelled && finished.success && produced && !truncated;
+    if staged.cancelled {
+        let _ = std::fs::remove_file(&finished.out_path);
+        let mut rows = wiring.downloads.borrow_mut();
+        if let Some(row) = rows.iter_mut().find(|row| row.key == key) {
+            row.progress = "Cancelled".to_string();
+            row.done = true;
+        }
+        drop(rows);
+        let active = wiring.downloads.borrow().iter().any(|row| !row.done);
+        wiring.downloads_active.set(active);
+        refresh_downloads_window(wiring);
+        return;
+    }
+    let set_row = |wiring: &Wiring, progress: String, done: bool| {
+        let mut rows = wiring.downloads.borrow_mut();
+        if let Some(row) = rows.iter_mut().find(|row| row.key == key) {
+            row.progress = progress;
+            row.done = done;
+        }
+    };
+    if complete && std::fs::rename(&finished.out_path, &staged.final_path).is_ok() {
+        set_row(wiring, "Done".to_string(), true);
+        status.set_label(&format!("Download finished: {}", staged.programme.title));
+    } else if staged.attempts < 2 {
+        let _ = std::fs::remove_file(&finished.out_path);
+        set_row(wiring, "Retrying...".to_string(), false);
+        let mut retry = staged;
+        retry.attempts += 1;
+        let title = retry.programme.title.clone();
+        if let Err(error) = launch_staged_capture(wiring, key, retry) {
+            set_row(wiring, format!("Failed: {error}"), true);
+            status.set_label(&format!("Download failed: {title}"));
+        }
+    } else {
+        let _ = std::fs::remove_file(&finished.out_path);
+        let reason = if truncated {
+            "Failed: download ended early"
+        } else if finished.success {
+            "Failed: nothing was recorded"
+        } else {
+            "Failed"
+        };
+        set_row(wiring, reason.to_string(), true);
+        status.set_label(&format!("Download failed: {}", staged.programme.title));
+    }
+    let active = wiring.downloads.borrow().iter().any(|row| !row.done);
+    wiring.downloads_active.set(active);
+    refresh_downloads_window(wiring);
+}
+
+/// Render the Downloads rows into a list (shared by the window
+/// builder and the live refresh, audit R06).
+fn download_row_labels(wiring: &Wiring) -> Vec<String> {
+    wiring
+        .downloads
+        .borrow()
+        .iter()
+        .map(|row| format!("{} — {} — {}", row.name, row.progress, row.destination))
+        .collect()
+}
+
+/// Refresh the open Downloads window from the tracked rows,
+/// keeping the selection where it was (audit R06: the window
+/// is live, not a snapshot).
+fn refresh_downloads_window(wiring: &Wiring) {
+    let Some(ui) = wiring.downloads_ui.borrow().as_ref().cloned() else {
+        return;
+    };
+    let selected = ui.list.get_selection();
+    let labels = download_row_labels(wiring);
+    ui.list
+        .set_items(&labels.iter().map(String::as_str).collect::<Vec<_>>());
+    if let Some(index) = selected {
+        if (index as usize) < labels.len() {
+            ui.list.set_selection(index, true);
+        }
+    }
+    ui.dstatus
+        .set_label(&format!("{} downloads.", labels.len()));
+}
+
+/// View > Show Downloads: tracked downloads with live progress
+/// and per-request cancellation (audit R06).
 fn open_downloads_window(wiring: &Wiring, status: Status) {
-    let rows = wiring.downloads.borrow();
-    if rows.is_empty() {
+    if wiring.downloads.borrow().is_empty() {
         status.set_label("No downloads yet. Downloads start from a channel's Catch-up dialog.");
         return;
     }
+    if let Some(ui) = wiring.downloads_ui.borrow().as_ref().cloned() {
+        refresh_downloads_window(wiring);
+        ui.frame.show(true);
+        ui.frame.raise();
+        return;
+    }
     let (frame, panel, list, dstatus) = list_dialog("Downloads", "Downloads");
-    let labels: Vec<String> = rows
-        .iter()
-        .map(|row| format!("{} — {} — {}", row.name, row.progress, row.destination))
-        .collect();
+    let labels = download_row_labels(wiring);
     list.set_items(&labels.iter().map(String::as_str).collect::<Vec<_>>());
-    dstatus.set_label(&format!("{} downloads.", rows.len()));
-    drop(rows);
+    dstatus.set_label(&format!("{} downloads.", labels.len()));
+    *wiring.downloads_ui.borrow_mut() = Some(DownloadsUi {
+        frame,
+        list,
+        dstatus,
+    });
     let cancel = Button::builder(&panel)
         .with_label("&Cancel Download")
         .build();
     let close = Button::builder(&panel).with_label("&Close").build();
     let wiring_c = clone_wiring(wiring);
     cancel.on_click(move |_| {
-        wiring_c.download_worker.cancel();
-        dstatus.set_label("Cancelling the active download...");
+        // Cancel acts on the SELECTED request only; other
+        // downloads, running or queued, are untouched, and
+        // starting another download never revives this one.
+        let Some(index) = list.get_selection() else {
+            dstatus.set_label("Choose a download to cancel first.");
+            return;
+        };
+        let index = usize::try_from(index).unwrap_or(usize::MAX);
+        let row = wiring_c
+            .downloads
+            .borrow()
+            .get(index)
+            .map(|row| (row.id, row.key.clone(), row.done));
+        match row {
+            Some((_, _, true)) => dstatus.set_label("That download has already finished."),
+            Some((id, _, _)) if id != 0 => {
+                wiring_c.download_worker.cancel(id);
+                dstatus.set_label("Cancelling the selected download...");
+            }
+            Some((_, key, _)) => {
+                // An ffmpeg catch-up capture: flag it cancelled
+                // (its finish then cleans up without retrying)
+                // and ask the engine to stop it.
+                if let Some(staged) = wiring_c.staged_downloads.borrow_mut().get_mut(&key) {
+                    staged.cancelled = true;
+                }
+                wiring_c.recordings.borrow_mut().stop(&key);
+                dstatus.set_label("Cancelling the selected download...");
+            }
+            None => dstatus.set_label("Choose a download to cancel first."),
+        }
     });
     close.on_click(move |_| frame.hide());
     frame.show(true);
@@ -11462,38 +12734,65 @@ fn open_account_info(wiring: &Wiring, status: Status) {
     frame.show(true);
 }
 
-/// Drain download events into the tracked rows and announce
-/// completions on the main status line.
+/// Drain download events into the tracked rows (matched by
+/// request id, audit R06) and announce completions on the main
+/// status line; the open Downloads window refreshes live.
+/// One queued row mutation from a download event (audit R06).
+type DownloadRowUpdate = (u64, Box<dyn FnOnce(&mut DownloadRow)>);
+
 fn poll_downloads(wiring: &Wiring, status: Status) {
+    let mut changed = false;
     while let Some(event) = wiring.download_worker.try_recv() {
         let mut rows = wiring.downloads.borrow_mut();
-        let Some(row) = rows.iter_mut().find(|row| !row.done) else {
-            continue;
+        let (id, apply): DownloadRowUpdate = match event {
+            iptv_core::downloads::DownloadEvent::Progress { id, written, total } => (
+                id,
+                Box::new(move |row: &mut DownloadRow| {
+                    row.progress = match total {
+                        Some(total) if total > 0 => {
+                            format!("{}% of {}", written * 100 / total, format_bytes(total))
+                        }
+                        _ => format!("{} downloaded", format_bytes(written)),
+                    };
+                }),
+            ),
+            iptv_core::downloads::DownloadEvent::Finished { id, result } => match result {
+                Ok(bytes) => (
+                    id,
+                    Box::new(move |row: &mut DownloadRow| {
+                        row.progress = format!("Done ({})", format_bytes(bytes));
+                        row.done = true;
+                    }),
+                ),
+                Err(error) => (
+                    id,
+                    Box::new(move |row: &mut DownloadRow| {
+                        row.progress = if error == "Download cancelled" {
+                            "Cancelled".to_string()
+                        } else {
+                            format!("Failed: {error}")
+                        };
+                        row.done = true;
+                    }),
+                ),
+            },
         };
-        match event {
-            iptv_core::downloads::DownloadEvent::Progress { written, total } => {
-                row.progress = match total {
-                    Some(total) if total > 0 => {
-                        format!("{}% of {}", written * 100 / total, format_bytes(total))
-                    }
-                    _ => format!("{} downloaded", format_bytes(written)),
-                };
-            }
-            iptv_core::downloads::DownloadEvent::Finished(Ok(bytes)) => {
-                row.progress = format!("Done ({})", format_bytes(bytes));
-                row.done = true;
+        if let Some(row) = rows.iter_mut().find(|row| row.id == id) {
+            let was_done = row.done;
+            apply(row);
+            if !was_done && row.done && row.progress.starts_with("Done") {
                 let name = row.name.clone();
                 drop(rows);
                 status.set_label(&format!("Download finished: {name}"));
             }
-            iptv_core::downloads::DownloadEvent::Finished(Err(error)) => {
-                row.progress = format!("Failed: {error}");
-                row.done = true;
-            }
+            changed = true;
         }
     }
     let active = wiring.downloads.borrow().iter().any(|row| !row.done);
     wiring.downloads_active.set(active);
+    if changed {
+        refresh_downloads_window(wiring);
+    }
 }
 
 /// Human-readable byte counts for download progress.
@@ -11595,6 +12894,7 @@ fn dispatch_main_hotkey(
                     &wiring.persist,
                     &channel,
                     status,
+                    Some(&wiring.player),
                 );
             } else {
                 status.set_label("Select a channel to record first.");
@@ -11781,9 +13081,22 @@ fn execute_shutdown(status: Status) {
     }
 }
 
+/// Disarm shutdown-after-recordings completely (audit R17):
+/// the saved option, the recorded-since-arming flag and the
+/// attempted flag all clear, so a later explicit re-arm starts
+/// a fresh countdown cycle.
+fn disarm_shutdown(wiring: &Wiring) {
+    wiring
+        .persist
+        .set_and_save("shutdown_after_recordings", serde_json::json!(false));
+    wiring.recorded.set(false);
+    wiring.shutdown_attempted.set(false);
+}
+
 /// The shutdown countdown window: 30 seconds to cancel before the
 /// computer shuts down after recordings (Python's dialog).
-fn open_shutdown_countdown(status: Status) {
+/// Cancelling disarms the option entirely (audit R17).
+fn open_shutdown_countdown(wiring: &Wiring, status: Status) {
     let frame = Frame::builder()
         .with_title("Shut Down After Recordings")
         .with_size(Size::new(440, 240))
@@ -11801,11 +13114,14 @@ fn open_shutdown_countdown(status: Status) {
     let timer = Rc::new(Timer::new(&frame));
     let timer_tick = Rc::clone(&timer);
     let remaining_tick = Rc::clone(&remaining);
+    let wiring_tick = clone_wiring(wiring);
     timer.on_tick(move |_| {
         let next = remaining_tick.get() - 1;
         remaining_tick.set(next);
         if next <= 0 {
             timer_tick.stop();
+            // The option turns itself off once used (Python).
+            disarm_shutdown(&wiring_tick);
             execute_shutdown(status);
             frame.hide();
         } else {
@@ -11815,14 +13131,18 @@ fn open_shutdown_countdown(status: Status) {
         }
     });
     let timer_cancel = Rc::clone(&timer);
+    let wiring_cancel = clone_wiring(wiring);
     cancel.on_click(move |_| {
         timer_cancel.stop();
-        status.set_label("Shutdown cancelled.");
+        disarm_shutdown(&wiring_cancel);
+        status.set_label("Shutdown canceled. Automatic shutdown after recordings is now off.");
         frame.hide();
     });
     let timer_now = Rc::clone(&timer);
+    let wiring_now = clone_wiring(wiring);
     now_button.on_click(move |_| {
         timer_now.stop();
+        disarm_shutdown(&wiring_now);
         execute_shutdown(status);
         frame.hide();
     });
@@ -12193,5 +13513,56 @@ mod tests {
         assert_eq!(pick_row(Some(2), Some(5)), Some(2));
         assert_eq!(pick_row(None, Some(5)), Some(5));
         assert_eq!(pick_row(None, None), None);
+    }
+
+    // R10: ffmpeg probe reports become Python-shaped audio labels.
+    #[test]
+    fn audio_probe_labels_match_python_shape() {
+        let report = "Input #0, mpegts, from 'x':\n  Stream #0:0: Video: h264\n  Stream #0:1(eng): Audio: aac\n  Stream #0:2(eng): Audio: aac, description: audio description\n";
+        assert_eq!(
+            parse_audio_stream_labels(report),
+            vec![
+                "Track 1 - [eng]".to_owned(),
+                "Track 2 - [eng] - audio description".to_owned()
+            ]
+        );
+        assert_eq!(
+            parse_audio_stream_labels("no streams"),
+            Vec::<String>::new()
+        );
+    }
+
+    // R05: media duration parsing for the short-capture check.
+    #[test]
+    fn ffmpeg_duration_report_parses() {
+        assert_eq!(
+            parse_ffmpeg_duration("  Duration: 01:02:03.50, start: 0.0"),
+            Some(3723.5)
+        );
+        assert_eq!(parse_ffmpeg_duration("Duration: N/A"), None);
+    }
+
+    // R11: media classification reads only explicit stream metadata.
+    #[test]
+    fn media_hint_reads_radio_attribute() {
+        let mut channel = Channel {
+            name: "News".to_owned(),
+            group: String::new(),
+            url: "https://example.com/news".to_owned(),
+            tvg_id: String::new(),
+            tvg_name: String::new(),
+            tvg_logo: String::new(),
+            unknown_attributes: std::collections::BTreeMap::new(),
+        };
+        assert_eq!(channel_media_is_audio(&channel), None);
+        channel
+            .unknown_attributes
+            .insert("radio".to_owned(), "true".to_owned());
+        assert_eq!(channel_media_is_audio(&channel), Some(true));
+        channel.unknown_attributes.remove("radio");
+        channel
+            .unknown_attributes
+            .insert("media-type".to_owned(), "video".to_owned());
+        assert_eq!(channel_media_is_audio(&channel), Some(false));
     }
 }

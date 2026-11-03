@@ -670,6 +670,30 @@ impl BufferRegistry {
         Some(Arc::clone(session))
     }
 
+    /// Take a recording lease on the live session for `url` and
+    /// open its protected live-edge view, storing the lease under
+    /// `key`; returns the view URL to record from. One `&mut self`
+    /// operation on purpose (audit R21): the adapter used to hold
+    /// the registry's `RefCell` borrow from `find` across a second
+    /// `borrow_mut` for the lease store, which panics on Rust 2021.
+    pub fn recording_view(
+        &mut self,
+        key: &str,
+        url: &str,
+        headers: &StreamHeaders,
+    ) -> Option<String> {
+        let session = self.find(url, headers)?;
+        let lease = session.acquire().ok()?;
+        if let Ok((view_url, _)) = session.cursor(0.0, true) {
+            self.recording_leases
+                .insert(key.to_string(), (session, lease));
+            Some(view_url)
+        } else {
+            session.release(lease);
+            None
+        }
+    }
+
     /// Whether any live session owns this view URL.
     #[must_use]
     pub fn owns_view(&self, url: &str) -> bool {
@@ -1151,7 +1175,9 @@ fn render_playlist(
 
 #[cfg(test)]
 mod tests {
-    use super::select_hls_variant;
+    use super::*;
+    use std::cell::RefCell;
+    use std::rc::Rc;
 
     const BASE: &str = "http://example.com/master.m3u8";
     const MASTER: [&str; 7] = [
@@ -1204,5 +1230,77 @@ mod tests {
             select_hls_variant(&["#EXTM3U"], BASE, Some(3.0)),
             Err("no usable HLS variant".to_string())
         );
+    }
+
+    fn session_with_media() -> Arc<BufferSession> {
+        let settings = BufferSettings {
+            enabled: true,
+            ..BufferSettings::default()
+        };
+        let session = BufferSession::new(&settings).expect("session");
+        {
+            let mut core = session.core.lock().expect("core");
+            let window = core.window_mut();
+            window.begin_segment("seg-000000000.ts").expect("begin");
+            window.append_chunk(1024).expect("append");
+            window.finish_segment().expect("finish");
+            // A cursor needs a published timeline over the segment.
+            window
+                .publish("#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:2,\nseg-000000000.ts\n")
+                .expect("publish");
+        }
+        session
+    }
+
+    /// Audit R21 regression: acquiring a recording view through
+    /// the shared `RefCell` (the exact adapter shape `start_recording`
+    /// uses) must store the lease without an overlapping borrow
+    /// panic, and must not open a second provider connection (the
+    /// returned URL is the session's own loopback view).
+    #[test]
+    fn recording_view_stores_lease_through_refcell_without_panic() {
+        let url = "http://example.com/live";
+        let headers = StreamHeaders::default();
+        let session = session_with_media();
+        let leases_before = session.lease_count();
+        let mut registry = BufferRegistry::default();
+        registry
+            .sessions
+            .insert(source_key(url, &headers), Arc::clone(&session));
+        let registry = Rc::new(RefCell::new(registry));
+
+        let view = registry
+            .borrow_mut()
+            .recording_view("rec-key", url, &headers)
+            .expect("view");
+        assert!(view.starts_with("http://127.0.0.1:"));
+        let registry_ref = registry.borrow();
+        let (stored_session, _) = registry_ref
+            .recording_leases
+            .get("rec-key")
+            .expect("lease stored");
+        assert!(Arc::ptr_eq(stored_session, &session));
+        assert_eq!(session.lease_count(), leases_before + 1);
+    }
+
+    /// When the cursor cannot open (no retained media yet), the
+    /// lease is handed back and nothing is stored.
+    #[test]
+    fn recording_view_releases_lease_when_cursor_fails() {
+        let url = "http://example.com/empty";
+        let headers = StreamHeaders::default();
+        let settings = BufferSettings {
+            enabled: true,
+            ..BufferSettings::default()
+        };
+        let session = BufferSession::new(&settings).expect("session");
+        let leases_before = session.lease_count();
+        let mut registry = BufferRegistry::default();
+        registry
+            .sessions
+            .insert(source_key(url, &headers), Arc::clone(&session));
+        assert!(registry.recording_view("k", url, &headers).is_none());
+        assert!(registry.recording_leases.is_empty());
+        assert_eq!(session.lease_count(), leases_before);
     }
 }
