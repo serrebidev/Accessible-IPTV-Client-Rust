@@ -40,7 +40,12 @@ pub fn acquire(config_dir: &Path) -> Option<InstanceGuard> {
     let _ = std::fs::create_dir_all(config_dir);
     let file = OpenOptions::new()
         .create(true)
-        .append(true)
+        // Write access, not append: LockFileEx (Windows) refuses a
+        // handle that carries only FILE_APPEND_DATA, so an append-only
+        // open makes try_lock fail there and no launch could ever hold
+        // the lock. Nothing is ever written through this handle.
+        .write(true)
+        .truncate(false)
         .open(config_dir.join(LOCK_FILE_NAME))
         .ok()?;
     // `File::try_lock` is the std flock/LockFile wrapper: it fails
