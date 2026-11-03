@@ -159,11 +159,15 @@ impl StreamHeaders {
         }
         headers.extra.extend(modifiers.extra);
         if let Some(extra) = channel.unknown_attributes.get("http-headers") {
-            if let Some((name, value)) = extra.split_once(':') {
-                let name = name.trim();
-                let value = value.trim();
-                if !name.is_empty() && !value.is_empty() {
-                    headers.extra.push(format!("{name}: {value}"));
+            // One header per line (the parser joins directive-supplied
+            // headers this way); a single bare header still works.
+            for line in extra.lines() {
+                if let Some((name, value)) = line.split_once(':') {
+                    let name = name.trim();
+                    let value = value.trim();
+                    if !name.is_empty() && !value.is_empty() {
+                        headers.extra.push(format!("{name}: {value}"));
+                    }
                 }
             }
         }

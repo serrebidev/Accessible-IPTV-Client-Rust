@@ -56,6 +56,13 @@ pub fn group_name(channel: &Channel) -> &str {
 /// first-appearance order. The same playlist always yields the same list.
 #[must_use]
 pub fn categories(channels: &[Channel]) -> Vec<Category> {
+    categories_from(channels.iter())
+}
+
+/// [`categories`] over borrowed channels (B19): the scope-filtered
+/// variant must not clone every channel just to list group names.
+#[must_use]
+pub fn categories_from<'a>(channels: impl Iterator<Item = &'a Channel>) -> Vec<Category> {
     let mut list = vec![Category::All, Category::Favorites];
     let mut seen = std::collections::HashSet::new();
     for channel in channels {

@@ -47,6 +47,10 @@ pub fn normalize_base_url(url: &str) -> String {
         &with_scheme
     };
     let (scheme, rest) = url.split_once("://").unwrap_or(("http", url));
+    // B16: Python parses and rebuilds the URL, dropping query and
+    // fragment before any endpoint is appended; a pasted
+    // `get.php?username=...` or `#section` must not leak into paths.
+    let rest = rest.split(['?', '#']).next().unwrap_or("");
     let (authority, path) = match rest.find('/') {
         Some(i) => (&rest[..i], &rest[i..]),
         None => (rest, ""),
@@ -527,11 +531,7 @@ impl StalkerClient {
             ],
             false,
         )?;
-        let token = data
-            .get("js")
-            .and_then(|js| js.get("token"))
-            .and_then(Value::as_str)
-            .filter(|t| !t.is_empty())
+        let token = portal_token(&data)
             .ok_or_else(|| "Portal handshake failed: no token returned".to_string())?;
         *self.token.borrow_mut() = Some((token.to_string(), now));
         if !self.cfg.username.is_empty() || !self.cfg.password.is_empty() {
@@ -545,12 +545,7 @@ impl StalkerClient {
                 ],
                 true,
             )?;
-            if let Some(new_token) = auth
-                .get("js")
-                .and_then(|js| js.get("token"))
-                .and_then(Value::as_str)
-                .filter(|t| !t.is_empty())
-            {
+            if let Some(new_token) = portal_token(&auth) {
                 *self.token.borrow_mut() = Some((new_token.to_string(), now));
             }
         }
@@ -597,6 +592,11 @@ impl StalkerClient {
             attrs.insert("provider-type".to_string(), "stalker".to_string());
             if let Some(id) = &self.cfg.provider_id {
                 attrs.insert("provider-id".to_string(), id.clone());
+                // B01: scope tag, as with the Xtream mapper.
+                attrs.insert(
+                    crate::sources::PLAYLIST_ID_ATTRIBUTE.to_string(),
+                    id.clone(),
+                );
             }
             attrs.insert("cmd".to_string(), cmd);
             for key in [
@@ -719,6 +719,119 @@ impl StalkerClient {
         )?;
         portal_link(&payload).ok_or_else(|| "Portal did not provide catch-up link".to_string())
     }
+}
+
+/// The session token of a handshake/login response (B15): Python
+/// accepts it at the top level or nested under `js`; portals in the
+/// wild use both shapes.
+#[must_use]
+pub fn portal_token(payload: &Value) -> Option<&str> {
+    payload
+        .get("token")
+        .and_then(Value::as_str)
+        .filter(|token| !token.is_empty())
+        .or_else(|| {
+            payload
+                .get("js")
+                .and_then(|js| js.get("token"))
+                .and_then(Value::as_str)
+                .filter(|token| !token.is_empty())
+        })
+}
+
+/// Normalize a MAC address the way Python's Stalker form does (B06):
+/// dashes become colons, dots are dropped, letters uppercase, and a
+/// bare 12-hex-digit string gains its colons.
+#[must_use]
+pub fn sanitize_mac(value: &str) -> String {
+    let mut cleaned: String = value
+        .trim()
+        .replace('-', ":")
+        .replace('.', "")
+        .to_uppercase();
+    if !cleaned.contains(':') && cleaned.len() == 12 {
+        cleaned = cleaned
+            .as_bytes()
+            .chunks(2)
+            .map(|pair| std::str::from_utf8(pair).unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join(":");
+    }
+    cleaned
+}
+
+/// Whether a (sanitized) MAC has the six octets the portal expects.
+#[must_use]
+pub fn mac_is_valid(mac: &str) -> bool {
+    let parts: Vec<&str> = mac.split(':').collect();
+    parts.len() == 6
+        && parts
+            .iter()
+            .all(|part| part.len() == 2 && part.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+/// A fresh MAG-style MAC: Python's default prefix `00:1A:79` plus
+/// three random octets (also the Randomise MAC action's output).
+#[must_use]
+#[allow(clippy::cast_possible_truncation)] // only the low bits seed the PRNG
+pub fn random_mag_mac() -> String {
+    let seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0x5eed, |d| d.as_nanos() as u64);
+    let mut state = seed ^ 0x9e37_79b9_7f4a_7c15;
+    let mut next = move || {
+        // xorshift64*: ample for a default MAC suggestion.
+        state ^= state >> 12;
+        state ^= state << 25;
+        state ^= state >> 27;
+        (state.wrapping_mul(0x2545_f491_4f6c_dd1d) >> 56) as u8
+    };
+    format!("00:1A:79:{:02X}:{:02X}:{:02X}", next(), next(), next())
+}
+
+/// Validate the account-form fields the way Python's dialogs do
+/// (B06): values are trimmed by the caller-side form; returns the
+/// user-facing problem, or None when the account may be saved.
+#[must_use]
+pub fn account_form_error(
+    kind: &str,
+    base_url: &str,
+    username: &str,
+    password: &str,
+    mac: &str,
+) -> Option<String> {
+    if kind == "stalker" {
+        if base_url.trim().is_empty() {
+            return Some("Portal URL is required.".to_string());
+        }
+        if !mac_is_valid(&sanitize_mac(mac)) {
+            return Some(
+                "MAC address must contain six octets (e.g., 00:1A:79:12:34:56).".to_string(),
+            );
+        }
+        None
+    } else {
+        if base_url.trim().is_empty() || username.trim().is_empty() || password.trim().is_empty() {
+            return Some("Username, password, and URL are required.".to_string());
+        }
+        None
+    }
+}
+
+/// Merge account-form values into an existing config entry (B04):
+/// fields the form does not know about — Stalker credentials on an
+/// Xtream-shaped edit, output/type keys, auto-EPG, unknown retained
+/// settings — survive a name-only edit. `updates` wins per key.
+#[must_use]
+pub fn merge_account_fields(existing: &Value, updates: serde_json::Map<String, Value>) -> Value {
+    let mut merged = match existing {
+        Value::Object(map) => map.clone(),
+        _ => serde_json::Map::new(),
+    };
+    for (key, value) in updates {
+        merged.insert(key, value);
+    }
+    Value::Object(merged)
 }
 
 fn portal_link(payload: &Value) -> Option<String> {
@@ -872,7 +985,11 @@ impl ProviderAccount {
 
 enum ProviderJob {
     SetCacheDir(std::path::PathBuf),
-    Load(Vec<ProviderAccount>),
+    Load {
+        accounts: Vec<ProviderAccount>,
+        /// Bypass the fresh provider cache (B13 forced refresh).
+        force: bool,
+    },
     Resolve {
         request: u64,
         provider_id: String,
@@ -943,6 +1060,7 @@ fn handle_load(
     accounts: Vec<ProviderAccount>,
     clients: &mut BTreeMap<String, (ProviderAccount, Client)>,
     cache_dir: Option<&std::path::Path>,
+    force: bool,
 ) -> ProviderEvent {
     let mut channels = Vec::new();
     let mut epg_urls = Vec::new();
@@ -953,7 +1071,7 @@ fn handle_load(
         match &account {
             ProviderAccount::Xtream(cfg) => {
                 let client = XtreamClient::new(cfg.clone());
-                let (found, urls, fails) = load_xtream_account(&client, cfg, cache_dir);
+                let (found, urls, fails) = load_xtream_account(&client, cfg, cache_dir, force);
                 channels.extend(found);
                 epg_urls.extend(urls);
                 failures.extend(fails);
@@ -961,7 +1079,8 @@ fn handle_load(
             }
             ProviderAccount::Stalker(cfg) => {
                 let client = StalkerClient::new(cfg.clone());
-                let (found, urls, fails) = load_stalker_account(&client, cfg, cache_dir, now);
+                let (found, urls, fails) =
+                    load_stalker_account(&client, cfg, cache_dir, now, force);
                 channels.extend(found);
                 epg_urls.extend(urls);
                 failures.extend(fails);
@@ -986,6 +1105,21 @@ fn tag_xtream_channels(parsed: &mut [Channel], cfg: &XtreamConfig) {
             channel
                 .unknown_attributes
                 .insert("provider-id".to_string(), id.clone());
+            // B01: Python tags every source's channels with the
+            // source's scope id; the Playlist view scope filter keys
+            // on it, so provider channels need it too.
+            channel.unknown_attributes.insert(
+                crate::sources::PLAYLIST_ID_ATTRIBUTE.to_string(),
+                id.clone(),
+            );
+        }
+        // B10: Python extracts the stream id from the provider URL;
+        // both favorite-key algorithms include it.
+        if let Some(stream_id) = crate::extract_stream_id(&channel.url) {
+            channel
+                .unknown_attributes
+                .entry("stream-id".to_string())
+                .or_insert(stream_id);
         }
     }
 }
@@ -996,6 +1130,7 @@ fn load_xtream_account(
     client: &XtreamClient,
     cfg: &XtreamConfig,
     cache_dir: Option<&std::path::Path>,
+    force: bool,
 ) -> (Vec<Channel>, Vec<String>, Vec<String>) {
     let cache_file = cache_dir.map(|dir| {
         crate::cache::file_for(
@@ -1003,9 +1138,13 @@ fn load_xtream_account(
             &crate::cache::cache_key(&["xtream", &cfg.base_url, &cfg.username]),
         )
     });
-    let fresh = cache_file
-        .as_ref()
-        .and_then(|path| crate::cache::read(path, Some(CACHE_TTL), std::time::SystemTime::now()));
+    let fresh = if force {
+        None
+    } else {
+        cache_file.as_ref().and_then(|path| {
+            crate::cache::read(path, Some(CACHE_TTL), std::time::SystemTime::now())
+        })
+    };
     let fetched = match fresh {
         Some(text) => Ok(text),
         None => client.fetch_playlist().inspect(|text| {
@@ -1054,6 +1193,7 @@ fn load_stalker_account(
     cfg: &StalkerConfig,
     cache_dir: Option<&std::path::Path>,
     now: i64,
+    force: bool,
 ) -> (Vec<Channel>, Vec<String>, Vec<String>) {
     let cache_file = cache_dir.map(|dir| {
         crate::cache::file_for(
@@ -1073,8 +1213,10 @@ fn load_stalker_account(
         let urls: Vec<String> = serde_json::from_value(value.get("epg_urls")?.clone()).ok()?;
         Some((found, urls))
     };
-    if let Some((found, urls)) = read_cache(true) {
-        return (found, urls, Vec::new());
+    if !force {
+        if let Some((found, urls)) = read_cache(true) {
+            return (found, urls, Vec::new());
+        }
     }
     match client.fetch_channels(now) {
         Ok((found, urls)) => {
@@ -1119,8 +1261,8 @@ impl ProviderWorker {
                     continue;
                 }
                 let event = match job {
-                    ProviderJob::Load(accounts) => {
-                        handle_load(accounts, &mut clients, cache_dir.as_deref())
+                    ProviderJob::Load { accounts, force } => {
+                        handle_load(accounts, &mut clients, cache_dir.as_deref(), force)
                     }
                     ProviderJob::SetCacheDir(_) => unreachable!(),
                     ProviderJob::Resolve {
@@ -1195,7 +1337,19 @@ impl ProviderWorker {
     }
 
     pub fn load(&self, accounts: Vec<ProviderAccount>) {
-        let _ = self.jobs.send(ProviderJob::Load(accounts));
+        let _ = self.jobs.send(ProviderJob::Load {
+            accounts,
+            force: false,
+        });
+    }
+
+    /// Load bypassing the fresh provider cache (B13 forced refresh);
+    /// the stale cache still serves when a fetch fails.
+    pub fn load_fresh(&self, accounts: Vec<ProviderAccount>) {
+        let _ = self.jobs.send(ProviderJob::Load {
+            accounts,
+            force: true,
+        });
     }
 
     pub fn resolve_catchup(
@@ -1711,6 +1865,119 @@ fn stalker_report(payload: &Value) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn base_url_normalization_drops_query_and_fragment() {
+        // B16 regression.
+        assert_eq!(
+            normalize_base_url("http://example.com:8080/get.php?username=u&password=p"),
+            "http://example.com:8080"
+        );
+        assert_eq!(
+            normalize_base_url("https://example.com/c/#section"),
+            "https://example.com/c"
+        );
+        assert_eq!(
+            normalize_base_url("example.com/portal.php?x=1"),
+            "http://example.com"
+        );
+    }
+
+    #[test]
+    fn portal_token_accepts_top_level_and_nested_shapes() {
+        // B15 regression: {"token":"abc"} must work like {"js":{...}}.
+        let top = serde_json::json!({"token": "abc"});
+        assert_eq!(portal_token(&top), Some("abc"));
+        let nested = serde_json::json!({"js": {"token": "def"}});
+        assert_eq!(portal_token(&nested), Some("def"));
+        let both = serde_json::json!({"token": "abc", "js": {"token": "def"}});
+        assert_eq!(portal_token(&both), Some("abc"));
+        let empty = serde_json::json!({"js": {"token": ""}});
+        assert_eq!(portal_token(&empty), None);
+        let rejected = serde_json::json!({"js": null});
+        assert_eq!(portal_token(&rejected), None);
+    }
+
+    #[test]
+    fn mac_sanitize_validate_and_form_errors() {
+        // B06 regression.
+        assert_eq!(sanitize_mac("00-1a-79-12-34-56"), "00:1A:79:12:34:56");
+        assert_eq!(sanitize_mac("001a79123456"), "00:1A:79:12:34:56");
+        assert_eq!(sanitize_mac("00:1a:79:12:34:56"), "00:1A:79:12:34:56");
+        assert!(mac_is_valid("00:1A:79:12:34:56"));
+        assert!(!mac_is_valid("00:1A:79:12:34"));
+        assert!(!mac_is_valid("00:1A:79:12:34:ZZ"));
+        let mac = random_mag_mac();
+        assert!(mac.starts_with("00:1A:79:"));
+        assert!(mac_is_valid(&mac));
+        assert_eq!(
+            account_form_error("xtream", " ", "u", "p", "").as_deref(),
+            Some("Username, password, and URL are required.")
+        );
+        assert_eq!(
+            account_form_error("xtream", "http://h", "", "p", "").as_deref(),
+            Some("Username, password, and URL are required.")
+        );
+        assert!(account_form_error("xtream", "http://h", "u", "p", "").is_none());
+        assert_eq!(
+            account_form_error("stalker", "", "", "", "00:1A:79:12:34:56").as_deref(),
+            Some("Portal URL is required.")
+        );
+        assert!(account_form_error("stalker", "http://h", "", "", "00-1a-79-12-34-56").is_none());
+        assert!(account_form_error("stalker", "http://h", "", "", "12:34").is_some());
+    }
+
+    #[test]
+    fn account_edit_merge_preserves_fields_absent_from_the_form() {
+        // B04 regression: a name-only edit keeps credentials,
+        // output/type, auto-EPG and unknown retained settings.
+        let existing = serde_json::json!({
+            "type": "stalker",
+            "id": "stalker-1",
+            "name": "Portal",
+            "base_url": "http://portal.example",
+            "mac": "00:1A:79:12:34:56",
+            "username": "mag-user",
+            "password": "mag-pass",
+            "auto_epg": false,
+            "custom_note": "keep me"
+        });
+        let mut updates = serde_json::Map::new();
+        updates.insert("name".to_string(), serde_json::json!("Renamed"));
+        let merged = merge_account_fields(&existing, updates);
+        assert_eq!(merged["name"], "Renamed");
+        assert_eq!(merged["username"], "mag-user");
+        assert_eq!(merged["password"], "mag-pass");
+        assert_eq!(merged["mac"], "00:1A:79:12:34:56");
+        assert_eq!(merged["auto_epg"], false);
+        assert_eq!(merged["custom_note"], "keep me");
+        assert_eq!(merged["id"], "stalker-1");
+    }
+
+    #[test]
+    fn xtream_channels_carry_scope_and_stream_id() {
+        // B01 + B10 regression (mapper half).
+        let cfg = XtreamConfig {
+            provider_id: Some("xtream-9".to_string()),
+            ..XtreamConfig::default()
+        };
+        let mut parsed = crate::parse_m3u(
+            "#EXTINF:-1,Movie\nhttp://h/movie/u/p/42.mp4\n#EXTINF:-1,Live\nhttp://h/live/u/p/7.ts\n",
+        );
+        tag_xtream_channels(&mut parsed, &cfg);
+        assert_eq!(
+            parsed[0].unknown_attributes[crate::sources::PLAYLIST_ID_ATTRIBUTE],
+            "xtream-9"
+        );
+        assert_eq!(parsed[0].unknown_attributes["stream-id"], "42");
+        assert_eq!(parsed[1].unknown_attributes["stream-id"], "7");
+        // The favorite key now matches what Python computes for the
+        // same entry (provider type, id, stream id, name).
+        assert_eq!(
+            crate::favorites::channel_key(&parsed[0]),
+            "xtream|xtream-9|42|Movie"
+        );
+    }
 
     #[test]
     fn base_url_normalization() {
