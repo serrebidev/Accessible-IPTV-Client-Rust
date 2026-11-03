@@ -20,7 +20,10 @@ use iptv_core::{
         resume_position, EngineAction, EngineEvent, LaunchGate, PlaybackRequest, PlaybackSession,
         PlayerChoice, SessionState,
     },
-    providers::{ProviderAccount, ProviderEvent, ProviderWorker},
+    providers::{
+        account_form_error, merge_account_fields, random_mag_mac, sanitize_mac, ProviderAccount,
+        ProviderEvent, ProviderWorker,
+    },
     recording::{self, RecordingEngine},
     reminders::{normalize_reminders, Reminder, ReminderStatus},
     search::SearchResults,
@@ -378,6 +381,9 @@ struct EpgSearchRow {
 struct Wiring {
     browser: Rc<RefCell<BrowserWorker>>,
     categories: Rc<RefCell<Vec<Category>>>,
+    /// The favorite count the category tree currently displays
+    /// (B20: a count change alone must rebuild the Favorites label).
+    category_fav_count: Rc<std::cell::Cell<usize>>,
     timer: Rc<Timer<Frame>>,
     model: Rc<RefCell<SearchResults>>,
     persist: Persist,
@@ -640,9 +646,11 @@ fn bind_browser(
     };
     let mut browser_worker = BrowserWorker::default();
     browser_worker.set_favorites(FavoriteSet::from_stored(loaded.config.favorites()));
+    browser_worker.set_source_cache_dir(config::user_config_dir().join("playlist-cache"));
     let wiring = Wiring {
         browser: Rc::new(RefCell::new(browser_worker)),
         categories: Rc::new(RefCell::new(vec![Category::All, Category::Favorites])),
+        category_fav_count: Rc::new(std::cell::Cell::new(0)),
         timer: Rc::new(Timer::new(&frame)),
         model,
         persist: Persist {
@@ -813,11 +821,26 @@ fn bind_completion(wiring: &Wiring, controls: Controls) {
                 let in_all = matches!(results.category(), Category::All);
                 publish_results(list, status, &completed.model, results);
                 append_epg_rows(&completed, list, &query, matches, in_all);
-                sync_category_control(category, &completed.categories, &completed.browser);
+                sync_category_control(
+                    category,
+                    &completed.categories,
+                    &completed.category_fav_count,
+                    &completed.browser,
+                );
             }
             Some(BrowseEvent::Recovery(error)) => {
                 status.set_label(error.message());
                 list.set_accessibility_description("");
+            }
+            Some(BrowseEvent::Loaded { stale_sources }) => {
+                // B12: name the sources showing retained channels.
+                for source in &stale_sources {
+                    status.set_label(&format!(
+                        "{source} could not be loaded; showing its previous channels."
+                    ));
+                }
+                // B09: playlist-header guides join the guide load.
+                reload_epg(&completed);
             }
             None => {}
         }
@@ -1023,9 +1046,14 @@ fn fill_scope_choices(wiring: &Wiring, choice: Choice) {
     choice.append("All playlists");
     choice.set_selection(0);
     let (sources, accounts) = configured_entries(wiring);
+    let names = playlist_names(wiring);
     let mut ids: Vec<Option<String>> = vec![None];
     for source in &sources {
-        choice.append(&scope_display_name(source.location()));
+        // B13: the friendly name wins over the host/file label.
+        choice.append(&iptv_core::sources::source_display_label(
+            source.location(),
+            &names,
+        ));
         ids.push(Some(source.scope_id()));
     }
     for account in &accounts {
@@ -1303,11 +1331,14 @@ fn poll_providers(wiring: &Wiring, controls: Controls) {
             } => {
                 wiring.provider_pending.set(false);
                 let count = channels.len();
+                // B02: a provider load replaces the provider channels
+                // wholesale — reloads never append duplicates, and a
+                // removed account's channels disappear.
+                wiring
+                    .browser
+                    .borrow_mut()
+                    .replace_provider_channels(channels, &controls.search.get_value());
                 if count > 0 {
-                    wiring
-                        .browser
-                        .borrow_mut()
-                        .add_channels(channels, &controls.search.get_value());
                     status.set_label(&format!("{count} provider channels loaded."));
                     assert!(wiring.timer.start(50, false));
                 }
@@ -2243,9 +2274,12 @@ fn open_vod_window(wiring: &Wiring, status: Status) {
     ui.frame.raise();
     let accounts = vod_accounts(&wiring.persist);
     ui.view.borrow_mut().accounts.clone_from(&accounts);
-    wiring
-        .vod_worker
-        .build(accounts, wiring.browser.borrow().all_channels());
+    // B17: the catalogue is limited to the active playlist scope;
+    // B19: the worker receives the model Arc + extras and does the
+    // filtering/cloning on its own thread.
+    let (model, extras) = wiring.browser.borrow().catalogue_parts();
+    let scope = wiring.browser.borrow().scope().map(str::to_owned);
+    wiring.vod_worker.build(accounts, model, extras, scope);
     wiring.vod_pending.set(true);
     assert!(wiring.timer.start(50, false));
     status.set_label("Loading video on demand catalogue...");
@@ -2308,7 +2342,10 @@ fn ensure_vod_ui(
         let view = Rc::clone(&ui.view);
         let groups_box = groups;
         let items_box = items;
+        let worker = Rc::clone(worker);
         groups.bind_internal(EventType::COMMAND_LISTBOX_SELECTED, move |_| {
+            // B18: changing group supersedes an in-flight episode reply.
+            worker.invalidate();
             let Some(selection) = groups_box.get_selection() else {
                 return;
             };
@@ -2372,7 +2409,9 @@ fn ensure_vod_ui(
     {
         let view = Rc::clone(&ui.view);
         let items_box = items;
+        let worker = Rc::clone(worker);
         back.on_click(move |_| {
+            worker.invalidate();
             let mut view = view.borrow_mut();
             if let Some(previous) = view.stack.pop() {
                 view.showing = previous;
@@ -2383,7 +2422,10 @@ fn ensure_vod_ui(
     // Closing the VOD window hides it; the window is reused.
     {
         let frame_hide = frame;
+        let worker = Rc::clone(worker);
         frame.on_close(move |event| {
+            // B18: a late reply must not reopen obsolete navigation.
+            worker.invalidate();
             frame_hide.hide();
             event.skip(false);
         });
@@ -2405,12 +2447,23 @@ fn show_items(items_box: ListBox, showing: &[VodItem]) {
 /// Collect VOD worker events into the window.
 fn poll_vod(wiring: &Wiring, status: Status) {
     while let Some(event) = wiring.vod_worker.try_recv() {
+        // B18: a reply from a superseded build/episode request must
+        // never replace newer navigation.
+        let current = match &event {
+            VodEvent::Catalog { generation, .. } => {
+                wiring.vod_worker.is_current_catalog(*generation)
+            }
+            VodEvent::Episodes { token, .. } => wiring.vod_worker.is_current_episodes(*token),
+        };
+        if !current {
+            continue;
+        }
         wiring.vod_pending.set(false);
         let Some(ui) = wiring.vod_ui.borrow().clone() else {
             continue;
         };
         match event {
-            VodEvent::Catalog(catalog) => {
+            VodEvent::Catalog { catalog, .. } => {
                 let groups_count = catalog.order.len();
                 let items_count: usize = catalog.groups.values().map(Vec::len).sum();
                 let labels = catalog.order.clone();
@@ -2425,7 +2478,10 @@ fn poll_vod(wiring: &Wiring, status: Status) {
                 ));
                 status.set_label("VOD catalogue loaded.");
             }
-            VodEvent::Episodes(Ok(episodes)) => {
+            VodEvent::Episodes {
+                result: Ok(episodes),
+                ..
+            } => {
                 let count = episodes.len();
                 let mut view = ui.view.borrow_mut();
                 let previous = std::mem::take(&mut view.showing);
@@ -2434,7 +2490,9 @@ fn poll_vod(wiring: &Wiring, status: Status) {
                 show_items(ui.items, &view.showing);
                 ui.status.set_label(&format!("{count} episodes loaded."));
             }
-            VodEvent::Episodes(Err(error)) => {
+            VodEvent::Episodes {
+                result: Err(error), ..
+            } => {
                 ui.status
                     .set_label(&format!("Could not load episodes: {error}"));
             }
@@ -2666,6 +2724,7 @@ fn clone_wiring(wiring: &Wiring) -> Wiring {
         },
         browser: Rc::clone(&wiring.browser),
         categories: Rc::clone(&wiring.categories),
+        category_fav_count: Rc::clone(&wiring.category_fav_count),
         timer: Rc::clone(&wiring.timer),
         model: Rc::clone(&wiring.model),
         player: Rc::clone(&wiring.player),
@@ -7903,16 +7962,76 @@ fn pick_row(selected: Option<usize>, focused: Option<usize>) -> Option<usize> {
 /// Reload playlists and provider accounts from the config (startup
 /// and after the Playlist Manager saves).
 fn reload_sources(wiring: &Wiring) {
+    reload_sources_mode(wiring, false);
+}
+
+/// Reload with the provider cache bypassed when `force` is set
+/// (B13 refresh; plain sources shed their download caches at the
+/// refresh call site instead, so untouched sources stay cached).
+fn reload_sources_mode(wiring: &Wiring, force: bool) {
     let (sources, accounts) = configured_entries(wiring);
-    if !sources.is_empty() {
-        wiring.browser.borrow_mut().load_sources(sources);
-        assert!(wiring.timer.start(50, false));
+    // B03: always load, even with no plain sources left — an empty
+    // source list must publish an empty catalogue, not keep the
+    // removed playlist's channels on screen.
+    {
+        let mut browser = wiring.browser.borrow_mut();
+        browser.reset_scope();
+        if force {
+            browser.refresh_sources(sources);
+        } else {
+            browser.load_sources(sources);
+        }
     }
-    if !accounts.is_empty() {
+    assert!(wiring.timer.start(50, false));
+    if accounts.is_empty() {
+        // B02: no accounts configured — any provider channels from a
+        // removed account must disappear from every surface.
+        wiring
+            .browser
+            .borrow_mut()
+            .replace_provider_channels(Vec::new(), "");
+    } else if force {
+        wiring.provider_worker.load_fresh(accounts);
+        wiring.provider_pending.set(true);
+        assert!(wiring.timer.start(50, false));
+    } else {
         wiring.provider_worker.load(accounts);
         wiring.provider_pending.set(true);
         assert!(wiring.timer.start(50, false));
     }
+}
+
+/// The stored friendly names for plain sources (B13), cleaned.
+fn playlist_names(wiring: &Wiring) -> BTreeMap<String, String> {
+    let raw = wiring
+        .persist
+        .config
+        .borrow()
+        .value("playlist_names")
+        .cloned();
+    let mut map = BTreeMap::new();
+    if let Some(serde_json::Value::Object(object)) = raw {
+        for (key, value) in &object {
+            if let Some(text) = value.as_str() {
+                map.insert(key.clone(), text.to_string());
+            }
+        }
+    }
+    iptv_core::sources::normalize_source_names(&map)
+}
+
+/// The stored friendly names for EPG sources (B13), cleaned.
+fn epg_names(wiring: &Wiring) -> BTreeMap<String, String> {
+    let raw = wiring.persist.config.borrow().value("epg_names").cloned();
+    let mut map = BTreeMap::new();
+    if let Some(serde_json::Value::Object(object)) = raw {
+        for (key, value) in &object {
+            if let Some(text) = value.as_str() {
+                map.insert(key.clone(), text.to_string());
+            }
+        }
+    }
+    iptv_core::sources::normalize_source_names(&map)
 }
 
 /// Where the guide's `SQLite` mirror lives.
@@ -7936,7 +8055,10 @@ fn effective_epg_sources(wiring: &Wiring) -> Vec<String> {
     }
     let use_playlist = config.bool_or("use_playlist_epg", true);
     let extra = wiring.epg_extra_sources.borrow();
-    merged_epg_sources(&own, &extra, &[], use_playlist)
+    // Playlist-linked guides (B09) enter through the browser's
+    // header discovery; the merge applies the opt-out.
+    let playlist_guides = wiring.browser.borrow().playlist_guide_urls();
+    merged_epg_sources(&own, &extra, &playlist_guides, use_playlist)
 }
 
 /// Start a guide load (the worker also mirrors the guide to the
@@ -8011,9 +8133,17 @@ fn reload_epg(wiring: &Wiring) {
 }
 
 /// Display name for one `playlists` config entry in the manager.
-fn entry_display(entry: &serde_json::Value) -> String {
+/// Plain sources show their friendly name when one is stored (B13);
+/// URLs otherwise show in full, files by name.
+fn entry_display(entry: &serde_json::Value, names: &BTreeMap<String, String>) -> String {
     match entry {
         serde_json::Value::String(text) => {
+            let key = iptv_core::sources::source_name_key(text);
+            if let Some(name) = names.get(&key) {
+                if !name.trim().is_empty() {
+                    return name.trim().to_string();
+                }
+            }
             if text.starts_with("http://") || text.starts_with("https://") {
                 text.clone()
             } else {
@@ -8027,8 +8157,11 @@ fn entry_display(entry: &serde_json::Value) -> String {
 }
 
 /// Refresh a manager list box from its working entries.
-fn manager_refresh(list: ListBox, entries: &[serde_json::Value]) {
-    let labels: Vec<String> = entries.iter().map(entry_display).collect();
+fn manager_refresh(list: ListBox, entries: &[serde_json::Value], names: &BTreeMap<String, String>) {
+    let labels: Vec<String> = entries
+        .iter()
+        .map(|entry| entry_display(entry, names))
+        .collect();
     list.set_items(&labels.iter().map(String::as_str).collect::<Vec<_>>());
 }
 
@@ -8051,6 +8184,215 @@ struct PlaylistManagerButtons {
     add_stalker: Button,
     edit: Button,
     remove: Button,
+    refresh: Button,
+    rename: Button,
+    copy_url: Button,
+}
+
+/// Working state shared by the Playlist Manager's actions.
+#[derive(Clone)]
+struct ManagerState {
+    entries: Rc<RefCell<Vec<serde_json::Value>>>,
+    names: Rc<RefCell<BTreeMap<String, String>>>,
+    /// Ctrl+A arms "refresh all" until the highlight moves (B13).
+    refresh_all: Rc<std::cell::Cell<bool>>,
+}
+
+fn manager_selected(list: ListBox, state: &ManagerState) -> Option<(usize, serde_json::Value)> {
+    let selection = list.get_selection()?;
+    let index = usize::try_from(selection).unwrap_or(usize::MAX);
+    state
+        .entries
+        .borrow()
+        .get(index)
+        .cloned()
+        .map(|entry| (index, entry))
+}
+
+/// Rename the selected entry (B13, Python's F2): accounts rename
+/// their `name` field; plain sources rename their stored friendly
+/// name. An empty or unchanged name keeps the existing label.
+fn manager_rename(manager_frame: Frame, list: ListBox, state: &ManagerState, mstatus: Status) {
+    let Some((index, entry)) = manager_selected(list, state) else {
+        mstatus.set_label("Choose an entry to rename first.");
+        return;
+    };
+    let current = match &entry {
+        serde_json::Value::String(text) => state
+            .names
+            .borrow()
+            .get(&iptv_core::sources::source_name_key(text))
+            .cloned()
+            .unwrap_or_default(),
+        serde_json::Value::Object(map) => map
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        _ => return,
+    };
+    let dialog = TextEntryDialog::builder(&manager_frame, "Name", "Rename")
+        .with_default_value(&current)
+        .build();
+    if dialog.show_modal() != ID_OK {
+        return;
+    }
+    let Some(value) = dialog.get_value() else {
+        return;
+    };
+    let name = value.trim().to_string();
+    if name == current {
+        return;
+    }
+    match &entry {
+        serde_json::Value::String(text) => {
+            let key = iptv_core::sources::source_name_key(text);
+            if name.is_empty() {
+                state.names.borrow_mut().remove(&key);
+            } else {
+                state.names.borrow_mut().insert(key, name);
+            }
+        }
+        serde_json::Value::Object(_) => {
+            if let Some(serde_json::Value::Object(map)) = state.entries.borrow_mut().get_mut(index)
+            {
+                if name.is_empty() {
+                    map.remove("name");
+                } else {
+                    map.insert("name".to_string(), serde_json::json!(name));
+                }
+            }
+        }
+        _ => {}
+    }
+    manager_refresh(list, &state.entries.borrow(), &state.names.borrow());
+}
+
+/// Remove the selected entry after Python's confirmation (B14):
+/// the question names the playlist and defaults to No, so a slip
+/// on Del cannot lose an account's credentials.
+fn manager_remove(manager_frame: Frame, list: ListBox, state: &ManagerState, mstatus: Status) {
+    let Some((index, entry)) = manager_selected(list, state) else {
+        mstatus.set_label("Choose an entry to remove first.");
+        return;
+    };
+    let label = entry_display(&entry, &state.names.borrow());
+    let answer = MessageDialog::builder(
+        &manager_frame,
+        &format!(
+            "Delete the playlist \u{201c}{label}\u{201d}?\n\nThis removes it from the list of playlists. It cannot be undone."
+        ),
+        "Delete Playlist",
+    )
+    .with_style(MessageDialogStyle::YesNo | MessageDialogStyle::NoDefault)
+    .build()
+    .show_modal();
+    if answer != ID_YES {
+        return;
+    }
+    state.entries.borrow_mut().remove(index);
+    manager_refresh(list, &state.entries.borrow(), &state.names.borrow());
+}
+
+/// Copy the selected entry's URL (B13): the source string itself for
+/// URL playlists, the account's base URL for providers.
+fn manager_copy_url(list: ListBox, state: &ManagerState, mstatus: Status) {
+    let Some((_, entry)) = manager_selected(list, state) else {
+        mstatus.set_label("Choose an entry first.");
+        return;
+    };
+    let url = match &entry {
+        serde_json::Value::String(text) => Some(text.clone()),
+        serde_json::Value::Object(map) => map
+            .get("base_url")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        _ => None,
+    };
+    let url = url.filter(|text| text.starts_with("http://") || text.starts_with("https://"));
+    match url {
+        Some(url) if Clipboard::get().set_text(&url) => {
+            mstatus.set_label("URL copied to the clipboard.");
+        }
+        Some(_) => mstatus.set_label("Could not open the clipboard."),
+        None => mstatus.set_label("The selected entry has no URL to copy."),
+    }
+}
+
+/// Refresh playlists (B13, Python's F5): the working list is saved
+/// first, as the Python dialog edits the live list. Refresh All (or
+/// Ctrl+A armed) bypasses every cache; a single plain source sheds
+/// only its own download cache; a single account reloads providers
+/// fresh.
+fn manager_refresh_sources(
+    wiring: &Wiring,
+    manager_frame: Frame,
+    list: ListBox,
+    state: &ManagerState,
+    scope_choice: Choice,
+    mstatus: Status,
+    status: Status,
+) {
+    let _ = manager_frame;
+    wiring.persist.set_and_save(
+        "playlists",
+        serde_json::Value::Array(state.entries.borrow().clone()),
+    );
+    wiring.persist.set_and_save(
+        "playlist_names",
+        serde_json::Value::Object(
+            state
+                .names
+                .borrow()
+                .iter()
+                .map(|(key, value)| (key.clone(), serde_json::json!(value)))
+                .collect(),
+        ),
+    );
+    fill_scope_choices(wiring, scope_choice);
+    let cache_dir = config::user_config_dir().join("playlist-cache");
+    let selected = manager_selected(list, state);
+    let all = state.refresh_all.get() || selected.is_none();
+    state.refresh_all.set(false);
+    if all {
+        let (sources, _) = configured_entries(wiring);
+        for source in &sources {
+            if source.is_url() {
+                iptv_core::sources::drop_url_download_cache(&cache_dir, source.location());
+            }
+        }
+        reload_sources_mode(wiring, true);
+        status.set_label("Refreshing all playlists...");
+        mstatus.set_label("Refreshing all playlists...");
+        return;
+    }
+    let Some((_, entry)) = selected else {
+        return;
+    };
+    match &entry {
+        serde_json::Value::String(text) if text.starts_with("http") => {
+            iptv_core::sources::drop_url_download_cache(&cache_dir, text);
+            let (sources, _) = configured_entries(wiring);
+            wiring.browser.borrow_mut().load_sources(sources);
+            assert!(wiring.timer.start(50, false));
+            status.set_label("Refreshing playlist...");
+        }
+        serde_json::Value::String(_) => {
+            let (sources, _) = configured_entries(wiring);
+            wiring.browser.borrow_mut().load_sources(sources);
+            assert!(wiring.timer.start(50, false));
+            status.set_label("Refreshing playlist...");
+        }
+        serde_json::Value::Object(_) => {
+            let (_, accounts) = configured_entries(wiring);
+            wiring.provider_worker.load_fresh(accounts);
+            wiring.provider_pending.set(true);
+            assert!(wiring.timer.start(50, false));
+            status.set_label("Refreshing account...");
+        }
+        _ => {}
+    }
+    mstatus.set_label("Refreshing...");
 }
 
 /// Bind the Playlist Manager's add/edit/remove actions.
@@ -8059,9 +8401,11 @@ fn bind_playlist_manager_buttons(
     wiring: &Wiring,
     manager_frame: Frame,
     list: ListBox,
-    entries: &Rc<RefCell<Vec<serde_json::Value>>>,
+    state: &ManagerState,
     buttons: &PlaylistManagerButtons,
+    scope_choice: Choice,
     mstatus: Status,
+    status: Status,
 ) {
     let PlaylistManagerButtons {
         add_file,
@@ -8070,9 +8414,11 @@ fn bind_playlist_manager_buttons(
         add_stalker,
         edit,
         remove,
+        refresh,
+        rename,
+        copy_url,
     } = *buttons;
-    let entries = Rc::clone(entries);
-    let entries_f = Rc::clone(&entries);
+    let state_f = state.clone();
     add_file.on_click(move |_| {
         let dialog = FileDialog::builder(&manager_frame)
             .with_message("Add playlist file")
@@ -8083,11 +8429,14 @@ fn bind_playlist_manager_buttons(
             return;
         }
         if let Some(path) = dialog.get_path() {
-            entries_f.borrow_mut().push(serde_json::Value::String(path));
-            manager_refresh(list, &entries_f.borrow());
+            state_f
+                .entries
+                .borrow_mut()
+                .push(serde_json::Value::String(path));
+            manager_refresh(list, &state_f.entries.borrow(), &state_f.names.borrow());
         }
     });
-    let entries_u = Rc::clone(&entries);
+    let state_u = state.clone();
     add_url.on_click(move |_| {
         let dialog = TextEntryDialog::builder(&manager_frame, "Playlist URL:", "Add URL").build();
         if dialog.show_modal() != ID_OK {
@@ -8095,38 +8444,103 @@ fn bind_playlist_manager_buttons(
         }
         if let Some(url) = dialog.get_value() {
             if !url.trim().is_empty() {
-                entries_u
+                state_u
+                    .entries
                     .borrow_mut()
                     .push(serde_json::Value::String(url.trim().to_string()));
-                manager_refresh(list, &entries_u.borrow());
+                manager_refresh(list, &state_u.entries.borrow(), &state_u.names.borrow());
             }
         }
     });
     let wiring_x = clone_wiring(wiring);
-    let entries_x = Rc::clone(&entries);
+    let state_x = state.clone();
     add_xtream.on_click(move |_| {
-        open_account_form(
-            &wiring_x,
-            "xtream",
-            None,
-            Rc::clone(&entries_x),
-            list,
-            mstatus,
-        );
+        open_account_form(&wiring_x, "xtream", None, &state_x, list, mstatus);
     });
     let wiring_s = clone_wiring(wiring);
-    let entries_s = Rc::clone(&entries);
+    let state_s = state.clone();
     add_stalker.on_click(move |_| {
-        open_account_form(
-            &wiring_s,
-            "stalker",
-            None,
-            Rc::clone(&entries_s),
+        open_account_form(&wiring_s, "stalker", None, &state_s, list, mstatus);
+    });
+    let wiring_r = clone_wiring(wiring);
+    let state_r = state.clone();
+    refresh.on_click(move |_| {
+        manager_refresh_sources(
+            &wiring_r,
+            manager_frame,
             list,
+            &state_r,
+            scope_choice,
             mstatus,
+            status,
         );
     });
-    bind_manager_edit_buttons(wiring, manager_frame, list, &entries, edit, remove, mstatus);
+    let state_n = state.clone();
+    rename.on_click(move |_| manager_rename(manager_frame, list, &state_n, mstatus));
+    let state_c = state.clone();
+    copy_url.on_click(move |_| manager_copy_url(list, &state_c, mstatus));
+    bind_manager_edit_buttons(wiring, manager_frame, list, state, edit, remove, mstatus);
+    bind_manager_keys(
+        wiring,
+        manager_frame,
+        list,
+        state,
+        scope_choice,
+        mstatus,
+        status,
+    );
+}
+
+/// The list's row shortcuts (B13): F5 refresh, Ctrl+A arms refresh
+/// all, F2 rename, Del remove (with the B14 confirmation).
+#[allow(clippy::too_many_arguments)]
+fn bind_manager_keys(
+    wiring: &Wiring,
+    manager_frame: Frame,
+    list: ListBox,
+    state: &ManagerState,
+    scope_choice: Choice,
+    mstatus: Status,
+    status: Status,
+) {
+    let wiring_k = clone_wiring(wiring);
+    let state_k = state.clone();
+    list.bind_internal(EventType::KEY_DOWN, move |event| {
+        let label = key_event_label(event);
+        match label.as_deref() {
+            Some("F5") => {
+                manager_refresh_sources(
+                    &wiring_k,
+                    manager_frame,
+                    list,
+                    &state_k,
+                    scope_choice,
+                    mstatus,
+                    status,
+                );
+                event.skip(false);
+            }
+            Some("Ctrl+A") => {
+                state_k.refresh_all.set(true);
+                mstatus.set_label("All playlists selected. Press F5 to refresh them all.");
+                event.skip(false);
+            }
+            Some("F2") => {
+                manager_rename(manager_frame, list, &state_k, mstatus);
+                event.skip(false);
+            }
+            _ if event.get_key_code() == Some(127) => {
+                manager_remove(manager_frame, list, &state_k, mstatus);
+                event.skip(false);
+            }
+            _ => event.skip(true),
+        }
+    });
+    // Moving the highlight disarms refresh-all (Python behavior).
+    let state_m = state.clone();
+    list.bind_internal(EventType::COMMAND_LISTBOX_SELECTED, move |_| {
+        state_m.refresh_all.set(false);
+    });
 }
 
 /// Bind the Playlist Manager's edit/remove actions.
@@ -8135,21 +8549,16 @@ fn bind_manager_edit_buttons(
     wiring: &Wiring,
     manager_frame: Frame,
     list: ListBox,
-    entries: &Rc<RefCell<Vec<serde_json::Value>>>,
+    state: &ManagerState,
     edit: Button,
     remove: Button,
     mstatus: Status,
 ) {
-    let entries = Rc::clone(entries);
     let wiring_e = clone_wiring(wiring);
-    let entries_e = Rc::clone(&entries);
+    let state_e = state.clone();
     edit.on_click(move |_| {
-        let Some(selection) = list.get_selection() else {
+        let Some((index, entry)) = manager_selected(list, &state_e) else {
             mstatus.set_label("Choose an entry to edit first.");
-            return;
-        };
-        let index = usize::try_from(selection).unwrap_or(usize::MAX);
-        let Some(entry) = entries_e.borrow().get(index).cloned() else {
             return;
         };
         match &entry {
@@ -8162,9 +8571,9 @@ fn bind_manager_edit_buttons(
                     return;
                 }
                 if let Some(value) = dialog.get_value() {
-                    entries_e.borrow_mut()[index] =
+                    state_e.entries.borrow_mut()[index] =
                         serde_json::Value::String(value.trim().to_string());
-                    manager_refresh(list, &entries_e.borrow());
+                    manager_refresh(list, &state_e.entries.borrow(), &state_e.names.borrow());
                 }
             }
             serde_json::Value::Object(map) => {
@@ -8177,7 +8586,7 @@ fn bind_manager_edit_buttons(
                     &wiring_e,
                     &kind,
                     Some((index, entry)),
-                    Rc::clone(&entries_e),
+                    &state_e,
                     list,
                     mstatus,
                 );
@@ -8185,18 +8594,8 @@ fn bind_manager_edit_buttons(
             _ => {}
         }
     });
-    let entries_r = Rc::clone(&entries);
-    remove.on_click(move |_| {
-        let Some(selection) = list.get_selection() else {
-            mstatus.set_label("Choose an entry to remove first.");
-            return;
-        };
-        let index = usize::try_from(selection).unwrap_or(usize::MAX);
-        if index < entries_r.borrow().len() {
-            entries_r.borrow_mut().remove(index);
-            manager_refresh(list, &entries_r.borrow());
-        }
-    });
+    let state_r = state.clone();
+    remove.on_click(move |_| manager_remove(manager_frame, list, &state_r, mstatus));
 }
 
 /// File > Playlist Manager: edit the `playlists` config list
@@ -8217,7 +8616,6 @@ fn open_playlist_manager(wiring: &Wiring, status: Status, scope_choice: Choice) 
     let panel = Panel::builder(&manager).build();
     let list = ListBox::builder(&panel).build();
     list.set_accessibility_label("Playlists");
-    manager_refresh(list, &entries.borrow());
     let add_file = Button::builder(&panel).with_label("Add &File").build();
     let add_url = Button::builder(&panel).with_label("Add &URL").build();
     let add_xtream = Button::builder(&panel)
@@ -8244,12 +8642,21 @@ fn open_playlist_manager(wiring: &Wiring, status: Status, scope_choice: Choice) 
         bar: None,
     };
 
+    let state = ManagerState {
+        entries,
+        names: Rc::new(RefCell::new(playlist_names(wiring))),
+        refresh_all: Rc::new(std::cell::Cell::new(false)),
+    };
+    manager_refresh(list, &state.entries.borrow(), &state.names.borrow());
+    let refresh = Button::builder(&panel).with_label("Re&fresh").build();
+    let rename = Button::builder(&panel).with_label("Rena&me").build();
+    let copy_url = Button::builder(&panel).with_label("Copy &URL").build();
     let manager_frame = manager;
     bind_playlist_manager_buttons(
         wiring,
         manager_frame,
         list,
-        &entries,
+        &state,
         &PlaylistManagerButtons {
             add_file,
             add_url,
@@ -8257,15 +8664,31 @@ fn open_playlist_manager(wiring: &Wiring, status: Status, scope_choice: Choice) 
             add_stalker,
             edit,
             remove,
+            refresh,
+            rename,
+            copy_url,
         },
+        scope_choice,
         mstatus,
+        status,
     );
     let wiring_ok = clone_wiring(wiring);
-    let entries_ok = Rc::clone(&entries);
+    let state_ok = state.clone();
     ok.on_click(move |_| {
         wiring_ok.persist.set_and_save(
             "playlists",
-            serde_json::Value::Array(entries_ok.borrow().clone()),
+            serde_json::Value::Array(state_ok.entries.borrow().clone()),
+        );
+        wiring_ok.persist.set_and_save(
+            "playlist_names",
+            serde_json::Value::Object(
+                state_ok
+                    .names
+                    .borrow()
+                    .iter()
+                    .map(|(key, value)| (key.clone(), serde_json::json!(value)))
+                    .collect(),
+            ),
         );
         fill_scope_choices(&wiring_ok, scope_choice);
         reload_sources(&wiring_ok);
@@ -8278,11 +8701,12 @@ fn open_playlist_manager(wiring: &Wiring, status: Status, scope_choice: Choice) 
 
 /// The Xtream / Stalker account form (add or edit). Fields write the
 /// same config dict shape `ProviderAccount::from_config` reads.
+#[allow(clippy::too_many_lines)] // one dialog: fields for both provider shapes
 fn open_account_form(
     wiring: &Wiring,
     kind: &str,
     existing: Option<(usize, serde_json::Value)>,
-    entries: Rc<RefCell<Vec<serde_json::Value>>>,
+    state: &ManagerState,
     manager_list: ListBox,
     mstatus: Status,
 ) {
@@ -8294,7 +8718,7 @@ fn open_account_form(
     };
     let form = Frame::builder()
         .with_title(title)
-        .with_size(Size::new(520, 420))
+        .with_size(Size::new(520, 460))
         .build();
     form.set_accessibility_label(title);
     let panel = Panel::builder(&form).build();
@@ -8306,11 +8730,23 @@ fn open_account_form(
             .unwrap_or("")
             .to_string()
     };
+    let get_bool = |key: &str, default: bool| -> bool {
+        existing
+            .as_ref()
+            .and_then(|(_, value)| value.get(key))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(default)
+    };
     let mut fields: Vec<(String, TextCtrl)> = Vec::new();
+    // B05: the forms expose every provider option Python exposes —
+    // Stalker username/password, both auto-EPG switches, Xtream
+    // playlist type and stream output.
     let specs: Vec<(&str, &str, bool)> = if kind == "stalker" {
         vec![
             ("Name", "name", false),
             ("Portal URL", "base_url", false),
+            ("Username (optional)", "username", false),
+            ("Password (optional)", "password", true),
             ("MAC address", "mac", false),
         ]
     } else {
@@ -8324,7 +8760,14 @@ fn open_account_form(
     for (label, key, secret) in &specs {
         let caption = StaticText::builder(&panel).with_label(label).build();
         let _ = caption;
-        let builder = TextCtrl::builder(&panel).with_value(&get(key));
+        let initial = if *key == "mac" && get("mac").is_empty() && existing.is_none() {
+            // B06: a new portal account starts from Python's default
+            // MAG-prefix MAC, ready to randomise or replace.
+            random_mag_mac()
+        } else {
+            get(key)
+        };
+        let builder = TextCtrl::builder(&panel).with_value(&initial);
         let field = if *secret {
             builder.with_style(TextCtrlStyle::Password).build()
         } else {
@@ -8333,57 +8776,256 @@ fn open_account_form(
         field.set_accessibility_label(label);
         fields.push(((*key).to_string(), field));
     }
+    let mac_field = fields
+        .iter()
+        .find(|(key, _)| key == "mac")
+        .map(|(_, field)| *field);
+    let mut randomise: Option<Button> = None;
+    if let Some(mac_field) = mac_field {
+        let button = Button::builder(&panel).with_label("Randomise &MAC").build();
+        button.on_click(move |_| mac_field.set_value(&random_mag_mac()));
+        randomise = Some(button);
+    }
+    let _ = randomise;
+    let (stream_type_choice, output_choice) = if kind == "stalker" {
+        (None, None)
+    } else {
+        let type_label = StaticText::builder(&panel)
+            .with_label("Playlist type")
+            .build();
+        let _ = type_label;
+        let type_choice = Choice::builder(&panel).build();
+        type_choice.set_accessibility_label("Playlist type");
+        for option in ["m3u_plus", "m3u", "enigma2"] {
+            type_choice.append(option);
+        }
+        let current_type = {
+            let value = get("stream_type");
+            if value.is_empty() {
+                "m3u_plus".to_string()
+            } else {
+                value
+            }
+        };
+        type_choice.set_selection(
+            ["m3u_plus", "m3u", "enigma2"]
+                .iter()
+                .position(|option| *option == current_type)
+                .map_or(0, |pos| u32::try_from(pos).unwrap_or(0)),
+        );
+        let output_label = StaticText::builder(&panel)
+            .with_label("Stream output")
+            .build();
+        let _ = output_label;
+        let output_choice = Choice::builder(&panel).build();
+        output_choice.set_accessibility_label("Stream output");
+        for option in ["ts", "m3u8", "rtmp"] {
+            output_choice.append(option);
+        }
+        let current_output = {
+            let value = get("output");
+            if value.is_empty() {
+                "ts".to_string()
+            } else {
+                value
+            }
+        };
+        output_choice.set_selection(
+            ["ts", "m3u8", "rtmp"]
+                .iter()
+                .position(|option| *option == current_output)
+                .map_or(0, |pos| u32::try_from(pos).unwrap_or(0)),
+        );
+        (Some(type_choice), Some(output_choice))
+    };
+    let auto_epg_label = if kind == "stalker" {
+        "Attempt to add provider XMLTV"
+    } else {
+        "Automatically add XMLTV URL"
+    };
+    let auto_epg = CheckBox::builder(&panel).with_label(auto_epg_label).build();
+    auto_epg.set_accessibility_label(auto_epg_label);
+    auto_epg.set_value(get_bool("auto_epg", true));
     let ok = Button::builder(&panel).with_label("&OK").build();
     let cancel = Button::builder(&panel).with_label("&Cancel").build();
     let form_hide = form;
     cancel.on_click(move |_| form_hide.hide());
     let kind_owned = kind.to_string();
+    let entries = Rc::clone(&state.entries);
+    let names = Rc::clone(&state.names);
     ok.on_click(move |_| {
-        let mut map = serde_json::Map::new();
-        map.insert("type".to_string(), serde_json::json!(kind_owned));
-        let mut base_url = String::new();
-        let mut user = String::new();
-        for (key, field) in &fields {
-            let value = field.get_value();
-            if key == "base_url" {
-                base_url.clone_from(&value);
+        let value_of = |key: &str| -> String {
+            fields
+                .iter()
+                .find(|(field_key, _)| field_key == key)
+                .map(|(_, field)| field.get_value().trim().to_string())
+                .unwrap_or_default()
+        };
+        let base_url = value_of("base_url");
+        let username = value_of("username");
+        let password = value_of("password");
+        let mac_raw = value_of("mac");
+        // B06: Python's required-field and MAC checks run before the
+        // form may close; the problem is reported and the form stays.
+        if let Some(error) =
+            account_form_error(&kind_owned, &base_url, &username, &password, &mac_raw)
+        {
+            mstatus.set_label(&error);
+            let _ = MessageDialog::builder(&form, &error, "Validation")
+                .with_style(MessageDialogStyle::OK)
+                .build()
+                .show_modal();
+            return;
+        }
+        let mut updates = serde_json::Map::new();
+        updates.insert("type".to_string(), serde_json::json!(kind_owned));
+        updates.insert("base_url".to_string(), serde_json::json!(base_url));
+        updates.insert("username".to_string(), serde_json::json!(username));
+        updates.insert("password".to_string(), serde_json::json!(password));
+        updates.insert(
+            "auto_epg".to_string(),
+            serde_json::json!(auto_epg.get_value()),
+        );
+        if kind_owned == "stalker" {
+            updates.insert("mac".to_string(), serde_json::json!(sanitize_mac(&mac_raw)));
+        } else {
+            let stream_type = stream_type_choice
+                .and_then(|choice| choice.get_string_selection())
+                .unwrap_or_else(|| "m3u_plus".to_string());
+            let output = output_choice
+                .and_then(|choice| choice.get_string_selection())
+                .unwrap_or_else(|| "ts".to_string());
+            updates.insert("stream_type".to_string(), serde_json::json!(stream_type));
+            updates.insert("output".to_string(), serde_json::json!(output));
+        }
+        let name = value_of("name");
+        if !name.is_empty() {
+            updates.insert("name".to_string(), serde_json::json!(name));
+        }
+        // B04: edits merge into the existing entry — fields the form
+        // does not carry (credentials of the other shape, unknown
+        // retained settings) survive untouched.
+        let base = existing.as_ref().map_or_else(
+            || serde_json::Value::Object(serde_json::Map::new()),
+            |(_, value)| value.clone(),
+        );
+        let mut merged = merge_account_fields(&base, updates);
+        if name.is_empty() {
+            if let serde_json::Value::Object(map) = &mut merged {
+                map.remove("name");
             }
-            if key == "username" || key == "mac" {
-                user.clone_from(&value);
-            }
-            if key == "name" && value.trim().is_empty() {
-                continue;
-            }
-            map.insert(key.clone(), serde_json::json!(value));
         }
         let id = existing
             .as_ref()
-            .and_then(|(_, value)| value.get("id"))
-            .and_then(serde_json::Value::as_str)
-            .map_or_else(
-                || generated_account_id(&kind_owned, &base_url, &user),
-                ToString::to_string,
-            );
-        map.insert("id".to_string(), serde_json::json!(id));
-        let value = serde_json::Value::Object(map);
+            .and_then(|(_, value)| {
+                value
+                    .get("id")
+                    .or_else(|| value.get("provider_id"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(ToString::to_string)
+            })
+            .unwrap_or_else(|| {
+                let user = if kind_owned == "stalker" {
+                    sanitize_mac(&mac_raw)
+                } else {
+                    username.clone()
+                };
+                generated_account_id(&kind_owned, &base_url, &user)
+            });
+        if let serde_json::Value::Object(map) = &mut merged {
+            map.entry("id".to_string())
+                .or_insert_with(|| serde_json::json!(id));
+        }
         match &existing {
             Some((index, _)) => {
-                entries.borrow_mut()[*index] = value;
+                entries.borrow_mut()[*index] = merged;
             }
-            None => entries.borrow_mut().push(value),
+            None => entries.borrow_mut().push(merged),
         }
-        manager_refresh(manager_list, &entries.borrow());
+        manager_refresh(manager_list, &entries.borrow(), &names.borrow());
         mstatus.set_label("Account saved in the list. OK in the Playlist Manager writes it.");
         form.hide();
     });
     form.show(true);
 }
 
+/// Refresh the EPG manager's list from its working state: friendly
+/// name when one is stored, else the URL in full or the file name,
+/// matching the playlist manager's plain-source labels.
+fn epg_manager_refresh(list: ListBox, urls: &[String], names: &BTreeMap<String, String>) {
+    let labels: Vec<String> = urls
+        .iter()
+        .map(|url| {
+            let friendly = names
+                .get(&iptv_core::sources::source_name_key(url))
+                .filter(|name| !name.trim().is_empty())
+                .map(|name| name.trim().to_string());
+            match friendly {
+                Some(name) => name,
+                None if url.starts_with("http://") || url.starts_with("https://") => url.clone(),
+                None => scope_display_name(url),
+            }
+        })
+        .collect();
+    list.set_items(&labels.iter().map(String::as_str).collect::<Vec<_>>());
+}
+
+/// Remove the EPG manager's selected row (B13).
+fn epg_remove_row(
+    list: ListBox,
+    urls: &Rc<RefCell<Vec<String>>>,
+    names: &Rc<RefCell<BTreeMap<String, String>>>,
+) {
+    if let Some(selection) = list.get_selection() {
+        let index = usize::try_from(selection).unwrap_or(usize::MAX);
+        if index < urls.borrow().len() {
+            urls.borrow_mut().remove(index);
+            epg_manager_refresh(list, &urls.borrow(), &names.borrow());
+        }
+    }
+}
+
+/// Rename the EPG manager's selected row (B13): the friendly name
+/// is stored separately from the source itself.
+fn epg_rename_row(
+    manager_frame: Frame,
+    list: ListBox,
+    urls: &Rc<RefCell<Vec<String>>>,
+    names: &Rc<RefCell<BTreeMap<String, String>>>,
+) {
+    let Some(selection) = list.get_selection() else {
+        return;
+    };
+    let index = usize::try_from(selection).unwrap_or(usize::MAX);
+    let Some(source) = urls.borrow().get(index).cloned() else {
+        return;
+    };
+    let key = iptv_core::sources::source_name_key(&source);
+    let current = names.borrow().get(&key).cloned().unwrap_or_default();
+    let dialog = TextEntryDialog::builder(&manager_frame, "Name", "Rename")
+        .with_default_value(&current)
+        .build();
+    if dialog.show_modal() != ID_OK {
+        return;
+    }
+    if let Some(value) = dialog.get_value() {
+        let name = value.trim().to_string();
+        if name.is_empty() {
+            names.borrow_mut().remove(&key);
+        } else if name != current {
+            names.borrow_mut().insert(key, name);
+        }
+        epg_manager_refresh(list, &urls.borrow(), &names.borrow());
+    }
+}
+
 /// File > EPG Manager: edit the user's own guide sources
 /// (Python's `epgs` key; the legacy `epg_urls` spelling is read
-/// as the same list and kept in sync on save — audit E01).
-/// Discovered provider/playlist guides are not the user's list
-/// and never land here.
+/// as the same list and kept in sync on save — audit E01; guides
+/// discovered from providers and playlist headers are not editable
+/// here, as in Python), with friendly names, the playlist-guide
+/// checkbox (B09) and the shared row actions (B13).
+#[allow(clippy::too_many_lines)] // one dialog: list, row actions and persistence
 fn open_epg_manager(wiring: &Wiring, status: Status) {
     let urls: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new({
         let config = wiring.persist.config.borrow();
@@ -8395,22 +9037,38 @@ fn open_epg_manager(wiring: &Wiring, status: Status) {
         }
         own
     }));
+    let names: Rc<RefCell<BTreeMap<String, String>>> = Rc::new(RefCell::new(epg_names(wiring)));
     let manager = Frame::builder()
         .with_title("EPG Manager")
-        .with_size(Size::new(640, 440))
+        .with_size(Size::new(640, 480))
         .build();
     manager.set_accessibility_label("EPG Manager");
     let panel = Panel::builder(&manager).build();
     let list = ListBox::builder(&panel).build();
     list.set_accessibility_label("EPG sources");
-    list.set_items(&urls.borrow().iter().map(String::as_str).collect::<Vec<_>>());
+    epg_manager_refresh(list, &urls.borrow(), &names.borrow());
     let add_url = Button::builder(&panel).with_label("Add &URL").build();
     let add_file = Button::builder(&panel).with_label("Add &File").build();
     let remove = Button::builder(&panel).with_label("&Remove").build();
+    let rename = Button::builder(&panel).with_label("Rena&me").build();
+    let copy_url = Button::builder(&panel).with_label("Copy &URL").build();
+    // B09: the playlist-guide opt-out lives here, as in Python.
+    let playlist_epg = CheckBox::builder(&panel)
+        .with_label("Also use the guide each playlist links to")
+        .build();
+    playlist_epg.set_accessibility_label("Also use the guide each playlist links to");
+    playlist_epg.set_value(
+        wiring
+            .persist
+            .config
+            .borrow()
+            .bool_or("use_playlist_epg", true),
+    );
     let ok = Button::builder(&panel).with_label("&OK").build();
     let cancel = Button::builder(&panel).with_label("&Cancel").build();
-    let urls_u = Rc::clone(&urls);
     let manager_frame = manager;
+    let urls_u = Rc::clone(&urls);
+    let names_u = Rc::clone(&names);
     add_url.on_click(move |_| {
         let dialog =
             TextEntryDialog::builder(&manager_frame, "EPG URL (XMLTV):", "Add EPG URL").build();
@@ -8420,17 +9078,12 @@ fn open_epg_manager(wiring: &Wiring, status: Status) {
         if let Some(url) = dialog.get_value() {
             if !url.trim().is_empty() {
                 urls_u.borrow_mut().push(url.trim().to_string());
-                list.set_items(
-                    &urls_u
-                        .borrow()
-                        .iter()
-                        .map(String::as_str)
-                        .collect::<Vec<_>>(),
-                );
+                epg_manager_refresh(list, &urls_u.borrow(), &names_u.borrow());
             }
         }
     });
     let urls_f = Rc::clone(&urls);
+    let names_f = Rc::clone(&names);
     add_file.on_click(move |_| {
         let dialog = FileDialog::builder(&manager_frame)
             .with_message("Add EPG file")
@@ -8442,39 +9095,67 @@ fn open_epg_manager(wiring: &Wiring, status: Status) {
         }
         if let Some(path) = dialog.get_path() {
             urls_f.borrow_mut().push(path);
-            list.set_items(
-                &urls_f
-                    .borrow()
-                    .iter()
-                    .map(String::as_str)
-                    .collect::<Vec<_>>(),
-            );
+            epg_manager_refresh(list, &urls_f.borrow(), &names_f.borrow());
         }
     });
     let urls_r = Rc::clone(&urls);
-    remove.on_click(move |_| {
-        if let Some(selection) = list.get_selection() {
-            let index = usize::try_from(selection).unwrap_or(usize::MAX);
-            if index < urls_r.borrow().len() {
-                urls_r.borrow_mut().remove(index);
-                list.set_items(
-                    &urls_r
-                        .borrow()
-                        .iter()
-                        .map(String::as_str)
-                        .collect::<Vec<_>>(),
-                );
+    let names_r = Rc::clone(&names);
+    remove.on_click(move |_| epg_remove_row(list, &urls_r, &names_r));
+    let urls_n = Rc::clone(&urls);
+    let names_n = Rc::clone(&names);
+    rename.on_click(move |_| epg_rename_row(manager_frame, list, &urls_n, &names_n));
+    let urls_c = Rc::clone(&urls);
+    copy_url.on_click(move |_| {
+        let Some(selection) = list.get_selection() else {
+            return;
+        };
+        let index = usize::try_from(selection).unwrap_or(usize::MAX);
+        if let Some(url) = urls_c.borrow().get(index) {
+            if url.starts_with("http://") || url.starts_with("https://") {
+                let _ = Clipboard::get().set_text(url);
             }
         }
     });
+    // Row shortcuts (B13): F2 rename, Del remove.
+    let urls_k = Rc::clone(&urls);
+    let names_k = Rc::clone(&names);
+    list.bind_internal(EventType::KEY_DOWN, move |event| {
+        match key_event_label(event).as_deref() {
+            Some("F2") => {
+                epg_rename_row(manager_frame, list, &urls_k, &names_k);
+                event.skip(false);
+            }
+            _ if event.get_key_code() == Some(127) => {
+                epg_remove_row(list, &urls_k, &names_k);
+                event.skip(false);
+            }
+            _ => event.skip(true),
+        }
+    });
     let wiring_ok = clone_wiring(wiring);
+    let persist_urls = Rc::clone(&urls);
+    let persist_names = Rc::clone(&names);
     ok.on_click(move |_| {
         wiring_ok
             .persist
-            .set_and_save("epgs", serde_json::json!(urls.borrow().clone()));
+            .set_and_save("epgs", serde_json::json!(persist_urls.borrow().clone()));
         wiring_ok
             .persist
-            .set_and_save("epg_urls", serde_json::json!(urls.borrow().clone()));
+            .set_and_save("epg_urls", serde_json::json!(persist_urls.borrow().clone()));
+        wiring_ok.persist.set_and_save(
+            "epg_names",
+            serde_json::Value::Object(
+                persist_names
+                    .borrow()
+                    .iter()
+                    .map(|(key, value)| (key.clone(), serde_json::json!(value)))
+                    .collect(),
+            ),
+        );
+        wiring_ok.persist.set_and_save(
+            "use_playlist_epg",
+            serde_json::json!(playlist_epg.get_value()),
+        );
         reload_epg(&wiring_ok);
         status.set_label("EPG sources saved. Reloading guide...");
         manager_frame.hide();
@@ -9849,13 +10530,18 @@ fn category_display(category: &Category, favorite_count: usize) -> String {
 fn sync_category_control(
     control: TreeCtrl,
     state: &RefCell<Vec<Category>>,
+    last_count: &std::cell::Cell<usize>,
     browser: &RefCell<BrowserWorker>,
 ) {
     let browser = browser.borrow();
     let current = browser.categories();
     let favorite_count = browser.favorite_count();
     let favorites_active = browser.active_category() == &Category::Favorites;
-    if *state.borrow() != current || favorites_active {
+    // B20: a changed favorite count alone (toggle from All Channels,
+    // a scope switch) must rebuild the label too — it used to stay
+    // stale unless the category set changed or Favorites was active.
+    let count_changed = favorite_count != last_count.get();
+    if *state.borrow() != current || favorites_active || count_changed {
         // Rebuild the tree rows (the Favorites count can change the
         // label without a set change, as with the old list).
         if let Some(root) = control.get_root_item() {
@@ -9873,6 +10559,7 @@ fn sync_category_control(
         if *state.borrow() != current {
             *state.borrow_mut() = current;
         }
+        last_count.set(favorite_count);
     }
     let active = browser.active_category().clone();
     if let Some(position) = state.borrow().iter().position(|item| item == &active) {

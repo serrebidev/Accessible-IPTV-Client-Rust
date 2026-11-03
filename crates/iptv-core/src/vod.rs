@@ -566,26 +566,94 @@ pub fn merge_catalogs(catalogs: Vec<VodCatalog>) -> VodCatalog {
 /// Jobs for the VOD worker.
 pub enum VodJob {
     Build {
+        generation: u64,
         accounts: Vec<ProviderAccount>,
-        channels: Vec<Channel>,
+        model: std::sync::Arc<crate::BrowseModel>,
+        extras: Vec<Channel>,
+        /// The active playlist scope id; None = all playlists (B17).
+        scope: Option<String>,
     },
     Episodes {
+        token: (u64, u64),
         account: ProviderAccount,
         series_id: String,
     },
 }
 
-/// Events from the VOD worker.
+/// Events from the VOD worker (B18): catalogue events carry their
+/// build generation; episode events carry a (build, navigation)
+/// token. The adapter drops anything no longer current, so a late
+/// reply can never replace newer navigation.
 #[derive(Clone, Debug)]
 pub enum VodEvent {
-    Catalog(VodCatalog),
-    Episodes(Result<Vec<VodItem>, String>),
+    Catalog {
+        generation: u64,
+        catalog: VodCatalog,
+    },
+    Episodes {
+        token: (u64, u64),
+        result: Result<Vec<VodItem>, String>,
+    },
+}
+
+/// Assemble one build's catalogues on the worker thread (B17/B19):
+/// only the scoped source contributes, provider channels never enter
+/// the plain-M3U heuristic, and only scoped Xtream accounts are
+/// queried.
+fn build_catalog(
+    accounts: &[ProviderAccount],
+    model: &crate::BrowseModel,
+    extras: &[Channel],
+    scope: Option<&str>,
+) -> VodCatalog {
+    let in_scope = |channel: &Channel| match scope {
+        None => true,
+        Some(id) => crate::sources::channel_scope(channel) == Some(id),
+    };
+    let mut catalogs: Vec<VodCatalog> = Vec::new();
+    for account in accounts {
+        if scope.is_some() && account.provider_id().as_deref() != scope {
+            continue;
+        }
+        if let ProviderAccount::Xtream(creds) = account {
+            let client = XtreamClient::new(creds.clone());
+            let pid = account.provider_id().unwrap_or_else(|| account.describe());
+            catalogs.push(xtream_catalog(&client, &pid));
+        }
+    }
+    let m3u_channels: Vec<Channel> = model
+        .channels()
+        .iter()
+        .chain(extras.iter())
+        .filter(|channel| in_scope(channel))
+        .filter(|channel| {
+            !matches!(
+                channel
+                    .unknown_attributes
+                    .get("provider-type")
+                    .map(String::as_str),
+                Some("xtream" | "stalker")
+            )
+        })
+        .cloned()
+        .collect();
+    if !m3u_channels.is_empty() {
+        catalogs.push(categorize_m3u_vod(&m3u_channels));
+    }
+    merge_catalogs(catalogs)
 }
 
 /// Background VOD catalogue/episodes worker.
 pub struct VodWorker {
     jobs: std::sync::mpsc::Sender<VodJob>,
     events: std::sync::Mutex<std::sync::mpsc::Receiver<VodEvent>>,
+    /// Catalogue build generation: a newer build supersedes older
+    /// builds and every episode request made against them.
+    build_generation: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Navigation generation: group changes, Back and window close
+    /// supersede in-flight episode replies without touching an
+    /// in-flight catalogue build.
+    nav_generation: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Default for VodWorker {
@@ -602,22 +670,21 @@ impl VodWorker {
         std::thread::spawn(move || {
             while let Ok(job) = job_receiver.recv() {
                 let event = match job {
-                    VodJob::Build { accounts, channels } => {
-                        let mut catalogs: Vec<VodCatalog> = Vec::new();
-                        for account in &accounts {
-                            if let ProviderAccount::Xtream(creds) = account {
-                                let client = XtreamClient::new(creds.clone());
-                                let pid =
-                                    account.provider_id().unwrap_or_else(|| account.describe());
-                                catalogs.push(xtream_catalog(&client, &pid));
-                            }
-                        }
-                        if !channels.is_empty() {
-                            catalogs.push(categorize_m3u_vod(&channels));
-                        }
-                        VodEvent::Catalog(merge_catalogs(catalogs))
-                    }
-                    VodJob::Episodes { account, series_id } => {
+                    VodJob::Build {
+                        generation,
+                        accounts,
+                        model,
+                        extras,
+                        scope,
+                    } => VodEvent::Catalog {
+                        generation,
+                        catalog: build_catalog(&accounts, &model, &extras, scope.as_deref()),
+                    },
+                    VodJob::Episodes {
+                        token,
+                        account,
+                        series_id,
+                    } => {
                         let result = match &account {
                             ProviderAccount::Xtream(creds) => {
                                 let client = XtreamClient::new(creds.clone());
@@ -629,7 +696,7 @@ impl VodWorker {
                                 Err("Series episodes need an Xtream account.".to_string())
                             }
                         };
-                        VodEvent::Episodes(result)
+                        VodEvent::Episodes { token, result }
                     }
                 };
                 if event_sender.send(event).is_err() {
@@ -640,15 +707,74 @@ impl VodWorker {
         Self {
             jobs: job_sender,
             events: std::sync::Mutex::new(event_receiver),
+            build_generation: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            nav_generation: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
-    pub fn build(&self, accounts: Vec<ProviderAccount>, channels: Vec<Channel>) {
-        let _ = self.jobs.send(VodJob::Build { accounts, channels });
+    fn bump(counter: &std::sync::atomic::AtomicU64) -> u64 {
+        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+    }
+
+    /// Whether a catalogue event is from the newest build.
+    #[must_use]
+    pub fn is_current_catalog(&self, generation: u64) -> bool {
+        generation
+            == self
+                .build_generation
+                .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Whether an episode event's token is still current: same
+    /// build, and navigation has not moved since the request.
+    #[must_use]
+    pub fn is_current_episodes(&self, token: (u64, u64)) -> bool {
+        token.0
+            == self
+                .build_generation
+                .load(std::sync::atomic::Ordering::Relaxed)
+            && token.1
+                == self
+                    .nav_generation
+                    .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Navigation moved on (group change, Back, window close):
+    /// in-flight episode replies become stale.
+    pub fn invalidate(&self) {
+        Self::bump(&self.nav_generation);
+    }
+
+    pub fn build(
+        &self,
+        accounts: Vec<ProviderAccount>,
+        model: std::sync::Arc<crate::BrowseModel>,
+        extras: Vec<Channel>,
+        scope: Option<String>,
+    ) {
+        let generation = Self::bump(&self.build_generation);
+        // A rebuild also supersedes episode requests in flight.
+        Self::bump(&self.nav_generation);
+        let _ = self.jobs.send(VodJob::Build {
+            generation,
+            accounts,
+            model,
+            extras,
+            scope,
+        });
     }
 
     pub fn episodes(&self, account: ProviderAccount, series_id: String) {
-        let _ = self.jobs.send(VodJob::Episodes { account, series_id });
+        let token = (
+            self.build_generation
+                .load(std::sync::atomic::Ordering::Relaxed),
+            Self::bump(&self.nav_generation),
+        );
+        let _ = self.jobs.send(VodJob::Episodes {
+            token,
+            account,
+            series_id,
+        });
     }
 
     /// The next VOD event, when one is waiting.
@@ -682,6 +808,92 @@ mod tests {
         assert_eq!(parse_season_episode("Plain Movie"), None);
         assert_eq!(series_title("Breaking Bad S01E02 - Pilot"), "Breaking Bad");
         assert_eq!(series_title("Plain Movie"), "Plain Movie");
+    }
+
+    fn scoped_channel(name: &str, group: &str, url: &str, scope: &str, provider: bool) -> Channel {
+        let mut channel = channel(name, group, url);
+        channel.unknown_attributes.insert(
+            crate::sources::PLAYLIST_ID_ATTRIBUTE.to_string(),
+            scope.to_string(),
+        );
+        if provider {
+            channel
+                .unknown_attributes
+                .insert("provider-type".to_string(), "xtream".to_string());
+        }
+        channel
+    }
+
+    #[test]
+    fn build_catalog_respects_scope_and_excludes_provider_channels() {
+        // B17 regression: one scoped playlist contributes; provider
+        // channels never enter the plain-M3U heuristic.
+        let model = crate::BrowseModel::from_parts(
+            vec![
+                scoped_channel("Film A", "Movies", "http://x/1", "m3u:a", false),
+                scoped_channel("Film B", "Movies", "http://x/2", "m3u:b", false),
+                scoped_channel("Provider Film", "Movies", "http://x/3", "m3u:a", true),
+            ],
+            0,
+        );
+        let scoped = build_catalog(&[], &model, &[], Some("m3u:a"));
+        let movies = &scoped.groups["Movies"];
+        assert_eq!(movies.len(), 1);
+        assert_eq!(movies[0].name, "Film A");
+        let all = build_catalog(&[], &model, &[], None);
+        let names: Vec<&str> = all.groups["Movies"]
+            .iter()
+            .map(|i| i.name.as_str())
+            .collect();
+        assert_eq!(names, ["Film A", "Film B"], "provider film excluded");
+    }
+
+    #[test]
+    fn worker_events_carry_generations_and_invalidate_stales_them() {
+        // B18 regression (core half): a superseded build's event is
+        // recognizable as stale; navigation invalidates episode
+        // tokens but not an in-flight catalogue build.
+        let worker = VodWorker::new();
+        let model = std::sync::Arc::new(crate::BrowseModel::from_parts(
+            vec![channel("Film", "Movies", "http://x/1")],
+            0,
+        ));
+        worker.build(Vec::new(), std::sync::Arc::clone(&model), Vec::new(), None);
+        let first = loop {
+            if let Some(event) = worker.try_recv() {
+                break event;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        };
+        let VodEvent::Catalog { generation, .. } = first else {
+            panic!("expected a catalogue event");
+        };
+        assert!(worker.is_current_catalog(generation));
+        worker.build(Vec::new(), model, Vec::new(), None);
+        assert!(
+            !worker.is_current_catalog(generation),
+            "newer build supersedes"
+        );
+        // Episode token mechanics: a token is current until
+        // navigation moves or a rebuild lands.
+        let worker2 = VodWorker::new();
+        worker2.build(
+            Vec::new(),
+            std::sync::Arc::new(crate::BrowseModel::default()),
+            Vec::new(),
+            None,
+        );
+        let token = (
+            worker2
+                .build_generation
+                .load(std::sync::atomic::Ordering::Relaxed),
+            worker2
+                .nav_generation
+                .load(std::sync::atomic::Ordering::Relaxed),
+        );
+        assert!(worker2.is_current_episodes(token));
+        worker2.invalidate();
+        assert!(!worker2.is_current_episodes(token));
     }
 
     #[test]

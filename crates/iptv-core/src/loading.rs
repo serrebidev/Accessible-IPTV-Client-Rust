@@ -28,6 +28,26 @@ impl LoadFailure {
 pub struct LoadResult {
     pub generation: u64,
     pub outcome: Result<Arc<BrowseModel>, LoadFailure>,
+    /// A parsed-cache prefill (B11): displayable now, but a final
+    /// result for the same generation still follows.
+    pub intermediate: bool,
+    /// Sources whose previous channels were retained (B12).
+    pub stale_sources: Vec<String>,
+    /// Playlist-header guides per source read this load (B09).
+    pub guide_urls: Vec<(String, Vec<String>)>,
+}
+
+impl LoadResult {
+    #[cfg(test)]
+    fn plain(generation: u64, outcome: Result<Arc<BrowseModel>, LoadFailure>) -> Self {
+        Self {
+            generation,
+            outcome,
+            intermediate: false,
+            stale_sources: Vec::new(),
+            guide_urls: Vec::new(),
+        }
+    }
 }
 
 /// Read in bounded chunks, checking cancellation between reads and parser batches.
@@ -90,7 +110,14 @@ pub(crate) fn read_local_text(
 
 enum LoadRequest {
     Local(PathBuf),
-    Sources(Vec<crate::sources::PlaylistSource>),
+    Sources {
+        sources: Vec<crate::sources::PlaylistSource>,
+        cache_dir: Option<PathBuf>,
+        /// The last usable catalogue, for per-source retention (B12).
+        previous: Arc<BrowseModel>,
+        /// Bypass the URL download cache (B13 refresh).
+        force_refresh: bool,
+    },
 }
 
 /// One loader serializes work and discards obsolete requests and completions.
@@ -113,25 +140,69 @@ impl Default for LoadWorker {
                     request = newer;
                 }
                 let current = || active.load(Ordering::Relaxed) == request.0;
-                let outcome = match &request.1 {
+                if let LoadRequest::Sources {
+                    sources,
+                    cache_dir: Some(dir),
+                    ..
+                } = &request.1
+                {
+                    // B11 prefill: parsed-cache channels display
+                    // before any network work, then the real load
+                    // replaces them.
+                    if let Some(prefill) = crate::sources::prefill_model(sources, dir) {
+                        if !current()
+                            || completed
+                                .send(LoadResult {
+                                    generation: request.0,
+                                    outcome: Ok(Arc::new(prefill)),
+                                    intermediate: true,
+                                    stale_sources: Vec::new(),
+                                    guide_urls: Vec::new(),
+                                })
+                                .is_err()
+                        {
+                            break;
+                        }
+                    }
+                }
+                let (outcome, stale_sources, guide_urls) = match &request.1 {
                     LoadRequest::Local(path) => match read_local(path, current) {
-                        Ok(Some(model)) => Ok(Arc::new(model)),
+                        Ok(Some(model)) => (Ok(Arc::new(model)), Vec::new(), Vec::new()),
                         Ok(None) => continue,
-                        Err(error) => Err(if error.kind() == io::ErrorKind::NotFound {
-                            LoadFailure::Missing
-                        } else {
-                            LoadFailure::Unreadable
-                        }),
+                        Err(error) => (
+                            Err(if error.kind() == io::ErrorKind::NotFound {
+                                LoadFailure::Missing
+                            } else {
+                                LoadFailure::Unreadable
+                            }),
+                            Vec::new(),
+                            Vec::new(),
+                        ),
                     },
-                    LoadRequest::Sources(sources) => {
-                        match crate::sources::load_merged(
+                    LoadRequest::Sources {
+                        sources,
+                        cache_dir,
+                        previous,
+                        force_refresh,
+                    } => {
+                        let options = crate::sources::MergeOptions {
+                            cache_dir: cache_dir.as_deref(),
+                            previous: previous.channels(),
+                            force_refresh: *force_refresh,
+                        };
+                        match crate::sources::load_merged_with(
                             sources,
                             &crate::sources::DefaultFetcher,
+                            options,
                             current,
                         ) {
-                            Ok(Some(merged)) => Ok(Arc::new(merged.model)),
+                            Ok(Some(merged)) => (
+                                Ok(Arc::new(merged.model)),
+                                merged.stale_sources,
+                                merged.guide_urls,
+                            ),
                             Ok(None) => continue,
-                            Err(failure) => Err(failure),
+                            Err(failure) => (Err(failure), Vec::new(), Vec::new()),
                         }
                     }
                 };
@@ -140,6 +211,9 @@ impl Default for LoadWorker {
                         .send(LoadResult {
                             generation: request.0,
                             outcome,
+                            intermediate: false,
+                            stale_sources,
+                            guide_urls,
                         })
                         .is_err()
                 {
@@ -162,10 +236,28 @@ impl LoadWorker {
     }
 
     pub fn submit_sources(&self, sources: Vec<crate::sources::PlaylistSource>) {
+        self.submit_sources_full(sources, None, Arc::new(BrowseModel::empty()), false);
+    }
+
+    /// Sources load with the plain-source caches, the previous
+    /// catalogue for retention, and optional cache bypass.
+    pub fn submit_sources_full(
+        &self,
+        sources: Vec<crate::sources::PlaylistSource>,
+        cache_dir: Option<PathBuf>,
+        previous: Arc<BrowseModel>,
+        force_refresh: bool,
+    ) {
         let generation = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
-        let _ = self
-            .requests
-            .send((generation, LoadRequest::Sources(sources)));
+        let _ = self.requests.send((
+            generation,
+            LoadRequest::Sources {
+                sources,
+                cache_dir,
+                previous,
+                force_refresh,
+            },
+        ));
     }
 
     pub fn cancel(&self) {
@@ -236,6 +328,67 @@ mod tests {
     }
 
     #[test]
+    fn sources_load_prefills_from_parsed_cache_then_publishes_final() {
+        // B11/B12 worker plumbing: the second load of an unchanged
+        // file source emits the parsed-cache prefill first and the
+        // final result after; a vanished source retains its channels.
+        let dir = std::env::temp_dir().join(format!("iptv-load-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("list.m3u");
+        std::fs::write(
+            &file,
+            "#EXTM3U x-tvg-url=\"https://g.example/a.xml\"\n#EXTINF:-1,Alpha\nhttp://a/1\n",
+        )
+        .unwrap();
+        let cache_dir = dir.join("cache");
+        let source = crate::sources::PlaylistSource::new(file.to_string_lossy().into_owned());
+        let worker = LoadWorker::default();
+        worker.submit_sources_full(
+            vec![source.clone()],
+            Some(cache_dir.clone()),
+            Arc::new(BrowseModel::empty()),
+            false,
+        );
+        let first = wait(&worker);
+        assert!(!first.intermediate);
+        assert_eq!(first.outcome.as_ref().unwrap().channels().len(), 1);
+        assert_eq!(
+            first.guide_urls,
+            [(
+                file.to_string_lossy().into_owned(),
+                vec!["https://g.example/a.xml".to_string()]
+            )]
+        );
+        let previous = first.outcome.unwrap();
+        worker.submit_sources_full(
+            vec![source.clone()],
+            Some(cache_dir.clone()),
+            Arc::clone(&previous),
+            false,
+        );
+        let prefill = wait(&worker);
+        assert!(prefill.intermediate, "parsed-cache prefill comes first");
+        assert_eq!(prefill.outcome.as_ref().unwrap().channels().len(), 1);
+        let final_result = wait(&worker);
+        assert!(!final_result.intermediate);
+        // Remove the file: the load now retains the previous channels
+        // and reports the source stale instead of failing.
+        std::fs::remove_file(&file).unwrap();
+        worker.submit_sources_full(vec![source], Some(cache_dir), Arc::clone(&previous), false);
+        let retained = wait(&worker);
+        if retained.intermediate {
+            let retained = wait(&worker);
+            assert_eq!(retained.stale_sources.len(), 1);
+            assert_eq!(retained.outcome.unwrap().channels().len(), 1);
+        } else {
+            assert_eq!(retained.stale_sources.len(), 1);
+            assert_eq!(retained.outcome.unwrap().channels().len(), 1);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn queued_success_and_failure_cannot_survive_cancel_or_replacement() {
         let (completed, results) = mpsc::channel();
         let (requests, _pending) = mpsc::channel();
@@ -245,18 +398,12 @@ mod tests {
             results,
         };
         completed
-            .send(LoadResult {
-                generation: 0,
-                outcome: Ok(Arc::new(BrowseModel::empty())),
-            })
+            .send(LoadResult::plain(0, Ok(Arc::new(BrowseModel::empty()))))
             .unwrap();
         worker.cancel();
         assert!(worker.try_latest().is_none());
         completed
-            .send(LoadResult {
-                generation: 1,
-                outcome: Err(LoadFailure::Missing),
-            })
+            .send(LoadResult::plain(1, Err(LoadFailure::Missing)))
             .unwrap();
         worker.submit(PathBuf::new());
         assert!(worker.try_latest().is_none());
