@@ -1727,17 +1727,26 @@ fn run_dvr_tick(wiring: &Wiring, status: Status, now: f64) {
             (key, used)
         })
         .collect();
+    // Starts granted earlier in this same tick count against
+    // later jobs: the in-use snapshot cannot see them yet, and
+    // two waiting jobs must never both take one freed slot
+    // (issue #135).
+    let mut started_this_tick: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
     let mut gate = |job: &iptv_core::dvr::DvrJob| -> Option<String> {
-        if wiring.conflict_override.borrow().contains(&job.id) {
-            return None;
-        }
         let (key, _) = job_account(job, &accounts)?;
         if job_shares_buffer(wiring, job) {
             return None;
         }
+        if wiring.conflict_override.borrow().contains(&job.id) {
+            *started_this_tick.entry(key).or_insert(0) += 1;
+            return None;
+        }
         let limit = wiring.account_limits.borrow().get(&key).copied()??;
-        let used = used_by_account.get(&key).copied().unwrap_or(0);
+        let used = used_by_account.get(&key).copied().unwrap_or(0)
+            + started_this_tick.get(&key).copied().unwrap_or(0);
         if used < usize::try_from(limit).unwrap_or(0) {
+            *started_this_tick.entry(key).or_insert(0) += 1;
             return None;
         }
         Some(match &playing {

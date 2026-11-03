@@ -510,6 +510,19 @@ impl DvrSchedule {
     /// gate is only consulted for jobs that are due. A waiting job
     /// whose window closes is missed with its conflict reason; a
     /// waiting job the gate later clears starts (late, per #130).
+    /// Job ids in fair processing order (issue #135):
+    /// earliest scheduled start first, ties by saved order.
+    fn fair_order_ids(&self) -> Vec<String> {
+        let mut keyed: Vec<(f64, usize, String)> = self
+            .jobs
+            .iter()
+            .enumerate()
+            .map(|(i, j)| (j.start_ts, i, j.id.clone()))
+            .collect();
+        keyed.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+        keyed.into_iter().map(|k| k.2).collect()
+    }
+
     pub fn tick_gated(
         &mut self,
         now: f64,
@@ -517,7 +530,7 @@ impl DvrSchedule {
     ) -> Vec<DvrAction> {
         let mut actions = Vec::new();
         let mut changed = false;
-        let ids: Vec<String> = self.jobs.iter().map(|j| j.id.clone()).collect();
+        let ids = self.fair_order_ids();
         for id in ids {
             let Some(job) = self.jobs.iter().find(|j| j.id == id).cloned() else {
                 continue;
@@ -1076,6 +1089,134 @@ mod tests {
         // wait is reassessed, never replayed.
         let reloaded = DvrSchedule::load(path, 0.0);
         assert_eq!(reloaded.get(&id).expect("job").status, STATUS_SCHEDULED);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn gated_tick_grants_a_freed_slot_to_the_earliest_start() {
+        let dir = std::env::temp_dir().join(format!("iptv-dvr-fair-{}", std::process::id()));
+        let path = dir.join("scheduled_recordings.json");
+        let mut schedule = DvrSchedule::load(path, 0.0);
+        let chan = channel();
+        // Saved second, due first.
+        let later = build_job(&spec(&chan, "Later", 300, 900, 0, 0), 0.0).expect("j");
+        let earlier = build_job(&spec(&chan, "Earlier", 100, 900, 0, 0), 0.0).expect("j");
+        let (later_id, earlier_id) = (later.id.clone(), earlier.id.clone());
+        schedule.add_job(later);
+        schedule.add_job(earlier);
+        // One slot only: the gate frees exactly its first caller.
+        let mut calls = 0;
+        let mut one_slot = |_: &DvrJob| {
+            calls += 1;
+            if calls == 1 {
+                None
+            } else {
+                Some("busy".to_string())
+            }
+        };
+        let actions = schedule.tick_gated(400.0, &mut one_slot);
+        assert!(actions.contains(&DvrAction::Start(earlier_id.clone())));
+        assert!(actions.contains(&DvrAction::Conflict(later_id.clone())));
+        assert_eq!(
+            schedule.get(&earlier_id).expect("j").status,
+            STATUS_RECORDING
+        );
+        assert_eq!(schedule.get(&later_id).expect("j").status, STATUS_WAITING);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn gated_tick_breaks_equal_starts_by_saved_order() {
+        let dir = std::env::temp_dir().join(format!("iptv-dvr-tie-{}", std::process::id()));
+        let path = dir.join("scheduled_recordings.json");
+        let mut schedule = DvrSchedule::load(path, 0.0);
+        let chan = channel();
+        let first = build_job(&spec(&chan, "First", 100, 900, 0, 0), 0.0).expect("j");
+        let second = build_job(&spec(&chan, "Second", 100, 900, 0, 0), 1.0).expect("j");
+        let (first_id, second_id) = (first.id.clone(), second.id.clone());
+        schedule.add_job(first);
+        schedule.add_job(second);
+        let mut calls = 0;
+        let mut one_slot = |_: &DvrJob| {
+            calls += 1;
+            if calls == 1 {
+                None
+            } else {
+                Some("busy".to_string())
+            }
+        };
+        let actions = schedule.tick_gated(400.0, &mut one_slot);
+        assert!(actions.contains(&DvrAction::Start(first_id.clone())));
+        assert_eq!(schedule.get(&first_id).expect("j").status, STATUS_RECORDING);
+        assert_eq!(schedule.get(&second_id).expect("j").status, STATUS_WAITING);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn gated_tick_leaves_other_accounts_independent() {
+        let dir = std::env::temp_dir().join(format!("iptv-dvr-ind-{}", std::process::id()));
+        let path = dir.join("scheduled_recordings.json");
+        let mut schedule = DvrSchedule::load(path, 0.0);
+        let chan = channel();
+        let blocked = build_job(&spec(&chan, "Blocked", 100, 900, 0, 0), 0.0).expect("j");
+        let free = build_job(&spec(&chan, "Free", 100, 900, 0, 0), 1.0).expect("j");
+        let (blocked_id, free_id) = (blocked.id.clone(), free.id.clone());
+        schedule.add_job(blocked);
+        schedule.add_job(free);
+        let mut gate = |job: &DvrJob| {
+            if job.title == "Blocked" {
+                Some("busy".to_string())
+            } else {
+                None
+            }
+        };
+        let actions = schedule.tick_gated(400.0, &mut gate);
+        assert!(actions.contains(&DvrAction::Start(free_id.clone())));
+        assert_eq!(schedule.get(&blocked_id).expect("j").status, STATUS_WAITING);
+        assert_eq!(schedule.get(&free_id).expect("j").status, STATUS_RECORDING);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn waiting_job_at_its_stop_boundary_is_missed_not_started() {
+        let dir = std::env::temp_dir().join(format!("iptv-dvr-race-{}", std::process::id()));
+        let path = dir.join("scheduled_recordings.json");
+        let mut schedule = DvrSchedule::load(path, 0.0);
+        let chan = channel();
+        let job = build_job(&spec(&chan, "Show", 100, 200, 0, 0), 0.0).expect("j");
+        let id = job.id.clone();
+        schedule.add_job(job);
+        let _ = schedule.tick_gated(150.0, &mut |_| Some("busy".to_string()));
+        // Capacity frees exactly as the window closes: expiry
+        // wins the race, the job is missed with its reason.
+        let actions = schedule.tick_gated(200.0, &mut |_| None);
+        assert!(actions.is_empty());
+        let job = schedule.get(&id).expect("job");
+        assert_eq!(job.status, STATUS_MISSED);
+        assert_eq!(job.message, "Missed while waiting for a connection: busy");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn waiting_job_expired_during_downtime_is_missed_after_restart() {
+        let dir = std::env::temp_dir().join(format!("iptv-dvr-wdown-{}", std::process::id()));
+        let path = dir.join("scheduled_recordings.json");
+        let mut schedule = DvrSchedule::load(path.clone(), 0.0);
+        let chan = channel();
+        let job = build_job(&spec(&chan, "Show", 100, 200, 0, 0), 0.0).expect("j");
+        let id = job.id.clone();
+        schedule.add_job(job);
+        let _ = schedule.tick_gated(150.0, &mut |_| Some("busy".to_string()));
+        assert_eq!(schedule.get(&id).expect("job").status, STATUS_WAITING);
+        drop(schedule);
+        // The app restarts after the window closed: the job is
+        // reassessed, not replayed — plain missed, reason kept.
+        let mut reloaded = DvrSchedule::load(path, 300.0);
+        assert_eq!(reloaded.get(&id).expect("job").status, STATUS_SCHEDULED);
+        let _ = reloaded.tick(300.0);
+        let job = reloaded.get(&id).expect("job");
+        assert_eq!(job.status, STATUS_MISSED);
+        assert_eq!(job.wait_reason, "busy");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
