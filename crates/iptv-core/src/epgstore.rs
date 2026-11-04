@@ -36,7 +36,25 @@ impl EpgStore {
     /// opened or the schema cannot be created.
     pub fn open(path: &Path) -> Result<Self, String> {
         let conn = Connection::open(path).map_err(|e| e.to_string())?;
-        let _ = conn.busy_timeout(Duration::from_secs(2));
+        let _ = conn.busy_timeout(Duration::from_secs(20));
+        // Python's PRAGMA_IMPORT set, applied before the schema so
+        // auto_vacuum can take effect on a fresh database. The big
+        // page cache, mmap and NORMAL synchronous are what make a
+        // several-hundred-thousand-programme import survivable;
+        // with SQLite defaults the same import took 773 s where
+        // Python's whole parse+import took 290 s (audit 0067).
+        // Failures are ignored per statement, as Python does.
+        for pragma in [
+            "PRAGMA auto_vacuum=INCREMENTAL;",
+            "PRAGMA journal_mode=WAL;",
+            "PRAGMA synchronous=NORMAL;",
+            "PRAGMA temp_store=MEMORY;",
+            "PRAGMA mmap_size=268435456;",
+            "PRAGMA cache_size=-131072;",
+            "PRAGMA wal_autocheckpoint=0;",
+        ] {
+            let _ = conn.execute_batch(pragma);
+        }
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS channels (
                  id TEXT PRIMARY KEY,
@@ -60,7 +78,6 @@ impl EpgStore {
              );",
         )
         .map_err(|e| e.to_string())?;
-        let _ = conn.execute_batch("PRAGMA journal_mode=WAL;");
         let mut store = Self { conn };
         store.migrate()?;
         Ok(store)
@@ -131,15 +148,31 @@ impl EpgStore {
         }
         // Python's upsert keys programmes by (channel, start, stop);
         // older databases can hold duplicate slots, so keep the
-        // newest row per slot before enforcing uniqueness.
-        self.conn
-            .execute(
-                "DELETE FROM programmes WHERE rowid NOT IN (
-                     SELECT MAX(rowid) FROM programmes GROUP BY channel, start, stop
-                 )",
+        // newest row per slot before enforcing uniqueness. Only a
+        // legacy database without the slot index pays for the scan:
+        // running it on every open cost 46.8 s on a 672k-programme
+        // database where Python opens in 0.08 s (audit 0067) — the
+        // same every-open-repair trap Python gates behind version
+        // stamps in its own store.
+        let slot_index_exists = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'index' AND name = 'idx_programmes_slot'",
                 [],
+                |row| row.get::<_, i64>(0),
             )
-            .map_err(|e| e.to_string())?;
+            .is_ok_and(|n| n > 0);
+        if !slot_index_exists {
+            self.conn
+                .execute(
+                    "DELETE FROM programmes WHERE rowid NOT IN (
+                         SELECT MAX(rowid) FROM programmes GROUP BY channel, start, stop
+                     )",
+                    [],
+                )
+                .map_err(|e| e.to_string())?;
+        }
         self.conn
             .execute_batch(
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_programmes_slot
@@ -147,6 +180,16 @@ impl EpgStore {
             )
             .map_err(|e| e.to_string())?;
         Ok(())
+    }
+
+    /// Commit one batch of programmes and PASSIVE-checkpoint the
+    /// WAL (Python's per-batch cadence during import).
+    fn flush_programme_batch(&mut self, batch: &[&Programme]) -> Result<usize, String> {
+        let tx = self.conn.transaction().map_err(|e| e.to_string())?;
+        let count = insert_programmes(&tx, batch)?;
+        tx.commit().map_err(|e| e.to_string())?;
+        let _ = self.conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);");
+        Ok(count)
     }
 
     /// Replace the stored guide with the given one, in a single
@@ -177,15 +220,17 @@ impl EpgStore {
     /// never touched. Returns the imported programme count.
     ///
     /// # Errors
-    /// Returns the `SQLite` error text on any failed write (the
-    /// transaction rolls back, keeping the previous guide).
+    /// Returns the `SQLite` error text on any failed write. Like
+    /// Python's importer, batches commit as they complete, so a
+    /// failure leaves the batches written so far in place.
     pub fn import_source(
         &mut self,
         source_key: &str,
         guide: &EpgGuide,
         now: i64,
     ) -> Result<usize, String> {
-        let keep: Vec<String> = guide.channels.iter().map(|c| c.id.clone()).collect();
+        let keep: std::collections::HashSet<&str> =
+            guide.channels.iter().map(|c| c.id.as_str()).collect();
         let listed: Vec<String> = {
             let mut statement = self
                 .conn
@@ -200,12 +245,36 @@ impl EpgStore {
             }
             out
         };
+        // Channels first, in their own transaction; programmes
+        // follow in Python's batch size (EPG_IMPORT_BATCH), each
+        // batch committing and PASSIVE-checkpointing the WAL. One
+        // giant transaction over a whole guide is what made a
+        // fresh import take 773 s against Python's 290 s combined
+        // parse+import (audit 0067).
+        {
+            let tx = self.conn.transaction().map_err(|e| e.to_string())?;
+            insert_channels(&tx, guide, Some(source_key), now)?;
+            tx.commit().map_err(|e| e.to_string())?;
+        }
+        let mut count = 0_usize;
+        let mut batch: Vec<&Programme> = Vec::with_capacity(IMPORT_BATCH);
+        for programmes in guide.programmes.values() {
+            for programme in programmes {
+                batch.push(programme);
+                if batch.len() == IMPORT_BATCH {
+                    count += self.flush_programme_batch(&batch)?;
+                    batch.clear();
+                }
+            }
+        }
+        if !batch.is_empty() {
+            count += self.flush_programme_batch(&batch)?;
+        }
         let tx = self.conn.transaction().map_err(|e| e.to_string())?;
-        let count = insert_guide_rows(&tx, guide, Some(source_key), now)?;
         // Forget this source's listing of channels it no longer
         // defines; delete a channel only when no source lists it
         // any more (Python's `_drop_channels_missing_from`).
-        for id in listed.iter().filter(|id| !keep.contains(id)) {
+        for id in listed.iter().filter(|id| !keep.contains(id.as_str())) {
             tx.execute(
                 "DELETE FROM channel_sources WHERE channel_id = ?1 AND source_key = ?2",
                 [id, source_key],
@@ -602,6 +671,10 @@ impl EpgStore {
 }
 
 /// Insert one guide's channels and programmes inside `tx`, with
+/// Programmes per import transaction (Python's `EPG_IMPORT_BATCH`):
+/// each batch commits and runs a PASSIVE WAL checkpoint.
+const IMPORT_BATCH: usize = 15_000;
+
 /// Python's upserts: a channel whose normalized name changed was
 /// renumbered (its stored programmes go), programmes delete the
 /// stored rows they overlap, and an exact slot keeps the newer
@@ -613,6 +686,21 @@ fn insert_guide_rows(
     source_key: Option<&str>,
     now: i64,
 ) -> Result<usize, String> {
+    insert_channels(tx, guide, source_key, now)?;
+    let mut count = 0_usize;
+    for programmes in guide.programmes.values() {
+        let refs: Vec<&Programme> = programmes.iter().collect();
+        count += insert_programmes(tx, &refs)?;
+    }
+    Ok(count)
+}
+
+fn insert_channels(
+    tx: &rusqlite::Transaction<'_>,
+    guide: &EpgGuide,
+    source_key: Option<&str>,
+    now: i64,
+) -> Result<(), String> {
     {
         let mut read_norm = tx
             .prepare("SELECT norm_name FROM channels WHERE id = ?1")
@@ -657,6 +745,13 @@ fn insert_guide_rows(
             }
         }
     }
+    Ok(())
+}
+
+fn insert_programmes(
+    tx: &rusqlite::Transaction<'_>,
+    programmes: &[&Programme],
+) -> Result<usize, String> {
     let mut count = 0_usize;
     {
         let mut delete_overlap = tx
@@ -681,26 +776,24 @@ fn insert_guide_rows(
                     OR length(excluded.description) > length(coalesce(programmes.description, ''))",
             )
             .map_err(|e| e.to_string())?;
-        for programmes in guide.programmes.values() {
-            for programme in programmes {
-                delete_overlap
-                    .execute(rusqlite::params![
-                        programme.channel_id,
-                        programme.start,
-                        programme.stop
-                    ])
-                    .map_err(|e| e.to_string())?;
-                upsert
-                    .execute(rusqlite::params![
-                        programme.channel_id,
-                        programme.start,
-                        programme.stop,
-                        programme.title,
-                        programme.description
-                    ])
-                    .map_err(|e| e.to_string())?;
-                count += 1;
-            }
+        for programme in programmes {
+            delete_overlap
+                .execute(rusqlite::params![
+                    programme.channel_id,
+                    programme.start,
+                    programme.stop
+                ])
+                .map_err(|e| e.to_string())?;
+            upsert
+                .execute(rusqlite::params![
+                    programme.channel_id,
+                    programme.start,
+                    programme.stop,
+                    programme.title,
+                    programme.description
+                ])
+                .map_err(|e| e.to_string())?;
+            count += 1;
         }
     }
     Ok(count)
