@@ -13,7 +13,7 @@ use iptv_core::{
         airing_index, epg_info_message, epg_row_label, epg_time_range, hash_epg_sources,
         local_datetime, local_hhmm, match_guide_channel, merged_epg_sources,
         should_auto_import_epg, should_run_epg_search, EpgGuide, EpgWorker, GuideIndexes, NowNext,
-        Programme, SEARCH_EPG_RESULT_LIMIT,
+        Programme, SuffixJob, SuffixWorker, SEARCH_EPG_RESULT_LIMIT,
     },
     favorites::{channel_key, remember_recent, FavoriteSet, Toggle},
     playback::{
@@ -453,11 +453,15 @@ struct Wiring {
     player: Rc<RefCell<PlayerState>>,
     epg: Rc<RefCell<Option<(EpgGuide, GuideIndexes)>>>,
     epg_suffixes: Rc<EpgSuffixes>,
-    /// Guide matches for the current playlist (audit E12 match
-    /// cache): keyed by the model's playlist pointer, cleared
-    /// whenever a guide load lands, so the per-minute suffix
-    /// refresh never re-matches the catalogue.
-    epg_match_cache: Rc<RefCell<Option<(usize, iptv_core::epg::GuideMatchCache)>>>,
+    /// The row-suffix rebuild pipeline (validation 0070): the
+    /// worker owns the guide indexes and the playlist match
+    /// cache; the UI only dispatches jobs and applies results.
+    /// `guide_generation` bumps whenever a guide load lands, so
+    /// the worker rebuilds its caches for the new guide.
+    suffix_worker: Rc<SuffixWorker>,
+    suffix_pending: Rc<std::cell::Cell<bool>>,
+    suffix_generation: Rc<std::cell::Cell<u64>>,
+    guide_generation: Rc<std::cell::Cell<u64>>,
     epg_store: Rc<RefCell<Option<iptv_core::epgstore::EpgStore>>>,
     epg_worker: Rc<EpgWorker>,
     epg_pending: Rc<std::cell::Cell<bool>>,
@@ -931,7 +935,10 @@ fn bind_browser(
         player: Rc::new(RefCell::new(PlayerState::default())),
         epg: Rc::new(RefCell::new(None)),
         epg_suffixes: suffixes,
-        epg_match_cache: Rc::new(RefCell::new(None)),
+        suffix_worker: Rc::new(SuffixWorker::new()),
+        suffix_pending: Rc::new(std::cell::Cell::new(false)),
+        suffix_generation: Rc::new(std::cell::Cell::new(0)),
+        guide_generation: Rc::new(std::cell::Cell::new(0)),
         // The saved guide database is reopened for reading at
         // startup (audit E02): schedules, What's on Now and the
         // information panel answer from it before — and without —
@@ -1128,11 +1135,11 @@ fn bind_epg_timer(frame: Frame, wiring: &Wiring, controls: Controls) {
         if !tick.persist.config.borrow().bool_or("epg_enabled", true) {
             return;
         }
-        refresh_epg_suffixes(&tick);
-        let total = tick.model.borrow().len() + tick.epg_rows.borrow().len();
-        if total > 0 {
-            list.refresh_items(0, i64::try_from(total).unwrap_or(i64::MAX) - 1);
-        }
+        // The rebuild itself runs on the suffix worker
+        // (validation 0070); the tick only applies a finished
+        // result and queues the next refresh.
+        drain_suffix_results(&tick, list);
+        request_suffix_refresh(&tick);
     });
     let _ = wiring.epg_timer.start(60_000, false);
 }
@@ -1203,6 +1210,7 @@ fn bind_completion(wiring: &Wiring, controls: Controls) {
             reload_epg(&completed);
         }
         poll_epg(&completed, status);
+        drain_suffix_results(&completed, list);
         {
             let stale = {
                 let slot = completed.epg_suffixes.borrow();
@@ -1210,11 +1218,7 @@ fn bind_completion(wiring: &Wiring, controls: Controls) {
                     || (completed.epg.borrow().is_some() && now_epoch() - slot.0 > 300)
             };
             if stale {
-                refresh_epg_suffixes(&completed);
-                let count = list.get_item_count();
-                if count > 0 {
-                    list.refresh_items(0, i64::from(count) - 1);
-                }
+                request_suffix_refresh(&completed);
             }
         }
         poll_providers(&completed, controls);
@@ -1224,6 +1228,7 @@ fn bind_completion(wiring: &Wiring, controls: Controls) {
         poll_downloads(&completed, status);
         if !completed.browser.borrow().is_busy()
             && !completed.epg_pending.get()
+            && !completed.suffix_pending.get()
             && !completed.provider_pending.get()
             && !completed
                 .reminders
@@ -1815,8 +1820,12 @@ fn poll_epg(wiring: &Wiring, status: Status) {
                 };
                 // The store changed under the cached indexes.
                 *wiring.epg_store_indexes.borrow_mut() = None;
-                // The guide changed under the match cache (E12).
-                *wiring.epg_match_cache.borrow_mut() = None;
+                // The guide changed under the suffix worker's
+                // caches (validation 0070): bump its generation
+                // and mark the on-screen suffixes stale.
+                wiring
+                    .guide_generation
+                    .set(wiring.guide_generation.get() + 1);
                 wiring.epg_suffixes.borrow_mut().0 = 0;
                 // Python records the import stamp and the hash of
                 // the sources actually imported, so the next
@@ -3860,7 +3869,10 @@ fn clone_wiring(wiring: &Wiring) -> Wiring {
         player: Rc::clone(&wiring.player),
         epg: Rc::clone(&wiring.epg),
         epg_suffixes: Rc::clone(&wiring.epg_suffixes),
-        epg_match_cache: Rc::clone(&wiring.epg_match_cache),
+        suffix_worker: Rc::clone(&wiring.suffix_worker),
+        suffix_pending: Rc::clone(&wiring.suffix_pending),
+        suffix_generation: Rc::clone(&wiring.suffix_generation),
+        guide_generation: Rc::clone(&wiring.guide_generation),
         epg_store: Rc::clone(&wiring.epg_store),
         epg_worker: Rc::clone(&wiring.epg_worker),
         epg_pending: Rc::clone(&wiring.epg_pending),
@@ -14085,67 +14097,80 @@ fn channel_text(
     }
 }
 
-/// Rebuild the row suffixes and on-air descriptions for the
-/// current playlist + guide from ONE bulk now/next snapshot
-/// (audit E12): the snapshot walks every guide channel once,
-/// the catalogue is borrowed rather than cloned, and the guide
-/// indexes are the ones built with the guide — nothing is
-/// rebuilt per channel. The store alone can drive the rebuild
-/// after a restart (audit E02).
-/// The row guide for the current playlist+guide, through the
-/// match cache (audit E12): the first build for a playlist
-/// matches every channel once; later refreshes only assemble
-/// suffixes from the fresh bulk snapshot.
-fn cached_row_guide(
-    wiring: &Wiring,
-    channels: &[Channel],
-    indexes: &GuideIndexes,
-    bulk: &std::collections::HashMap<String, NowNext>,
-) -> (
-    std::collections::HashMap<usize, String>,
-    std::collections::HashMap<usize, String>,
-) {
-    let ptr = wiring.model.borrow().playlist_ptr();
-    let mut slot = wiring.epg_match_cache.borrow_mut();
-    if !matches!(slot.as_ref(), Some((key, _)) if *key == ptr) {
-        *slot = Some((
-            ptr,
-            iptv_core::epg::GuideMatchCache::build(channels, indexes),
-        ));
+/// Queue a row-suffix rebuild on the suffix worker
+/// (validation 0070). The pipeline that used to run here on the
+/// UI tick — store snapshot, guide indexes, the playlist-wide
+/// fuzzy match, the row build — measured up to 25 s at
+/// real-world scale and froze the window on every refresh;
+/// Python runs the same refresh on a background thread and so
+/// does this port now. Dispatch only: one job in flight at a
+/// time, and none while the browser is busy (Python's gate
+/// defers while the user is interacting; the timers retry).
+fn request_suffix_refresh(wiring: &Wiring) {
+    if !wiring.persist.config.borrow().bool_or("epg_enabled", true) {
+        // EPG off clears the suffixes, as the old synchronous
+        // refresh did.
+        let ptr = wiring.model.borrow().playlist_ptr();
+        let mut slot = wiring.epg_suffixes.borrow_mut();
+        if slot.1 != ptr || !slot.2.is_empty() {
+            *slot = (now_epoch(), ptr, std::collections::HashMap::new());
+        }
+        return;
     }
-    let cache = &slot.as_ref().expect("match cache just set").1;
-    iptv_core::epg::row_guide_from_matches(cache.matches(), bulk)
+    if wiring.suffix_pending.get() || wiring.browser.borrow().is_busy() {
+        return;
+    }
+    let (model, _extras) = wiring.browser.borrow().catalogue_parts();
+    if model.channels().is_empty() {
+        return;
+    }
+    let generation = wiring.suffix_generation.get() + 1;
+    wiring.suffix_generation.set(generation);
+    wiring.suffix_pending.set(true);
+    wiring.suffix_worker.build(SuffixJob {
+        generation,
+        guide_generation: wiring.guide_generation.get(),
+        model,
+        store_path: epg_store_path(),
+        at: now_epoch(),
+    });
+    ensure_polling(wiring);
 }
 
-fn refresh_epg_suffixes(wiring: &Wiring) {
-    let now = now_epoch();
-    let playlist_ptr = wiring.model.borrow().playlist_ptr();
-    let mut suffixes = std::collections::HashMap::new();
-    if wiring.persist.config.borrow().bool_or("epg_enabled", true) {
-        let browser = wiring.browser.borrow();
-        if let Some((guide, indexes)) = wiring.epg.borrow().as_ref() {
-            let bulk = guide.bulk_now_next(now);
-            browser.with_all_channels(|channels| {
-                suffixes = cached_row_guide(wiring, channels, indexes, &bulk).0;
-            });
-        } else if let Some(indexes) = store_indexes(wiring) {
-            if let Some(bulk) = wiring
-                .epg_store
-                .borrow()
-                .as_ref()
-                .and_then(|store| store.all_now_next(now).ok())
-            {
-                let bulk: std::collections::HashMap<String, NowNext> = bulk
-                    .into_iter()
-                    .map(|(channel, entry)| (channel.id, entry))
-                    .collect();
-                browser.with_all_channels(|channels| {
-                    suffixes = cached_row_guide(wiring, channels, &indexes, &bulk).0;
-                });
+/// Apply finished suffix rebuilds (validation 0070): a result
+/// lands only while its generation is the newest dispatched
+/// AND the playlist it was built from is still the model's —
+/// a republish since dispatch makes it stale and it drops.
+/// The list repaints only when the map actually changed
+/// (Python publishes on change only).
+fn drain_suffix_results(wiring: &Wiring, list: ListCtrl) {
+    while let Some(result) = wiring.suffix_worker.try_recv() {
+        wiring.suffix_pending.set(false);
+        if result.generation != wiring.suffix_generation.get() {
+            continue;
+        }
+        let Some(suffixes) = result.suffixes else {
+            // The store could not be read: keep the on-screen
+            // suffixes and let the next cycle retry.
+            wiring.epg_suffixes.borrow_mut().0 = now_epoch();
+            continue;
+        };
+        if result.playlist_ptr != wiring.model.borrow().playlist_ptr() {
+            continue;
+        }
+        let changed = {
+            let mut slot = wiring.epg_suffixes.borrow_mut();
+            let changed = slot.2 != suffixes;
+            *slot = (now_epoch(), result.playlist_ptr, suffixes);
+            changed
+        };
+        if changed {
+            let count = list.get_item_count();
+            if count > 0 {
+                list.refresh_items(0, i64::from(count) - 1);
             }
         }
     }
-    *wiring.epg_suffixes.borrow_mut() = (now, playlist_ptr, suffixes);
 }
 
 #[cfg(test)]
