@@ -33,8 +33,9 @@ locale-independent. Rust now does the same through `fs4`.
 
 ## Evidence
 
-- Tests: `free_space_bytes_reads_a_real_destination`, plus the
-  existing `check_destination_*` tests.
+- Tests: `free_space_bytes_reads_a_real_destination`,
+  `free_space_bytes_reports_query_failure`, plus the existing
+  `check_destination_*` tests.
 - `cargo test -p iptv-core` passed on Windows: 268 unit tests and
   all integration tests passed. CI is Ubuntu-only
   (`.github/workflows/pull-request.yml`), so CI does not exercise

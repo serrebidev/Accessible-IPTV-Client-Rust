@@ -848,6 +848,16 @@ mod tests {
     }
 
     #[test]
+    fn free_space_bytes_reports_query_failure() {
+        let err =
+            free_space_bytes(Path::new("")).expect_err("empty path must fail the free-space query");
+        assert!(
+            err.starts_with("Free space could not be determined:"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn check_destination_succeeds_with_zero_reserve() {
         let dir = std::env::temp_dir().join(format!(
             "iptv-storage-ok-{}-{}",

@@ -106,7 +106,8 @@ for any item here; all UI changes keep accessible names only.
 - Tests: `check_destination_succeeds_with_zero_reserve`,
   `check_destination_fails_when_reserve_exceeds_free_space`,
   `check_destination_fails_for_unwritable_path`,
-  `free_space_bytes_reads_a_real_destination`.
+  `free_space_bytes_reads_a_real_destination`,
+  `free_space_bytes_reports_query_failure`.
 
 ## R09 — completion requires produced media
 
