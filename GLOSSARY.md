@@ -49,3 +49,13 @@ _Avoid_: folder, filter
 **Favorite**:
 A channel the user marked for the Favorites category, identified by a stable key built from provider identity fields or the display name — never from a stream URL.
 _Avoid_: bookmark, starred item
+
+## Video on demand
+
+**VOD catalogue**:
+A browsable collection of movies and series available to play; a series contains its episodes.
+_Avoid_: VOD playlist
+
+**VOD group**:
+A named set of VOD items presented together in the catalogue.
+_Avoid_: VOD category

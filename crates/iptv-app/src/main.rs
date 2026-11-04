@@ -27,10 +27,10 @@ use iptv_core::{
     recording::{self, RecordingEngine},
     reminders::{normalize_reminders, Reminder, ReminderStatus},
     search::SearchResults,
-    sources::PlaylistSource,
+    sources::{source_display_label, PlaylistSource},
     speech::{CueRoute, CueSpeech, DevicePolicy, SpeechBackend},
     subtitles::{active as active_cue, load_cues, started as started_cue, Cue, ReviewCursor},
-    vod::{VodCatalog, VodEvent, VodItem, VodKind, VodWorker},
+    vod::{item_details, VodCatalog, VodEvent, VodItem, VodKind, VodSearchHit, VodWorker},
     Channel,
 };
 use std::{cell::RefCell, collections::BTreeMap, path::PathBuf, process::Command, rc::Rc};
@@ -3080,8 +3080,10 @@ fn run_series_scan(wiring: &Wiring) {
 #[derive(Clone)]
 struct VodUi {
     frame: Frame,
+    search: TextCtrl,
     groups: ListBox,
     items: ListBox,
+    details: TextCtrl,
     status: Status,
     view: Rc<RefCell<VodView>>,
 }
@@ -3091,7 +3093,15 @@ struct VodView {
     catalog: VodCatalog,
     accounts: Vec<ProviderAccount>,
     showing: Vec<VodItem>,
-    stack: Vec<Vec<VodItem>>,
+    /// Drill-in history: the previous list and the row that was
+    /// opened from it, so Back restores the same selection
+    /// (spec 0006).
+    stack: Vec<(Vec<VodItem>, usize)>,
+    /// The applied search query (spec 0006); empty = unfiltered.
+    query: String,
+    /// The group retained while a query is active; clearing the
+    /// query restores this group's unfiltered items.
+    group_label: Option<String>,
 }
 
 /// The provider accounts from the configured playlists (the accounts
@@ -3112,14 +3122,7 @@ fn vod_accounts(persist: &Persist) -> Vec<ProviderAccount> {
 /// Open (or raise) the VOD window and rebuild its catalogue
 /// (shared by the button and the View menu).
 fn open_vod_window(wiring: &Wiring, status: Status) {
-    let ui = ensure_vod_ui(
-        &wiring.vod_ui,
-        &wiring.player,
-        &wiring.persist,
-        &wiring.vod_worker,
-        &wiring.vod_pending,
-        &wiring.timer,
-    );
+    let ui = ensure_vod_ui(wiring);
     ui.frame.show(true);
     ui.frame.raise();
     let accounts = vod_accounts(&wiring.persist);
@@ -3129,25 +3132,69 @@ fn open_vod_window(wiring: &Wiring, status: Status) {
     // filtering/cloning on its own thread.
     let (model, extras) = wiring.browser.borrow().catalogue_parts();
     let scope = wiring.browser.borrow().scope().map(str::to_owned);
-    wiring.vod_worker.build(accounts, model, extras, scope);
+    // Spec 0006: the M3U source labels keyed by scope id, derived
+    // from the configured playlists and their friendly names.
+    let (sources, _) = configured_entries(wiring);
+    let names = playlist_names(wiring);
+    let source_labels: Vec<(String, String)> = sources
+        .iter()
+        .map(|source| {
+            (
+                source.scope_id(),
+                source_display_label(source.location(), &names),
+            )
+        })
+        .collect();
+    wiring
+        .vod_worker
+        .build(accounts, model, extras, scope, source_labels);
     wiring.vod_pending.set(true);
     assert!(wiring.timer.start(50, false));
     status.set_label("Loading video on demand catalogue...");
 }
 
-/// Build the VOD window's widgets: (frame, groups, items, play, back,
-/// status).
-fn build_vod_window() -> (Frame, ListBox, ListBox, Button, Button, Status) {
+/// Build the VOD window's widgets: (frame, search, groups, items,
+/// item details, play, back, status).
+#[allow(clippy::type_complexity)]
+fn build_vod_window() -> (
+    Frame,
+    TextCtrl,
+    ListBox,
+    ListBox,
+    TextCtrl,
+    Button,
+    Button,
+    Status,
+) {
     let frame = Frame::builder()
         .with_title("Video on Demand")
         .with_size(Size::new(720, 520))
         .build();
     frame.set_accessibility_label("Video on Demand");
     let panel = Panel::builder(&frame).build();
+    // Spec 0006: the search applies only on Enter; editing the
+    // field alone changes nothing.
+    let search_label = StaticText::builder(&panel).with_label("&Search").build();
+    let _ = search_label;
+    let search = TextCtrl::builder(&panel)
+        .with_style(TextCtrlStyle::ProcessEnter)
+        .build();
+    search.set_accessibility_label("Search VOD");
     let groups = ListBox::builder(&panel).build();
     groups.set_accessibility_label("VOD groups");
     let items = ListBox::builder(&panel).build();
     items.set_accessibility_label("VOD items");
+    // Spec 0006: the read-only item-details control; the stream
+    // URL appears here and nowhere else.
+    let details_label = StaticText::builder(&panel)
+        .with_label("Item details")
+        .build();
+    let _ = details_label;
+    let item_details_box = TextCtrl::builder(&panel)
+        .with_style(TextCtrlStyle::ReadOnly | TextCtrlStyle::MultiLine)
+        .with_value("No item selected.")
+        .build();
+    item_details_box.set_accessibility_label("Item details");
     let play = Button::builder(&panel).with_label("&Play / Open").build();
     play.set_accessibility_label("Play or open selected item");
     let back = Button::builder(&panel).with_label("&Back").build();
@@ -3163,36 +3210,51 @@ fn build_vod_window() -> (Frame, ListBox, ListBox, Button, Button, Status) {
         details,
         bar: None,
     };
-    (frame, groups, items, play, back, status)
+    (
+        frame,
+        search,
+        groups,
+        items,
+        item_details_box,
+        play,
+        back,
+        status,
+    )
 }
 
 /// Build the VOD window once and keep it (closing hides it).
-fn ensure_vod_ui(
-    slot: &Rc<RefCell<Option<VodUi>>>,
-    player: &Rc<RefCell<PlayerState>>,
-    persist: &Persist,
-    worker: &Rc<VodWorker>,
-    pending: &Rc<std::cell::Cell<bool>>,
-    timer: &Rc<Timer<Frame>>,
-) -> VodUi {
+#[allow(clippy::too_many_lines)]
+fn ensure_vod_ui(wiring: &Wiring) -> VodUi {
+    let slot = &wiring.vod_ui;
     if let Some(ui) = slot.borrow().as_ref() {
         return ui.clone();
     }
-    let (frame, groups, items, play, back, status) = build_vod_window();
+    let player = &wiring.player;
+    let persist = &wiring.persist;
+    let worker = &wiring.vod_worker;
+    let pending = &wiring.vod_pending;
+    let timer = &wiring.timer;
+    let (frame, search, groups, items, item_details_box, play, back, status) = build_vod_window();
     let view = Rc::new(RefCell::new(VodView::default()));
     let ui = VodUi {
         frame,
+        search,
         groups,
         items,
+        details: item_details_box,
         status,
         view,
     };
-    // Group selection shows that group's items.
+    // Group selection shows that group's items. Choosing a group
+    // leaves search mode (spec 0006): the filter and the field
+    // both reset, and the group becomes the retained group.
     {
         let view = Rc::clone(&ui.view);
         let groups_box = groups;
         let items_box = items;
+        let search_box = search;
         let worker = Rc::clone(worker);
+        let wiring = wiring.clone();
         groups.bind_internal(EventType::COMMAND_LISTBOX_SELECTED, move |_| {
             // B18: changing group supersedes an in-flight episode reply.
             worker.invalidate();
@@ -3203,9 +3265,90 @@ fn ensure_vod_ui(
             let Some(label) = view.catalog.order.get(selection as usize).cloned() else {
                 return;
             };
+            if !view.query.is_empty() {
+                view.query.clear();
+                search_box.set_value("");
+            }
+            view.group_label = Some(label.clone());
             view.showing = view.catalog.groups.get(&label).cloned().unwrap_or_default();
             view.stack.clear();
             show_items(items_box, &view.showing);
+            let first = (!view.showing.is_empty()).then_some(0);
+            refresh_vod_details(&wiring, &view, item_details_box, first);
+        });
+    }
+    // Search (spec 0006): Enter applies the query against the
+    // retained catalogue on the worker; focus stays in the field.
+    // A blank query clears the filter and restores the retained
+    // group's unfiltered items.
+    {
+        let view = Rc::clone(&ui.view);
+        let groups_box = groups;
+        let items_box = items;
+        let search_box = search;
+        let worker = Rc::clone(worker);
+        let pending = Rc::clone(pending);
+        let timer = Rc::clone(timer);
+        let wiring = wiring.clone();
+        search.bind_internal(EventType::TEXT_ENTER, move |_| {
+            let query = search_box.get_value().trim().to_string();
+            if query.is_empty() {
+                let mut view = view.borrow_mut();
+                if view.query.is_empty() {
+                    return;
+                }
+                view.query.clear();
+                view.stack.clear();
+                let label = view
+                    .group_label
+                    .clone()
+                    .or_else(|| view.catalog.order.first().cloned());
+                if let Some(label) = label {
+                    if let Some(position) =
+                        view.catalog.order.iter().position(|group| group == &label)
+                    {
+                        groups_box.set_selection(u32::try_from(position).unwrap_or(0), true);
+                    }
+                    view.showing = view.catalog.groups.get(&label).cloned().unwrap_or_default();
+                    status.set_label(&trf(
+                        "Search cleared. Showing {group}.",
+                        &[("group", &label)],
+                    ));
+                }
+                show_items(items_box, &view.showing);
+                let first = (!view.showing.is_empty()).then_some(0);
+                refresh_vod_details(&wiring, &view, item_details_box, first);
+                return;
+            }
+            {
+                let mut view = view.borrow_mut();
+                if view.query.is_empty() {
+                    // Retain the group to restore when the filter
+                    // is cleared; the groups selection still names
+                    // it even while drilled into a series.
+                    if let Some(selection) = groups_box.get_selection() {
+                        view.group_label = view.catalog.order.get(selection as usize).cloned();
+                    }
+                }
+                view.query.clone_from(&query);
+            }
+            worker.search(query);
+            pending.set(true);
+            assert!(timer.start(50, false));
+        });
+    }
+    // Item selection updates the details control in place
+    // (spec 0006): no focus movement.
+    {
+        let view = Rc::clone(&ui.view);
+        let items_box = items;
+        let wiring = wiring.clone();
+        items.bind_internal(EventType::COMMAND_LISTBOX_SELECTED, move |_| {
+            let Some(selection) = items_box.get_selection() else {
+                return;
+            };
+            let view = view.borrow();
+            refresh_vod_details(&wiring, &view, item_details_box, Some(selection as usize));
         });
     }
     // Play / Open: movies play; series drill in (episodes inline for
@@ -3218,6 +3361,7 @@ fn ensure_vod_ui(
         let worker = Rc::clone(worker);
         let pending = Rc::clone(pending);
         let timer = Rc::clone(timer);
+        let wiring = wiring.clone();
         play.on_click(move |_| {
             let Some(selection) = items_box.get_selection() else {
                 return;
@@ -3234,9 +3378,11 @@ fn ensure_vod_ui(
                     if !item.episodes.is_empty() {
                         let mut view = view.borrow_mut();
                         let previous = std::mem::take(&mut view.showing);
-                        view.stack.push(previous);
+                        view.stack.push((previous, selection as usize));
                         view.showing.clone_from(&item.episodes);
                         show_items(items_box, &view.showing);
+                        let first = (!view.showing.is_empty()).then_some(0);
+                        refresh_vod_details(&wiring, &view, item_details_box, first);
                     } else if let Some(series_id) = &item.series_id {
                         let account = view
                             .borrow()
@@ -3255,17 +3401,20 @@ fn ensure_vod_ui(
             }
         });
     }
-    // Back: return to the previous item list.
+    // Back: return to the previous item list with the row that was
+    // opened from it reselected (spec 0006).
     {
         let view = Rc::clone(&ui.view);
         let items_box = items;
         let worker = Rc::clone(worker);
+        let wiring = wiring.clone();
         back.on_click(move |_| {
             worker.invalidate();
             let mut view = view.borrow_mut();
-            if let Some(previous) = view.stack.pop() {
+            if let Some((previous, selection)) = view.stack.pop() {
                 view.showing = previous;
-                show_items(items_box, &view.showing);
+                show_items_at(items_box, &view.showing, selection);
+                refresh_vod_details(&wiring, &view, item_details_box, Some(selection));
             }
         });
     }
@@ -3286,12 +3435,63 @@ fn ensure_vod_ui(
 
 /// Fill the items list from `VodItem`s and select the first row.
 fn show_items(items_box: ListBox, showing: &[VodItem]) {
+    show_items_at(items_box, showing, 0);
+}
+
+/// Fill the items list and select `selection` (Back restores the
+/// row the user opened, spec 0006).
+fn show_items_at(items_box: ListBox, showing: &[VodItem], selection: usize) {
     let names: Vec<String> = showing.iter().map(|i| i.name.clone()).collect();
-    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    fill_items(items_box, &names, selection);
+}
+
+/// Fill the items list with search-result rows (title, type,
+/// group, source in the accessible row text) and select the
+/// first row.
+fn show_hit_rows(items_box: ListBox, hits: &[VodSearchHit]) {
+    let labels: Vec<String> = hits.iter().map(VodSearchHit::row_label).collect();
+    fill_items(items_box, &labels, 0);
+}
+
+fn fill_items(items_box: ListBox, labels: &[String], selection: usize) {
+    let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
     items_box.set_items(&refs);
     if !refs.is_empty() {
-        items_box.set_selection(0, true);
+        let index = selection.min(refs.len() - 1);
+        items_box.set_selection(u32::try_from(index).unwrap_or(0), true);
     }
+}
+
+/// The EPG description for an item's channel when one is already
+/// available (spec 0006): the current programme's description.
+fn vod_item_description(wiring: &Wiring, item: &VodItem) -> Option<String> {
+    let channel = item.channel.as_ref()?;
+    guide_now_next(wiring, channel)?
+        .current
+        .map(|programme| programme.description)
+}
+
+/// Refresh the item-details control for the row at `selection`
+/// (spec 0006): read-only text, no focus movement; the stream
+/// URL reaches only this control.
+fn refresh_vod_details(
+    wiring: &Wiring,
+    view: &VodView,
+    details: TextCtrl,
+    selection: Option<usize>,
+) {
+    let text = selection
+        .and_then(|index| view.showing.get(index))
+        .map_or_else(
+            || "No item selected.".to_string(),
+            |item| {
+                let description = vod_item_description(wiring, item);
+                item_details(item, description.as_deref())
+                    .lines()
+                    .join("\n")
+            },
+        );
+    details.set_value(&text);
 }
 
 /// Collect VOD worker events into the window.
@@ -3299,8 +3499,10 @@ fn poll_vod(wiring: &Wiring, status: Status) {
     while let Some(event) = wiring.vod_worker.try_recv() {
         // B18: a reply from a superseded build/episode request must
         // never replace newer navigation.
+        // A search answers at the build generation it was issued
+        // under; a rebuild supersedes it, like a catalogue reply.
         let current = match &event {
-            VodEvent::Catalog { generation, .. } => {
+            VodEvent::Catalog { generation, .. } | VodEvent::SearchResults { generation, .. } => {
                 wiring.vod_worker.is_current_catalog(*generation)
             }
             VodEvent::Episodes { token, .. } => wiring.vod_worker.is_current_episodes(*token),
@@ -3317,7 +3519,17 @@ fn poll_vod(wiring: &Wiring, status: Status) {
                 let groups_count = catalog.order.len();
                 let items_count: usize = catalog.groups.values().map(Vec::len).sum();
                 let labels = catalog.order.clone();
-                ui.view.borrow_mut().catalog = catalog;
+                {
+                    let mut view = ui.view.borrow_mut();
+                    view.catalog = catalog;
+                    // A reload supersedes any applied search
+                    // (spec 0006): filter, field, and drill-in
+                    // state all reset.
+                    view.query.clear();
+                    view.group_label = labels.first().cloned();
+                    view.stack.clear();
+                }
+                ui.search.set_value("");
                 let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
                 ui.groups.set_items(&refs);
                 if !refs.is_empty() {
@@ -3332,16 +3544,22 @@ fn poll_vod(wiring: &Wiring, status: Status) {
                 ));
                 status.set_label("VOD catalogue loaded.");
             }
+            VodEvent::SearchResults { query, hits, .. } => {
+                apply_vod_search_results(wiring, &ui, &query, &hits);
+            }
             VodEvent::Episodes {
                 result: Ok(episodes),
                 ..
             } => {
                 let count = episodes.len();
+                let selection = ui.items.get_selection().map_or(0, |row| row as usize);
                 let mut view = ui.view.borrow_mut();
                 let previous = std::mem::take(&mut view.showing);
-                view.stack.push(previous);
+                view.stack.push((previous, selection));
                 view.showing = episodes;
                 show_items(ui.items, &view.showing);
+                let first = (!view.showing.is_empty()).then_some(0);
+                refresh_vod_details(wiring, &view, ui.details, first);
                 ui.status.set_label(&trf(
                     "{count} episodes loaded.",
                     &[("count", &count.to_string())],
@@ -3356,6 +3574,41 @@ fn poll_vod(wiring: &Wiring, status: Status) {
                 ));
             }
         }
+    }
+}
+
+/// Apply one VOD search reply (spec 0006): results for a query
+/// the view no longer holds (cleared or replaced) are stale and
+/// drop; live results replace the item list at the top level,
+/// keep focus where it is, and announce a concise count.
+fn apply_vod_search_results(wiring: &Wiring, ui: &VodUi, query: &str, hits: &[VodSearchHit]) {
+    let mut view = ui.view.borrow_mut();
+    if view.query != query {
+        return;
+    }
+    let count = hits.len();
+    view.showing = hits
+        .iter()
+        .filter_map(|hit| {
+            view.catalog
+                .groups
+                .get(&hit.group)
+                .and_then(|items| items.get(hit.index))
+                .cloned()
+        })
+        .collect();
+    view.stack.clear();
+    show_hit_rows(ui.items, hits);
+    let first = (!view.showing.is_empty()).then_some(0);
+    refresh_vod_details(wiring, &view, ui.details, first);
+    if count == 0 {
+        ui.status
+            .set_label(&trf("No results for {query}.", &[("query", query)]));
+    } else {
+        ui.status.set_label(&trf(
+            "{count} results for {query}.",
+            &[("count", &count.to_string()), ("query", query)],
+        ));
     }
 }
 
