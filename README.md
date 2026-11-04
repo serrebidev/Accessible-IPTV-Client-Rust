@@ -22,8 +22,8 @@ not yet feature-complete against that reference.
   SQLite database: episode descriptions, What's on Now, per-channel
   guide, reminders and catch-up playback and downloads.
 - Recording: manual and scheduled recordings (DVR) with padding,
-  ten format presets, a minimum-free-space setting (Windows
-  enforcement remains a gap),
+  ten format presets, a minimum-free-space setting enforced on
+  every platform,
   and shutdown-after-recordings with a 60-second countdown.
   Scheduled Stalker recordings resolve a fresh stream link at
   their start time and retry until their window closes.

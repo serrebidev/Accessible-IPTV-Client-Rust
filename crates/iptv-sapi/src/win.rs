@@ -89,7 +89,6 @@ extern "system" {
         ppv: *mut *mut c_void,
     ) -> i32;
     fn SysAllocString(text: *const u16) -> *mut u16;
-    fn SysFreeString(bstr: *mut u16);
     fn SysStringLen(bstr: *mut u16) -> u32;
     fn VariantClear(variant: *mut Variant) -> i32;
 }

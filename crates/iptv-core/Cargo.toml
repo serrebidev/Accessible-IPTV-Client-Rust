@@ -4,6 +4,7 @@ sha2.workspace = true
 ureq.workspace = true
 quick-xml.workspace = true
 flate2.workspace = true
+fs4.workspace = true
 chrono.workspace = true
 chrono-tz.workspace = true
 rusqlite.workspace = true
