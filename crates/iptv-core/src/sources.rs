@@ -474,7 +474,14 @@ pub fn source_display_label(
     }
     if source.starts_with("http://") || source.starts_with("https://") {
         let rest = source.split("://").nth(1).unwrap_or(source);
-        return rest.split('/').next().unwrap_or(rest).to_string();
+        let authority = rest.split('/').next().unwrap_or(rest);
+        // Labels never carry URL credentials (spec 0006): drop any
+        // userinfo before the host.
+        return authority
+            .rsplit('@')
+            .next()
+            .unwrap_or(authority)
+            .to_string();
     }
     Path::new(source).file_name().map_or_else(
         || source.to_string(),
@@ -583,6 +590,34 @@ mod tests {
     const ONE: &str = "#EXTM3U\n#EXTINF:-1 group-title=\"News\",Alpha\nhttp://a/1\n";
     const TWO: &str =
         "#EXTM3U\n#EXTINF:-1 group-title=\"News\",Alpha\nhttp://b/2\n#EXTINF:-1,Beta\nhttp://b/3\n";
+
+    #[test]
+    fn display_label_strips_url_userinfo() {
+        // Spec 0006: labels never carry URL credentials.
+        let names = std::collections::BTreeMap::new();
+        assert_eq!(
+            source_display_label("http://user:secret@host.example:8080/list.m3u", &names),
+            "host.example:8080"
+        );
+        assert_eq!(
+            source_display_label("https://host.example/list.m3u", &names),
+            "host.example"
+        );
+        assert_eq!(
+            source_display_label("/home/user/lists/films.m3u", &names),
+            "films.m3u"
+        );
+        let mut friendly = std::collections::BTreeMap::new();
+        friendly.insert(
+            source_name_key("http://user:secret@host.example/list.m3u"),
+            "  My List  ".to_string(),
+        );
+        assert_eq!(
+            source_display_label("http://user:secret@host.example/list.m3u", &friendly),
+            "My List",
+            "the friendly name wins and is trimmed"
+        );
+    }
 
     #[test]
     fn scope_id_is_the_python_sha256_form() {

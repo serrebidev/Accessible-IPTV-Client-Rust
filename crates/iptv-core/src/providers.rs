@@ -407,7 +407,13 @@ fn strip_bom(bytes: &[u8]) -> Vec<u8> {
 
 fn host_of(url: &str) -> String {
     let rest = url.split_once("://").map_or(url, |(_, r)| r);
-    rest.split('/').next().unwrap_or(rest).to_string()
+    let authority = rest.split('/').next().unwrap_or(rest);
+    // Display labels never carry URL credentials (spec 0006).
+    authority
+        .rsplit('@')
+        .next()
+        .unwrap_or(authority)
+        .to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -887,6 +893,21 @@ pub enum ProviderAccount {
 }
 
 impl ProviderAccount {
+    /// The safe source label for catalogue rows (spec 0006): the
+    /// configured friendly account name when one is set, else the
+    /// base URL's host with any userinfo removed.
+    #[must_use]
+    pub fn source_label(&self) -> String {
+        let (name, base_url) = match self {
+            ProviderAccount::Xtream(cfg) => (&cfg.name, &cfg.base_url),
+            ProviderAccount::Stalker(cfg) => (&cfg.name, &cfg.base_url),
+        };
+        name.as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map_or_else(|| host_of(base_url), str::to_owned)
+    }
+
     #[must_use]
     pub fn provider_id(&self) -> Option<String> {
         match self {
