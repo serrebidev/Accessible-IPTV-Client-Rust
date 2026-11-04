@@ -105,22 +105,27 @@ impl EpgGuide {
     /// rebuild — per playlist channel (audit E12).
     #[must_use]
     pub fn bulk_now_next(&self, at: i64) -> HashMap<String, NowNext> {
+        // Python's `get_all_now_next` window (audit 0068): a
+        // programme airing now cannot have started more than ~a
+        // day ago, and "next" reaches six hours out — the store
+        // twin applies the same bounds so both guide surfaces
+        // answer identically.
+        let floor = at - 24 * 3_600;
+        let horizon = at + 6 * 3_600;
         let mut out = HashMap::with_capacity(self.programmes.len());
         for (id, list) in &self.programmes {
             let idx = list.partition_point(|p| p.start <= at);
             let current = if idx > 0 {
                 let candidate = &list[idx - 1];
-                (candidate.stop > at).then(|| candidate.clone())
+                (candidate.stop > at && candidate.start >= floor).then(|| candidate.clone())
             } else {
                 None
             };
-            out.insert(
-                id.clone(),
-                NowNext {
-                    current,
-                    next: list.get(idx).cloned(),
-                },
-            );
+            let next = list
+                .get(idx)
+                .filter(|programme| programme.start <= horizon)
+                .cloned();
+            out.insert(id.clone(), NowNext { current, next });
         }
         out
     }
