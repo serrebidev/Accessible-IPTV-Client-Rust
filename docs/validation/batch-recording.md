@@ -102,7 +102,7 @@ for any item here; all UI changes keep accessible names only.
   silently skips the gate.
   Superseded 2026-11-03: the original `dir`/`df` text parsing
   returned no reading on non-English Windows and refused every
-  recording; see validation 0065.
+  recording; see validation 0066.
 - Tests: `check_destination_succeeds_with_zero_reserve`,
   `check_destination_fails_when_reserve_exceeds_free_space`,
   `check_destination_fails_for_unwritable_path`,

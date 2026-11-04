@@ -1,4 +1,4 @@
-# 0065 — Locale-independent free-space gate
+# 0066 — Locale-independent free-space gate
 
 Date: 2026-11-03. Branch: `fix/windows-free-space-locale`. Follow-up
 to R08, recorded in `docs/feature-parity-audit.md` and
