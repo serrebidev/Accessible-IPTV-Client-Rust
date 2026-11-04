@@ -1,5 +1,17 @@
 //! wx-free domain types and playlist behavior for the Rust port.
 
+/// Lowercase hex for digest bytes (sha2 0.11's output array has no
+/// `LowerHex`, and clippy rejects `format!` in an iterator collect).
+pub(crate) fn hex_lower(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    bytes
+        .iter()
+        .fold(String::with_capacity(bytes.len() * 2), |mut acc, b| {
+            let _ = write!(acc, "{b:02x}");
+            acc
+        })
+}
+
 pub mod applog;
 pub mod audiotracks;
 pub mod bookmarks;

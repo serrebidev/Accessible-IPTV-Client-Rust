@@ -117,7 +117,7 @@ fn py_json_locator(locator: &BookmarkLocator) -> String {
 fn digest(text: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(text.as_bytes());
-    format!("{:x}", hasher.finalize())
+    crate::hex_lower(&hasher.finalize())
 }
 
 /// Python `_identifier`: `[1-9][0-9]{0,19}` or empty.

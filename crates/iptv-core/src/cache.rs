@@ -14,7 +14,7 @@ pub fn cache_key(parts: &[&str]) -> String {
         hasher.update(part.as_bytes());
         hasher.update(b"\0");
     }
-    format!("{:x}", hasher.finalize())
+    crate::hex_lower(&hasher.finalize())
 }
 
 /// The file for a key inside a cache directory.

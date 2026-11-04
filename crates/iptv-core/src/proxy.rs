@@ -144,7 +144,8 @@ impl Drop for ProxyServer {
 
 fn token_for(url: &str) -> String {
     let digest = Sha256::digest(url.as_bytes());
-    format!("{digest:x}")[..20].to_string()
+    let hex = crate::hex_lower(&digest);
+    hex[..20].to_string()
 }
 
 fn handle_connection(
