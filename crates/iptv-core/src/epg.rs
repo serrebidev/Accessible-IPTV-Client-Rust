@@ -68,20 +68,17 @@ impl EpgGuide {
             .map(|(index, channel)| (channel.id.clone(), index))
             .collect();
         for channel in other.channels {
-            match positions.get(&channel.id) {
-                Some(&index) => {
-                    let existing = &mut self.channels[index];
-                    let old_norm = canonicalize_name(&strip_noise_words(&existing.display_name));
-                    let new_norm = canonicalize_name(&strip_noise_words(&channel.display_name));
-                    if !old_norm.is_empty() && !new_norm.is_empty() && old_norm != new_norm {
-                        self.programmes.remove(&channel.id);
-                    }
-                    existing.display_name = channel.display_name;
+            if let Some(&index) = positions.get(&channel.id) {
+                let existing = &mut self.channels[index];
+                let old_norm = canonicalize_name(&strip_noise_words(&existing.display_name));
+                let new_norm = canonicalize_name(&strip_noise_words(&channel.display_name));
+                if !old_norm.is_empty() && !new_norm.is_empty() && old_norm != new_norm {
+                    self.programmes.remove(&channel.id);
                 }
-                None => {
-                    positions.insert(channel.id.clone(), self.channels.len());
-                    self.channels.push(channel);
-                }
+                existing.display_name = channel.display_name;
+            } else {
+                positions.insert(channel.id.clone(), self.channels.len());
+                self.channels.push(channel);
             }
         }
         for (id, programmes) in other.programmes {
@@ -1842,9 +1839,8 @@ impl SuffixWorkerState {
             self.matches = None;
         }
         let store = &self.store.as_ref().expect("store just ensured").1;
-        let channels = match store.channels() {
-            Ok(channels) => channels,
-            Err(_) => return result(None),
+        let Ok(channels) = store.channels() else {
+            return result(None);
         };
         if !matches!(self.indexes.as_ref(), Some((gen, _)) if *gen == job.guide_generation) {
             self.indexes = Some((job.guide_generation, GuideIndexes::build(&channels)));
