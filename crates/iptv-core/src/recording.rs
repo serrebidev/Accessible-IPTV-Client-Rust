@@ -546,74 +546,18 @@ pub fn normalize_reserve_mib(value: Option<i64>) -> u64 {
     }
 }
 
-/// Parse portable `df -kP` output: the second line's fourth
-/// whitespace-separated column is the available space in KiB.
-#[must_use]
-pub fn parse_df_kp_avail(text: &str) -> Option<u64> {
-    let line = text.lines().nth(1)?;
-    let kib: u64 = line.split_whitespace().nth(3)?.parse().ok()?;
-    kib.checked_mul(1024)
-}
-
-/// Parse Windows `dir` output: the free space is the integer token
-/// immediately before `bytes free` (thousands separators stripped).
-#[must_use]
-pub fn parse_dir_free_bytes(text: &str) -> Option<u64> {
-    let at = text.rfind("bytes free")?;
-    let token = text[..at].split_whitespace().next_back()?;
-    token.replace(',', "").parse().ok()
-}
-
-/// Free bytes on the filesystem holding `path`, when the platform
-/// can report it: Unix `df` (GNU form first, portable `df -kP`
-/// fallback for macOS and other non-GNU systems), Windows `dir`;
-/// `None` elsewhere.
-#[must_use]
-pub fn free_space_bytes(path: &std::path::Path) -> Option<u64> {
-    #[cfg(unix)]
-    {
-        if let Some(output) = std::process::Command::new("df")
-            .args(["-B1", "--output=avail"])
-            .arg(path)
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-        {
-            let text = String::from_utf8_lossy(&output.stdout);
-            if let Some(free) = text
-                .lines()
-                .nth(1)
-                .and_then(|line| line.trim().parse::<u64>().ok())
-            {
-                return Some(free);
-            }
-        }
-        let output = std::process::Command::new("df")
-            .arg("-kP")
-            .arg(path)
-            .output()
-            .ok()?;
-        if !output.status.success() {
-            return None;
-        }
-        let text = String::from_utf8_lossy(&output.stdout);
-        parse_df_kp_avail(&text)
-    }
-    #[cfg(windows)]
-    {
-        let output = std::process::Command::new("cmd")
-            .args(["/C", "dir", "/-C"])
-            .arg(path)
-            .output()
-            .ok()?;
-        let text = String::from_utf8_lossy(&output.stdout);
-        return parse_dir_free_bytes(&text);
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = path;
-        None
-    }
+/// Free bytes available to non-privileged users on the filesystem
+/// holding `path` (Python `shutil.disk_usage(...).free`). `fs4`
+/// asks the platform (`GetDiskFreeSpaceExW` on Windows, `statvfs`
+/// on Unix), so the reading does not depend on localized `dir` or
+/// `df` text.
+///
+/// # Errors
+///
+/// Returns a user-facing message when the filesystem holding
+/// `path` cannot be queried.
+pub fn free_space_bytes(path: &Path) -> Result<u64, String> {
+    fs4::available_space(path).map_err(|e| format!("Free space could not be determined: {e}"))
 }
 
 /// A successful pre-recording destination check (R08): the free
@@ -666,9 +610,7 @@ pub fn check_destination(dir: &Path, reserve_mib: Option<i64>) -> Result<Storage
             "The recording folder is unavailable or not writable: {e}"
         ));
     }
-    let free = free_space_bytes(dir).ok_or_else(|| {
-        "Free space could not be determined: no free-space reading for this destination".to_string()
-    })?;
+    let free = free_space_bytes(dir)?;
     let reserve_bytes = reserve * 1024 * 1024;
     if free < reserve_bytes {
         return Err(format!(
@@ -898,30 +840,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // ----- R08: storage check and free-space parsing -----
+    // ----- R08: storage check and free-space reading -----
 
     #[test]
-    fn parse_df_kp_avail_reads_fourth_column_of_second_line() {
-        let sample = "Filesystem   1024-blocks      Used Available Capacity Mounted on\n\
-                      /dev/disk3s1   976490576 400000000 12345678    98% /\n";
-        assert_eq!(parse_df_kp_avail(sample), Some(12_345_678 * 1024));
-        assert_eq!(parse_df_kp_avail("only one line\n"), None);
-        assert_eq!(parse_df_kp_avail("a b\n1 2 3 nope\n"), None);
-        assert_eq!(parse_df_kp_avail(""), None);
-    }
-
-    #[test]
-    fn parse_dir_free_bytes_reads_token_before_bytes_free() {
-        let sample = " Volume in drive C is Windows\n\
-                      \n Directory of C:\\Recordings\n\
-                      \n2026/11/03  12:00    <DIR>          .\n\
-                      \n               0 File(s)              0 bytes\n\
-                      \n               2 Dir(s)  53,687,091,200 bytes free\n";
-        assert_eq!(parse_dir_free_bytes(sample), Some(53_687_091_200));
-        let plain = "               1 Dir(s)  987654321 bytes free";
-        assert_eq!(parse_dir_free_bytes(plain), Some(987_654_321));
-        assert_eq!(parse_dir_free_bytes("no free space line"), None);
-        assert_eq!(parse_dir_free_bytes(""), None);
+    fn free_space_bytes_reads_a_real_destination() {
+        free_space_bytes(&std::env::temp_dir()).expect("free space for temp dir");
     }
 
     #[test]

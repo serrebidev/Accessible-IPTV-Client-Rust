@@ -820,6 +820,8 @@ platform coverage.
 
 **Fix:** Landed in the parity integration; regression evidence in docs/validation/batch-recording.md and validation 0063.
 
+**Correction (2026-11-03):** That fix still parsed localized `dir`/`df` text, so non-English Windows reported no free-space reading and refused every recording. Free space now comes from `fs4::available_space`; see validation 0065.
+
 ### R09 — Empty exit-zero recordings are reported as saved (high)
 
 Rust trusts ffmpeg exit status and marks DVR completion before measuring output;

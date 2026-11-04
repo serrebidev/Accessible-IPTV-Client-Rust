@@ -95,15 +95,18 @@ for any item here; all UI changes keep accessible names only.
 - Changes: core `recording::check_destination` creates the folder,
   probes writeability with a flushed one-byte temp file, and
   refuses when free space is unknown or below the reserve — on
-  every platform. Free space: Unix tries GNU `df -B1` then falls
-  back to POSIX `df -kP` (macOS); Windows parses `dir /-C`. The
-  start-recording, catch-up and Recording Storage paths all use
-  it; nothing silently skips the gate any more.
+  every platform. Free space comes from `fs4::available_space`
+  (Windows `GetDiskFreeSpaceExW`, Unix `statvfs`), matching Python's
+  locale-independent `shutil.disk_usage`. The start-recording,
+  catch-up and Recording Storage paths all use it; nothing
+  silently skips the gate.
+  Superseded 2026-11-03: the original `dir`/`df` text parsing
+  returned no reading on non-English Windows and refused every
+  recording; see validation 0065.
 - Tests: `check_destination_succeeds_with_zero_reserve`,
   `check_destination_fails_when_reserve_exceeds_free_space`,
   `check_destination_fails_for_unwritable_path`,
-  `parse_df_kp_avail_reads_fourth_column_of_second_line`,
-  `parse_dir_free_bytes_reads_token_before_bytes_free`.
+  `free_space_bytes_reads_a_real_destination`.
 
 ## R09 — completion requires produced media
 
