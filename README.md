@@ -27,8 +27,10 @@ not yet feature-complete against that reference.
   and shutdown-after-recordings with a 60-second countdown.
   Scheduled Stalker recordings resolve a fresh stream link at
   their start time and retry until their window closes.
-- Casting to UPnP/DLNA renderers and Roku players. Header-protected
-  casting has proxy gaps; other Caster protocols remain incomplete.
+- Casting to UPnP/DLNA renderers and Roku players. The stream proxy
+  forwards HEAD, follows redirects and passes upstream response headers,
+  so header-protected casts resolve; other Caster protocols remain
+  incomplete.
 - Provider playlists are cached on disk for six hours, with the
   cached copy used (and announced) when a portal is unreachable.
 - Check for Updates uses ship-shape to verify minisign signatures;

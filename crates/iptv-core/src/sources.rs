@@ -350,7 +350,7 @@ fn playlist_text_hash(text: &str) -> String {
     hasher.update(PARSED_CACHE_VERSION.as_bytes());
     hasher.update(b"\n");
     hasher.update(text.as_bytes());
-    format!("{:x}", hasher.finalize())
+    crate::hex_lower(&hasher.finalize())
 }
 
 fn parsed_cache_path(dir: &Path, source: &PlaylistSource) -> std::path::PathBuf {
@@ -444,7 +444,7 @@ pub fn prefill_model(sources: &[PlaylistSource], cache_dir: &Path) -> Option<Bro
 #[must_use]
 pub fn source_name_key(source: &str) -> String {
     use sha2::{Digest, Sha256};
-    format!("{:x}", Sha256::digest(source.as_bytes()))
+    crate::hex_lower(&Sha256::digest(source.as_bytes()))
 }
 
 /// Clean a stored friendly-name map (Python `normalize_source_names`):
