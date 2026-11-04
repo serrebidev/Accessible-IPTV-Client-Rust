@@ -238,6 +238,7 @@ fn generate_big_guide() -> String {
 
 #[test]
 #[ignore = "audit bench: run explicitly in release mode"]
+#[allow(clippy::too_many_lines)]
 fn epg_now_next_at_real_scale() {
     use iptv_core::epg::{parse_xmltv_checked, GuideIndexes};
     use iptv_core::epgstore::EpgStore;
@@ -287,6 +288,84 @@ fn epg_now_next_at_real_scale() {
         "store.all_now_next(mid-window): {:?} ({} channels)",
         t.elapsed(),
         snapshot.len()
+    );
+
+    // The per-minute row-suffix refresh pipeline (the work
+    // refresh_epg_suffixes does): bulk now/next for the in-memory
+    // guide, the playlist-wide guide match, and the row build.
+    // Timed here at the same scale because this pipeline is the
+    // audit target for playback-time UI stalls.
+    let xml = generate_big_guide();
+    let t = Instant::now();
+    let guide = parse_xmltv_checked(&xml).unwrap();
+    println!(
+        "parse big guide (in-memory path): {:?} ({} programmes)",
+        t.elapsed(),
+        guide.programme_count()
+    );
+    let t = Instant::now();
+    let guide_indexes = GuideIndexes::build(&guide.channels);
+    println!("GuideIndexes::build (guide channels): {:?}", t.elapsed());
+
+    let dir2 = std::env::temp_dir().join(format!("iptv-suffix-bench-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir2);
+    std::fs::create_dir_all(&dir2).unwrap();
+    let file2 = dir2.join("big.m3u");
+    std::fs::write(&file2, generate_playlist()).unwrap();
+    let model2 = BrowseModel::open_local(&file2).unwrap();
+    let playlist_channels: &[iptv_core::Channel] = model2.channels();
+    println!("playlist channels: {}", playlist_channels.len());
+
+    let t = Instant::now();
+    let bulk = guide.bulk_now_next(AT_MID_WINDOW);
+    println!(
+        "guide.bulk_now_next(mid-window): {:?} ({} channels)",
+        t.elapsed(),
+        bulk.len()
+    );
+
+    let t = Instant::now();
+    let cache = iptv_core::epg::GuideMatchCache::build(playlist_channels, &guide_indexes);
+    let matched = cache.matches().iter().filter(|m| m.is_some()).count();
+    println!(
+        "GuideMatchCache::build (115k, worst case ids/names disjoint): {:?} ({matched} matched)",
+        t.elapsed()
+    );
+
+    let t = Instant::now();
+    let (suffixes, descriptions) = iptv_core::epg::row_guide_from_matches(cache.matches(), &bulk);
+    println!(
+        "row_guide_from_matches: {:?} ({} suffixes, {} descriptions)",
+        t.elapsed(),
+        suffixes.len(),
+        descriptions.len()
+    );
+
+    // Warm repeat (the steady-state per-minute refresh): bulk +
+    // row build with the match cache already built.
+    let t = Instant::now();
+    let bulk2 = guide.bulk_now_next(AT_MID_WINDOW);
+    let (suffixes2, _) = iptv_core::epg::row_guide_from_matches(cache.matches(), &bulk2);
+    println!(
+        "warm refresh (bulk + row build): {:?} ({} suffixes)",
+        t.elapsed(),
+        suffixes2.len()
+    );
+    let _ = std::fs::remove_dir_all(&dir2);
+
+    // Guide merge at delivery (poll_epg runs this on the UI
+    // thread when an import lands over an in-memory guide):
+    // merge a full second copy of the guide into the first.
+    let mut merged_guide = guide;
+    let t = Instant::now();
+    let second = parse_xmltv_checked(&xml).unwrap();
+    println!("parse big guide (second copy): {:?}", t.elapsed());
+    let t = Instant::now();
+    merged_guide.merge(second);
+    println!(
+        "EpgGuide::merge (full 813k guide into existing): {:?} ({} programmes after)",
+        t.elapsed(),
+        merged_guide.programme_count()
     );
     let with_current = snapshot
         .iter()
