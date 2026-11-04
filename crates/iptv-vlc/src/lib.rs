@@ -125,6 +125,17 @@ unsafe fn c_string(ptr: *const c_char) -> String {
         .into_owned()
 }
 
+/// The plugins directory bundled beside the executable, when the
+/// package shipped one.
+fn bundled_plugins_dir() -> Option<std::path::PathBuf> {
+    plugins_dir_in(&exe_dir()?)
+}
+
+fn plugins_dir_in(exe_dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    let dir = exe_dir.join("plugins");
+    dir.is_dir().then_some(dir)
+}
+
 /// The directory the running executable lives in, when known.
 /// Release packages bundle libVLC there (see PACKAGING.md).
 fn exe_dir() -> Option<std::path::PathBuf> {
@@ -294,24 +305,14 @@ impl VlcEngine {
         let new_instance: NewFn = sym!(b"libvlc_new", NewFn);
         // Point libVLC at the plugins bundled beside the executable
         // when the package shipped them; a system VLC finds its own.
-        let plugin_arg = exe_dir()
-            .map(|dir| dir.join("plugins"))
-            .filter(|dir| dir.is_dir())
-            .and_then(|dir| {
-                std::ffi::CString::new(format!("--plugin-path={}", dir.to_string_lossy())).ok()
-            });
-        let arg_ptrs: Vec<*const std::ffi::c_char> =
-            plugin_arg.iter().map(|arg| arg.as_ptr()).collect();
-        let instance = unsafe {
-            new_instance(
-                i32::try_from(arg_ptrs.len()).unwrap_or(0),
-                if arg_ptrs.is_empty() {
-                    std::ptr::null()
-                } else {
-                    arg_ptrs.as_ptr()
-                },
-            )
-        };
+        // libVLC 3 removed the --plugin-path instance option:
+        // passing it only logs "option --plugin-path no longer
+        // exists" and it is ignored. VLC_PLUGIN_PATH is the
+        // supported mechanism (Brandon's log, 2026-11-03).
+        if let Some(dir) = bundled_plugins_dir() {
+            std::env::set_var("VLC_PLUGIN_PATH", dir);
+        }
+        let instance = unsafe { new_instance(0, std::ptr::null()) };
         if instance.is_null() {
             return Err("libVLC instance creation failed.".to_string());
         }
@@ -698,7 +699,24 @@ impl Drop for EngineInner {
 
 #[cfg(test)]
 mod tests {
-    use super::{candidates_from, map_state, VlcState};
+    use super::{candidates_from, map_state, plugins_dir_in, VlcState};
+
+    #[test]
+    fn bundled_plugins_dir_found_only_when_shipped() {
+        let base =
+            std::env::temp_dir().join(format!("iptv-vlc-plugins-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        // No plugins folder shipped: nothing to point libVLC at.
+        assert_eq!(plugins_dir_in(&base), None);
+        std::fs::create_dir(base.join("plugins")).unwrap();
+        assert_eq!(
+            plugins_dir_in(&base),
+            Some(base.join("plugins")),
+            "the shipped plugins folder is the one libVLC must use"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     #[test]
     fn bundled_copy_beside_the_exe_wins() {
