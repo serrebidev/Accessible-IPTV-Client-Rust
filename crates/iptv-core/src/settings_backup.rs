@@ -14,7 +14,7 @@ use aes::Aes128;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE};
 use base64::Engine;
 use cbc::{Decryptor, Encryptor};
-use hmac::{Hmac, Mac};
+use hmac::{digest::KeyInit, Hmac, Mac};
 use sha2::Sha256;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -47,7 +47,7 @@ pub fn export_settings(config_json_bytes: &[u8], password: &str) -> Result<Vec<u
         return Err(ERR_PASSWORD_REQUIRED.to_string());
     }
     let mut salt = [0u8; SALT_LEN];
-    getrandom::getrandom(&mut salt).map_err(|_| "Could not generate random salt.".to_string())?;
+    getrandom::fill(&mut salt).map_err(|_| "Could not generate random salt.".to_string())?;
     let key = derive_key(password, &salt);
     let token = fernet_encrypt(&key, config_json_bytes)
         .map_err(|()| "Could not generate random IV.".to_string())?;
@@ -177,12 +177,12 @@ fn fernet_mac(signing_key: &[u8], signed: &[u8]) -> HmacSha256 {
 /// || HMAC-SHA256`, urlsafe-base64 with padding.
 fn fernet_encrypt(key: &[u8; 32], plaintext: &[u8]) -> Result<String, ()> {
     let mut iv = [0u8; 16];
-    getrandom::getrandom(&mut iv).map_err(|_| ())?;
+    getrandom::fill(&mut iv).map_err(|_| ())?;
     let ciphertext = {
-        use cbc::cipher::{BlockEncryptMut, KeyIvInit};
+        use cbc::cipher::{BlockModeEncrypt, KeyIvInit};
         Aes128CbcEnc::new_from_slices(&key[16..], &iv)
             .expect("16-byte key and IV")
-            .encrypt_padded_vec_mut::<cbc::cipher::block_padding::Pkcs7>(plaintext)
+            .encrypt_padded_vec::<cbc::cipher::block_padding::Pkcs7>(plaintext)
     };
     let mut blob = Vec::with_capacity(1 + 8 + 16 + ciphertext.len() + 32);
     blob.push(0x80);
@@ -197,7 +197,7 @@ fn fernet_encrypt(key: &[u8; 32], plaintext: &[u8]) -> Result<String, ()> {
 /// Fernet decrypt; every failure is the same `None` (Python's
 /// `InvalidToken`), so callers cannot leak which check failed.
 fn fernet_decrypt(key: &[u8; 32], token: &str) -> Option<Vec<u8>> {
-    use cbc::cipher::{BlockDecryptMut, KeyIvInit};
+    use cbc::cipher::{BlockModeDecrypt, KeyIvInit};
     let blob = URL_SAFE.decode(token).ok()?;
     // version(1) + timestamp(8) + IV(16) + >=1 block(16) + HMAC(32)
     if blob.len() < 73 || blob[0] != 0x80 {
@@ -212,7 +212,7 @@ fn fernet_decrypt(key: &[u8; 32], token: &str) -> Option<Vec<u8>> {
     let iv: [u8; 16] = signed[9..25].try_into().ok()?;
     Aes128CbcDec::new_from_slices(&key[16..], &iv)
         .ok()?
-        .decrypt_padded_vec_mut::<cbc::cipher::block_padding::Pkcs7>(&signed[25..])
+        .decrypt_padded_vec::<cbc::cipher::block_padding::Pkcs7>(&signed[25..])
         .ok()
 }
 

@@ -445,11 +445,10 @@ pub fn decode_epg_bytes(bytes: &[u8]) -> Result<String, String> {
 /// The element's local name: namespace prefixes (`ns:tag`, or a
 /// `{uri}tag` expansion) are stripped, as Python's importer does
 /// with `tag.rsplit('}', 1)[-1]` and `{*}` lookups (audit E06).
-fn local_name(raw: &[u8]) -> String {
-    let name = String::from_utf8_lossy(raw).into_owned();
-    match name.rfind([':', '}']) {
-        Some(index) => name[index + 1..].to_string(),
-        None => name,
+fn local_name(raw: &str) -> String {
+    match raw.rfind([':', '}']) {
+        Some(index) => raw[index + 1..].to_string(),
+        None => raw.to_string(),
     }
 }
 
@@ -616,14 +615,12 @@ fn parse_xmltv_inner(xml: &str) -> (EpgGuide, Option<String>) {
             }
             Ok(Event::Text(t)) => {
                 if capture.is_some() {
-                    if let Ok(decoded) = t.unescape() {
-                        text.push_str(&decoded);
-                    }
+                    text.push_str(&t);
                 }
             }
             Ok(Event::CData(t)) => {
                 if capture.is_some() {
-                    text.push_str(&String::from_utf8_lossy(&t));
+                    text.push_str(&t);
                 }
             }
             Ok(Event::End(e)) => {
@@ -672,23 +669,23 @@ fn start_element(
 ) {
     match name {
         "channel" => {
-            let id = attr(element, b"id").unwrap_or_default();
+            let id = attr(element, "id").unwrap_or_default();
             *channel = Some((id, String::new()));
         }
         "programme" => {
             *programme = Some(PendingProgramme {
                 row: Programme {
-                    channel_id: attr(element, b"channel").unwrap_or_default(),
-                    start: attr(element, b"start")
+                    channel_id: attr(element, "channel").unwrap_or_default(),
+                    start: attr(element, "start")
                         .and_then(|v| parse_xmltv_time(&v))
                         .unwrap_or(0),
-                    stop: attr(element, b"stop")
+                    stop: attr(element, "stop")
                         .and_then(|v| parse_xmltv_time(&v))
                         .unwrap_or(0),
                     title: String::new(),
                     description: String::new(),
                 },
-                end_attr: attr(element, b"end").and_then(|v| parse_xmltv_time(&v)),
+                end_attr: attr(element, "end").and_then(|v| parse_xmltv_time(&v)),
                 length: None,
                 duration: None,
             });
@@ -706,7 +703,7 @@ fn start_element(
             text.clear();
         }
         "length" if programme.is_some() => {
-            let units = attr(element, b"units").unwrap_or_default();
+            let units = attr(element, "units").unwrap_or_default();
             if let Some(p) = programme.as_mut() {
                 p.length = Some((String::new(), units));
             }
@@ -802,12 +799,12 @@ fn end_element(
     }
 }
 
-fn attr(event: &quick_xml::events::BytesStart<'_>, key: &[u8]) -> Option<String> {
+fn attr(event: &quick_xml::events::BytesStart<'_>, key: &str) -> Option<String> {
     event
         .attributes()
         .flatten()
         .find(|a| a.key.as_ref() == key)
-        .and_then(|a| String::from_utf8(a.value.into_owned()).ok())
+        .map(|a| a.value.into_owned())
 }
 
 /// Local wall-clock `YYYY-MM-DD` for an epoch second.
