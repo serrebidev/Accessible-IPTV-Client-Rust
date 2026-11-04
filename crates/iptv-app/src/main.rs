@@ -13,7 +13,7 @@ use iptv_core::{
         airing_index, epg_info_message, epg_row_label, epg_time_range, hash_epg_sources,
         local_datetime, local_hhmm, match_guide_channel, merged_epg_sources,
         should_auto_import_epg, should_run_epg_search, EpgGuide, EpgWorker, GuideIndexes, NowNext,
-        Programme, SEARCH_EPG_RESULT_LIMIT,
+        Programme, SuffixJob, SuffixWorker, SEARCH_EPG_RESULT_LIMIT,
     },
     favorites::{channel_key, remember_recent, FavoriteSet, Toggle},
     playback::{
@@ -27,10 +27,10 @@ use iptv_core::{
     recording::{self, RecordingEngine},
     reminders::{normalize_reminders, Reminder, ReminderStatus},
     search::SearchResults,
-    sources::PlaylistSource,
+    sources::{source_display_label, PlaylistSource},
     speech::{CueRoute, CueSpeech, DevicePolicy, SpeechBackend},
     subtitles::{active as active_cue, load_cues, started as started_cue, Cue, ReviewCursor},
-    vod::{VodCatalog, VodEvent, VodItem, VodKind, VodWorker},
+    vod::{item_details, VodCatalog, VodEvent, VodItem, VodKind, VodSearchHit, VodWorker},
     Channel,
 };
 use std::{cell::RefCell, collections::BTreeMap, path::PathBuf, process::Command, rc::Rc};
@@ -453,11 +453,15 @@ struct Wiring {
     player: Rc<RefCell<PlayerState>>,
     epg: Rc<RefCell<Option<(EpgGuide, GuideIndexes)>>>,
     epg_suffixes: Rc<EpgSuffixes>,
-    /// Guide matches for the current playlist (audit E12 match
-    /// cache): keyed by the model's playlist pointer, cleared
-    /// whenever a guide load lands, so the per-minute suffix
-    /// refresh never re-matches the catalogue.
-    epg_match_cache: Rc<RefCell<Option<(usize, iptv_core::epg::GuideMatchCache)>>>,
+    /// The row-suffix rebuild pipeline (validation 0070): the
+    /// worker owns the guide indexes and the playlist match
+    /// cache; the UI only dispatches jobs and applies results.
+    /// `guide_generation` bumps whenever a guide load lands, so
+    /// the worker rebuilds its caches for the new guide.
+    suffix_worker: Rc<SuffixWorker>,
+    suffix_pending: Rc<std::cell::Cell<bool>>,
+    suffix_generation: Rc<std::cell::Cell<u64>>,
+    guide_generation: Rc<std::cell::Cell<u64>>,
     epg_store: Rc<RefCell<Option<iptv_core::epgstore::EpgStore>>>,
     epg_worker: Rc<EpgWorker>,
     epg_pending: Rc<std::cell::Cell<bool>>,
@@ -931,7 +935,10 @@ fn bind_browser(
         player: Rc::new(RefCell::new(PlayerState::default())),
         epg: Rc::new(RefCell::new(None)),
         epg_suffixes: suffixes,
-        epg_match_cache: Rc::new(RefCell::new(None)),
+        suffix_worker: Rc::new(SuffixWorker::new()),
+        suffix_pending: Rc::new(std::cell::Cell::new(false)),
+        suffix_generation: Rc::new(std::cell::Cell::new(0)),
+        guide_generation: Rc::new(std::cell::Cell::new(0)),
         // The saved guide database is reopened for reading at
         // startup (audit E02): schedules, What's on Now and the
         // information panel answer from it before — and without —
@@ -1128,11 +1135,11 @@ fn bind_epg_timer(frame: Frame, wiring: &Wiring, controls: Controls) {
         if !tick.persist.config.borrow().bool_or("epg_enabled", true) {
             return;
         }
-        refresh_epg_suffixes(&tick);
-        let total = tick.model.borrow().len() + tick.epg_rows.borrow().len();
-        if total > 0 {
-            list.refresh_items(0, i64::try_from(total).unwrap_or(i64::MAX) - 1);
-        }
+        // The rebuild itself runs on the suffix worker
+        // (validation 0070); the tick only applies a finished
+        // result and queues the next refresh.
+        drain_suffix_results(&tick, list);
+        request_suffix_refresh(&tick);
     });
     let _ = wiring.epg_timer.start(60_000, false);
 }
@@ -1203,6 +1210,7 @@ fn bind_completion(wiring: &Wiring, controls: Controls) {
             reload_epg(&completed);
         }
         poll_epg(&completed, status);
+        drain_suffix_results(&completed, list);
         {
             let stale = {
                 let slot = completed.epg_suffixes.borrow();
@@ -1210,11 +1218,7 @@ fn bind_completion(wiring: &Wiring, controls: Controls) {
                     || (completed.epg.borrow().is_some() && now_epoch() - slot.0 > 300)
             };
             if stale {
-                refresh_epg_suffixes(&completed);
-                let count = list.get_item_count();
-                if count > 0 {
-                    list.refresh_items(0, i64::from(count) - 1);
-                }
+                request_suffix_refresh(&completed);
             }
         }
         poll_providers(&completed, controls);
@@ -1224,6 +1228,7 @@ fn bind_completion(wiring: &Wiring, controls: Controls) {
         poll_downloads(&completed, status);
         if !completed.browser.borrow().is_busy()
             && !completed.epg_pending.get()
+            && !completed.suffix_pending.get()
             && !completed.provider_pending.get()
             && !completed
                 .reminders
@@ -1815,8 +1820,12 @@ fn poll_epg(wiring: &Wiring, status: Status) {
                 };
                 // The store changed under the cached indexes.
                 *wiring.epg_store_indexes.borrow_mut() = None;
-                // The guide changed under the match cache (E12).
-                *wiring.epg_match_cache.borrow_mut() = None;
+                // The guide changed under the suffix worker's
+                // caches (validation 0070): bump its generation
+                // and mark the on-screen suffixes stale.
+                wiring
+                    .guide_generation
+                    .set(wiring.guide_generation.get() + 1);
                 wiring.epg_suffixes.borrow_mut().0 = 0;
                 // Python records the import stamp and the hash of
                 // the sources actually imported, so the next
@@ -3080,8 +3089,10 @@ fn run_series_scan(wiring: &Wiring) {
 #[derive(Clone)]
 struct VodUi {
     frame: Frame,
+    search: TextCtrl,
     groups: ListBox,
     items: ListBox,
+    details: TextCtrl,
     status: Status,
     view: Rc<RefCell<VodView>>,
 }
@@ -3091,7 +3102,15 @@ struct VodView {
     catalog: VodCatalog,
     accounts: Vec<ProviderAccount>,
     showing: Vec<VodItem>,
-    stack: Vec<Vec<VodItem>>,
+    /// Drill-in history: the previous list and the row that was
+    /// opened from it, so Back restores the same selection
+    /// (spec 0006).
+    stack: Vec<(Vec<VodItem>, usize)>,
+    /// The applied search query (spec 0006); empty = unfiltered.
+    query: String,
+    /// The group retained while a query is active; clearing the
+    /// query restores this group's unfiltered items.
+    group_label: Option<String>,
 }
 
 /// The provider accounts from the configured playlists (the accounts
@@ -3112,14 +3131,7 @@ fn vod_accounts(persist: &Persist) -> Vec<ProviderAccount> {
 /// Open (or raise) the VOD window and rebuild its catalogue
 /// (shared by the button and the View menu).
 fn open_vod_window(wiring: &Wiring, status: Status) {
-    let ui = ensure_vod_ui(
-        &wiring.vod_ui,
-        &wiring.player,
-        &wiring.persist,
-        &wiring.vod_worker,
-        &wiring.vod_pending,
-        &wiring.timer,
-    );
+    let ui = ensure_vod_ui(wiring);
     ui.frame.show(true);
     ui.frame.raise();
     let accounts = vod_accounts(&wiring.persist);
@@ -3129,25 +3141,69 @@ fn open_vod_window(wiring: &Wiring, status: Status) {
     // filtering/cloning on its own thread.
     let (model, extras) = wiring.browser.borrow().catalogue_parts();
     let scope = wiring.browser.borrow().scope().map(str::to_owned);
-    wiring.vod_worker.build(accounts, model, extras, scope);
+    // Spec 0006: the M3U source labels keyed by scope id, derived
+    // from the configured playlists and their friendly names.
+    let (sources, _) = configured_entries(wiring);
+    let names = playlist_names(wiring);
+    let source_labels: Vec<(String, String)> = sources
+        .iter()
+        .map(|source| {
+            (
+                source.scope_id(),
+                source_display_label(source.location(), &names),
+            )
+        })
+        .collect();
+    wiring
+        .vod_worker
+        .build(accounts, model, extras, scope, source_labels);
     wiring.vod_pending.set(true);
     assert!(wiring.timer.start(50, false));
     status.set_label("Loading video on demand catalogue...");
 }
 
-/// Build the VOD window's widgets: (frame, groups, items, play, back,
-/// status).
-fn build_vod_window() -> (Frame, ListBox, ListBox, Button, Button, Status) {
+/// Build the VOD window's widgets: (frame, search, groups, items,
+/// item details, play, back, status).
+#[allow(clippy::type_complexity)]
+fn build_vod_window() -> (
+    Frame,
+    TextCtrl,
+    ListBox,
+    ListBox,
+    TextCtrl,
+    Button,
+    Button,
+    Status,
+) {
     let frame = Frame::builder()
         .with_title("Video on Demand")
         .with_size(Size::new(720, 520))
         .build();
     frame.set_accessibility_label("Video on Demand");
     let panel = Panel::builder(&frame).build();
+    // Spec 0006: the search applies only on Enter; editing the
+    // field alone changes nothing.
+    let search_label = StaticText::builder(&panel).with_label("&Search").build();
+    let _ = search_label;
+    let search = TextCtrl::builder(&panel)
+        .with_style(TextCtrlStyle::ProcessEnter)
+        .build();
+    search.set_accessibility_label("Search VOD");
     let groups = ListBox::builder(&panel).build();
     groups.set_accessibility_label("VOD groups");
     let items = ListBox::builder(&panel).build();
     items.set_accessibility_label("VOD items");
+    // Spec 0006: the read-only item-details control; the stream
+    // URL appears here and nowhere else.
+    let details_label = StaticText::builder(&panel)
+        .with_label("Item details")
+        .build();
+    let _ = details_label;
+    let item_details_box = TextCtrl::builder(&panel)
+        .with_style(TextCtrlStyle::ReadOnly | TextCtrlStyle::MultiLine)
+        .with_value("No item selected.")
+        .build();
+    item_details_box.set_accessibility_label("Item details");
     let play = Button::builder(&panel).with_label("&Play / Open").build();
     play.set_accessibility_label("Play or open selected item");
     let back = Button::builder(&panel).with_label("&Back").build();
@@ -3163,36 +3219,51 @@ fn build_vod_window() -> (Frame, ListBox, ListBox, Button, Button, Status) {
         details,
         bar: None,
     };
-    (frame, groups, items, play, back, status)
+    (
+        frame,
+        search,
+        groups,
+        items,
+        item_details_box,
+        play,
+        back,
+        status,
+    )
 }
 
 /// Build the VOD window once and keep it (closing hides it).
-fn ensure_vod_ui(
-    slot: &Rc<RefCell<Option<VodUi>>>,
-    player: &Rc<RefCell<PlayerState>>,
-    persist: &Persist,
-    worker: &Rc<VodWorker>,
-    pending: &Rc<std::cell::Cell<bool>>,
-    timer: &Rc<Timer<Frame>>,
-) -> VodUi {
+#[allow(clippy::too_many_lines)]
+fn ensure_vod_ui(wiring: &Wiring) -> VodUi {
+    let slot = &wiring.vod_ui;
     if let Some(ui) = slot.borrow().as_ref() {
         return ui.clone();
     }
-    let (frame, groups, items, play, back, status) = build_vod_window();
+    let player = &wiring.player;
+    let persist = &wiring.persist;
+    let worker = &wiring.vod_worker;
+    let pending = &wiring.vod_pending;
+    let timer = &wiring.timer;
+    let (frame, search, groups, items, item_details_box, play, back, status) = build_vod_window();
     let view = Rc::new(RefCell::new(VodView::default()));
     let ui = VodUi {
         frame,
+        search,
         groups,
         items,
+        details: item_details_box,
         status,
         view,
     };
-    // Group selection shows that group's items.
+    // Group selection shows that group's items. Choosing a group
+    // leaves search mode (spec 0006): the filter and the field
+    // both reset, and the group becomes the retained group.
     {
         let view = Rc::clone(&ui.view);
         let groups_box = groups;
         let items_box = items;
+        let search_box = search;
         let worker = Rc::clone(worker);
+        let wiring = wiring.clone();
         groups.bind_internal(EventType::COMMAND_LISTBOX_SELECTED, move |_| {
             // B18: changing group supersedes an in-flight episode reply.
             worker.invalidate();
@@ -3203,9 +3274,90 @@ fn ensure_vod_ui(
             let Some(label) = view.catalog.order.get(selection as usize).cloned() else {
                 return;
             };
+            if !view.query.is_empty() {
+                view.query.clear();
+                search_box.set_value("");
+            }
+            view.group_label = Some(label.clone());
             view.showing = view.catalog.groups.get(&label).cloned().unwrap_or_default();
             view.stack.clear();
             show_items(items_box, &view.showing);
+            let first = (!view.showing.is_empty()).then_some(0);
+            refresh_vod_details(&wiring, &view, item_details_box, first);
+        });
+    }
+    // Search (spec 0006): Enter applies the query against the
+    // retained catalogue on the worker; focus stays in the field.
+    // A blank query clears the filter and restores the retained
+    // group's unfiltered items.
+    {
+        let view = Rc::clone(&ui.view);
+        let groups_box = groups;
+        let items_box = items;
+        let search_box = search;
+        let worker = Rc::clone(worker);
+        let pending = Rc::clone(pending);
+        let timer = Rc::clone(timer);
+        let wiring = wiring.clone();
+        search.bind_internal(EventType::TEXT_ENTER, move |_| {
+            let query = search_box.get_value().trim().to_string();
+            if query.is_empty() {
+                let mut view = view.borrow_mut();
+                if view.query.is_empty() {
+                    return;
+                }
+                view.query.clear();
+                view.stack.clear();
+                let label = view
+                    .group_label
+                    .clone()
+                    .or_else(|| view.catalog.order.first().cloned());
+                if let Some(label) = label {
+                    if let Some(position) =
+                        view.catalog.order.iter().position(|group| group == &label)
+                    {
+                        groups_box.set_selection(u32::try_from(position).unwrap_or(0), true);
+                    }
+                    view.showing = view.catalog.groups.get(&label).cloned().unwrap_or_default();
+                    status.set_label(&trf(
+                        "Search cleared. Showing {group}.",
+                        &[("group", &label)],
+                    ));
+                }
+                show_items(items_box, &view.showing);
+                let first = (!view.showing.is_empty()).then_some(0);
+                refresh_vod_details(&wiring, &view, item_details_box, first);
+                return;
+            }
+            {
+                let mut view = view.borrow_mut();
+                if view.query.is_empty() {
+                    // Retain the group to restore when the filter
+                    // is cleared; the groups selection still names
+                    // it even while drilled into a series.
+                    if let Some(selection) = groups_box.get_selection() {
+                        view.group_label = view.catalog.order.get(selection as usize).cloned();
+                    }
+                }
+                view.query.clone_from(&query);
+            }
+            worker.search(query);
+            pending.set(true);
+            assert!(timer.start(50, false));
+        });
+    }
+    // Item selection updates the details control in place
+    // (spec 0006): no focus movement.
+    {
+        let view = Rc::clone(&ui.view);
+        let items_box = items;
+        let wiring = wiring.clone();
+        items.bind_internal(EventType::COMMAND_LISTBOX_SELECTED, move |_| {
+            let Some(selection) = items_box.get_selection() else {
+                return;
+            };
+            let view = view.borrow();
+            refresh_vod_details(&wiring, &view, item_details_box, Some(selection as usize));
         });
     }
     // Play / Open: movies play; series drill in (episodes inline for
@@ -3218,6 +3370,7 @@ fn ensure_vod_ui(
         let worker = Rc::clone(worker);
         let pending = Rc::clone(pending);
         let timer = Rc::clone(timer);
+        let wiring = wiring.clone();
         play.on_click(move |_| {
             let Some(selection) = items_box.get_selection() else {
                 return;
@@ -3234,9 +3387,11 @@ fn ensure_vod_ui(
                     if !item.episodes.is_empty() {
                         let mut view = view.borrow_mut();
                         let previous = std::mem::take(&mut view.showing);
-                        view.stack.push(previous);
+                        view.stack.push((previous, selection as usize));
                         view.showing.clone_from(&item.episodes);
                         show_items(items_box, &view.showing);
+                        let first = (!view.showing.is_empty()).then_some(0);
+                        refresh_vod_details(&wiring, &view, item_details_box, first);
                     } else if let Some(series_id) = &item.series_id {
                         let account = view
                             .borrow()
@@ -3255,17 +3410,20 @@ fn ensure_vod_ui(
             }
         });
     }
-    // Back: return to the previous item list.
+    // Back: return to the previous item list with the row that was
+    // opened from it reselected (spec 0006).
     {
         let view = Rc::clone(&ui.view);
         let items_box = items;
         let worker = Rc::clone(worker);
+        let wiring = wiring.clone();
         back.on_click(move |_| {
             worker.invalidate();
             let mut view = view.borrow_mut();
-            if let Some(previous) = view.stack.pop() {
+            if let Some((previous, selection)) = view.stack.pop() {
                 view.showing = previous;
-                show_items(items_box, &view.showing);
+                show_items_at(items_box, &view.showing, selection);
+                refresh_vod_details(&wiring, &view, item_details_box, Some(selection));
             }
         });
     }
@@ -3286,12 +3444,63 @@ fn ensure_vod_ui(
 
 /// Fill the items list from `VodItem`s and select the first row.
 fn show_items(items_box: ListBox, showing: &[VodItem]) {
+    show_items_at(items_box, showing, 0);
+}
+
+/// Fill the items list and select `selection` (Back restores the
+/// row the user opened, spec 0006).
+fn show_items_at(items_box: ListBox, showing: &[VodItem], selection: usize) {
     let names: Vec<String> = showing.iter().map(|i| i.name.clone()).collect();
-    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    fill_items(items_box, &names, selection);
+}
+
+/// Fill the items list with search-result rows (title, type,
+/// group, source in the accessible row text) and select the
+/// first row.
+fn show_hit_rows(items_box: ListBox, hits: &[VodSearchHit]) {
+    let labels: Vec<String> = hits.iter().map(VodSearchHit::row_label).collect();
+    fill_items(items_box, &labels, 0);
+}
+
+fn fill_items(items_box: ListBox, labels: &[String], selection: usize) {
+    let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
     items_box.set_items(&refs);
     if !refs.is_empty() {
-        items_box.set_selection(0, true);
+        let index = selection.min(refs.len() - 1);
+        items_box.set_selection(u32::try_from(index).unwrap_or(0), true);
     }
+}
+
+/// The EPG description for an item's channel when one is already
+/// available (spec 0006): the current programme's description.
+fn vod_item_description(wiring: &Wiring, item: &VodItem) -> Option<String> {
+    let channel = item.channel.as_ref()?;
+    guide_now_next(wiring, channel)?
+        .current
+        .map(|programme| programme.description)
+}
+
+/// Refresh the item-details control for the row at `selection`
+/// (spec 0006): read-only text, no focus movement; the stream
+/// URL reaches only this control.
+fn refresh_vod_details(
+    wiring: &Wiring,
+    view: &VodView,
+    details: TextCtrl,
+    selection: Option<usize>,
+) {
+    let text = selection
+        .and_then(|index| view.showing.get(index))
+        .map_or_else(
+            || "No item selected.".to_string(),
+            |item| {
+                let description = vod_item_description(wiring, item);
+                item_details(item, description.as_deref())
+                    .lines()
+                    .join("\n")
+            },
+        );
+    details.set_value(&text);
 }
 
 /// Collect VOD worker events into the window.
@@ -3299,8 +3508,10 @@ fn poll_vod(wiring: &Wiring, status: Status) {
     while let Some(event) = wiring.vod_worker.try_recv() {
         // B18: a reply from a superseded build/episode request must
         // never replace newer navigation.
+        // A search answers at the build generation it was issued
+        // under; a rebuild supersedes it, like a catalogue reply.
         let current = match &event {
-            VodEvent::Catalog { generation, .. } => {
+            VodEvent::Catalog { generation, .. } | VodEvent::SearchResults { generation, .. } => {
                 wiring.vod_worker.is_current_catalog(*generation)
             }
             VodEvent::Episodes { token, .. } => wiring.vod_worker.is_current_episodes(*token),
@@ -3317,7 +3528,17 @@ fn poll_vod(wiring: &Wiring, status: Status) {
                 let groups_count = catalog.order.len();
                 let items_count: usize = catalog.groups.values().map(Vec::len).sum();
                 let labels = catalog.order.clone();
-                ui.view.borrow_mut().catalog = catalog;
+                {
+                    let mut view = ui.view.borrow_mut();
+                    view.catalog = catalog;
+                    // A reload supersedes any applied search
+                    // (spec 0006): filter, field, and drill-in
+                    // state all reset.
+                    view.query.clear();
+                    view.group_label = labels.first().cloned();
+                    view.stack.clear();
+                }
+                ui.search.set_value("");
                 let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
                 ui.groups.set_items(&refs);
                 if !refs.is_empty() {
@@ -3332,16 +3553,22 @@ fn poll_vod(wiring: &Wiring, status: Status) {
                 ));
                 status.set_label("VOD catalogue loaded.");
             }
+            VodEvent::SearchResults { query, hits, .. } => {
+                apply_vod_search_results(wiring, &ui, &query, &hits);
+            }
             VodEvent::Episodes {
                 result: Ok(episodes),
                 ..
             } => {
                 let count = episodes.len();
+                let selection = ui.items.get_selection().map_or(0, |row| row as usize);
                 let mut view = ui.view.borrow_mut();
                 let previous = std::mem::take(&mut view.showing);
-                view.stack.push(previous);
+                view.stack.push((previous, selection));
                 view.showing = episodes;
                 show_items(ui.items, &view.showing);
+                let first = (!view.showing.is_empty()).then_some(0);
+                refresh_vod_details(wiring, &view, ui.details, first);
                 ui.status.set_label(&trf(
                     "{count} episodes loaded.",
                     &[("count", &count.to_string())],
@@ -3356,6 +3583,41 @@ fn poll_vod(wiring: &Wiring, status: Status) {
                 ));
             }
         }
+    }
+}
+
+/// Apply one VOD search reply (spec 0006): results for a query
+/// the view no longer holds (cleared or replaced) are stale and
+/// drop; live results replace the item list at the top level,
+/// keep focus where it is, and announce a concise count.
+fn apply_vod_search_results(wiring: &Wiring, ui: &VodUi, query: &str, hits: &[VodSearchHit]) {
+    let mut view = ui.view.borrow_mut();
+    if view.query != query {
+        return;
+    }
+    let count = hits.len();
+    view.showing = hits
+        .iter()
+        .filter_map(|hit| {
+            view.catalog
+                .groups
+                .get(&hit.group)
+                .and_then(|items| items.get(hit.index))
+                .cloned()
+        })
+        .collect();
+    view.stack.clear();
+    show_hit_rows(ui.items, hits);
+    let first = (!view.showing.is_empty()).then_some(0);
+    refresh_vod_details(wiring, &view, ui.details, first);
+    if count == 0 {
+        ui.status
+            .set_label(&trf("No results for {query}.", &[("query", query)]));
+    } else {
+        ui.status.set_label(&trf(
+            "{count} results for {query}.",
+            &[("count", &count.to_string()), ("query", query)],
+        ));
     }
 }
 
@@ -3607,7 +3869,10 @@ fn clone_wiring(wiring: &Wiring) -> Wiring {
         player: Rc::clone(&wiring.player),
         epg: Rc::clone(&wiring.epg),
         epg_suffixes: Rc::clone(&wiring.epg_suffixes),
-        epg_match_cache: Rc::clone(&wiring.epg_match_cache),
+        suffix_worker: Rc::clone(&wiring.suffix_worker),
+        suffix_pending: Rc::clone(&wiring.suffix_pending),
+        suffix_generation: Rc::clone(&wiring.suffix_generation),
+        guide_generation: Rc::clone(&wiring.guide_generation),
         epg_store: Rc::clone(&wiring.epg_store),
         epg_worker: Rc::clone(&wiring.epg_worker),
         epg_pending: Rc::clone(&wiring.epg_pending),
@@ -13577,7 +13842,7 @@ fn open_whats_new(wiring: &Wiring, status: Status) {
 }
 
 /// The What's New text for the running version (updated per release).
-const WHATS_NEW_TEXT: &str = "Version 0.4.9 refreshes everything under the hood: the cryptography, the guide parser, the database and the platform libraries are all at their newest released versions. Nothing changes on screen, and settings backups stay fully compatible; backups written by earlier versions still restore.\n\nVersion 0.4.8\n\nCasting works with header-protected streams again. The built-in cast proxy now answers the HEAD requests casting devices send before playing, follows redirects so playlists resolve against the address they actually live at, and passes range and duration headers through, so casting devices can probe a stream properly. Streams that need a specific player identity now get the default one automatically. Thanks to Farhan Khan for the fix. The PR validation gate also checks whitespace properly again.\n\nVersion 0.4.7\n\nFaster with big playlists and guides, and the last parity gaps closed. Large playlists now keep a background index, so switching playlists or categories and searching stay quick even with hundreds of thousands of channels, and the guide shown on each row refreshes almost instantly instead of re-checking every channel against the guide every minute. Scheduled Recordings has the right-click menu (Refresh, Cancel, Delete) like the Python client. The preferred audio track check now waits as long as the Python client does, so a slow stream is less likely to lose your saved track. Closing the app no longer waits on the player engine. The log file lives where the Python client puts it. And pressing F1 while a menu is open now opens the help for the menu item you are on.\n\nVersion 0.4.6\n\nFix: single-instance handover now works on Windows (the lock file is opened with the access Windows requires). Plus the Python parity catch-up. Guide sources saved by the Python client now load, the saved guide is there again after a restart, and search finds programmes as well as channels. Provider playlists keep their own channels separate, replace cleanly on refresh, and a failed refresh keeps the channels you had. Resume positions now read the Python client's bookmarks, so Continue Watching carries across. Recordings get unique file names, retries, destination space checks, and honest empty-recording reports; reminders and series recording match the Python dialogs. The app is single-instance (a second launch hands over to the running one), keeps a real log file under Help, checks for updates hourly, and F1 opens the help topic for the window you are in.\n\nVersion 0.4.4\n\nLess talk, working keys. Controls no longer read out instructional sentences when you land on them — Categories, Search, and Channels announce their names, like the Python app, and the channel list no longer repeats the playlist status message every time you tab to it. Ctrl+Up and Ctrl+Down now only change the volume; they no longer move the channel or category selection at the same time. And the search field selects your whole query when you enter it, so typing replaces it, with Ctrl+A selecting all.\n\nVersion 0.4.3\n\nRecording conflicts and safer imports. When a scheduled recording would take a provider connection your watching is using, the recording waits with its reason shown in Scheduled Recordings instead of cutting in; you choose there: keep watching and let it wait, stop playback and record, or cancel the recording. Waiting recordings start fairly, earliest first, when a connection frees. And importing settings now first saves a verified encrypted recovery copy of your current settings where you choose, under its own password, and refuses to run while recordings or downloads are active. The basic player (when libVLC is unavailable) also reports its state honestly now, and its menus no longer offer full-player-only controls.\n\nVersion 0.4.2\n\nReliability and subtitle speech. Playback now confirms before it counts as playing, and a failing stream retries inside one 30-second budget with a clear Stream lost message instead of spinning forever. Recordings that start late say so honestly, and cancelling a scheduled recording now stops its capture. Settings backups interchange with the Python client, verified both ways. Subtitles can now speak through an application voice on Windows (SAPI), not only through your screen reader: pick the backend, output device, volume, and speed under Options, Subtitle Speech, and if the chosen output device disappears, speech pauses until it returns or falls back to the system default, per the device policy.\n\nVersion 0.4.1\n\nLess talk. Channel rows now carry the guide the way the Python app does — channel name first, then the current and next programmes after it — and moving through the list no longer speaks the guide out loud on every step; the description panel still fills in silently.\n\nVersion 0.4.0\n\nSigned updates. Check for Updates now uses the ship-shape updater, the same signed updater as BlindRadio: update packages are cryptographically signed and verified before anything installs, then install and relaunch on their own (Windows and Linux; macOS opens the verified disk image for a manual install). Releases before this one can still update forward onto it.\n\nVersion 0.3.4\n\nFix: large playlists load promptly at startup. The playlist now loads first and the programme guide follows once it settles, instead of the two downloads racing; the guide database write no longer freezes the window; and the channel list says Loading playlist while a load is in flight instead of claiming no playlist is loaded.\n\nVersion 0.3.3\n\nFix: streams play again. The packages now bundle libVLC (the built-in player engine) beside the app on Windows, Linux, and macOS, so playback works with no separate VLC install. If libVLC still cannot load, pressing play now says so instead of failing silently.\n\nVersion 0.3.2\n\nFix: large playlists and guides now load. The HTTP library silently capped downloads at 10 MB, so a big provider playlist (for example a 28 MB, 115,000-channel list) failed to add and its EPG could never load. Playlist, EPG, Xtream, and Stalker fetches now take the full body.\n\nVersion 0.3.1\n\nFix: the Windows build no longer shows a wxWidgets debug dialog (\"Can't expand/collapse hidden root node!\") at startup or when the category list rebuilds. Nothing else changes from 0.3.0.\n\nVersion 0.3.0\n\nMain window: the layout now matches the Python client exactly (Playlist view and Categories on the left; Search, Channels, description and Stream URL on the right), and the menu-less shortcuts from the Python client work here: Ctrl+Up/Down volume, Ctrl+Shift+R record, Ctrl+D favorite and the rest of the documented set.\n\nPlayer: a Playback menu in Python's order, a Sleep Timer with an optional volume fade-out, and an Audio Output Device dialog that lists the real libVLC devices (System default first) and applies the saved choice at playback start. Announcement levels now gate player speech exactly as Python's do (None, Errors only, Important events, Detailed status).\n\nLocal Live Buffer: live TV in the built-in player can be buffered locally (off by default; set it up from the player's Playback menu), which enables pausing live TV, Rewind Live TV and Return to Live. A recording of a buffered channel reads the buffer instead of opening a second provider connection.\n\nDialogs: What's on Now has its filter box with a program count; Continue Watching gains Check Availability, which re-resolves each saved position against the current playlists and reports Available or Unavailable per row. Settings backup and restore now use Python's password-protected encrypted format, so backups interchange with the Python client both ways.\n\nMenus and shell: the Media Player menu lists all 32 players the Python client offers, with its exact per-platform program lookup. The tray icon builds Python's popup fresh on every right-click (Restore, Player Controls, Stop Recording(s) while recording, Exit) and left-click restores the window. The Recordings menu's minimum-free-space reserve and schedule padding use Python's values.";
+const WHATS_NEW_TEXT: &str = "Version 0.4.12 adds VOD search and item details, and stops the window freezing during playback. In the VOD window, the new Search VOD field searches movies and series across every group: type a title and press Enter; each result row names its group and where it comes from, the status line says how many items matched, and clearing the search brings back the group you were browsing. The new Item details view shows the selected item's title, type, group, source, its guide description when one is available, and its stream address. Opening a series from the results and going back returns you to the same results with that series still selected. Also fixed: the guide information on channel rows now refreshes on a background thread instead of on the window itself, so alt-tabbing back into the app during playback answers right away instead of taking five to ten seconds, and a refreshed guide merges in much faster.\\n\\nVersion 0.4.11 makes startup and channel changes feel instant with a large guide. The channel rows used to freeze for several seconds after each playlist load, because refreshing the guide information on each row scanned the whole saved guide; it now looks at just the hours around the current time, the same way the Python client does. On a guide with about 800,000 programmes that step drops from about five seconds to a fraction of a second, so new channels are ready to use as soon as they appear.\n\nVersion 0.4.10 speeds up the programme guide and fixes a recording check. The guide now loads and refreshes as fast as the Python client or faster: on a large test guide, a first load dropped from about thirteen minutes to about two and a half, a refresh from about three minutes to about one, and opening the app with a guide already saved is instant instead of taking most of a minute. Recordings work again on non-English Windows systems: the free-space check before recording no longer depends on localized command output (thanks to Farhan Khan for that fix). And the player no longer logs a warning about a plugin-path option that current libVLC removed; it uses the mechanism libVLC supports now.\n\nVersion 0.4.9 refreshes everything under the hood: the cryptography, the guide parser, the database and the platform libraries are all at their newest released versions. Nothing changes on screen, and settings backups stay fully compatible; backups written by earlier versions still restore.\n\nVersion 0.4.8\n\nCasting works with header-protected streams again. The built-in cast proxy now answers the HEAD requests casting devices send before playing, follows redirects so playlists resolve against the address they actually live at, and passes range and duration headers through, so casting devices can probe a stream properly. Streams that need a specific player identity now get the default one automatically. Thanks to Farhan Khan for the fix. The PR validation gate also checks whitespace properly again.\n\nVersion 0.4.7\n\nFaster with big playlists and guides, and the last parity gaps closed. Large playlists now keep a background index, so switching playlists or categories and searching stay quick even with hundreds of thousands of channels, and the guide shown on each row refreshes almost instantly instead of re-checking every channel against the guide every minute. Scheduled Recordings has the right-click menu (Refresh, Cancel, Delete) like the Python client. The preferred audio track check now waits as long as the Python client does, so a slow stream is less likely to lose your saved track. Closing the app no longer waits on the player engine. The log file lives where the Python client puts it. And pressing F1 while a menu is open now opens the help for the menu item you are on.\n\nVersion 0.4.6\n\nFix: single-instance handover now works on Windows (the lock file is opened with the access Windows requires). Plus the Python parity catch-up. Guide sources saved by the Python client now load, the saved guide is there again after a restart, and search finds programmes as well as channels. Provider playlists keep their own channels separate, replace cleanly on refresh, and a failed refresh keeps the channels you had. Resume positions now read the Python client's bookmarks, so Continue Watching carries across. Recordings get unique file names, retries, destination space checks, and honest empty-recording reports; reminders and series recording match the Python dialogs. The app is single-instance (a second launch hands over to the running one), keeps a real log file under Help, checks for updates hourly, and F1 opens the help topic for the window you are in.\n\nVersion 0.4.4\n\nLess talk, working keys. Controls no longer read out instructional sentences when you land on them — Categories, Search, and Channels announce their names, like the Python app, and the channel list no longer repeats the playlist status message every time you tab to it. Ctrl+Up and Ctrl+Down now only change the volume; they no longer move the channel or category selection at the same time. And the search field selects your whole query when you enter it, so typing replaces it, with Ctrl+A selecting all.\n\nVersion 0.4.3\n\nRecording conflicts and safer imports. When a scheduled recording would take a provider connection your watching is using, the recording waits with its reason shown in Scheduled Recordings instead of cutting in; you choose there: keep watching and let it wait, stop playback and record, or cancel the recording. Waiting recordings start fairly, earliest first, when a connection frees. And importing settings now first saves a verified encrypted recovery copy of your current settings where you choose, under its own password, and refuses to run while recordings or downloads are active. The basic player (when libVLC is unavailable) also reports its state honestly now, and its menus no longer offer full-player-only controls.\n\nVersion 0.4.2\n\nReliability and subtitle speech. Playback now confirms before it counts as playing, and a failing stream retries inside one 30-second budget with a clear Stream lost message instead of spinning forever. Recordings that start late say so honestly, and cancelling a scheduled recording now stops its capture. Settings backups interchange with the Python client, verified both ways. Subtitles can now speak through an application voice on Windows (SAPI), not only through your screen reader: pick the backend, output device, volume, and speed under Options, Subtitle Speech, and if the chosen output device disappears, speech pauses until it returns or falls back to the system default, per the device policy.\n\nVersion 0.4.1\n\nLess talk. Channel rows now carry the guide the way the Python app does — channel name first, then the current and next programmes after it — and moving through the list no longer speaks the guide out loud on every step; the description panel still fills in silently.\n\nVersion 0.4.0\n\nSigned updates. Check for Updates now uses the ship-shape updater, the same signed updater as BlindRadio: update packages are cryptographically signed and verified before anything installs, then install and relaunch on their own (Windows and Linux; macOS opens the verified disk image for a manual install). Releases before this one can still update forward onto it.\n\nVersion 0.3.4\n\nFix: large playlists load promptly at startup. The playlist now loads first and the programme guide follows once it settles, instead of the two downloads racing; the guide database write no longer freezes the window; and the channel list says Loading playlist while a load is in flight instead of claiming no playlist is loaded.\n\nVersion 0.3.3\n\nFix: streams play again. The packages now bundle libVLC (the built-in player engine) beside the app on Windows, Linux, and macOS, so playback works with no separate VLC install. If libVLC still cannot load, pressing play now says so instead of failing silently.\n\nVersion 0.3.2\n\nFix: large playlists and guides now load. The HTTP library silently capped downloads at 10 MB, so a big provider playlist (for example a 28 MB, 115,000-channel list) failed to add and its EPG could never load. Playlist, EPG, Xtream, and Stalker fetches now take the full body.\n\nVersion 0.3.1\n\nFix: the Windows build no longer shows a wxWidgets debug dialog (\"Can't expand/collapse hidden root node!\") at startup or when the category list rebuilds. Nothing else changes from 0.3.0.\n\nVersion 0.3.0\n\nMain window: the layout now matches the Python client exactly (Playlist view and Categories on the left; Search, Channels, description and Stream URL on the right), and the menu-less shortcuts from the Python client work here: Ctrl+Up/Down volume, Ctrl+Shift+R record, Ctrl+D favorite and the rest of the documented set.\n\nPlayer: a Playback menu in Python's order, a Sleep Timer with an optional volume fade-out, and an Audio Output Device dialog that lists the real libVLC devices (System default first) and applies the saved choice at playback start. Announcement levels now gate player speech exactly as Python's do (None, Errors only, Important events, Detailed status).\n\nLocal Live Buffer: live TV in the built-in player can be buffered locally (off by default; set it up from the player's Playback menu), which enables pausing live TV, Rewind Live TV and Return to Live. A recording of a buffered channel reads the buffer instead of opening a second provider connection.\n\nDialogs: What's on Now has its filter box with a program count; Continue Watching gains Check Availability, which re-resolves each saved position against the current playlists and reports Available or Unavailable per row. Settings backup and restore now use Python's password-protected encrypted format, so backups interchange with the Python client both ways.\n\nMenus and shell: the Media Player menu lists all 32 players the Python client offers, with its exact per-platform program lookup. The tray icon builds Python's popup fresh on every right-click (Restore, Player Controls, Stop Recording(s) while recording, Exit) and left-click restores the window. The Recordings menu's minimum-free-space reserve and schedule padding use Python's values.";
 
 /// Run the platform shutdown (factored out of the recordings poll
 /// for the countdown dialog).
@@ -13832,67 +14097,80 @@ fn channel_text(
     }
 }
 
-/// Rebuild the row suffixes and on-air descriptions for the
-/// current playlist + guide from ONE bulk now/next snapshot
-/// (audit E12): the snapshot walks every guide channel once,
-/// the catalogue is borrowed rather than cloned, and the guide
-/// indexes are the ones built with the guide — nothing is
-/// rebuilt per channel. The store alone can drive the rebuild
-/// after a restart (audit E02).
-/// The row guide for the current playlist+guide, through the
-/// match cache (audit E12): the first build for a playlist
-/// matches every channel once; later refreshes only assemble
-/// suffixes from the fresh bulk snapshot.
-fn cached_row_guide(
-    wiring: &Wiring,
-    channels: &[Channel],
-    indexes: &GuideIndexes,
-    bulk: &std::collections::HashMap<String, NowNext>,
-) -> (
-    std::collections::HashMap<usize, String>,
-    std::collections::HashMap<usize, String>,
-) {
-    let ptr = wiring.model.borrow().playlist_ptr();
-    let mut slot = wiring.epg_match_cache.borrow_mut();
-    if !matches!(slot.as_ref(), Some((key, _)) if *key == ptr) {
-        *slot = Some((
-            ptr,
-            iptv_core::epg::GuideMatchCache::build(channels, indexes),
-        ));
+/// Queue a row-suffix rebuild on the suffix worker
+/// (validation 0070). The pipeline that used to run here on the
+/// UI tick — store snapshot, guide indexes, the playlist-wide
+/// fuzzy match, the row build — measured up to 25 s at
+/// real-world scale and froze the window on every refresh;
+/// Python runs the same refresh on a background thread and so
+/// does this port now. Dispatch only: one job in flight at a
+/// time, and none while the browser is busy (Python's gate
+/// defers while the user is interacting; the timers retry).
+fn request_suffix_refresh(wiring: &Wiring) {
+    if !wiring.persist.config.borrow().bool_or("epg_enabled", true) {
+        // EPG off clears the suffixes, as the old synchronous
+        // refresh did.
+        let ptr = wiring.model.borrow().playlist_ptr();
+        let mut slot = wiring.epg_suffixes.borrow_mut();
+        if slot.1 != ptr || !slot.2.is_empty() {
+            *slot = (now_epoch(), ptr, std::collections::HashMap::new());
+        }
+        return;
     }
-    let cache = &slot.as_ref().expect("match cache just set").1;
-    iptv_core::epg::row_guide_from_matches(cache.matches(), bulk)
+    if wiring.suffix_pending.get() || wiring.browser.borrow().is_busy() {
+        return;
+    }
+    let (model, _extras) = wiring.browser.borrow().catalogue_parts();
+    if model.channels().is_empty() {
+        return;
+    }
+    let generation = wiring.suffix_generation.get() + 1;
+    wiring.suffix_generation.set(generation);
+    wiring.suffix_pending.set(true);
+    wiring.suffix_worker.build(SuffixJob {
+        generation,
+        guide_generation: wiring.guide_generation.get(),
+        model,
+        store_path: epg_store_path(),
+        at: now_epoch(),
+    });
+    ensure_polling(wiring);
 }
 
-fn refresh_epg_suffixes(wiring: &Wiring) {
-    let now = now_epoch();
-    let playlist_ptr = wiring.model.borrow().playlist_ptr();
-    let mut suffixes = std::collections::HashMap::new();
-    if wiring.persist.config.borrow().bool_or("epg_enabled", true) {
-        let browser = wiring.browser.borrow();
-        if let Some((guide, indexes)) = wiring.epg.borrow().as_ref() {
-            let bulk = guide.bulk_now_next(now);
-            browser.with_all_channels(|channels| {
-                suffixes = cached_row_guide(wiring, channels, indexes, &bulk).0;
-            });
-        } else if let Some(indexes) = store_indexes(wiring) {
-            if let Some(bulk) = wiring
-                .epg_store
-                .borrow()
-                .as_ref()
-                .and_then(|store| store.all_now_next(now).ok())
-            {
-                let bulk: std::collections::HashMap<String, NowNext> = bulk
-                    .into_iter()
-                    .map(|(channel, entry)| (channel.id, entry))
-                    .collect();
-                browser.with_all_channels(|channels| {
-                    suffixes = cached_row_guide(wiring, channels, &indexes, &bulk).0;
-                });
+/// Apply finished suffix rebuilds (validation 0070): a result
+/// lands only while its generation is the newest dispatched
+/// AND the playlist it was built from is still the model's —
+/// a republish since dispatch makes it stale and it drops.
+/// The list repaints only when the map actually changed
+/// (Python publishes on change only).
+fn drain_suffix_results(wiring: &Wiring, list: ListCtrl) {
+    while let Some(result) = wiring.suffix_worker.try_recv() {
+        wiring.suffix_pending.set(false);
+        if result.generation != wiring.suffix_generation.get() {
+            continue;
+        }
+        let Some(suffixes) = result.suffixes else {
+            // The store could not be read: keep the on-screen
+            // suffixes and let the next cycle retry.
+            wiring.epg_suffixes.borrow_mut().0 = now_epoch();
+            continue;
+        };
+        if result.playlist_ptr != wiring.model.borrow().playlist_ptr() {
+            continue;
+        }
+        let changed = {
+            let mut slot = wiring.epg_suffixes.borrow_mut();
+            let changed = slot.2 != suffixes;
+            *slot = (now_epoch(), result.playlist_ptr, suffixes);
+            changed
+        };
+        if changed {
+            let count = list.get_item_count();
+            if count > 0 {
+                list.refresh_items(0, i64::from(count) - 1);
             }
         }
     }
-    *wiring.epg_suffixes.borrow_mut() = (now, playlist_ptr, suffixes);
 }
 
 #[cfg(test)]

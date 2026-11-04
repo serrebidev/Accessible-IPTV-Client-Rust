@@ -58,25 +58,32 @@ impl EpgGuide {
     /// title and the longer description. Two sources describing the
     /// same slot therefore yield one row, never duplicates.
     pub fn merge(&mut self, other: EpgGuide) {
+        // Channel positions by id, built once: the linear find
+        // this replaces made a full-guide merge quadratic in the
+        // channel count before any programme was touched.
+        let mut positions: std::collections::HashMap<String, usize> = self
+            .channels
+            .iter()
+            .enumerate()
+            .map(|(index, channel)| (channel.id.clone(), index))
+            .collect();
         for channel in other.channels {
-            match self.channels.iter_mut().find(|c| c.id == channel.id) {
-                Some(existing) => {
-                    let old_norm = canonicalize_name(&strip_noise_words(&existing.display_name));
-                    let new_norm = canonicalize_name(&strip_noise_words(&channel.display_name));
-                    if !old_norm.is_empty() && !new_norm.is_empty() && old_norm != new_norm {
-                        self.programmes.remove(&channel.id);
-                    }
-                    existing.display_name = channel.display_name;
+            if let Some(&index) = positions.get(&channel.id) {
+                let existing = &mut self.channels[index];
+                let old_norm = canonicalize_name(&strip_noise_words(&existing.display_name));
+                let new_norm = canonicalize_name(&strip_noise_words(&channel.display_name));
+                if !old_norm.is_empty() && !new_norm.is_empty() && old_norm != new_norm {
+                    self.programmes.remove(&channel.id);
                 }
-                None => self.channels.push(channel),
+                existing.display_name = channel.display_name;
+            } else {
+                positions.insert(channel.id.clone(), self.channels.len());
+                self.channels.push(channel);
             }
         }
         for (id, programmes) in other.programmes {
             let entry = self.programmes.entry(id).or_default();
-            for programme in programmes {
-                upsert_programme(entry, programme);
-            }
-            entry.sort_by_key(|p| p.start);
+            merge_programmes(entry, programmes);
         }
     }
 
@@ -105,22 +112,27 @@ impl EpgGuide {
     /// rebuild — per playlist channel (audit E12).
     #[must_use]
     pub fn bulk_now_next(&self, at: i64) -> HashMap<String, NowNext> {
+        // Python's `get_all_now_next` window (audit 0068): a
+        // programme airing now cannot have started more than ~a
+        // day ago, and "next" reaches six hours out — the store
+        // twin applies the same bounds so both guide surfaces
+        // answer identically.
+        let floor = at - 24 * 3_600;
+        let horizon = at + 6 * 3_600;
         let mut out = HashMap::with_capacity(self.programmes.len());
         for (id, list) in &self.programmes {
             let idx = list.partition_point(|p| p.start <= at);
             let current = if idx > 0 {
                 let candidate = &list[idx - 1];
-                (candidate.stop > at).then(|| candidate.clone())
+                (candidate.stop > at && candidate.start >= floor).then(|| candidate.clone())
             } else {
                 None
             };
-            out.insert(
-                id.clone(),
-                NowNext {
-                    current,
-                    next: list.get(idx).cloned(),
-                },
-            );
+            let next = list
+                .get(idx)
+                .filter(|programme| programme.start <= horizon)
+                .cloned();
+            out.insert(id.clone(), NowNext { current, next });
         }
         out
     }
@@ -176,15 +188,134 @@ fn upsert_programme(rows: &mut Vec<Programme>, incoming: Programme) {
         .iter_mut()
         .find(|p| p.start == incoming.start && p.stop == incoming.stop)
     {
-        if existing.title != incoming.title {
-            existing.title = incoming.title;
-            existing.description = incoming.description;
-        } else if incoming.description.len() > existing.description.len() {
-            existing.description = incoming.description;
-        }
+        absorb_slot(existing, incoming);
     } else {
         rows.push(incoming);
     }
+}
+
+/// The exact-slot field rule: a changed title brings the new
+/// title AND description; an unchanged title keeps the longer
+/// description.
+fn absorb_slot(existing: &mut Programme, incoming: Programme) {
+    if existing.title != incoming.title {
+        existing.title = incoming.title;
+        existing.description = incoming.description;
+    } else if incoming.description.len() > existing.description.len() {
+        existing.description = incoming.description;
+    }
+}
+
+/// Whether `rows` is sorted by start (the parse/merge invariant
+/// the fast path below relies on).
+fn starts_sorted(rows: &[Programme]) -> bool {
+    rows.windows(2).all(|pair| pair[0].start <= pair[1].start)
+}
+
+/// Prefix maxima of `stop` over start-sorted rows.
+fn prefix_max_stop(rows: &[Programme]) -> Vec<i64> {
+    let mut out = Vec::with_capacity(rows.len());
+    let mut max = i64::MIN;
+    for row in rows {
+        max = max.max(row.stop);
+        out.push(max);
+    }
+    out
+}
+
+/// Whether any stored row overlaps `probe` outside the probe's
+/// own exact slot. Two exact cases: a stored row that starts
+/// before the probe and stops after the probe starts spans it
+/// (the prefix maxima answer this in one look, and such a row
+/// is never the exact partner, which starts AT the probe); and
+/// a stored row starting inside the probe's span overlaps it
+/// by construction (its stop is past its start, hence past the
+/// probe's start) — the only such row allowed is the exact
+/// partner itself. Rows starting inside one span are few in a
+/// real guide, so the scan is O(log n + a few).
+fn stored_crossing(rows: &[Programme], prefix_max: &[i64], probe: &Programme) -> bool {
+    let lo = rows.partition_point(|row| row.start < probe.start);
+    if lo > 0 && prefix_max[lo - 1] > probe.start {
+        return true;
+    }
+    let hi = lo + rows[lo..].partition_point(|row| row.start < probe.stop);
+    rows[lo..hi]
+        .iter()
+        .any(|row| (row.start, row.stop) != (probe.start, probe.stop))
+}
+
+/// Merge one channel's incoming programmes into its stored
+/// rows, with exactly `upsert_programme`'s semantics. The
+/// sequential upsert is quadratic (a retain scan per programme),
+/// which put a full-guide re-import merge at ~1.4 s for 813k
+/// programmes (validation 0070) — paid on whatever thread
+/// delivers the guide. When no incoming row overlaps a stored
+/// or sibling row outside an exact slot — the re-import shape —
+/// the merge is a slot-map pass instead: exact slots absorb in
+/// document order, the rest append, one final sort. Any real
+/// overlap (a corrected slot crossing stored rows) falls back
+/// to the sequential upserts for that channel, so crossing
+/// corrections keep their exact behavior.
+fn merge_programmes(rows: &mut Vec<Programme>, incoming: Vec<Programme>) {
+    if !starts_sorted(rows) || !starts_sorted(&incoming) {
+        for programme in incoming {
+            upsert_programme(rows, programme);
+        }
+        rows.sort_by_key(|p| p.start);
+        return;
+    }
+    let row_slots: std::collections::HashSet<(i64, i64)> =
+        rows.iter().map(|p| (p.start, p.stop)).collect();
+    // Non-exact overlap detection, stored side and within the
+    // incoming list; exact-slot pairs are partners, not
+    // crossings, and the checks never miss a real one.
+    let rows_max = prefix_max_stop(rows);
+    // Incoming rows with no stored exact partner: only these
+    // can cross anything. Within the list, overlap is symmetric,
+    // so probing each row against the later rows (start order)
+    // meets every pair once; in a sequential guide that scan
+    // ends at the first row starting at or after the probe's
+    // stop, i.e. it is O(1) per row in practice.
+    let filtered: Vec<&Programme> = incoming
+        .iter()
+        .filter(|p| !row_slots.contains(&(p.start, p.stop)))
+        .collect();
+    let crossing = incoming
+        .iter()
+        .any(|probe| stored_crossing(rows, &rows_max, probe))
+        || filtered.iter().enumerate().any(|(index, probe)| {
+            filtered[index + 1..]
+                .iter()
+                .take_while(|row| row.start < probe.stop)
+                .any(|row| row.stop > probe.start)
+        });
+    if crossing {
+        for programme in incoming {
+            upsert_programme(rows, programme);
+        }
+        rows.sort_by_key(|p| p.start);
+        return;
+    }
+    let mut slots: std::collections::HashMap<(i64, i64), usize> = std::collections::HashMap::new();
+    for (index, row) in rows.iter().enumerate() {
+        slots.entry((row.start, row.stop)).or_insert(index);
+    }
+    let mut appends: Vec<Programme> = Vec::new();
+    let mut append_slots: std::collections::HashMap<(i64, i64), usize> =
+        std::collections::HashMap::new();
+    for programme in incoming {
+        let key = (programme.start, programme.stop);
+        if let Some(&index) = slots.get(&key) {
+            absorb_slot(&mut rows[index], programme);
+        } else if let Some(&index) = append_slots.get(&key) {
+            absorb_slot(&mut appends[index], programme);
+        } else {
+            append_slots.insert(key, appends.len());
+            appends.push(programme);
+        }
+    }
+    rows.extend(appends);
+    rows.sort_by_key(|p| p.start);
 }
 
 /// Parse an XMLTV timestamp (`20261101190000 +0000`; the offset and the
@@ -1601,6 +1732,141 @@ fn run_epg_load(sources: &[String], store_path: Option<&std::path::Path>) -> Epg
     EpgEvent::Loaded(Box::new(merged), note)
 }
 
+// ---------------------------------------------------------------------------
+// Background row-suffix refresh
+// ---------------------------------------------------------------------------
+
+/// One suffix rebuild request (validation 0070): the playlist
+/// model whose rows the suffixes key, the guide store to read,
+/// and the instant the snapshot answers for.
+pub struct SuffixJob {
+    pub generation: u64,
+    pub guide_generation: u64,
+    pub model: std::sync::Arc<crate::BrowseModel>,
+    pub store_path: std::path::PathBuf,
+    pub at: i64,
+}
+
+/// One finished suffix rebuild, for the model and generations it
+/// was built from — the UI applies it only while both still
+/// match. `suffixes` is None when the store could not be read:
+/// no fresh data, keep what is on screen.
+pub struct SuffixResult {
+    pub generation: u64,
+    pub guide_generation: u64,
+    pub playlist_ptr: usize,
+    pub suffixes: Option<std::collections::HashMap<usize, String>>,
+}
+
+/// Off-UI-thread builder for the channel rows' now/next
+/// suffixes (validation 0070): the port of Python's background
+/// `_refresh_now_playing_labels` (its issue #109 lane). The
+/// whole pipeline — the store snapshot, the guide indexes, the
+/// playlist-wide fuzzy match, the row build — runs here, never
+/// on the UI tick: at real-world scale the match alone measured
+/// 25 s worst case, paid as a frozen window on every refresh
+/// that followed a model republish or a guide load. The worker
+/// caches the indexes and the match by (guide generation,
+/// playlist pointer), so the recurring refresh pays only the
+/// store snapshot and the row build.
+pub struct SuffixWorker {
+    jobs: std::sync::mpsc::Sender<SuffixJob>,
+    events: std::sync::Mutex<std::sync::mpsc::Receiver<SuffixResult>>,
+}
+
+impl Default for SuffixWorker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SuffixWorker {
+    #[must_use]
+    pub fn new() -> Self {
+        let (job_sender, job_receiver) = std::sync::mpsc::channel::<SuffixJob>();
+        let (event_sender, event_receiver) = std::sync::mpsc::channel::<SuffixResult>();
+        std::thread::spawn(move || {
+            let mut state = SuffixWorkerState::default();
+            while let Ok(job) = job_receiver.recv() {
+                if event_sender.send(state.run(&job)).is_err() {
+                    break;
+                }
+            }
+        });
+        Self {
+            jobs: job_sender,
+            events: std::sync::Mutex::new(event_receiver),
+        }
+    }
+
+    /// Queue one rebuild. A newer job supersedes an older one
+    /// still queued: the UI drops its result by generation.
+    pub fn build(&self, job: SuffixJob) {
+        let _ = self.jobs.send(job);
+    }
+
+    /// The next finished rebuild, when one is waiting.
+    #[must_use]
+    pub fn try_recv(&self) -> Option<SuffixResult> {
+        let events = self.events.lock().ok()?;
+        events.try_recv().ok()
+    }
+}
+
+/// The suffix worker's caches, owned by its thread.
+#[derive(Default)]
+struct SuffixWorkerState {
+    store: Option<(std::path::PathBuf, crate::epgstore::EpgStore)>,
+    indexes: Option<(u64, GuideIndexes)>,
+    matches: Option<(usize, u64, GuideMatchCache)>,
+}
+
+impl SuffixWorkerState {
+    fn run(&mut self, job: &SuffixJob) -> SuffixResult {
+        let playlist_ptr = std::sync::Arc::as_ptr(&job.model) as usize;
+        let result = |suffixes| SuffixResult {
+            generation: job.generation,
+            guide_generation: job.guide_generation,
+            playlist_ptr,
+            suffixes,
+        };
+        if !matches!(self.store.as_ref(), Some((path, _)) if *path == job.store_path) {
+            match crate::epgstore::EpgStore::open(&job.store_path) {
+                Ok(store) => self.store = Some((job.store_path.clone(), store)),
+                Err(_) => return result(None),
+            }
+            self.indexes = None;
+            self.matches = None;
+        }
+        let store = &self.store.as_ref().expect("store just ensured").1;
+        let Ok(channels) = store.channels() else {
+            return result(None);
+        };
+        if !matches!(self.indexes.as_ref(), Some((gen, _)) if *gen == job.guide_generation) {
+            self.indexes = Some((job.guide_generation, GuideIndexes::build(&channels)));
+            self.matches = None;
+        }
+        let bulk: std::collections::HashMap<String, NowNext> = match store.all_now_next(job.at) {
+            Ok(entries) => entries
+                .into_iter()
+                .map(|(channel, entry)| (channel.id, entry))
+                .collect(),
+            Err(_) => return result(None),
+        };
+        if !matches!(self.matches.as_ref(), Some((ptr, gen, _)) if *ptr == playlist_ptr && *gen == job.guide_generation)
+        {
+            let indexes = &self.indexes.as_ref().expect("indexes just ensured").1;
+            self.matches = Some((
+                playlist_ptr,
+                job.guide_generation,
+                GuideMatchCache::build(job.model.channels(), indexes),
+            ));
+        }
+        let cache = &self.matches.as_ref().expect("match cache just ensured").2;
+        result(Some(row_guide_from_matches(cache.matches(), &bulk).0))
+    }
+}
+
 /// Whether re-opening the source is likely to succeed (port of
 /// `_is_transient_epg_error`'s message hints: truncated transfers,
 /// gzip damage, resets and timeouts are transient; a 404 or a
@@ -1988,6 +2254,173 @@ mod tests {
         let rows = &merged.programmes["bbc2.uk"];
         let titles: Vec<&str> = rows.iter().map(|p| p.title.as_str()).collect();
         assert_eq!(titles, ["Corrected"], "{rows:?}");
+    }
+
+    fn programme(start: i64, stop: i64, title: &str, description: &str) -> Programme {
+        Programme {
+            channel_id: "x".to_string(),
+            start,
+            stop,
+            title: title.to_string(),
+            description: description.to_string(),
+        }
+    }
+
+    /// The pre-0070 sequential upsert, kept as the merge
+    /// equivalence oracle.
+    fn reference_merge(
+        rows: &[Programme],
+        incoming: &[Programme],
+    ) -> Vec<(i64, i64, String, String)> {
+        let mut rows = rows.to_vec();
+        for incoming in incoming {
+            rows.retain(|p| {
+                !(p.start < incoming.stop && p.stop > incoming.start)
+                    || (p.start == incoming.start && p.stop == incoming.stop)
+            });
+            if let Some(existing) = rows
+                .iter_mut()
+                .find(|p| p.start == incoming.start && p.stop == incoming.stop)
+            {
+                if existing.title != incoming.title {
+                    existing.title.clone_from(&incoming.title);
+                    existing.description.clone_from(&incoming.description);
+                } else if incoming.description.len() > existing.description.len() {
+                    existing.description.clone_from(&incoming.description);
+                }
+            } else {
+                rows.push(incoming.clone());
+            }
+        }
+        rows.sort_by_key(|p| p.start);
+        rows.iter()
+            .map(|p| (p.start, p.stop, p.title.clone(), p.description.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn merge_fast_path_matches_the_sequential_upserts() {
+        // Validation 0070: the slot-map fast path and the
+        // crossing fallback must both reproduce the sequential
+        // upsert semantics exactly, in every order that matters.
+        let guide_with = |rows: &[Programme]| {
+            let mut guide = EpgGuide::default();
+            guide.channels.push(EpgChannel {
+                id: "x".to_string(),
+                display_name: "X".to_string(),
+            });
+            guide.programmes.insert("x".to_string(), rows.to_vec());
+            guide
+        };
+        let cases: Vec<(Vec<Programme>, Vec<Programme>)> = vec![
+            // Identical re-import (the fast path's home case).
+            (
+                vec![programme(100, 200, "A", "d1"), programme(200, 300, "B", "")],
+                vec![programme(100, 200, "A", "d1"), programme(200, 300, "B", "")],
+            ),
+            // Exact-slot enrichment plus a fresh append.
+            (
+                vec![programme(100, 200, "A", "short")],
+                vec![
+                    programme(100, 200, "A", "a longer description"),
+                    programme(200, 300, "B", ""),
+                ],
+            ),
+            // A crossing correction replaces both stored rows.
+            (
+                vec![programme(100, 200, "A", ""), programme(200, 300, "B", "")],
+                vec![programme(150, 250, "C", "")],
+            ),
+            // An exact partner AND a crossing sibling, both orders.
+            (
+                vec![programme(100, 200, "A", "")],
+                vec![programme(100, 200, "A2", ""), programme(150, 250, "C", "")],
+            ),
+            (
+                vec![programme(100, 200, "A", "")],
+                vec![programme(150, 250, "C", ""), programme(100, 200, "A2", "")],
+            ),
+            // A spanning stored row is dropped by the first
+            // incoming row it crosses.
+            (
+                vec![programme(0, 1000, "Long", "")],
+                vec![programme(100, 200, "A", ""), programme(200, 300, "B", "")],
+            ),
+            // Incoming rows crossing each other.
+            (
+                vec![programme(500, 600, "Z", "")],
+                vec![programme(100, 300, "A", ""), programme(200, 400, "B", "")],
+            ),
+            // Same-slot duplicates within one incoming list.
+            (
+                vec![programme(100, 200, "A", "short")],
+                vec![
+                    programme(100, 200, "A", "mid length"),
+                    programme(100, 200, "A", "the longest description"),
+                ],
+            ),
+        ];
+        for (rows, incoming) in &cases {
+            let mut guide = guide_with(rows);
+            guide.merge(guide_with(incoming));
+            let got: Vec<(i64, i64, String, String)> = guide.programmes["x"]
+                .iter()
+                .map(|p| (p.start, p.stop, p.title.clone(), p.description.clone()))
+                .collect();
+            assert_eq!(
+                got,
+                reference_merge(rows, incoming),
+                "rows {rows:?} + {incoming:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn suffix_worker_builds_suffixes_from_the_store() {
+        // Validation 0070: the whole suffix pipeline (store
+        // snapshot, indexes, fuzzy match, row build) answers
+        // from the worker, keyed to the model it was given.
+        let dir = std::env::temp_dir().join(format!("iptv-suffix-worker-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("epg.db");
+        let guide = parse_xmltv(GUIDE);
+        let at = parse_xmltv_time("20261101183000 +0000").expect("time");
+        {
+            let mut store = crate::epgstore::EpgStore::open(&path).unwrap();
+            store.import_source("test", &guide, at).unwrap();
+        }
+        let model = std::sync::Arc::new(crate::BrowseModel::from_parts(
+            vec![channel("BBC Two", "bbc2.uk", ""), channel("Other", "", "")],
+            0,
+        ));
+        let worker = SuffixWorker::new();
+        worker.build(SuffixJob {
+            generation: 7,
+            guide_generation: 3,
+            model: model.clone(),
+            store_path: path.clone(),
+            at,
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let result = loop {
+            if let Some(result) = worker.try_recv() {
+                break result;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "suffix worker timed out"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        assert_eq!(result.generation, 7);
+        assert_eq!(result.guide_generation, 3);
+        assert_eq!(result.playlist_ptr, std::sync::Arc::as_ptr(&model) as usize);
+        let suffixes = result.suffixes.expect("store read must succeed");
+        assert!(suffixes[&0].contains("News Hour"), "{suffixes:?}");
+        assert!(suffixes[&0].contains("Next: Quiz"), "{suffixes:?}");
+        assert!(!suffixes.contains_key(&1));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

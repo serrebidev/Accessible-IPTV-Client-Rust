@@ -26,6 +26,15 @@ pub struct VodItem {
     /// Xtream series id for lazy episode loading.
     pub series_id: Option<String>,
     pub provider_id: Option<String>,
+    /// Stable source identity (spec 0006): the M3U playlist scope
+    /// id carried by the channel's playlist-id attribute, or the
+    /// Xtream provider id. Never a stream URL.
+    pub source_id: Option<String>,
+    /// Safe source label stamped at catalogue build time: the
+    /// configured friendly name when one exists, else the host
+    /// with userinfo removed, the local file name, or a generic
+    /// label. Never carries credentials.
+    pub source_label: Option<String>,
     /// Episodes for M3U-built series folders.
     pub episodes: Vec<VodItem>,
     /// Parsed (season, episode) for ordering.
@@ -230,6 +239,8 @@ fn flat_item(channel: &Channel, category: &str) -> VodItem {
         channel: Some(channel.clone()),
         series_id: None,
         provider_id: None,
+        source_id: crate::sources::channel_scope(channel).map(str::to_owned),
+        source_label: None,
         episodes: Vec::new(),
         season_episode: None,
     }
@@ -343,6 +354,12 @@ fn finish_m3u_catalog(
                             channel: None,
                             series_id: None,
                             provider_id: None,
+                            // A folder's source is its episodes'
+                            // source (one playlist per folder).
+                            source_id: episodes
+                                .first()
+                                .and_then(|episode| episode.source_id.clone()),
+                            source_label: None,
                             episodes,
                             season_episode: None,
                         },
@@ -397,11 +414,13 @@ fn str_field(row: &Value, keys: &[&str]) -> Option<String> {
     None
 }
 
+#[allow(clippy::too_many_arguments)]
 fn playable_item(
     name: String,
     group: String,
     url: String,
     provider_id: Option<String>,
+    source_label: Option<String>,
     resume_type: &str,
     resume_id: &str,
 ) -> VodItem {
@@ -430,6 +449,8 @@ fn playable_item(
         group,
         channel: Some(channel),
         series_id: None,
+        source_id: provider_id.clone(),
+        source_label,
         provider_id,
         episodes: Vec::new(),
         season_episode: None,
@@ -440,7 +461,7 @@ fn playable_item(
 /// `build_xtream_catalog`): movies eagerly, series lazily. Section
 /// failures skip that section, like the reference.
 #[must_use]
-pub fn xtream_catalog(client: &XtreamClient, provider_id: &str) -> VodCatalog {
+pub fn xtream_catalog(client: &XtreamClient, provider_id: &str, source_label: &str) -> VodCatalog {
     let mut catalog = VodCatalog::default();
     if let Ok(streams) = client.vod_streams(None) {
         let categories = category_map(&client.vod_categories().unwrap_or(Value::Null));
@@ -467,6 +488,7 @@ pub fn xtream_catalog(client: &XtreamClient, provider_id: &str) -> VodCatalog {
                     group.clone(),
                     url,
                     Some(provider_id.to_string()),
+                    Some(source_label.to_string()),
                     "movie",
                     &sid,
                 );
@@ -500,6 +522,8 @@ pub fn xtream_catalog(client: &XtreamClient, provider_id: &str) -> VodCatalog {
                         channel: None,
                         series_id: Some(sid),
                         provider_id: Some(provider_id.to_string()),
+                        source_id: Some(provider_id.to_string()),
+                        source_label: Some(source_label.to_string()),
                         episodes: Vec::new(),
                         season_episode: None,
                     },
@@ -521,6 +545,7 @@ pub fn xtream_series_episodes(
     client: &XtreamClient,
     series_id: &str,
     provider_id: &str,
+    source_label: &str,
 ) -> Result<Vec<VodItem>, String> {
     let info = client.series_info(series_id)?;
     let empty = Value::Object(serde_json::Map::new());
@@ -544,6 +569,7 @@ pub fn xtream_series_episodes(
                 String::new(),
                 url,
                 Some(provider_id.to_string()),
+                Some(source_label.to_string()),
                 "episode",
                 &eid,
             );
@@ -599,6 +625,166 @@ pub fn merge_catalogs(catalogs: Vec<VodCatalog>) -> VodCatalog {
     merged
 }
 
+/// The label used when no safe source label can be derived
+/// (spec 0006).
+pub const GENERIC_SOURCE_LABEL: &str = "Unknown source";
+
+/// The short type word for rows and details.
+#[must_use]
+pub fn kind_label(kind: VodKind) -> &'static str {
+    match kind {
+        VodKind::Movie => "Movie",
+        VodKind::Series => "Series",
+    }
+}
+
+/// One top-level search result (spec 0006): the item's group and
+/// its position in that group, plus the display fields. Episodes
+/// are never top-level results; they stay inside series drill-in.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VodSearchHit {
+    pub group: String,
+    pub index: usize,
+    pub name: String,
+    pub kind: VodKind,
+    pub source_label: Option<String>,
+}
+
+impl VodSearchHit {
+    /// The accessible row text: title and type first (the short
+    /// announcement), then group and source.
+    #[must_use]
+    pub fn row_label(&self) -> String {
+        let mut label = format!("{}, {}", self.name, kind_label(self.kind));
+        if !self.group.is_empty() {
+            label.push_str(", ");
+            label.push_str(&self.group);
+        }
+        if let Some(source) = &self.source_label {
+            label.push_str(", ");
+            label.push_str(source);
+        }
+        label
+    }
+}
+
+/// Search the loaded catalogue snapshot (spec 0006): a
+/// case-insensitive substring match on top-level movie and series
+/// titles across all groups, in catalogue group order and item
+/// order. The query is trimmed; a blank query yields no hits
+/// (the adapter treats it as clearing the filter). The catalogue
+/// is not mutated.
+#[must_use]
+pub fn search_catalog(catalog: &VodCatalog, query: &str) -> Vec<VodSearchHit> {
+    let needle = query.trim().to_lowercase();
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    let mut hits = Vec::new();
+    for group in &catalog.order {
+        let Some(items) = catalog.groups.get(group) else {
+            continue;
+        };
+        for (index, item) in items.iter().enumerate() {
+            if item.name.to_lowercase().contains(&needle) {
+                hits.push(VodSearchHit {
+                    group: group.clone(),
+                    index,
+                    name: item.name.clone(),
+                    kind: item.kind,
+                    source_label: item.source_label.clone(),
+                });
+            }
+        }
+    }
+    hits
+}
+
+/// The detail surface for one item (spec 0006): only fields that
+/// are actually available. The stream URL appears here and only
+/// here; the caller supplies the EPG description when one is
+/// already available for the item's channel.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VodDetails {
+    pub title: String,
+    pub kind: VodKind,
+    pub group: String,
+    pub source_label: Option<String>,
+    pub description: Option<String>,
+    pub url: Option<String>,
+}
+
+impl VodDetails {
+    /// Labelled lines for the read-only detail control, omitting
+    /// unavailable fields.
+    #[must_use]
+    pub fn lines(&self) -> Vec<String> {
+        let mut lines = vec![
+            format!("Title: {}", self.title),
+            format!("Type: {}", kind_label(self.kind)),
+        ];
+        if !self.group.is_empty() {
+            lines.push(format!("Group: {}", self.group));
+        }
+        if let Some(source) = &self.source_label {
+            lines.push(format!("Source: {source}"));
+        }
+        if let Some(description) = &self.description {
+            lines.push(format!("Description: {description}"));
+        }
+        if let Some(url) = &self.url {
+            lines.push(format!("URL: {url}"));
+        }
+        lines
+    }
+}
+
+/// Build the detail surface for `item`.
+#[must_use]
+pub fn item_details(item: &VodItem, epg_description: Option<&str>) -> VodDetails {
+    VodDetails {
+        title: item.name.clone(),
+        kind: item.kind,
+        group: item.group.clone(),
+        source_label: item.source_label.clone(),
+        description: epg_description
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(str::to_owned),
+        url: item
+            .channel
+            .as_ref()
+            .map(|channel| channel.url.clone())
+            .filter(|url| !url.is_empty()),
+    }
+}
+
+/// Stamp M3U source labels onto a merged catalogue from the
+/// scope-id → label map the adapter derived from the configured
+/// playlists. Items that already carry a label (Xtream) keep it;
+/// an item whose source is missing from the map gets the generic
+/// label. Episodes inherit through their own stamped identity.
+fn stamp_source_labels(catalog: &mut VodCatalog, labels: &[(String, String)]) {
+    let label_for = |item: &VodItem| -> Option<String> {
+        if item.source_label.is_some() {
+            return item.source_label.clone();
+        }
+        let id = item.source_id.as_ref()?;
+        Some(labels.iter().find(|(scope, _)| scope == id).map_or_else(
+            || GENERIC_SOURCE_LABEL.to_string(),
+            |(_, label)| label.clone(),
+        ))
+    };
+    for items in catalog.groups.values_mut() {
+        for item in items.iter_mut() {
+            item.source_label = label_for(item);
+            for episode in &mut item.episodes {
+                episode.source_label = label_for(episode);
+            }
+        }
+    }
+}
+
 /// Jobs for the VOD worker.
 pub enum VodJob {
     Build {
@@ -608,6 +794,13 @@ pub enum VodJob {
         extras: Vec<Channel>,
         /// The active playlist scope id; None = all playlists (B17).
         scope: Option<String>,
+        /// Scope-id → safe source label for M3U items (spec 0006),
+        /// derived by the adapter from the configured playlists.
+        source_labels: Vec<(String, String)>,
+    },
+    Search {
+        generation: u64,
+        query: String,
     },
     Episodes {
         token: (u64, u64),
@@ -626,6 +819,11 @@ pub enum VodEvent {
         generation: u64,
         catalog: VodCatalog,
     },
+    SearchResults {
+        generation: u64,
+        query: String,
+        hits: Vec<VodSearchHit>,
+    },
     Episodes {
         token: (u64, u64),
         result: Result<Vec<VodItem>, String>,
@@ -641,6 +839,7 @@ fn build_catalog(
     model: &crate::BrowseModel,
     extras: &[Channel],
     scope: Option<&str>,
+    source_labels: &[(String, String)],
 ) -> VodCatalog {
     let in_scope = |channel: &Channel| match scope {
         None => true,
@@ -654,7 +853,7 @@ fn build_catalog(
         if let ProviderAccount::Xtream(creds) = account {
             let client = XtreamClient::new(creds.clone());
             let pid = account.provider_id().unwrap_or_else(|| account.describe());
-            catalogs.push(xtream_catalog(&client, &pid));
+            catalogs.push(xtream_catalog(&client, &pid, &account.source_label()));
         }
     }
     let m3u_channels: Vec<Channel> = model
@@ -676,7 +875,9 @@ fn build_catalog(
     if !m3u_channels.is_empty() {
         catalogs.push(categorize_m3u_vod(&m3u_channels));
     }
-    merge_catalogs(catalogs)
+    let mut merged = merge_catalogs(catalogs);
+    stamp_source_labels(&mut merged, source_labels);
+    merged
 }
 
 /// Background VOD catalogue/episodes worker.
@@ -703,6 +904,11 @@ impl VodWorker {
     pub fn new() -> Self {
         let (job_sender, job_receiver) = std::sync::mpsc::channel::<VodJob>();
         let (event_sender, event_receiver) = std::sync::mpsc::channel::<VodEvent>();
+        // The newest built catalogue, retained so searches run on
+        // this thread against the loaded snapshot (spec 0006).
+        let retained: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<VodCatalog>>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let retained_in_thread = std::sync::Arc::clone(&retained);
         std::thread::spawn(move || {
             while let Ok(job) = job_receiver.recv() {
                 let event = match job {
@@ -712,10 +918,37 @@ impl VodWorker {
                         model,
                         extras,
                         scope,
-                    } => VodEvent::Catalog {
-                        generation,
-                        catalog: build_catalog(&accounts, &model, &extras, scope.as_deref()),
-                    },
+                        source_labels,
+                    } => {
+                        let catalog = build_catalog(
+                            &accounts,
+                            &model,
+                            &extras,
+                            scope.as_deref(),
+                            &source_labels,
+                        );
+                        if let Ok(mut slot) = retained_in_thread.lock() {
+                            *slot = Some(std::sync::Arc::new(catalog.clone()));
+                        }
+                        VodEvent::Catalog {
+                            generation,
+                            catalog,
+                        }
+                    }
+                    VodJob::Search { generation, query } => {
+                        let hits = retained_in_thread
+                            .lock()
+                            .ok()
+                            .and_then(|slot| {
+                                slot.as_ref().map(|catalog| search_catalog(catalog, &query))
+                            })
+                            .unwrap_or_default();
+                        VodEvent::SearchResults {
+                            generation,
+                            query,
+                            hits,
+                        }
+                    }
                     VodJob::Episodes {
                         token,
                         account,
@@ -726,7 +959,12 @@ impl VodWorker {
                                 let client = XtreamClient::new(creds.clone());
                                 let pid =
                                     account.provider_id().unwrap_or_else(|| account.describe());
-                                xtream_series_episodes(&client, &series_id, &pid)
+                                xtream_series_episodes(
+                                    &client,
+                                    &series_id,
+                                    &pid,
+                                    &account.source_label(),
+                                )
                             }
                             ProviderAccount::Stalker(_) => {
                                 Err("Series episodes need an Xtream account.".to_string())
@@ -787,6 +1025,7 @@ impl VodWorker {
         model: std::sync::Arc<crate::BrowseModel>,
         extras: Vec<Channel>,
         scope: Option<String>,
+        source_labels: Vec<(String, String)>,
     ) {
         let generation = Self::bump(&self.build_generation);
         // A rebuild also supersedes episode requests in flight.
@@ -797,7 +1036,19 @@ impl VodWorker {
             model,
             extras,
             scope,
+            source_labels,
         });
+    }
+
+    /// Search the retained catalogue snapshot on the worker
+    /// thread (spec 0006). The reply carries the current build
+    /// generation, so a rebuild supersedes it like any other
+    /// catalogue work.
+    pub fn search(&self, query: String) {
+        let generation = self
+            .build_generation
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let _ = self.jobs.send(VodJob::Search { generation, query });
     }
 
     pub fn episodes(&self, account: ProviderAccount, series_id: String) {
@@ -872,11 +1123,11 @@ mod tests {
             ],
             0,
         );
-        let scoped = build_catalog(&[], &model, &[], Some("m3u:a"));
+        let scoped = build_catalog(&[], &model, &[], Some("m3u:a"), &[]);
         let movies = &scoped.groups["Movies"];
         assert_eq!(movies.len(), 1);
         assert_eq!(movies[0].name, "Film A");
-        let all = build_catalog(&[], &model, &[], None);
+        let all = build_catalog(&[], &model, &[], None, &[]);
         let names: Vec<&str> = all.groups["Movies"]
             .iter()
             .map(|i| i.name.as_str())
@@ -894,7 +1145,13 @@ mod tests {
             vec![channel("Film", "Movies", "http://x/1")],
             0,
         ));
-        worker.build(Vec::new(), std::sync::Arc::clone(&model), Vec::new(), None);
+        worker.build(
+            Vec::new(),
+            std::sync::Arc::clone(&model),
+            Vec::new(),
+            None,
+            Vec::new(),
+        );
         let first = loop {
             if let Some(event) = worker.try_recv() {
                 break event;
@@ -905,7 +1162,7 @@ mod tests {
             panic!("expected a catalogue event");
         };
         assert!(worker.is_current_catalog(generation));
-        worker.build(Vec::new(), model, Vec::new(), None);
+        worker.build(Vec::new(), model, Vec::new(), None, Vec::new());
         assert!(
             !worker.is_current_catalog(generation),
             "newer build supersedes"
@@ -918,6 +1175,7 @@ mod tests {
             std::sync::Arc::new(crate::BrowseModel::default()),
             Vec::new(),
             None,
+            Vec::new(),
         );
         let token = (
             worker2
@@ -952,5 +1210,152 @@ mod tests {
         assert_eq!(folders[0].episodes.len(), 2);
         assert!(catalog.groups.contains_key("Movies"));
         assert!(!catalog.groups.contains_key("News"));
+    }
+
+    fn discovery_channels() -> Vec<Channel> {
+        vec![
+            scoped_channel(
+                "Dune",
+                "Movies",
+                "http://user:secret@films.example.com/dune.mp4",
+                "m3u:a",
+                false,
+            ),
+            scoped_channel(
+                "Dune Part Two",
+                "Movies",
+                "http://films.example.com/dune2.mp4",
+                "m3u:a",
+                false,
+            ),
+            scoped_channel(
+                "The Dunwich Horror",
+                "Movies",
+                "http://other.example.org/dunwich.mp4",
+                "m3u:b",
+                false,
+            ),
+            scoped_channel("Dune S01E01", "Series", "http://x/d1", "m3u:a", false),
+            scoped_channel("Dune S01E02", "Series", "http://x/d2", "m3u:a", false),
+            scoped_channel("Other Film", "Movies", "http://x/o", "m3u:b", false),
+        ]
+    }
+
+    #[test]
+    fn search_matches_top_level_items_across_groups() {
+        // Spec 0006: case-insensitive substring, trimmed, all
+        // groups, catalogue order preserved; episode titles are
+        // not top-level results.
+        let catalog = categorize_m3u_vod(&discovery_channels());
+        let hits = search_catalog(&catalog, "  DUNE ");
+        let names: Vec<&str> = hits.iter().map(|hit| hit.name.as_str()).collect();
+        assert_eq!(names, ["Dune", "Dune Part Two", "Dune"], "{hits:?}");
+        // The third hit is the series folder, not an episode.
+        assert_eq!(hits[2].kind, VodKind::Series);
+        assert_eq!(hits[2].group, "Series");
+        assert!(search_catalog(&catalog, "s01e01").is_empty());
+        assert!(search_catalog(&catalog, "").is_empty());
+        assert!(search_catalog(&catalog, "   ").is_empty());
+        assert!(search_catalog(&catalog, "absent").is_empty());
+        // Searching does not mutate the catalogue.
+        assert_eq!(catalog.groups["Movies"].len(), 4);
+    }
+
+    #[test]
+    fn m3u_source_identity_and_labels_propagate() {
+        // Spec 0006: movies, series folders, and episodes carry
+        // the playlist scope id (never the stream URL); labels
+        // come from the adapter's scope map, generic when unmapped,
+        // and never contain URL credentials.
+        let model = crate::BrowseModel::from_parts(discovery_channels(), 0);
+        let labels = vec![("m3u:a".to_string(), "My Films".to_string())];
+        let catalog = build_catalog(&[], &model, &[], None, &labels);
+        let movies = &catalog.groups["Movies"];
+        let dune = &movies[0];
+        assert_eq!(dune.source_id.as_deref(), Some("m3u:a"));
+        assert_eq!(dune.source_label.as_deref(), Some("My Films"));
+        let dunwich = movies
+            .iter()
+            .find(|item| item.name == "The Dunwich Horror")
+            .unwrap();
+        assert_eq!(dunwich.source_id.as_deref(), Some("m3u:b"));
+        assert_eq!(
+            dunwich.source_label.as_deref(),
+            Some(GENERIC_SOURCE_LABEL),
+            "unmapped scope falls back to the generic label"
+        );
+        let series = &catalog.groups["Series"][0];
+        assert_eq!(series.source_id.as_deref(), Some("m3u:a"));
+        assert_eq!(series.source_label.as_deref(), Some("My Films"));
+        assert!(series
+            .episodes
+            .iter()
+            .all(|ep| ep.source_id.as_deref() == Some("m3u:a")
+                && ep.source_label.as_deref() == Some("My Films")));
+        // No label or row text carries the credential-bearing URL.
+        let hit = &search_catalog(&catalog, "dune")[0];
+        assert!(!hit.row_label().contains("secret"), "{}", hit.row_label());
+        assert!(!hit.row_label().contains("user"), "{}", hit.row_label());
+    }
+
+    #[test]
+    fn details_carry_only_available_fields_and_the_url() {
+        // Spec 0006: the URL lives in the detail surface only;
+        // unavailable fields are omitted, not invented.
+        let catalog = categorize_m3u_vod(&discovery_channels());
+        let movie = &catalog.groups["Movies"][0];
+        let details = item_details(movie, Some("  A desert epic. "));
+        assert_eq!(
+            details.url.as_deref(),
+            Some(movie.channel.as_ref().unwrap().url.as_str())
+        );
+        assert_eq!(details.description.as_deref(), Some("A desert epic."));
+        let lines = details.lines();
+        assert!(
+            lines.iter().any(|line| line.starts_with("URL: http")),
+            "{lines:?}"
+        );
+        let series = &catalog.groups["Series"][0];
+        let folder_details = item_details(series, None);
+        assert!(folder_details.url.is_none(), "folders have no stream URL");
+        assert!(folder_details.description.is_none());
+        assert_eq!(folder_details.lines().len(), 3, "title, type, group only");
+    }
+
+    #[test]
+    fn worker_search_answers_from_the_retained_catalogue() {
+        // Spec 0006: searches run on the worker against the built
+        // snapshot and carry the build generation.
+        let worker = VodWorker::new();
+        let model = std::sync::Arc::new(crate::BrowseModel::from_parts(discovery_channels(), 0));
+        worker.build(Vec::new(), model, Vec::new(), None, Vec::new());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut catalog_generation = None;
+        while std::time::Instant::now() < deadline {
+            if let Some(VodEvent::Catalog { generation, .. }) = worker.try_recv() {
+                catalog_generation = Some(generation);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let generation = catalog_generation.expect("catalogue event");
+        worker.search("dune".to_string());
+        let mut found = None;
+        while std::time::Instant::now() < deadline {
+            if let Some(VodEvent::SearchResults {
+                generation: gen,
+                query,
+                hits,
+            }) = worker.try_recv()
+            {
+                found = Some((gen, query, hits));
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let (gen, query, hits) = found.expect("search results");
+        assert_eq!(gen, generation);
+        assert_eq!(query, "dune");
+        assert_eq!(hits.len(), 3);
     }
 }

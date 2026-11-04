@@ -19,6 +19,7 @@ sha2 = "0.11"
 ureq = "3"
 quick-xml = "0.42"
 flate2 = "1"
+fs4 = "1.1.0"
 chrono = "0.4"
 chrono-tz = "0.10"
 serde = { version = "1", features = ["derive"] }

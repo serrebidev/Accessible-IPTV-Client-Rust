@@ -36,7 +36,25 @@ impl EpgStore {
     /// opened or the schema cannot be created.
     pub fn open(path: &Path) -> Result<Self, String> {
         let conn = Connection::open(path).map_err(|e| e.to_string())?;
-        let _ = conn.busy_timeout(Duration::from_secs(2));
+        let _ = conn.busy_timeout(Duration::from_secs(20));
+        // Python's PRAGMA_IMPORT set, applied before the schema so
+        // auto_vacuum can take effect on a fresh database. The big
+        // page cache, mmap and NORMAL synchronous are what make a
+        // several-hundred-thousand-programme import survivable;
+        // with SQLite defaults the same import took 773 s where
+        // Python's whole parse+import took 290 s (audit 0067).
+        // Failures are ignored per statement, as Python does.
+        for pragma in [
+            "PRAGMA auto_vacuum=INCREMENTAL;",
+            "PRAGMA journal_mode=WAL;",
+            "PRAGMA synchronous=NORMAL;",
+            "PRAGMA temp_store=MEMORY;",
+            "PRAGMA mmap_size=268435456;",
+            "PRAGMA cache_size=-131072;",
+            "PRAGMA wal_autocheckpoint=0;",
+        ] {
+            let _ = conn.execute_batch(pragma);
+        }
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS channels (
                  id TEXT PRIMARY KEY,
@@ -60,7 +78,6 @@ impl EpgStore {
              );",
         )
         .map_err(|e| e.to_string())?;
-        let _ = conn.execute_batch("PRAGMA journal_mode=WAL;");
         let mut store = Self { conn };
         store.migrate()?;
         Ok(store)
@@ -131,22 +148,50 @@ impl EpgStore {
         }
         // Python's upsert keys programmes by (channel, start, stop);
         // older databases can hold duplicate slots, so keep the
-        // newest row per slot before enforcing uniqueness.
-        self.conn
-            .execute(
-                "DELETE FROM programmes WHERE rowid NOT IN (
-                     SELECT MAX(rowid) FROM programmes GROUP BY channel, start, stop
-                 )",
+        // newest row per slot before enforcing uniqueness. Only a
+        // legacy database without the slot index pays for the scan:
+        // running it on every open cost 46.8 s on a 672k-programme
+        // database where Python opens in 0.08 s (audit 0067) — the
+        // same every-open-repair trap Python gates behind version
+        // stamps in its own store.
+        let slot_index_exists = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'index' AND name = 'idx_programmes_slot'",
                 [],
+                |row| row.get::<_, i64>(0),
             )
-            .map_err(|e| e.to_string())?;
+            .is_ok_and(|n| n > 0);
+        if !slot_index_exists {
+            self.conn
+                .execute(
+                    "DELETE FROM programmes WHERE rowid NOT IN (
+                         SELECT MAX(rowid) FROM programmes GROUP BY channel, start, stop
+                     )",
+                    [],
+                )
+                .map_err(|e| e.to_string())?;
+        }
         self.conn
             .execute_batch(
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_programmes_slot
-                     ON programmes(channel, start, stop);",
+                     ON programmes(channel, start, stop);
+                 CREATE INDEX IF NOT EXISTS idx_programmes_start_cover
+                     ON programmes(start, stop, channel, title);",
             )
             .map_err(|e| e.to_string())?;
         Ok(())
+    }
+
+    /// Commit one batch of programmes and PASSIVE-checkpoint the
+    /// WAL (Python's per-batch cadence during import).
+    fn flush_programme_batch(&mut self, batch: &[&Programme]) -> Result<usize, String> {
+        let tx = self.conn.transaction().map_err(|e| e.to_string())?;
+        let count = insert_programmes(&tx, batch)?;
+        tx.commit().map_err(|e| e.to_string())?;
+        let _ = self.conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);");
+        Ok(count)
     }
 
     /// Replace the stored guide with the given one, in a single
@@ -177,15 +222,17 @@ impl EpgStore {
     /// never touched. Returns the imported programme count.
     ///
     /// # Errors
-    /// Returns the `SQLite` error text on any failed write (the
-    /// transaction rolls back, keeping the previous guide).
+    /// Returns the `SQLite` error text on any failed write. Like
+    /// Python's importer, batches commit as they complete, so a
+    /// failure leaves the batches written so far in place.
     pub fn import_source(
         &mut self,
         source_key: &str,
         guide: &EpgGuide,
         now: i64,
     ) -> Result<usize, String> {
-        let keep: Vec<String> = guide.channels.iter().map(|c| c.id.clone()).collect();
+        let keep: std::collections::HashSet<&str> =
+            guide.channels.iter().map(|c| c.id.as_str()).collect();
         let listed: Vec<String> = {
             let mut statement = self
                 .conn
@@ -200,12 +247,36 @@ impl EpgStore {
             }
             out
         };
+        // Channels first, in their own transaction; programmes
+        // follow in Python's batch size (EPG_IMPORT_BATCH), each
+        // batch committing and PASSIVE-checkpointing the WAL. One
+        // giant transaction over a whole guide is what made a
+        // fresh import take 773 s against Python's 290 s combined
+        // parse+import (audit 0067).
+        {
+            let tx = self.conn.transaction().map_err(|e| e.to_string())?;
+            insert_channels(&tx, guide, Some(source_key), now)?;
+            tx.commit().map_err(|e| e.to_string())?;
+        }
+        let mut count = 0_usize;
+        let mut batch: Vec<&Programme> = Vec::with_capacity(IMPORT_BATCH);
+        for programmes in guide.programmes.values() {
+            for programme in programmes {
+                batch.push(programme);
+                if batch.len() == IMPORT_BATCH {
+                    count += self.flush_programme_batch(&batch)?;
+                    batch.clear();
+                }
+            }
+        }
+        if !batch.is_empty() {
+            count += self.flush_programme_batch(&batch)?;
+        }
         let tx = self.conn.transaction().map_err(|e| e.to_string())?;
-        let count = insert_guide_rows(&tx, guide, Some(source_key), now)?;
         // Forget this source's listing of channels it no longer
         // defines; delete a channel only when no source lists it
         // any more (Python's `_drop_channels_missing_from`).
-        for id in listed.iter().filter(|id| !keep.contains(id)) {
+        for id in listed.iter().filter(|id| !keep.contains(id.as_str())) {
             tx.execute(
                 "DELETE FROM channel_sources WHERE channel_id = ?1 AND source_key = ?2",
                 [id, source_key],
@@ -352,65 +423,123 @@ impl EpgStore {
         Ok((current, next))
     }
 
-    /// Now/next for every stored channel in one range scan (the
-    /// store twin of `EpgGuide::bulk_now_next`, for guides that
-    /// live only in the database after a restart): rows arrive
-    /// ordered by channel and start, so each channel's current
-    /// programme is its last row started by `at` and its next is
-    /// the first row starting after `at`.
+    /// Now/next for every stored channel (the store twin of
+    /// `EpgGuide::bulk_now_next`, for guides that live only in the
+    /// database after a restart): a faithful port of Python's
+    /// `get_all_now_next`. One range scan over
+    /// `idx_programmes_start_cover` bounded to the window Python
+    /// uses — start within [at - 24 h, at + 6 h], stop after `at`
+    /// ("a programme airing now cannot have started more than ~a
+    /// day ago") — reduced in Rust: per channel, the current
+    /// programme is the row with the greatest start not after `at`
+    /// (first scanned wins a tie), the next is the first row
+    /// starting after `at`. Descriptions of the winning rows are
+    /// fetched afterwards by slot, the way Python fetches them by
+    /// id, so the scan itself never leaves the covering index.
+    ///
+    /// Audit 0068: the previous Rust scan ran out to a 31-day
+    /// horizon and materialized every programme in it — 4.7 s at
+    /// a real-world 813,600 programmes, on the UI thread, after
+    /// every playlist load.
     ///
     /// # Errors
-    /// Returns the `SQLite` error text when the query fails.
+    /// Returns the `SQLite` error text when a query fails.
     pub fn all_now_next(&self, at: i64) -> Result<Vec<(EpgChannel, NowNext)>, String> {
-        let horizon = at + 31 * 86_400;
+        let floor = at - 24 * 3_600;
+        let horizon = at + 6 * 3_600;
         let mut statement = self
             .conn
             .prepare(
-                "SELECT p.channel, p.start, p.stop, p.title, p.description, c.display_name
-                 FROM programmes p JOIN channels c ON c.id = p.channel
-                 WHERE p.stop > ?1 AND p.start < ?2
-                 ORDER BY p.channel, p.start",
+                "SELECT channel, start, stop, title FROM programmes
+                 WHERE start >= ?1 AND start <= ?2 AND stop > ?3
+                 ORDER BY start ASC, stop ASC",
             )
             .map_err(|e| e.to_string())?;
         let rows = statement
-            .query_map(rusqlite::params![at, horizon], |row| {
-                let programme = Programme {
+            .query_map(rusqlite::params![floor, horizon, at], |row| {
+                Ok(Programme {
                     channel_id: row.get(0)?,
                     start: row.get(1)?,
                     stop: row.get(2)?,
                     title: row.get(3)?,
-                    description: row.get(4)?,
-                };
-                Ok((programme, row.get::<_, String>(5)?))
+                    description: String::new(),
+                })
             })
             .map_err(|e| e.to_string())?;
-        let mut out: Vec<(EpgChannel, NowNext)> = Vec::new();
-        let mut group: Option<(EpgChannel, NowNext)> = None;
+        let mut by_channel: std::collections::HashMap<String, NowNext> =
+            std::collections::HashMap::new();
         for row in rows {
-            let (programme, display_name) = row.map_err(|e| e.to_string())?;
-            if group.as_ref().map(|(c, _)| c.id.as_str()) != Some(programme.channel_id.as_str()) {
-                if let Some(done) = group.take() {
-                    out.push(done);
-                }
-                group = Some((
-                    EpgChannel {
-                        id: programme.channel_id.clone(),
-                        display_name,
-                    },
-                    NowNext::default(),
-                ));
-            }
-            if let Some((_, entry)) = &mut group {
-                if programme.start <= at {
+            let programme = row.map_err(|e| e.to_string())?;
+            let entry = by_channel.entry(programme.channel_id.clone()).or_default();
+            if programme.start <= at {
+                let replace = entry
+                    .current
+                    .as_ref()
+                    .is_none_or(|current| programme.start > current.start);
+                if replace {
                     entry.current = Some(programme);
-                } else if entry.next.is_none() {
-                    entry.next = Some(programme);
+                }
+            } else if entry.next.is_none() {
+                entry.next = Some(programme);
+            }
+        }
+        drop(statement);
+        // Descriptions for the winning rows only, by unique slot.
+        let mut description_statement = self
+            .conn
+            .prepare(
+                "SELECT description FROM programmes
+                 WHERE channel = ?1 AND start = ?2 AND stop = ?3",
+            )
+            .map_err(|e| e.to_string())?;
+        for entry in by_channel.values_mut() {
+            for slot in [&mut entry.current, &mut entry.next] {
+                if let Some(programme) = slot.as_mut() {
+                    programme.description = description_statement
+                        .query_row(
+                            rusqlite::params![
+                                programme.channel_id,
+                                programme.start,
+                                programme.stop
+                            ],
+                            |row| row.get(0),
+                        )
+                        .optional()
+                        .map_err(|e| e.to_string())?
+                        .unwrap_or_default();
                 }
             }
         }
-        if let Some(done) = group.take() {
-            out.push(done);
+        drop(description_statement);
+        let mut names_statement = self
+            .conn
+            .prepare("SELECT id, display_name FROM channels")
+            .map_err(|e| e.to_string())?;
+        let name_rows = names_statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|e| e.to_string())?;
+        let mut names: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        for row in name_rows {
+            let (id, name) = row.map_err(|e| e.to_string())?;
+            names.insert(id, name);
         }
+        let mut out: Vec<(EpgChannel, NowNext)> = by_channel
+            .into_iter()
+            .filter_map(|(id, entry)| {
+                names.get(&id).map(|name| {
+                    (
+                        EpgChannel {
+                            id: id.clone(),
+                            display_name: name.clone(),
+                        },
+                        entry,
+                    )
+                })
+            })
+            .collect();
+        out.sort_by(|a, b| a.0.id.cmp(&b.0.id));
         Ok(out)
     }
 
@@ -602,6 +731,10 @@ impl EpgStore {
 }
 
 /// Insert one guide's channels and programmes inside `tx`, with
+/// Programmes per import transaction (Python's `EPG_IMPORT_BATCH`):
+/// each batch commits and runs a PASSIVE WAL checkpoint.
+const IMPORT_BATCH: usize = 15_000;
+
 /// Python's upserts: a channel whose normalized name changed was
 /// renumbered (its stored programmes go), programmes delete the
 /// stored rows they overlap, and an exact slot keeps the newer
@@ -613,6 +746,21 @@ fn insert_guide_rows(
     source_key: Option<&str>,
     now: i64,
 ) -> Result<usize, String> {
+    insert_channels(tx, guide, source_key, now)?;
+    let mut count = 0_usize;
+    for programmes in guide.programmes.values() {
+        let refs: Vec<&Programme> = programmes.iter().collect();
+        count += insert_programmes(tx, &refs)?;
+    }
+    Ok(count)
+}
+
+fn insert_channels(
+    tx: &rusqlite::Transaction<'_>,
+    guide: &EpgGuide,
+    source_key: Option<&str>,
+    now: i64,
+) -> Result<(), String> {
     {
         let mut read_norm = tx
             .prepare("SELECT norm_name FROM channels WHERE id = ?1")
@@ -657,6 +805,13 @@ fn insert_guide_rows(
             }
         }
     }
+    Ok(())
+}
+
+fn insert_programmes(
+    tx: &rusqlite::Transaction<'_>,
+    programmes: &[&Programme],
+) -> Result<usize, String> {
     let mut count = 0_usize;
     {
         let mut delete_overlap = tx
@@ -681,26 +836,24 @@ fn insert_guide_rows(
                     OR length(excluded.description) > length(coalesce(programmes.description, ''))",
             )
             .map_err(|e| e.to_string())?;
-        for programmes in guide.programmes.values() {
-            for programme in programmes {
-                delete_overlap
-                    .execute(rusqlite::params![
-                        programme.channel_id,
-                        programme.start,
-                        programme.stop
-                    ])
-                    .map_err(|e| e.to_string())?;
-                upsert
-                    .execute(rusqlite::params![
-                        programme.channel_id,
-                        programme.start,
-                        programme.stop,
-                        programme.title,
-                        programme.description
-                    ])
-                    .map_err(|e| e.to_string())?;
-                count += 1;
-            }
+        for programme in programmes {
+            delete_overlap
+                .execute(rusqlite::params![
+                    programme.channel_id,
+                    programme.start,
+                    programme.stop
+                ])
+                .map_err(|e| e.to_string())?;
+            upsert
+                .execute(rusqlite::params![
+                    programme.channel_id,
+                    programme.start,
+                    programme.stop,
+                    programme.title,
+                    programme.description
+                ])
+                .map_err(|e| e.to_string())?;
+            count += 1;
         }
     }
     Ok(count)
@@ -785,6 +938,205 @@ mod tests {
         // Re-import replaces rather than duplicating.
         assert_eq!(store.import_guide(&sample_guide()).unwrap(), 2);
         assert_eq!(store.counts().unwrap(), (1, 2));
+    }
+
+    /// Python's `get_all_now_next` restated independently as the
+    /// equivalence oracle for `all_now_next`: window start to
+    /// [at - 24 h, at + 6 h] with stop after `at`, rows taken in
+    /// (start, stop) order, current replaced only by a strictly
+    /// later start, next is the first future row.
+    fn all_now_next_python_oracle(
+        store: &EpgStore,
+        at: i64,
+    ) -> Vec<(EpgChannel, crate::epg::NowNext)> {
+        let floor = at - 24 * 3_600;
+        let horizon = at + 6 * 3_600;
+        let mut statement = store
+            .conn
+            .prepare("SELECT channel, start, stop, title, description FROM programmes")
+            .unwrap();
+        let rows = statement
+            .query_map([], |row| {
+                Ok(Programme {
+                    channel_id: row.get(0)?,
+                    start: row.get(1)?,
+                    stop: row.get(2)?,
+                    title: row.get(3)?,
+                    description: row.get(4)?,
+                })
+            })
+            .unwrap();
+        let mut programmes: Vec<Programme> = rows.map(|row| row.unwrap()).collect();
+        programmes.retain(|p| p.start >= floor && p.start <= horizon && p.stop > at);
+        programmes.sort_by_key(|p| (p.start, p.stop));
+        let mut by_channel: std::collections::HashMap<String, crate::epg::NowNext> =
+            std::collections::HashMap::new();
+        for programme in programmes {
+            let entry = by_channel.entry(programme.channel_id.clone()).or_default();
+            if programme.start <= at {
+                let replace = entry
+                    .current
+                    .as_ref()
+                    .is_none_or(|current| programme.start > current.start);
+                if replace {
+                    entry.current = Some(programme);
+                }
+            } else if entry.next.is_none() {
+                entry.next = Some(programme);
+            }
+        }
+        let all_channels = store.channels().unwrap();
+        let mut out: Vec<(EpgChannel, crate::epg::NowNext)> = by_channel
+            .into_iter()
+            .map(|(id, entry)| {
+                let name = all_channels
+                    .iter()
+                    .find(|c| c.id == id)
+                    .map(|c| c.display_name.clone())
+                    .unwrap_or_default();
+                (
+                    EpgChannel {
+                        id,
+                        display_name: name,
+                    },
+                    entry,
+                )
+            })
+            .collect();
+        out.sort_by(|a, b| a.0.id.cmp(&b.0.id));
+        out
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn all_now_next_matches_python_window_semantics() {
+        // Audit 0068: the store snapshot follows Python's
+        // get_all_now_next window and reduction exactly, including
+        // ties, the 24 h floor, and the 6 h horizon.
+        let mut store = EpgStore::open(std::path::Path::new(":memory:")).unwrap();
+        let mut guide = sample_guide();
+        guide.channels.push(EpgChannel {
+            id: "c2".into(),
+            display_name: "Past Only".into(),
+        });
+        guide
+            .programmes
+            .insert("c2".to_string(), vec![prog("c2", 10, 20, "Long Gone", "")]);
+        guide.channels.push(EpgChannel {
+            id: "c3".into(),
+            display_name: "Future Only".into(),
+        });
+        guide.programmes.insert(
+            "c3".to_string(),
+            vec![
+                prog("c3", 500, 600, "Later", ""),
+                prog("c3", 700, 800, "Even Later", ""),
+            ],
+        );
+        guide.channels.push(EpgChannel {
+            id: "c4".into(),
+            display_name: "Far Horizon".into(),
+        });
+        guide.programmes.insert(
+            "c4".to_string(),
+            vec![
+                prog("c4", 100, 900, "Long Runner", ""),
+                prog("c4", 150 + 40 * 86_400, 200 + 40 * 86_400, "Beyond", ""),
+            ],
+        );
+        guide.channels.push(EpgChannel {
+            id: "c5".into(),
+            display_name: "Overlaps And Ties".into(),
+        });
+        guide.programmes.insert(
+            "c5".to_string(),
+            vec![
+                prog("c5", 100, 200, "Tie Short", ""),
+                prog("c5", 100, 400, "Tie Long", ""),
+                prog("c5", 200, 250, "Tie Next Short", ""),
+                prog("c5", 200, 300, "Tie Next Long", ""),
+                prog("c5", 500, 600, "After", ""),
+            ],
+        );
+        // A deterministic spread for bulk equivalence.
+        let mut bulk: Vec<Programme> = Vec::new();
+        for i in 0..120_i64 {
+            bulk.push(prog("c6", i * 100, i * 100 + 150, &format!("Bulk {i}"), ""));
+        }
+        guide.channels.push(EpgChannel {
+            id: "c6".into(),
+            display_name: "Bulk".into(),
+        });
+        guide.programmes.insert("c6".to_string(), bulk);
+        // The window edges, probed at at = 100_000 below: a next
+        // five hours out counts, one seven hours out does not; a
+        // programme that started 25 h ago and is still airing is
+        // NOT current (Python's floor), while one that started
+        // 23 h ago is.
+        guide.channels.push(EpgChannel {
+            id: "c7".into(),
+            display_name: "Horizon".into(),
+        });
+        guide.programmes.insert(
+            "c7".to_string(),
+            vec![
+                prog("c7", 99_000, 101_000, "On Now", ""),
+                prog(
+                    "c7",
+                    100_000 + 7 * 3_600,
+                    100_000 + 8 * 3_600,
+                    "Too Far",
+                    "",
+                ),
+                prog(
+                    "c7",
+                    100_000 + 5 * 3_600,
+                    100_000 + 6 * 3_600,
+                    "In Reach",
+                    "",
+                ),
+            ],
+        );
+        guide.channels.push(EpgChannel {
+            id: "c8".into(),
+            display_name: "Marathon".into(),
+        });
+        guide.programmes.insert(
+            "c8".to_string(),
+            vec![
+                prog(
+                    "c8",
+                    100_000 - 25 * 3_600,
+                    100_000 + 3_600,
+                    "Started Yesterday",
+                    "",
+                ),
+                prog(
+                    "c8",
+                    100_000 - 23 * 3_600,
+                    100_000 + 3_600,
+                    "Started 23h Ago",
+                    "",
+                ),
+            ],
+        );
+        store.import_guide(&guide).unwrap();
+        for at in [
+            0_i64, 15, 99, 100, 150, 199, 200, 250, 450, 599, 5_000, 11_999, 100_000,
+        ] {
+            assert_eq!(
+                store.all_now_next(at).unwrap(),
+                all_now_next_python_oracle(&store, at),
+                "store and Python semantics disagree at {at}"
+            );
+        }
+        // Named expectations for the window edges at at = 100_000.
+        let bulk = store.all_now_next(100_000).unwrap();
+        let c7 = bulk.iter().find(|(c, _)| c.id == "c7").unwrap();
+        assert_eq!(c7.1.current.as_ref().unwrap().title, "On Now");
+        assert_eq!(c7.1.next.as_ref().unwrap().title, "In Reach");
+        let c8 = bulk.iter().find(|(c, _)| c.id == "c8").unwrap();
+        assert_eq!(c8.1.current.as_ref().unwrap().title, "Started 23h Ago");
     }
 
     fn guide_with(channel: &str, name: &str, programmes: Vec<Programme>) -> EpgGuide {
