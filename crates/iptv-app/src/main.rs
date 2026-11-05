@@ -468,6 +468,10 @@ enum PendingEpgReadUi {
     AutoImportCheck {
         sources: Vec<String>,
     },
+    SeriesProgrammes {
+        rule: iptv_core::dvr::DvrJob,
+        now: f64,
+    },
 }
 
 #[derive(Clone)]
@@ -2093,6 +2097,10 @@ fn drain_epg_reads(wiring: &Wiring) {
                 PendingEpgReadUi::CatchupCurrent { status, .. },
                 Ok(iptv_core::epg::EpgReadValue::NowNext(None)),
             ) => status.set_label("No current programme to catch up."),
+            (
+                PendingEpgReadUi::SeriesProgrammes { rule, now },
+                Ok(iptv_core::epg::EpgReadValue::Programmes(rows)),
+            ) => apply_series_programmes(wiring, &rule, now, rows),
             (PendingEpgReadUi::ChannelProgrammes { status, .. }, Err(error))
             | (PendingEpgReadUi::CatchupProgrammes { status, .. }, Err(error)) => {
                 iptv_core::applog::error("epg", &format!("Cold guide read failed: {error}"));
@@ -2112,6 +2120,44 @@ fn drain_epg_reads(wiring: &Wiring) {
 
 fn epg_read_generation_matches(result_generation: u64, current_generation: u64) -> bool {
     result_generation == current_generation
+}
+
+fn apply_series_programmes(
+    wiring: &Wiring,
+    rule: &iptv_core::dvr::DvrJob,
+    now: f64,
+    programmes: Vec<Programme>,
+) {
+    let channel = channel_from_snapshot(&rule.channel);
+    let mut added = false;
+    for programme in programmes {
+        if programme.start <= now_epoch()
+            || !iptv_core::dvr::series_title_matches(&rule.title, &programme.title)
+        {
+            continue;
+        }
+        let spec = iptv_core::dvr::NewJob {
+            channel: &channel,
+            programme_title: &programme.title,
+            programme_start: programme.start,
+            programme_stop: programme.stop,
+            format: &rule.format,
+            pre_padding_minutes: rule.pre_padding_minutes,
+            post_padding_minutes: rule.post_padding_minutes,
+            repeat: "none",
+        };
+        let Ok(job) = iptv_core::dvr::build_job(&spec, now) else {
+            continue;
+        };
+        let mut dvr = wiring.dvr.borrow_mut();
+        if dvr.find_duplicate(&job).is_none() {
+            dvr.add_job(job);
+            added = true;
+        }
+    }
+    if added {
+        wiring.dvr.borrow_mut().save();
+    }
 }
 
 /// Mark one reminder delivered and persist (Python's
@@ -3259,37 +3305,21 @@ fn run_series_scan(wiring: &Wiring) {
     if rules.is_empty() {
         return;
     }
-    let mut added = false;
     for rule in &rules {
         let channel = channel_from_snapshot(&rule.channel);
-        for programme in store_programmes(wiring, &channel) {
-            if programme.start <= now_epoch()
-                || !iptv_core::dvr::series_title_matches(&rule.title, &programme.title)
-            {
-                continue;
-            }
-            let spec = iptv_core::dvr::NewJob {
-                channel: &channel,
-                programme_title: &programme.title,
-                programme_start: programme.start,
-                programme_stop: programme.stop,
-                format: &rule.format,
-                pre_padding_minutes: rule.pre_padding_minutes,
-                post_padding_minutes: rule.post_padding_minutes,
-                repeat: "none",
-            };
-            let Ok(job) = iptv_core::dvr::build_job(&spec, now) else {
-                continue;
-            };
-            let mut dvr = wiring.dvr.borrow_mut();
-            if dvr.find_duplicate(&job).is_none() {
-                dvr.add_job(job);
-                added = true;
-            }
-        }
-    }
-    if added {
-        wiring.dvr.borrow_mut().save();
+        let at = now_epoch();
+        submit_epg_read(
+            wiring,
+            iptv_core::epg::EpgReadKind::Programmes {
+                channel,
+                from: at - 7 * 86_400,
+                to: at + 7 * 86_400,
+            },
+            PendingEpgReadUi::SeriesProgrammes {
+                rule: rule.clone(),
+                now,
+            },
+        );
     }
 }
 
@@ -6439,32 +6469,6 @@ fn guide_programmes(wiring: &Wiring, channel: &Channel) -> Vec<Programme> {
         }
     };
     in_memory
-}
-
-/// Programmes from the `SQLite` store for a channel (tvg-id
-/// candidates in match order), uncapped: seven days back (the
-/// catch-up window) through the seven-day current/upcoming
-/// horizon the Channel EPG view queries (Python's
-/// `_CHANNEL_EPG_HORIZON`). Callers filter to their own window,
-/// as the in-memory path's callers already do.
-fn store_programmes(wiring: &Wiring, channel: &Channel) -> Vec<Programme> {
-    let guard = wiring.epg_store.borrow();
-    let Some(store) = guard.as_ref() else {
-        return Vec::new();
-    };
-    let now = now_epoch();
-    let mut candidates = iptv_core::epg::expand_tvg_id_candidates(channel.tvg_id.trim());
-    candidates.push(channel.tvg_id.trim().to_string());
-    for candidate in candidates {
-        if let Ok(programmes) =
-            store.programmes_between(&candidate, now - 7 * 86_400, now + 7 * 86_400)
-        {
-            if !programmes.is_empty() {
-                return programmes;
-            }
-        }
-    }
-    Vec::new()
 }
 
 /// The programme airing now on a channel, when the guide has one.
