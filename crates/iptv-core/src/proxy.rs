@@ -50,12 +50,76 @@ pub fn advertised_host(lan: Option<std::net::IpAddr>) -> String {
     lan.map_or_else(|| "127.0.0.1".to_string(), |ip| ip.to_string())
 }
 
+/// The Windows firewall rule name for one proxy port.
+#[must_use]
+pub fn firewall_rule_name(port: u16) -> String {
+    format!("IPTV Proxy ({port})")
+}
+
+/// Windows: let devices on the local network reach the proxy
+/// (port of `stream_proxy.py`'s `_ensure_firewall_rule`): a
+/// per-port inbound allow rule for the private/domain
+/// profiles, deleted and re-added so a stale rule never
+/// shadows the new port. Best effort — like the reference,
+/// every failure is ignored. Returns the rule name to remove
+/// on shutdown.
+#[cfg(windows)]
+fn ensure_firewall_rule(port: u16) -> Option<String> {
+    use std::os::windows::process::CommandExt as _;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let name = firewall_rule_name(port);
+    let name_arg = format!("name={name}");
+    let port_arg = format!("localport={port}");
+    let delete: &[&str] = &["advfirewall", "firewall", "delete", "rule", &name_arg];
+    let add: &[&str] = &[
+        "advfirewall",
+        "firewall",
+        "add",
+        "rule",
+        &name_arg,
+        "dir=in",
+        "action=allow",
+        "protocol=TCP",
+        &port_arg,
+        "profile=private,domain",
+    ];
+    for args in [delete, add] {
+        let _ = std::process::Command::new("netsh")
+            .args(args)
+            .creation_flags(CREATE_NO_WINDOW)
+            .output();
+    }
+    Some(name)
+}
+
+#[cfg(not(windows))]
+fn ensure_firewall_rule(_port: u16) -> Option<String> {
+    None
+}
+
+/// Remove the rule `ensure_firewall_rule` created (port of
+/// `_remove_firewall_rule`); failures ignored.
+#[cfg(windows)]
+fn remove_firewall_rule(name: &str) {
+    use std::os::windows::process::CommandExt as _;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let name_arg = format!("name={name}");
+    let _ = std::process::Command::new("netsh")
+        .args(["advfirewall", "firewall", "delete", "rule", &name_arg])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
+}
+
+#[cfg(not(windows))]
+fn remove_firewall_rule(_name: &str) {}
+
 /// A running proxy server on an ephemeral port.
 pub struct ProxyServer {
     base: String,
     routes: Routes,
     stop: Arc<AtomicBool>,
     handle: Option<std::thread::JoinHandle<()>>,
+    firewall_rule: Option<String>,
 }
 
 impl ProxyServer {
@@ -99,11 +163,15 @@ impl ProxyServer {
                 }
             }
         });
+        // Python opens the firewall for the proxy port when
+        // the proxy starts, so cast devices can reach it.
+        let firewall_rule = ensure_firewall_rule(port);
         Ok(Self {
             base,
             routes,
             stop,
             handle: Some(handle),
+            firewall_rule,
         })
     }
 
@@ -138,6 +206,9 @@ impl Drop for ProxyServer {
         self.stop.store(true, Ordering::Relaxed);
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
+        }
+        if let Some(name) = self.firewall_rule.take() {
+            remove_firewall_rule(&name);
         }
     }
 }

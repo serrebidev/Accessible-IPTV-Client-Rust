@@ -3076,12 +3076,14 @@ fn probe_channel_media_now(wiring: &Wiring, channel: &Channel) {
     if wiring.player.borrow().session.current().is_some() {
         return;
     }
+    let cast_url = cast_source_url(&wiring.cast_ui);
     if single_stream_busy(
         &wiring.recordings,
         &wiring.buffers,
         Some(&wiring.player),
         &fetch_url,
         true,
+        cast_url.as_deref(),
     ) {
         return;
     }
@@ -3614,6 +3616,7 @@ fn single_stream_busy(
     player: Option<&Rc<RefCell<PlayerState>>>,
     url: &str,
     include_player: bool,
+    cast_source_url: Option<&str>,
 ) -> bool {
     let key = iptv_core::catchup_direct::single_stream_provider_key(url);
     if key.is_empty() {
@@ -3636,6 +3639,15 @@ fn single_stream_busy(
                     return true;
                 }
             }
+        }
+    }
+    // N20: a live cast holds the provider connection too
+    // (Python's caster arm, against the retained source URL).
+    if let Some(cast_url) = cast_source_url {
+        if !cast_url.is_empty()
+            && iptv_core::catchup_direct::single_stream_provider_key(cast_url) == key
+        {
+            return true;
         }
     }
     false
@@ -3707,12 +3719,14 @@ fn toggle_recording(
     let headers = iptv_core::playback::StreamHeaders::for_channel(channel);
     let share_with_player = player.is_some_and(|p| player_is_showing(p, channel))
         && buffers.borrow_mut().find(&channel.url, &headers).is_none();
+    let cast_url = player_cast_source(player);
     if single_stream_busy(
         recordings,
         buffers,
         player,
         &channel.url,
         !share_with_player,
+        cast_url.as_deref(),
     ) {
         status.set_label(iptv_core::catchup_direct::ONE_STREAM_REFUSAL);
         return;
@@ -4106,12 +4120,14 @@ fn record_dvr_channel(
     // N13: a one-stream provider whose only connection is in
     // use refuses the scheduled recording with the plain-words
     // reason, like Python's `_start_scheduled_recording`.
+    let cast_url = cast_source_url(&wiring.cast_ui);
     if single_stream_busy(
         &wiring.recordings,
         &wiring.buffers,
         Some(&wiring.player),
         &channel.url,
         true,
+        cast_url.as_deref(),
     ) {
         wiring.dvr.borrow_mut().mark_finished(
             &job.id,
@@ -5254,10 +5270,80 @@ struct CastUi {
     view: Rc<RefCell<CastView>>,
 }
 
+/// One cast the app believes is live (N20): the device and
+/// the channel URL it was started from — the pre-proxy source,
+/// which is what the one-stream provider check counts
+/// (Python's `_active_cast_source_url`).
+#[derive(Clone)]
+struct ActiveCast {
+    device: CastDevice,
+    source_url: String,
+}
+
 #[derive(Default)]
 struct CastView {
     devices: Vec<CastDevice>,
     channel: Option<Channel>,
+    /// The cast playing now, promoted from `pending_cast` when
+    /// the worker confirms it.
+    active_cast: Option<ActiveCast>,
+    /// The cast asked for most recently, awaiting the worker's
+    /// verdict.
+    pending_cast: Option<ActiveCast>,
+}
+
+/// The source URL of the live cast, when one is held.
+fn cast_source_url(slot: &Rc<RefCell<Option<CastUi>>>) -> Option<String> {
+    slot.borrow().as_ref().and_then(|ui| {
+        ui.view
+            .borrow()
+            .active_cast
+            .as_ref()
+            .map(|active| active.source_url.clone())
+    })
+}
+
+/// Whether a cast session is live (N20 refusals consult it,
+/// like Python's `caster.is_connected()`).
+fn cast_is_active(slot: &Rc<RefCell<Option<CastUi>>>) -> bool {
+    slot.borrow()
+        .as_ref()
+        .is_some_and(|ui| ui.view.borrow().active_cast.is_some())
+}
+
+/// The live cast's source URL as seen from a player handle.
+fn player_cast_source(player: Option<&Rc<RefCell<PlayerState>>>) -> Option<String> {
+    let state = player?.borrow();
+    cast_source_url(&state.shared.as_ref()?.cast_ui)
+}
+
+/// Python's connected prompt (main.py:8703), shared by the
+/// Cast entry points and the cast window's Play button:
+/// returns true when a cast was live and the prompt was shown
+/// — the caller then does nothing more, whichever way it was
+/// answered. A Yes disconnects through the cast worker
+/// (Python disconnects on a background thread; the worker is
+/// ours).
+fn prompt_cast_disconnect(
+    parent: &dyn WxWidget,
+    view: &Rc<RefCell<CastView>>,
+    worker: &CastWorker,
+) -> bool {
+    let active = view.borrow().active_cast.clone();
+    let Some(active) = active else {
+        return false;
+    };
+    let message = trf(
+        "Currently connected to: {device}\n\nDisconnect?",
+        &[("device", &active.device.name)],
+    );
+    let dialog = MessageDialog::builder(parent, &message, &tr("Casting"))
+        .with_style(MessageDialogStyle::YesNo | MessageDialogStyle::IconQuestion)
+        .build();
+    if dialog.show_modal_tracked() == ID_YES {
+        worker.stop(active.device.clone());
+    }
+    true
 }
 
 /// Open (or raise) the Cast window and start discovery for the
@@ -5277,6 +5363,7 @@ fn open_cast_window(wiring: &Wiring, list: ListCtrl) {
 /// The cast window's Play / Stop / Refresh bindings.
 #[allow(clippy::too_many_arguments)]
 fn bind_cast_buttons(
+    frame: Frame,
     play: Button,
     stop: Button,
     refresh: Button,
@@ -5295,22 +5382,32 @@ fn bind_cast_buttons(
         let timer = Rc::clone(timer);
         let proxy = Rc::clone(proxy);
         play.on_click(move |_| {
+            // N20: starting a cast while one is live asks
+            // Python's disconnect question instead.
+            if prompt_cast_disconnect(&frame, &view, &worker) {
+                return;
+            }
             let Some(selection) = devices.get_selection() else {
                 return;
             };
-            let view = view.borrow();
-            let (Some(device), Some(channel)) =
-                (view.devices.get(selection as usize), view.channel.as_ref())
-            else {
-                return;
+            let (device, channel) = {
+                let view = view.borrow();
+                let (Some(device), Some(channel)) = (
+                    view.devices.get(selection as usize).cloned(),
+                    view.channel.clone(),
+                ) else {
+                    return;
+                };
+                (device, channel)
             };
             let (clean_url, _) = iptv_core::playback::split_stream_modifiers(&channel.url);
-            let headers = iptv_core::downloads::channel_headers(channel);
+            let headers = iptv_core::downloads::channel_headers(&channel);
             // The media type is probed from the original stream and
             // travels independently of the playback URL (S04): the
             // proxy URL below is an opaque `/s/<hash>` path that
             // cannot reveal HLS/TS to the renderer.
             let probed_mime = iptv_core::cast::guess_mime(&clean_url);
+            let source_url = clean_url.clone();
             let play_url = if headers.is_empty() {
                 clean_url
             } else {
@@ -5323,6 +5420,10 @@ fn bind_cast_buttons(
                     None => clean_url,
                 }
             };
+            view.borrow_mut().pending_cast = Some(ActiveCast {
+                device: device.clone(),
+                source_url,
+            });
             worker.play(
                 device.clone(),
                 play_url,
@@ -5408,7 +5509,7 @@ fn ensure_cast_ui(
         view,
     };
     bind_cast_buttons(
-        play, stop, refresh, devices, &ui.view, worker, pending, timer, proxy, status,
+        frame, play, stop, refresh, devices, &ui.view, worker, pending, timer, proxy, status,
     );
     {
         let frame_hide = frame;
@@ -5450,16 +5551,35 @@ fn poll_cast(wiring: &Wiring, status: Status) {
                 status.set_label("Cast device search finished.");
             }
             CastEvent::Played(Ok(name)) => {
+                // N20: the worker confirmed the cast — it is
+                // the live session the refusals consult.
+                let mut view = ui.view.borrow_mut();
+                if let Some(pending) = view.pending_cast.take() {
+                    if pending.device.name == name {
+                        view.active_cast = Some(pending);
+                    }
+                }
+                drop(view);
                 ui.status
                     .set_label(&trf("Casting to {name}.", &[("name", &name)]));
                 status.set_label(&trf("Casting to {name}.", &[("name", &name)]));
             }
             CastEvent::Played(Err(error)) => {
+                ui.view.borrow_mut().pending_cast = None;
                 iptv_core::applog::error("cast", &format!("Casting failed: {error}"));
                 ui.status
                     .set_label(&trf("Casting failed: {error}", &[("error", &error)]));
             }
             CastEvent::Stopped(name) => {
+                let mut view = ui.view.borrow_mut();
+                if view
+                    .active_cast
+                    .as_ref()
+                    .is_some_and(|active| active.device.name == name)
+                {
+                    view.active_cast = None;
+                }
+                drop(view);
                 ui.status
                     .set_label(&trf("Stopped casting to {name}.", &[("name", &name)]));
             }
@@ -11223,18 +11343,38 @@ fn buffer_intercept(
         return false;
     }
     let settings = iptv_core::timeshift::BufferSettings::from_config(&persist.config.borrow());
+    // N20: the cast session state exists now, so the engage
+    // context consults it (was hardcoded off, validation 0045).
+    let casting = player
+        .borrow()
+        .shared
+        .as_ref()
+        .is_some_and(|shared| cast_is_active(&shared.cast_ui));
     let wants = iptv_core::timeshift::wants_buffer(
         &settings,
         iptv_core::timeshift::EngageContext {
             builtin_player: true,
-            // The Rust cast model keeps no persistent
-            // connection state to consult (recorded in
-            // validation 0045).
-            casting: false,
+            casting,
             live_stream: request.live,
             channel_is_movie: false,
         },
     );
+    if casting && buffers.borrow().current.is_some() {
+        // Python's refusal (client_timeshift.py): a buffered
+        // session is feeding the player while a cast is live —
+        // the launch is taken over and nothing plays locally.
+        if let Some(frame) = player.borrow().window.as_ref().map(|win| win.frame) {
+            let dialog = MessageDialog::builder(
+                &frame,
+                &tr("Stop local buffered playback before switching to a cast device."),
+                &tr("Local Live Buffer"),
+            )
+            .with_style(MessageDialogStyle::OK | MessageDialogStyle::IconInformation)
+            .build();
+            dialog.show_modal_tracked();
+        }
+        return true;
+    }
     if !wants {
         buffers.borrow_mut().release_current();
         return false;
@@ -12480,6 +12620,11 @@ fn show_cast_for(
     channel: Option<&Channel>,
 ) {
     let ui = ensure_cast_ui(ui_slot, worker, pending, timer, proxy);
+    // N20: Python's cast dialog opens with the disconnect
+    // prompt when a cast is already live, and nothing else.
+    if prompt_cast_disconnect(&ui.frame, &ui.view, worker) {
+        return;
+    }
     ui.frame.show(true);
     ui.frame.raise();
     ui.view.borrow_mut().channel = channel.cloned();
@@ -14845,6 +14990,37 @@ fn cw_check_availability(
     dstatus.set_label(&result);
 }
 
+/// N20: Python refuses a saved-position resume when the
+/// player is not the built-in one or a cast is live
+/// (main.py:6279) — the position would be silently dropped
+/// otherwise. Shows the refusal and returns true when the
+/// resume must not start.
+fn resume_blocked_by_player_or_cast(wiring: &Wiring, parent: &Frame) -> bool {
+    let (media_player, custom_path) = {
+        let config = wiring.persist.config.borrow();
+        (
+            config.string_or("media_player", "Built-in Player"),
+            config.string_or("custom_player_path", ""),
+        )
+    };
+    let builtin = matches!(
+        player_choice(&media_player, &custom_path),
+        PlayerChoice::BuiltIn
+    );
+    if builtin && !cast_is_active(&wiring.cast_ui) {
+        return false;
+    }
+    let dialog = MessageDialog::builder(
+        parent,
+        &tr("Saved positions can only be restored in the built-in player. Select it and disconnect casting before continuing."),
+        &tr("Continue Watching"),
+    )
+    .with_style(MessageDialogStyle::OK | MessageDialogStyle::IconInformation)
+    .build();
+    dialog.show_modal_tracked();
+    true
+}
+
 /// The Continue Watching buttons: Resume, Check Availability
 /// (Python: per selected row, identity re-resolution against
 /// the current catalogue — the stream URL is never probed),
@@ -14879,6 +15055,9 @@ fn wire_continue_watching(
             .and_then(|row| row.channel.clone());
         match channel {
             Some(channel) => {
+                if resume_blocked_by_player_or_cast(&wiring_p, &frame) {
+                    return;
+                }
                 play_channel(
                     &wiring_p.player,
                     &wiring_p.persist,
@@ -15803,12 +15982,14 @@ fn begin_catchup_download(
     // N13: on a one-stream provider whose only connection is
     // in use, refuse before any probing — the probes are media
     // requests too and would consume the slot ffmpeg needs.
+    let cast_url = cast_source_url(&wiring.cast_ui);
     if single_stream_busy(
         &wiring.recordings,
         &wiring.buffers,
         Some(&wiring.player),
         &url,
         true,
+        cast_url.as_deref(),
     ) {
         status.set_label(iptv_core::catchup_direct::ONE_STREAM_REFUSAL);
         return;
