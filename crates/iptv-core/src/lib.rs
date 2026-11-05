@@ -25,6 +25,7 @@ pub mod downloads;
 pub mod dvr;
 pub mod epg;
 pub mod epgstore;
+pub mod exit_guard;
 pub mod favorites;
 pub mod guide;
 pub mod i18n;
