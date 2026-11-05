@@ -7,6 +7,8 @@ use std::collections::BTreeMap;
 use std::net::UdpSocket;
 use std::time::{Duration, Instant};
 
+use rust_cast::channels::media::{GenericMediaMetadata, Media, Metadata, StreamType};
+
 // ---------------------------------------------------------------------------
 // Media helpers (caster_engine.py)
 // ---------------------------------------------------------------------------
@@ -224,6 +226,7 @@ pub struct CastDevice {
 pub enum CastKind {
     Upnp,
     Roku,
+    Chromecast,
 }
 
 fn tag_text(body: &str, tag: &str) -> Option<String> {
@@ -846,6 +849,364 @@ pub fn normalize_request_headers(
 }
 
 // ---------------------------------------------------------------------------
+// Chromecast (casting.py's `_scan_chromecast` / `_play_chromecast`):
+// mDNS discovery of `_googlecast._tcp`, Cast V2 control through the
+// `chromecast` crate (lib name `rust_cast`). The crate has no
+// discovery module, so discovery is ours (mdns-sd).
+// ---------------------------------------------------------------------------
+
+/// The mDNS service type Chromecast devices advertise.
+pub const GOOGLECAST_SERVICE: &str = "_googlecast._tcp.local.";
+
+/// The port a Cast device listens on when the advertisement
+/// does not say (Python's `info.port or 8009`).
+pub const DEFAULT_CAST_PORT: u16 = 8009;
+
+/// The host to dial for a resolved Cast service (port of
+/// `mdns_host`): IPv4 first — the app's media server is IPv4 —
+/// with a deterministic pick so repeat scans agree.
+#[must_use]
+pub fn pick_cast_host(addresses: &[String]) -> Option<String> {
+    let mut v4: Vec<&String> = addresses
+        .iter()
+        .filter(|a| a.parse::<std::net::Ipv4Addr>().is_ok())
+        .collect();
+    v4.sort();
+    if let Some(first) = v4.first() {
+        return Some((*first).clone());
+    }
+    let mut all: Vec<&String> = addresses.iter().collect();
+    all.sort();
+    all.first().map(|first| (*first).clone())
+}
+
+/// A Cast service's display name: the TXT `fn` record, else
+/// the service fullname's first label (Python's fallback).
+#[must_use]
+pub fn chromecast_display_name(fullname: &str, friendly: Option<&str>) -> String {
+    match friendly {
+        Some(name) if !name.trim().is_empty() => name.to_string(),
+        _ => fullname.split('.').next().unwrap_or(fullname).to_string(),
+    }
+}
+
+/// The device record for one resolved Cast service. The
+/// control URL is the `host:port` endpoint the session dials.
+#[must_use]
+pub fn chromecast_device(name: String, host: &str, port: u16, model: &str) -> CastDevice {
+    let endpoint = if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    };
+    CastDevice {
+        name,
+        control_url: endpoint,
+        manufacturer: if model.is_empty() {
+            "Chromecast".to_string()
+        } else {
+            model.to_string()
+        },
+        sink_mimes: Vec::new(),
+        kind: CastKind::Chromecast,
+    }
+}
+
+/// Split a stored `host:port` endpoint back into its parts; a
+/// bare host takes the default Cast port.
+#[must_use]
+pub fn parse_cast_endpoint(control_url: &str) -> Option<(String, u16)> {
+    let text = control_url.trim();
+    if text.is_empty() {
+        return None;
+    }
+    if let Some(bracketed) = text.strip_prefix('[') {
+        let (host, rest) = bracketed.split_once(']')?;
+        let port = rest
+            .strip_prefix(':')
+            .and_then(|p| p.parse::<u16>().ok())
+            .unwrap_or(DEFAULT_CAST_PORT);
+        return Some((host.to_string(), port));
+    }
+    match text.rsplit_once(':') {
+        Some((host, port)) if !host.is_empty() && port.parse::<u16>().is_ok() => Some((
+            host.to_string(),
+            port.parse::<u16>().unwrap_or(DEFAULT_CAST_PORT),
+        )),
+        _ => Some((text.to_string(), DEFAULT_CAST_PORT)),
+    }
+}
+
+/// Discover Chromecast devices by browsing `_googlecast._tcp`
+/// for the window (port of `_scan_chromecast`): each resolved
+/// service becomes a device, keyed by endpoint, with a
+/// same-name service disambiguated by host like the reference.
+#[must_use]
+pub fn chromecast_discover(timeout_seconds: u64) -> Vec<CastDevice> {
+    let Ok(daemon) = mdns_sd::ServiceDaemon::new() else {
+        return Vec::new();
+    };
+    let Ok(receiver) = daemon.browse(GOOGLECAST_SERVICE) else {
+        return Vec::new();
+    };
+    let deadline = Instant::now() + Duration::from_secs(timeout_seconds);
+    let mut devices: Vec<CastDevice> = Vec::new();
+    while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+        if remaining.is_zero() {
+            break;
+        }
+        match receiver.recv_timeout(remaining) {
+            Ok(mdns_sd::ServiceEvent::ServiceResolved(info)) => {
+                let addresses: Vec<String> = info
+                    .get_addresses()
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect();
+                let Some(host) = pick_cast_host(&addresses) else {
+                    continue;
+                };
+                let friendly = info.get_property_val_str("fn");
+                let mut name = chromecast_display_name(info.get_fullname(), friendly);
+                if devices.iter().any(|d| d.name == name) {
+                    name = format!("{name} ({host})");
+                }
+                let model = info.get_property_val_str("md").unwrap_or("Chromecast");
+                let device = chromecast_device(name, &host, info.get_port(), model);
+                if !devices.iter().any(|d| d.control_url == device.control_url) {
+                    devices.push(device);
+                }
+            }
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
+    let _ = daemon.stop_browse(GOOGLECAST_SERVICE);
+    let _ = daemon.shutdown();
+    devices
+}
+
+/// A live Chromecast session, owned by the cast worker thread.
+/// The `rust_cast` device is confined to that thread: its
+/// message manager holds the stream lock across a blocking
+/// read, so no second thread may ever read from it.
+struct ChromecastSession {
+    endpoint: String,
+    device: rust_cast::CastDevice<'static>,
+    transport_id: String,
+    session_id: String,
+    media_session_id: Option<i32>,
+    last_upkeep: Instant,
+}
+
+/// Connect to a Cast endpoint and launch the Default Media
+/// Receiver (the app Python's `CAST_APP_ID` names), returning
+/// the ready session.
+///
+/// # Errors
+///
+/// Returns the transport failure text.
+fn chromecast_connect(device: &CastDevice) -> Result<ChromecastSession, String> {
+    let (host, port) = parse_cast_endpoint(&device.control_url)
+        .ok_or_else(|| "Cast request failed: no address for this device".to_string())?;
+    let conn = rust_cast::CastDevice::connect_without_host_verification(host, port)
+        .map_err(|e| format!("Cast request failed: {e}"))?;
+    conn.connection
+        .connect("receiver-0")
+        .map_err(|e| format!("Cast request failed: {e}"))?;
+    let _ = conn.heartbeat.ping();
+    let app = conn
+        .receiver
+        .launch_app(&rust_cast::channels::receiver::CastDeviceApp::DefaultMediaReceiver)
+        .map_err(|e| format!("Cast request failed: {e}"))?;
+    conn.connection
+        .connect(app.transport_id.as_str())
+        .map_err(|e| format!("Cast request failed: {e}"))?;
+    Ok(ChromecastSession {
+        endpoint: device.control_url.clone(),
+        device: conn,
+        transport_id: app.transport_id,
+        session_id: app.session_id,
+        media_session_id: None,
+        last_upkeep: Instant::now(),
+    })
+}
+
+/// Wait for the receiver to start playing (a bounded version
+/// of Python's `_await_playing`): Playing settles it, an Idle
+/// entry carrying an error/finish reason refuses it, and
+/// Buffering counts as started once the wait runs out — a slow
+/// live start is not a rejection.
+///
+/// # Errors
+///
+/// Returns Python's refusal sentence with the idle reason.
+fn chromecast_await_playing(session: &ChromecastSession, name: &str) -> Result<(), String> {
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let mut saw_buffering = false;
+    loop {
+        let status = session
+            .device
+            .media
+            .get_status(session.transport_id.as_str(), None)
+            .map_err(|e| format!("Cast request failed: {e}"))?;
+        if let Some(entry) = status.entries.first() {
+            match entry.player_state {
+                rust_cast::channels::media::PlayerState::Playing => return Ok(()),
+                rust_cast::channels::media::PlayerState::Idle => {
+                    if let Some(idle) = &entry.idle_reason {
+                        let reason = format!("{idle:?}").to_lowercase();
+                        return Err(format!(
+                            "{name} did not start playing the stream ({reason})."
+                        ));
+                    }
+                }
+                rust_cast::channels::media::PlayerState::Buffering
+                | rust_cast::channels::media::PlayerState::Paused => {
+                    saw_buffering = true;
+                }
+            }
+        }
+        if Instant::now() >= deadline {
+            if saw_buffering {
+                return Ok(());
+            }
+            return Err(format!(
+                "{name} did not start playing the stream (no answer)."
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+/// Play on a Chromecast through the worker's session (port of
+/// `_play_chromecast`'s load, minus the probe/relay ladder the
+/// engine owns): connect or reuse the session, load with the
+/// live stream type, flip the type once when the load is
+/// refused (Python's final retry), and confirm playback.
+///
+/// # Errors
+///
+/// Returns the failure text; a transport failure also drops
+/// the session so the next Play reconnects.
+fn chromecast_play(
+    session: &mut Option<ChromecastSession>,
+    device: &CastDevice,
+    url: &str,
+    title: &str,
+    mime: &str,
+) -> Result<String, String> {
+    if session
+        .as_ref()
+        .is_none_or(|live| live.endpoint != device.control_url)
+    {
+        *session = None;
+        *session = Some(chromecast_connect(device)?);
+    }
+    let live = session.as_mut().expect("session just ensured");
+    let mut stream_type = if mime == "application/vnd.apple.mpegurl" {
+        StreamType::Live
+    } else {
+        StreamType::Buffered
+    };
+    let mut last_error = String::new();
+    for _ in 0..2 {
+        let media = Media {
+            content_id: url.to_string(),
+            stream_type,
+            content_type: mime.to_string(),
+            metadata: Some(Metadata::Generic(GenericMediaMetadata {
+                title: Some(title.to_string()),
+                subtitle: None,
+                images: Vec::new(),
+                release_date: None,
+            })),
+            duration: None,
+        };
+        let loaded =
+            live.device
+                .media
+                .load(live.transport_id.as_str(), live.session_id.as_str(), &media);
+        match loaded {
+            Ok(status) => {
+                live.media_session_id = status.entries.first().map(|entry| entry.media_session_id);
+                match chromecast_await_playing(live, &device.name) {
+                    Ok(()) => return Ok(device.name.clone()),
+                    Err(error) => {
+                        if error.starts_with("Cast request failed") {
+                            *session = None;
+                        }
+                        return Err(error);
+                    }
+                }
+            }
+            Err(error) => {
+                last_error = format!("Cast request failed: {error}");
+                stream_type = match stream_type {
+                    StreamType::Live => StreamType::Buffered,
+                    _ => StreamType::Live,
+                };
+            }
+        }
+    }
+    *session = None;
+    Err(last_error)
+}
+
+/// Stop a Chromecast session (port of `_release_cast`: stop
+/// the media, not the app, then close the connection).
+fn chromecast_stop(session: &mut Option<ChromecastSession>, device: &CastDevice) {
+    let Some(live) = session.take() else {
+        return;
+    };
+    if live.endpoint != device.control_url {
+        // A session to a different device is not this stop's
+        // business; put it back.
+        *session = Some(live);
+        return;
+    }
+    if let Some(media_session_id) = live.media_session_id {
+        let _ = live
+            .device
+            .media
+            .stop(live.transport_id.as_str(), media_session_id);
+    }
+    let _ = live
+        .device
+        .connection
+        .disconnect(live.transport_id.as_str());
+    // Dropping the device closes the TLS stream.
+}
+
+/// Session upkeep between jobs (heartbeat): ping on a slow
+/// cadence and answer the device's pings with pongs, exactly
+/// the crate's documented receive pattern. Every receive here
+/// is answered promptly in practice — our own ping guarantees
+/// a pong is in flight — and a dead connection simply ends the
+/// drain.
+fn chromecast_upkeep(session: &mut Option<ChromecastSession>) {
+    let Some(live) = session.as_mut() else {
+        return;
+    };
+    if live.last_upkeep.elapsed() < Duration::from_secs(4) {
+        return;
+    }
+    live.last_upkeep = Instant::now();
+    if live.device.heartbeat.ping().is_err() {
+        *session = None;
+        return;
+    }
+    for _ in 0..4 {
+        match live.device.receive() {
+            Ok(rust_cast::ChannelMessage::Heartbeat(_)) => {
+                let _ = live.device.heartbeat.pong();
+            }
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Cast worker
 // ---------------------------------------------------------------------------
 
@@ -892,10 +1253,23 @@ impl CastWorker {
         let (job_sender, job_receiver) = std::sync::mpsc::channel::<CastJob>();
         let (event_sender, event_receiver) = std::sync::mpsc::channel::<CastEvent>();
         std::thread::spawn(move || {
-            while let Ok(job) = job_receiver.recv() {
+            // The Chromecast session lives here and only here:
+            // its device handle is confined to this thread.
+            let mut cc_session: Option<ChromecastSession> = None;
+            loop {
+                let job = match job_receiver.recv_timeout(Duration::from_millis(200)) {
+                    Ok(job) => job,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        chromecast_upkeep(&mut cc_session);
+                        continue;
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                };
                 let event = match job {
                     CastJob::Discover => {
-                        let mut devices = upnp_discover(4);
+                        // Python's scan order: chromecast first.
+                        let mut devices = chromecast_discover(4);
+                        devices.extend(upnp_discover(4));
                         devices.extend(roku_discover(4));
                         CastEvent::Devices(devices)
                     }
@@ -923,6 +1297,10 @@ impl CastWorker {
                                 roku_play(&device.control_url, &url, &mime, &title)
                                     .map(|()| device.name.clone())
                             }
+                            CastKind::Chromecast => {
+                                let mime = effective_mime(mime.as_deref(), &url);
+                                chromecast_play(&mut cc_session, &device, &url, &title, &mime)
+                            }
                         };
                         CastEvent::Played(result)
                     }
@@ -930,6 +1308,9 @@ impl CastWorker {
                         match device.kind {
                             CastKind::Upnp => upnp_stop(&device.control_url),
                             CastKind::Roku => roku_stop(&device.control_url),
+                            CastKind::Chromecast => {
+                                chromecast_stop(&mut cc_session, &device);
+                            }
                         }
                         CastEvent::Stopped(device.name.clone())
                     }
@@ -1085,6 +1466,59 @@ mod tests {
         );
         assert!(didl.contains("http://x/s?a=1&amp;b=2"));
         assert!(didl.contains("<dc:title>A &amp; B</dc:title>"));
+    }
+
+    #[test]
+    fn chromecast_host_pick_prefers_ipv4() {
+        // Python's mdns_host: IPv4 first, deterministic among
+        // equals, IPv6 still discoverable on its own.
+        let mixed = vec![
+            "fe80::1".to_string(),
+            "192.168.1.30".to_string(),
+            "192.168.1.20".to_string(),
+        ];
+        assert_eq!(pick_cast_host(&mixed).as_deref(), Some("192.168.1.20"));
+        assert_eq!(
+            pick_cast_host(&["fe80::1".to_string()]).as_deref(),
+            Some("fe80::1")
+        );
+        assert_eq!(pick_cast_host(&[]), None);
+    }
+
+    #[test]
+    fn chromecast_names_endpoints_and_records() {
+        assert_eq!(
+            chromecast_display_name("Living Room._googlecast._tcp.local.", Some("TV")),
+            "TV"
+        );
+        assert_eq!(
+            chromecast_display_name("Living Room._googlecast._tcp.local.", None),
+            "Living Room"
+        );
+        assert_eq!(
+            chromecast_display_name("Living Room._googlecast._tcp.local.", Some("  ")),
+            "Living Room"
+        );
+        let device = chromecast_device("TV".to_string(), "192.168.1.20", 8009, "Chromecast Ultra");
+        assert_eq!(device.kind, CastKind::Chromecast);
+        assert_eq!(device.control_url, "192.168.1.20:8009");
+        assert_eq!(device.manufacturer, "Chromecast Ultra");
+        let v6 = chromecast_device("TV".to_string(), "fe80::1", 8009, "");
+        assert_eq!(v6.control_url, "[fe80::1]:8009");
+        assert_eq!(v6.manufacturer, "Chromecast");
+        assert_eq!(
+            parse_cast_endpoint("192.168.1.20:8009"),
+            Some(("192.168.1.20".to_string(), 8009))
+        );
+        assert_eq!(
+            parse_cast_endpoint("[fe80::1]:8009"),
+            Some(("fe80::1".to_string(), 8009))
+        );
+        assert_eq!(
+            parse_cast_endpoint("castbox.local"),
+            Some(("castbox.local".to_string(), DEFAULT_CAST_PORT))
+        );
+        assert_eq!(parse_cast_endpoint("  "), None);
     }
 
     #[test]

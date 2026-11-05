@@ -15,6 +15,8 @@ hmac.workspace = true
 pbkdf2.workspace = true
 base64.workspace = true
 getrandom.workspace = true
+rust_cast.workspace = true
+mdns-sd.workspace = true
 
 [package]
 name = "iptv-core"
