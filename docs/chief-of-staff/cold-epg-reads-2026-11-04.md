@@ -1,7 +1,7 @@
 # Cold EPG reads
 
 **Decision date:** 2026-11-04
-**Status:** Design confirmed; formal specification recorded in `docs/specs/0007-cold-epg-reads.md`; implementation not started.
+**Status:** Design confirmed; specification published as [issue #181](https://github.com/serrebidev/Accessible-IPTV-Client-Rust/issues/181); implementation not started.
 
 ## Decision
 
@@ -17,5 +17,6 @@ On 2026-11-04, the user chose to move all cold SQLite-backed EPG reads and index
 ## Follow-up
 
 - [Cold EPG Reads spec](../specs/0007-cold-epg-reads.md) records user-visible behavior, boundaries, and test seams.
+- The spec was published as [issue #181](https://github.com/serrebidev/Accessible-IPTV-Client-Rust/issues/181) with the `ready-for-agent` label.
 - Before implementation, split the multi-path work into tickets if it remains a multi-session change.
-- Correct validation 0070 when implementation updates its cold-store measurements and remaining-work description.
+- Validation 0070 was corrected on 2026-11-04 to separate worker-side guide merge/index construction from the remaining UI-thread cold-store fallback.

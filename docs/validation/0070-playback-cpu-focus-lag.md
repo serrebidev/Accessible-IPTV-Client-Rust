@@ -9,12 +9,12 @@ this loaded dev box — absolute numbers run faster on a quiet
 machine, the ratios and the thread each cost lands on are the
 finding).
 
-## Where the time goes
+## Where the time went before the suffix-worker fix
 
-Every cost below was paid synchronously on the UI thread by
-`refresh_epg_suffixes` and the guide-load delivery, i.e. the
-window could not process focus, paint, or input until each
-one finished:
+The synchronous costs below were paid by the old
+`refresh_epg_suffixes` path on the UI thread, so the window
+could not process focus, paint, or input until each one
+finished:
 
 - `GuideMatchCache::build` over the full playlist —
   **25.3 s** worst case (guide ids/names disjoint from the
@@ -33,13 +33,6 @@ one finished:
   against 65.6 ms warm in validation 0068. The variance is
   itself the bug on the UI thread: right after alt-tabbing
   back is exactly when caches are cold.
-- `EpgGuide::merge` of a full re-import into the in-memory
-  guide — **1.38 s**, paid on the UI thread in `poll_epg` at
-  every guide-load delivery (auto-import interval is 6 h, plus
-  manual refreshes and provider-driven reloads). The merge is
-  quadratic per channel (a `retain` scan per programme in
-  `upsert_programme`, plus a linear channel find).
-- `GuideIndexes::build` — 0.23–0.35 s, also at delivery.
 - The steady-state part was never the problem: bulk now/next
   for the in-memory guide is 7 ms and the row build is
   sub-millisecond to a few ms. The per-minute timer also
@@ -62,9 +55,10 @@ an unconditional full-list repaint.
 ## The fix
 
 The architecture now matches Python's: the suffix rebuild
-runs on a worker thread, the UI thread only swaps a finished
-map in, and the merge that remains at delivery is no longer
-quadratic for the re-import shape.
+runs on a worker thread, and the UI thread only swaps a
+finished map in. Guide loading already uses `EpgWorker` for
+the merge and `GuideIndexes::build`; those operations finish
+before the load result reaches `poll_epg`.
 
 - Core `SuffixWorker` (`epg.rs`): a background thread that
   owns the whole rebuild — open the durable EPG store (WAL
@@ -110,10 +104,20 @@ quadratic for the re-import shape.
   orders of exact partner + crossing sibling, a spanning
   stored row, an incoming-internal crossing, and a same-slot
   duplicate chain.
-- What stays on the UI thread at guide delivery: the merge
-  itself (now fast-path for the re-import shape) and
-  `GuideIndexes::build` for the in-memory guide (0.23–0.35 s,
-  once per delivery — the 6 h auto-import, not per minute).
+- `EpgWorker` builds the merged guide and its `GuideIndexes`
+  before sending the load result. `poll_epg` swaps the finished
+  snapshot and updates status; it does not merge programmes or
+  build those indexes on the UI thread.
+
+## Remaining cold-store path
+
+Before a loaded in-memory snapshot is available, the app still
+has synchronous SQLite fallback calls. In particular,
+`store_indexes` reads guide channels and builds indexes on the
+UI thread; `guide_now_next`, `guide_snapshot`, programme
+queries, and EPG search also read the store from the adapter.
+The cold persisted-store path is tracked separately in
+`docs/specs/0007-cold-epg-reads.md`.
 
 ## Measurements after the fix
 

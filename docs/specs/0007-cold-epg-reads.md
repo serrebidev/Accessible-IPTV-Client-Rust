@@ -56,3 +56,4 @@ Run all cold SQLite-backed guide reads and index construction in background work
 
 - The design was confirmed on 2026-11-04. The repository's validation record 0068 documents a cold `all_now_next` read of 3.20 seconds and a warm read of 65.6 milliseconds at its measured scale; validation 0070 moved the channel suffix pipeline to a worker.
 - As of `serrebidev/Accessible-IPTV-Client-Rust@654f43e`, `EpgWorker` already merges the guide and builds `GuideIndexes` before delivering a loaded snapshot. The remaining cold-store callers are the scope of this spec.
+- Implementation is tracked in [issue #181](https://github.com/serrebidev/Accessible-IPTV-Client-Rust/issues/181).
