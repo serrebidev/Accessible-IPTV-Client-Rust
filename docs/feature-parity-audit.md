@@ -1282,6 +1282,8 @@ Evidence for N01 to N06 is in docs/validation/0071-player-engine-cpu-and-ticks.m
 
 **N24, low: explanatory text in forms and dialogs.** Provider field descriptions (`playlist.py:3440` to `:3445`, `:3558` to `:3562`), the Preferred Audio Track and padding explanations (`dialogs_misc.py:644` to `:662`, `:704`), the catch-up hint (`:491`), and the storage check report (`planning_ui.py:307`). Screen-reader users rely on this text, so it is worth more than its size suggests.
 
+**Fix:** Fixed 2026-11-04 — every N24 text now present with Python's wording verbatim, as visible dialog text (never a control description): provider-form field descriptions as static lines under each field and switch, the Preferred Audio Track intro, switch label, keywords label and hint, the Schedule Padding introduction heading the first prompt, the Catch-up intro line, and the storage check report in Python's exact form ("Free space: {free} MiB", "Required reserve", the no-guarantee disclaimer, error-alone error box, queued presentation). See validation 0089. Residual: Brandon's NVDA reading-order pass on the reworded dialogs.
+
 **N25, low: smaller dialogs.** About's community links for Telegram and GitHub (`dialogs_misc.py:60` to `:66`), a typed path and Browse in Custom Player where Rust has a file picker only (`options.py:934` to `:954`), the exact What Is Playing wording (`main.py:1838`), and Go to Channel errors (`main.py:2974`, `:2983`).
 
 ### Still open from earlier records
