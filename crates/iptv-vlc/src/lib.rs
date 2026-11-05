@@ -235,6 +235,10 @@ struct Functions {
 pub struct MediaOptions {
     pub cache_ms: u32,
     pub live: bool,
+    /// False while the player window stays hidden (Show Player on
+    /// Enter off): Python's hidden play decodes no video at all,
+    /// which is most of playback's CPU cost (validation 0071).
+    pub video_visible: bool,
 }
 
 impl MediaOptions {
@@ -257,6 +261,13 @@ impl MediaOptions {
                 ":clock-synchro=0".to_string(),
                 ":drop-late-frames=0".to_string(),
                 ":skip-frames=0".to_string(),
+            ]);
+        }
+        if !self.video_visible {
+            options.extend([
+                ":no-video".to_string(),
+                ":vout=dummy".to_string(),
+                ":intf=dummy".to_string(),
             ]);
         }
         options
@@ -414,11 +425,8 @@ impl VlcEngine {
     /// Point the video output at a native window handle (Windows
     /// HWND, macOS `NSView`), passed as an opaque address. On Linux
     /// libVLC opens its own video window; the handle is ignored
-    /// there.
+    /// there. Zero detaches the window for a hidden play.
     pub fn set_window_handle(&self, handle: usize) {
-        if handle == 0 {
-            return;
-        }
         let pointer = handle as *mut c_void;
         if cfg!(windows) {
             if let Some(set) = self.inner.fns.set_hwnd {
@@ -754,6 +762,7 @@ mod tests {
         let live = super::MediaOptions {
             cache_ms: 500,
             live: true,
+            video_visible: true,
         }
         .option_strings();
         for name in ["network", "live", "file", "disc"] {
@@ -767,6 +776,7 @@ mod tests {
         let vod = super::MediaOptions {
             cache_ms: 25_000,
             live: false,
+            video_visible: true,
         }
         .option_strings();
         assert!(vod.contains(&":network-caching=25000".to_string()));
@@ -787,6 +797,25 @@ mod tests {
         assert_eq!(offset_of!(AudioOutputDevice, next), 0);
         assert_eq!(offset_of!(AudioOutputDevice, device), size_of::<usize>());
         assert_eq!(offset_of!(TrackDescription, next), 2 * size_of::<usize>());
+    }
+
+    #[test]
+    fn only_a_hidden_play_turns_video_off() {
+        let options = |video_visible| {
+            super::MediaOptions {
+                cache_ms: 500,
+                live: true,
+                video_visible,
+            }
+            .option_strings()
+        };
+        let hidden = options(false);
+        for flag in [":no-video", ":vout=dummy", ":intf=dummy"] {
+            assert!(hidden.contains(&flag.to_string()), "{flag}: {hidden:?}");
+        }
+        assert!(!options(true)
+            .iter()
+            .any(|o| o.contains("video=") || o == ":no-video"));
     }
 
     #[test]

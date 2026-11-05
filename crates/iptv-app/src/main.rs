@@ -589,6 +589,9 @@ struct PlayerState {
     vlc_tracks_ready: bool,
     vlc_track_ids: Vec<i32>,
     vlc_error: Option<String>,
+    /// Whether this stream was started with video. Reconnects keep
+    /// it, so a hidden channel never comes back decoding video.
+    video_visible: bool,
     /// The player window's 1 s and 150 ms ticks, held for its life.
     player_timers: Vec<Rc<Timer<Frame>>>,
     shared: Option<PlayerShared>,
@@ -676,6 +679,7 @@ impl Default for PlayerState {
             vlc_active: false,
             vlc_tracks_ready: false,
             vlc_error: None,
+            video_visible: true,
             player_timers: Vec::new(),
             vlc_track_ids: Vec::new(),
             shared: None,
@@ -7174,6 +7178,19 @@ fn release_engine_off_thread(player: &Rc<RefCell<PlayerState>>) {
     });
 }
 
+/// The media options for one load. A retry load carries the cache
+/// plan's retry value, a rollover load the quick-start value
+/// (P01/P04), and every load keeps the stream's video choice.
+fn vlc_media_options(state: &PlayerState, live: bool, retry: bool) -> iptv_vlc::MediaOptions {
+    iptv_vlc::MediaOptions {
+        cache_ms: state
+            .cache_plan
+            .cache_ms(live, retry, retry && state.reconnect_rollover),
+        live,
+        video_visible: state.video_visible,
+    }
+}
+
 /// Queue a load on the ops worker; the result lands in the
 /// state's reply slot for `deliver_vlc_load`. False when no
 /// engine or worker exists (the caller falls back).
@@ -7313,12 +7330,13 @@ fn play_builtin(
     state.supply_audio_name = names.get(&audio_key).cloned();
     state.supply_audio_index = indices.get(&audio_key).copied();
     state.audio_key = audio_key;
+    state.video_visible = persist
+        .config
+        .borrow()
+        .bool_or("show_player_on_enter", true);
     state.watchdog = iptv_core::playback::FreezeWatchdog::new(
         is_audio_only_channel(channel),
-        persist
-            .config
-            .borrow()
-            .bool_or("show_player_on_enter", true),
+        state.video_visible,
     );
     state.track_attempts = 0;
     state.selected_spu = -2;
@@ -7356,17 +7374,20 @@ fn play_builtin(
                 }
                 Err(error) => state.vlc_error = Some(error),
             }
-            if let Some(engine) = &state.vlc {
-                engine.set_window_handle(win.media.get_handle() as usize);
-            }
             if state.vlc.is_some() && state.vlc_ops.is_none() {
                 state.vlc_ops = Some(spawn_vlc_ops());
             }
         }
-        let options = iptv_vlc::MediaOptions {
-            cache_ms: state.cache_plan.cache_ms(load.live, false, false),
-            live: load.live,
-        };
+        if let Some(engine) = &state.vlc {
+            // Python's hidden play detaches the window, so libVLC
+            // cannot open a video window of its own.
+            engine.set_window_handle(if state.video_visible {
+                win.media.get_handle() as usize
+            } else {
+                0
+            });
+        }
+        let options = vlc_media_options(&state, load.live, false);
         let has_vlc = state.vlc.is_some();
         drop(state);
         // The load runs on the ops worker (P18); its result is
@@ -7543,15 +7564,7 @@ fn settle_session(player: &Rc<RefCell<PlayerState>>, persist: &Persist, status: 
 /// the quick-start value (P01/P04).
 fn engine_load(player: &Rc<RefCell<PlayerState>>, request: &PlaybackRequest) -> bool {
     if player.borrow().engine == ActiveEngine::Vlc {
-        let options = {
-            let state = player.borrow();
-            iptv_vlc::MediaOptions {
-                cache_ms: state
-                    .cache_plan
-                    .cache_ms(request.live, true, state.reconnect_rollover),
-                live: request.live,
-            }
-        };
+        let options = vlc_media_options(&player.borrow(), request.live, true);
         // Queued on the ops worker (P18); a refused load comes
         // back through deliver_vlc_load as a session error.
         let queued = queue_vlc_load(player, request, options, true);
@@ -14191,6 +14204,21 @@ mod tests {
     use super::*;
     use iptv_core::{search::SearchWorker, BrowseModel};
     use std::sync::Arc;
+
+    #[test]
+    fn hidden_stream_keeps_video_off_across_a_reconnect() {
+        let mut state = PlayerState {
+            video_visible: false,
+            ..PlayerState::default()
+        };
+        for retry in [false, true] {
+            let options = vlc_media_options(&state, true, retry);
+            assert!(options.option_strings().contains(&":no-video".to_string()));
+        }
+        state.video_visible = true;
+        let options = vlc_media_options(&state, true, true);
+        assert!(!options.option_strings().contains(&":no-video".to_string()));
+    }
 
     fn no_suffixes() -> (i64, usize, std::collections::HashMap<usize, String>) {
         (0, 0, std::collections::HashMap::new())
