@@ -1779,7 +1779,8 @@ fn dispatch_resolve_catchup(
 }
 
 /// Recordings > Schedule Padding... (Python's dialog fields and
-/// 0..=180 range, asked one at a time).
+/// 0..=180 range, asked one at a time; Python's introductory
+/// explanation heads the first prompt, N24).
 fn prompt_schedule_padding(wiring: &Wiring, frame: Frame, status: Status) {
     let ask = |label: &str, current: i64| -> Option<i64> {
         let dialog = TextEntryDialog::builder(&frame, label, "Schedule Padding")
@@ -1805,7 +1806,8 @@ fn prompt_schedule_padding(wiring: &Wiring, frame: Frame, status: Status) {
         .and_then(serde_json::Value::as_i64)
         .unwrap_or(2);
     drop(config);
-    let Some(pre) = ask("Minutes before programme:", pre) else {
+    let first_label = "Start scheduled recordings early or keep recording after the programme ends. Manual recordings are not changed.\n\nMinutes before programme:";
+    let Some(pre) = ask(first_label, pre) else {
         return;
     };
     let Some(post) = ask("Minutes after programme:", post) else {
@@ -6467,21 +6469,29 @@ fn show_recording_storage(wiring: &Wiring, frame: Frame, status: Status) {
     );
     // R08: report the same gate recordings face — a probed, writable
     // folder with known free space — not a platform-skippable check.
-    let free_text = match recording::check_destination(
+    // N24: the report text is Python's, verbatim (planning_ui.py);
+    // a failed check shows the error alone in an error box, and
+    // the box queues behind an open modal like Python's.
+    let (text, failed) = match recording::check_destination(
         &dir,
         Some(i64::try_from(reserve).unwrap_or(i64::MAX)),
     ) {
-        Ok(check) => format!("{} MB free", check.free_bytes / (1024 * 1024)),
-        Err(error) => error,
+        Ok(check) => (
+            format!(
+                "Recording folder: {}\nFree space: {} MiB\nRequired reserve: {reserve} MiB.\n\nThis check does not guarantee sufficient space for the entire recording.",
+                dir.display(),
+                check.free_bytes / (1024 * 1024)
+            ),
+            false,
+        ),
+        Err(error) => (error, true),
     };
-    let text = format!(
-        "Recordings folder: {}\nSpace: {free_text}\nMinimum free space before a recording starts: {reserve} MiB",
-        dir.display()
-    );
-    let dialog = MessageDialog::builder(&frame, &text, "Recording Storage")
-        .with_style(MessageDialogStyle::OK)
-        .build();
-    dialog.show_modal_tracked();
+    let style = if failed {
+        MessageDialogStyle::OK | MessageDialogStyle::IconError
+    } else {
+        MessageDialogStyle::OK | MessageDialogStyle::IconInformation
+    };
+    show_or_queue_notification(frame, &text, &tr("Recording Storage"), style, None);
     status.set_label("Recording storage shown.");
 }
 
@@ -13383,23 +13393,62 @@ fn open_account_form(
     // B05: the forms expose every provider option Python exposes —
     // Stalker username/password, both auto-EPG switches, Xtream
     // playlist type and stream output.
-    let specs: Vec<(&str, &str, bool)> = if kind == "stalker" {
+    // N24: each field carries Python's explanatory text as a
+    // visible line under the field (Python hangs it on the field
+    // as hint/tooltip/help text; here it is dialog text, never a
+    // control description).
+    let specs: Vec<(&str, &str, bool, &str)> = if kind == "stalker" {
         vec![
-            ("Name", "name", false),
-            ("Portal URL", "base_url", false),
-            ("Username (optional)", "username", false),
-            ("Password (optional)", "password", true),
-            ("MAC address", "mac", false),
+            (
+                "Name",
+                "name",
+                false,
+                "Optional nickname for this portal account",
+            ),
+            (
+                "Portal URL",
+                "base_url",
+                false,
+                "Base URL of the Stalker/Ministra portal",
+            ),
+            (
+                "Username (optional)",
+                "username",
+                false,
+                "Optional portal account username",
+            ),
+            (
+                "Password (optional)",
+                "password",
+                true,
+                "Optional portal account password",
+            ),
+            (
+                "MAC address",
+                "mac",
+                false,
+                "MAC address presented to the portal",
+            ),
         ]
     } else {
         vec![
-            ("Name", "name", false),
-            ("Server URL", "base_url", false),
-            ("Username", "username", false),
-            ("Password", "password", true),
+            (
+                "Name",
+                "name",
+                false,
+                "Optional nickname for this Xtream Codes account",
+            ),
+            (
+                "Server URL",
+                "base_url",
+                false,
+                "Base URL of the Xtream Codes server",
+            ),
+            ("Username", "username", false, "Xtream Codes username"),
+            ("Password", "password", true, "Xtream Codes password"),
         ]
     };
-    for (label, key, secret) in &specs {
+    for (label, key, secret, description) in &specs {
         let caption = StaticText::builder(&panel).with_label(label).build();
         let _ = caption;
         let initial = if *key == "mac" && get("mac").is_empty() && existing.is_none() {
@@ -13416,6 +13465,8 @@ fn open_account_form(
             builder.build()
         };
         field.set_accessibility_label(label);
+        let description_text = StaticText::builder(&panel).with_label(description).build();
+        let _ = description_text;
         fields.push(((*key).to_string(), field));
     }
     let mac_field = fields
@@ -13455,6 +13506,10 @@ fn open_account_form(
                 .position(|option| *option == current_type)
                 .map_or(0, |pos| u32::try_from(pos).unwrap_or(0)),
         );
+        let type_description = StaticText::builder(&panel)
+            .with_label("Select the playlist format to download")
+            .build();
+        let _ = type_description;
         let output_label = StaticText::builder(&panel)
             .with_label("Stream output")
             .build();
@@ -13478,6 +13533,10 @@ fn open_account_form(
                 .position(|option| *option == current_output)
                 .map_or(0, |pos| u32::try_from(pos).unwrap_or(0)),
         );
+        let output_description = StaticText::builder(&panel)
+            .with_label("Preferred stream container format")
+            .build();
+        let _ = output_description;
         (Some(type_choice), Some(output_choice))
     };
     let auto_epg_label = if kind == "stalker" {
@@ -13488,6 +13547,16 @@ fn open_account_form(
     let auto_epg = CheckBox::builder(&panel).with_label(auto_epg_label).build();
     auto_epg.set_accessibility_label(auto_epg_label);
     auto_epg.set_value(get_bool("auto_epg", true));
+    // N24: Python explains the auto-EPG switch in its tooltip;
+    // here it is a visible line under the checkbox.
+    let auto_epg_description = StaticText::builder(&panel)
+        .with_label(if kind == "stalker" {
+            "Try to add the portal's XMLTV guide automatically"
+        } else {
+            "Include the provider's XMLTV guide automatically"
+        })
+        .build();
+    let _ = auto_epg_description;
     let ok = Button::builder(&panel).with_label("&OK").build();
     let cancel = Button::builder(&panel).with_label("&Cancel").build();
     // F1 in the provider form opens the guide at the account's own
@@ -15048,6 +15117,11 @@ fn open_catchup_dialog(wiring: &Wiring, channel: &Channel, main_status: Status) 
         &format!("Catch-up — {}", channel.name),
         "Catch-up programmes",
     );
+    // N24: Python heads the dialog with this explanation.
+    let intro = StaticText::builder(&panel)
+        .with_label("Select a programme, then press Enter to open it, or use the context menu to download it. Press Escape to close.")
+        .build();
+    let _ = intro;
     // Audit R20: rows carry the DATE as well as the clock, so
     // same-time episodes on different days are distinguishable.
     let labels: Vec<String> = programmes
@@ -16563,8 +16637,25 @@ fn open_audio_prefs(wiring: &Wiring, status: Status) {
         .build();
     frame.set_accessibility_label("Preferred Audio Track");
     let panel = Panel::builder(&frame).build();
+    // N24: Python's dialog order — the explanation, the
+    // audio-description switch, then the keywords field with
+    // its label and the hint under it.
+    let intro = StaticText::builder(&panel)
+        .with_label("When a channel offers more than one audio track, the built-in player can switch to the track you want on its own.")
+        .build();
+    let _ = intro;
+    let ad_check = CheckBox::builder(&panel)
+        .with_label("Prefer an audio description track when the channel has one")
+        .build();
+    ad_check.set_value(
+        wiring
+            .persist
+            .config
+            .borrow()
+            .bool_or("prefer_audio_description", false),
+    );
     let caption = StaticText::builder(&panel)
-        .with_label("Preferred track keywords (comma separated)")
+        .with_label("Preferred track names or languages, most wanted first:")
         .build();
     let _ = caption;
     let keywords = TextCtrl::builder(&panel)
@@ -16577,17 +16668,11 @@ fn open_audio_prefs(wiring: &Wiring, status: Status) {
                 .join(", "),
         )
         .build();
-    keywords.set_accessibility_label("Preferred track keywords");
-    let ad_check = CheckBox::builder(&panel)
-        .with_label("Prefer audio description tracks")
+    keywords.set_accessibility_label("Preferred track names or languages, most wanted first:");
+    let hint = StaticText::builder(&panel)
+        .with_label("Separate them with commas, for example: audio description, English. A track is used when its name contains one of these words. Leave this empty to keep whatever track the channel starts on.")
         .build();
-    ad_check.set_value(
-        wiring
-            .persist
-            .config
-            .borrow()
-            .bool_or("prefer_audio_description", false),
-    );
+    let _ = hint;
     let ok = Button::builder(&panel).with_label("&OK").build();
     let cancel = Button::builder(&panel).with_label("&Cancel").build();
     let wiring_ok = clone_wiring(wiring);
