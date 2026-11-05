@@ -70,7 +70,7 @@ fn acquire_instance() -> Option<iptv_core::instance::InstanceGuard> {
                             "Accessible IPTV Client",
                         )
                         .build();
-                        dialog.show_modal();
+                        dialog.show_modal_tracked();
                     });
                     std::process::exit(iptv_core::instance::HANDED_OVER_EXIT_CODE);
                 }
@@ -1262,7 +1262,7 @@ fn bind_main_close(frame: Frame, wiring: &Wiring) {
             let answer = MessageDialog::builder(&frame, &prompt.message, prompt.title)
                 .with_style(style)
                 .build()
-                .show_modal();
+                .show_modal_tracked();
             if answer != ID_YES {
                 close_exit_requested.set(false);
                 event.veto();
@@ -1785,7 +1785,7 @@ fn prompt_schedule_padding(wiring: &Wiring, frame: Frame, status: Status) {
         let dialog = TextEntryDialog::builder(&frame, label, "Schedule Padding")
             .with_default_value(&current.to_string())
             .build();
-        if dialog.show_modal() != ID_OK {
+        if dialog.show_modal_tracked() != ID_OK {
             return None;
         }
         dialog
@@ -2666,6 +2666,144 @@ type AccountLookupMsg = (u64, usize, Result<String, String>);
 type AccountDiscovery =
     std::sync::mpsc::Receiver<Result<Vec<iptv_core::account_info::Account>, String>>;
 
+// Modal tracking (audit N18, Python's `modal_guard.py` +
+// `main.py:4071`): opening a second message box from inside
+// the first one's message loop desynchronizes wxMSW's
+// parent-enable bookkeeping and leaves the main frame
+// permanently disabled ("unavailable" to NVDA). So every
+// modal in the app counts toward one depth, and
+// notifications that arrive while a modal is up queue
+// (cap 8, dropped beyond) and show once the depth returns
+// to zero.
+thread_local! {
+    static MODAL_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    static DEFERRED_NOTES: RefCell<std::collections::VecDeque<DeferredNote>> =
+        const { RefCell::new(std::collections::VecDeque::new()) };
+}
+
+/// How many notifications may wait behind a modal box
+/// (Python's `_DEFERRED_NOTIFICATION_LIMIT`).
+const DEFERRED_NOTIFICATION_LIMIT: usize = 8;
+
+/// A notification waiting for the modal depth to clear.
+struct DeferredNote {
+    parent: Frame,
+    message: String,
+    caption: String,
+    style: MessageDialogStyle,
+    on_dismiss: Option<Rc<dyn Fn()>>,
+}
+
+/// True while any tracked modal is showing.
+fn modal_box_is_open() -> bool {
+    MODAL_DEPTH.with(|depth| depth.get() > 0)
+}
+
+/// Run a modal with the depth tracked; when the last modal
+/// closes, the deferred notifications drain (Python's
+/// closed-hook via `wx.CallAfter` — here the chain runs
+/// inline, bounded by the queue cap).
+fn run_modal<T>(f: impl FnOnce() -> T) -> T {
+    MODAL_DEPTH.with(|depth| depth.set(depth.get() + 1));
+    let result = f();
+    MODAL_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+    if !modal_box_is_open() {
+        drain_deferred_notes();
+    }
+    result
+}
+
+/// `show_modal` with the modal depth tracked (N18). Every
+/// modal call site in this file goes through it.
+trait ModalRun {
+    fn show_modal_tracked(&self) -> i32;
+}
+
+impl ModalRun for MessageDialog {
+    fn show_modal_tracked(&self) -> i32 {
+        run_modal(|| self.show_modal())
+    }
+}
+
+impl ModalRun for Dialog {
+    fn show_modal_tracked(&self) -> i32 {
+        run_modal(|| self.show_modal())
+    }
+}
+
+impl ModalRun for FileDialog {
+    fn show_modal_tracked(&self) -> i32 {
+        run_modal(|| self.show_modal())
+    }
+}
+
+impl ModalRun for TextEntryDialog {
+    fn show_modal_tracked(&self) -> i32 {
+        run_modal(|| self.show_modal())
+    }
+}
+
+impl ModalRun for SingleChoiceDialog {
+    fn show_modal_tracked(&self) -> i32 {
+        run_modal(|| self.show_modal())
+    }
+}
+
+impl ModalRun for DirDialog {
+    fn show_modal_tracked(&self) -> i32 {
+        run_modal(|| self.show_modal())
+    }
+}
+
+/// Show one deferred notification, if any is queued. The
+/// tracked show drains the rest of the queue behind it.
+fn drain_deferred_notes() {
+    let note = DEFERRED_NOTES.with(|queue| queue.borrow_mut().pop_front());
+    if let Some(note) = note {
+        let dialog = MessageDialog::builder(&note.parent, &note.message, &note.caption)
+            .with_style(note.style)
+            .build();
+        dialog.show_modal_tracked();
+        if let Some(on_dismiss) = note.on_dismiss {
+            on_dismiss();
+        }
+    }
+}
+
+/// Show a notification now, or queue it behind an open modal
+/// (Python's `_show_or_queue_message_box`). The dismissal
+/// callback runs after the box closes, whenever that is.
+fn show_or_queue_notification(
+    parent: Frame,
+    message: &str,
+    caption: &str,
+    style: MessageDialogStyle,
+    on_dismiss: Option<Rc<dyn Fn()>>,
+) {
+    if modal_box_is_open() {
+        DEFERRED_NOTES.with(|queue| {
+            let mut queue = queue.borrow_mut();
+            if queue.len() < DEFERRED_NOTIFICATION_LIMIT {
+                queue.push_back(DeferredNote {
+                    parent,
+                    message: message.to_string(),
+                    caption: caption.to_string(),
+                    style,
+                    on_dismiss,
+                });
+            }
+        });
+        return;
+    }
+    let dialog = MessageDialog::builder(&parent, message, caption)
+        .with_style(style)
+        .build();
+    dialog.show_modal_tracked();
+    if let Some(on_dismiss) = on_dismiss {
+        on_dismiss();
+    }
+}
+
 /// The open Account Info window's state (audit N17, Python's
 /// `AccountInfoDialog`): accounts with their cached reports,
 /// the request token that retires stale lookups, and the
@@ -3488,7 +3626,7 @@ fn toggle_recording(
             let _ = MessageDialog::builder(parent, &message, &tr("Recording"))
                 .with_style(MessageDialogStyle::OK | MessageDialogStyle::IconInformation)
                 .build()
-                .show_modal();
+                .show_modal_tracked();
         }
         Err(error) => status.set_label(&error),
     }
@@ -4326,11 +4464,10 @@ fn report_recording_finished(
     let rc = finished.exit_code;
     let code = rc.to_string();
     let path = finished.out_path.to_string_lossy().into_owned();
+    // N18: a recording can finish while another modal is up;
+    // the report queues behind it (Python queues these).
     let show = |message: String, title: &str, style: MessageDialogStyle| {
-        let _ = MessageDialog::builder(&frame, &message, &tr(title))
-            .with_style(style)
-            .build()
-            .show_modal();
+        show_or_queue_notification(frame, &message, &tr(title), style, None);
     };
     if rc == 0 && produced {
         show(
@@ -6039,7 +6176,7 @@ fn set_speech_backend(wiring: &Wiring, frame: Frame, status: Status, backend: Sp
             )
             .with_style(MessageDialogStyle::OK)
             .build()
-            .show_modal();
+            .show_modal_tracked();
             return;
         }
         state.app_voice.stop();
@@ -6133,7 +6270,7 @@ fn slider_dialog(
     cancel.on_click(move |_| {
         dialog_cancel.end_modal(ID_CANCEL);
     });
-    if dialog.show_modal() == ID_OK {
+    if dialog.show_modal_tracked() == ID_OK {
         chosen.get()
     } else {
         None
@@ -6200,7 +6337,7 @@ fn app_voice_rate_dialog(wiring: &Wiring, frame: Frame) {
             )
             .with_style(MessageDialogStyle::OK)
             .build()
-            .show_modal();
+            .show_modal_tracked();
         }
     }
 }
@@ -6243,7 +6380,7 @@ fn app_voice_output_dialog(wiring: &Wiring, frame: Frame, status: Status) {
     if let Some(position) = identities.iter().position(|id| id == &previous) {
         dialog.set_selection(i32::try_from(position).unwrap_or(0));
     }
-    if dialog.show_modal() != ID_OK {
+    if dialog.show_modal_tracked() != ID_OK {
         return;
     }
     let selection = usize::try_from(dialog.get_selection()).unwrap_or(usize::MAX);
@@ -6266,7 +6403,7 @@ fn app_voice_output_dialog(wiring: &Wiring, frame: Frame, status: Status) {
             )
             .with_style(MessageDialogStyle::OK)
             .build()
-            .show_modal();
+            .show_modal_tracked();
         } else if state
             .app_voice
             .speak("This is the application voice.", policy)
@@ -6276,7 +6413,7 @@ fn app_voice_output_dialog(wiring: &Wiring, frame: Frame, status: Status) {
             let _ = MessageDialog::builder(&frame, "Subtitle speech failed.", "Subtitle Speech")
                 .with_style(MessageDialogStyle::OK)
                 .build()
-                .show_modal();
+                .show_modal_tracked();
         } else {
             drop(state);
             keep = MessageDialog::builder(
@@ -6286,7 +6423,7 @@ fn app_voice_output_dialog(wiring: &Wiring, frame: Frame, status: Status) {
             )
             .with_style(MessageDialogStyle::YesNo)
             .build()
-            .show_modal()
+            .show_modal_tracked()
                 == ID_YES;
         }
     }
@@ -6313,7 +6450,7 @@ fn show_subtitle_capabilities(frame: Frame, status: Status) {
     let dialog = MessageDialog::builder(&frame, text, "Subtitle Capabilities")
         .with_style(MessageDialogStyle::OK)
         .build();
-    dialog.show_modal();
+    dialog.show_modal_tracked();
     status.set_label("Subtitle capabilities shown.");
 }
 
@@ -6344,7 +6481,7 @@ fn show_recording_storage(wiring: &Wiring, frame: Frame, status: Status) {
     let dialog = MessageDialog::builder(&frame, &text, "Recording Storage")
         .with_style(MessageDialogStyle::OK)
         .build();
-    dialog.show_modal();
+    dialog.show_modal_tracked();
     status.set_label("Recording storage shown.");
 }
 
@@ -6447,7 +6584,7 @@ fn show_recording_problem_times(wiring: &Wiring, frame: Frame) {
             )
             .with_style(MessageDialogStyle::OK | MessageDialogStyle::IconError)
             .build()
-            .show_modal();
+            .show_modal_tracked();
         }
     });
     let dialog_close = dialog;
@@ -6455,7 +6592,7 @@ fn show_recording_problem_times(wiring: &Wiring, frame: Frame) {
         dialog_close.end_modal(ID_CANCEL);
     });
     list.set_focus();
-    dialog.show_modal();
+    dialog.show_modal_tracked();
 }
 
 /// Recordings > Minimum Free Space...
@@ -6475,7 +6612,7 @@ fn prompt_min_free_space(wiring: &Wiring, frame: Frame, status: Status) {
     )
     .with_default_value(&current.to_string())
     .build();
-    if dialog.show_modal() != ID_OK {
+    if dialog.show_modal_tracked() != ID_OK {
         return;
     }
     let text = dialog.get_value().unwrap_or_default();
@@ -7005,7 +7142,7 @@ fn menu_recordings_action(
             let dialog =
                 DirDialog::builder(&frame, "Choose the folder for recordings and downloads", "")
                     .build();
-            if dialog.show_modal() == ID_OK {
+            if dialog.show_modal_tracked() == ID_OK {
                 if let Some(path) = dialog.get_path() {
                     wiring
                         .persist
@@ -7101,7 +7238,7 @@ fn menu_radio_action(id: i32, wiring: &Wiring, status: Status) -> bool {
                         &tr("Language"),
                     )
                     .build();
-                    dialog.show_modal();
+                    dialog.show_modal_tracked();
                 }
             }
         }
@@ -7201,7 +7338,7 @@ fn bind_menu_option_actions(frame: Frame, wiring: &Wiring, controls: Controls) {
                     "About Accessible IPTV Client",
                 )
                 .build();
-                dialog.show_modal();
+                dialog.show_modal_tracked();
             }
             _ => {}
         }
@@ -7246,7 +7383,7 @@ fn menu_import_epg(wiring: &Wiring, frame: Frame, status: Status) {
         .with_wildcard("XMLTV (*.xml;*.xml.gz)|*.xml;*.xml.gz|All files (*.*)|*.*")
         .with_style(FileDialogStyle::Open | FileDialogStyle::FileMustExist)
         .build();
-    if dialog.show_modal() != ID_OK {
+    if dialog.show_modal_tracked() != ID_OK {
         return;
     }
     let Some(path) = dialog.get_path() else {
@@ -7275,7 +7412,7 @@ fn menu_import_epg(wiring: &Wiring, frame: Frame, status: Status) {
 fn menu_go_to_channel_number(wiring: &Wiring, frame: Frame, list: ListCtrl, status: Status) {
     let dialog =
         TextEntryDialog::builder(&frame, "Go to channel number:", "Go to Channel Number").build();
-    if dialog.show_modal() != ID_OK {
+    if dialog.show_modal_tracked() != ID_OK {
         return;
     }
     let Some(text) = dialog.get_value() else {
@@ -7317,7 +7454,7 @@ fn menu_custom_player(wiring: &Wiring, frame: Frame, status: Status) {
         .with_message("Choose the custom player executable")
         .with_style(FileDialogStyle::Open | FileDialogStyle::FileMustExist)
         .build();
-    if dialog.show_modal() != ID_OK {
+    if dialog.show_modal_tracked() != ID_OK {
         return;
     }
     let Some(path) = dialog.get_path() else {
@@ -7344,7 +7481,7 @@ fn backup_password(frame: Frame, confirm: bool) -> Option<String> {
     )
     .password()
     .build();
-    if dialog.show_modal() != ID_OK {
+    if dialog.show_modal_tracked() != ID_OK {
         return None;
     }
     let password = dialog.get_value().unwrap_or_default();
@@ -7352,7 +7489,7 @@ fn backup_password(frame: Frame, confirm: bool) -> Option<String> {
         let _ = MessageDialog::builder(&frame, "A backup password is required.", "Settings Backup")
             .with_style(MessageDialogStyle::OK)
             .build()
-            .show_modal();
+            .show_modal_tracked();
         return None;
     }
     if confirm {
@@ -7360,7 +7497,7 @@ fn backup_password(frame: Frame, confirm: bool) -> Option<String> {
             TextEntryDialog::builder(&frame, "Enter the password again:", "Settings Backup")
                 .password()
                 .build();
-        if verify.show_modal() != ID_OK {
+        if verify.show_modal_tracked() != ID_OK {
             return None;
         }
         if verify.get_value().unwrap_or_default() != password {
@@ -7368,7 +7505,7 @@ fn backup_password(frame: Frame, confirm: bool) -> Option<String> {
                 MessageDialog::builder(&frame, "The passwords do not match.", "Settings Backup")
                     .with_style(MessageDialogStyle::OK)
                     .build()
-                    .show_modal();
+                    .show_modal_tracked();
             return None;
         }
     }
@@ -7388,7 +7525,7 @@ fn menu_export_settings(wiring: &Wiring, frame: Frame, status: Status) {
         .with_wildcard("Accessible IPTV backup (*.aiptv)|*.aiptv|All files (*.*)|*.*")
         .with_style(FileDialogStyle::Save | FileDialogStyle::OverwritePrompt)
         .build();
-    if dialog.show_modal() != ID_OK {
+    if dialog.show_modal_tracked() != ID_OK {
         return;
     }
     let Some(path) = dialog.get_path() else {
@@ -7408,7 +7545,7 @@ fn menu_export_settings(wiring: &Wiring, frame: Frame, status: Status) {
                 )
                 .with_style(MessageDialogStyle::OK)
                 .build()
-                .show_modal();
+                .show_modal_tracked();
                 status.set_label("Encrypted settings backup saved.");
             }
             Err(error) => status.set_label(&trf(
@@ -7450,7 +7587,7 @@ fn make_recovery_copy(wiring: &Wiring, frame: Frame, status: Status) -> Option<S
         .with_wildcard("Accessible IPTV backup (*.aiptv)|*.aiptv|All files (*.*)|*.*")
         .with_style(FileDialogStyle::Save | FileDialogStyle::OverwritePrompt)
         .build();
-    if save.show_modal() != ID_OK {
+    if save.show_modal_tracked() != ID_OK {
         return None;
     }
     let recovery_path = save.get_path()?;
@@ -7513,7 +7650,7 @@ fn menu_import_settings(wiring: &Wiring, frame: Frame, status: Status) {
         .with_wildcard("Accessible IPTV backup (*.aiptv)|*.aiptv|All files (*.*)|*.*")
         .with_style(FileDialogStyle::Open | FileDialogStyle::FileMustExist)
         .build();
-    if dialog.show_modal() != ID_OK {
+    if dialog.show_modal_tracked() != ID_OK {
         return;
     }
     let Some(path) = dialog.get_path() else {
@@ -7551,7 +7688,7 @@ fn menu_import_settings(wiring: &Wiring, frame: Frame, status: Status) {
     )
     .with_style(MessageDialogStyle::YesNo)
     .build();
-    if confirm.show_modal() != ID_YES {
+    if confirm.show_modal_tracked() != ID_YES {
         return;
     }
     // Rechecked at the moment of applying: work that started
@@ -7865,7 +8002,7 @@ fn prompt_lead_minutes(frame: Frame, current: i64) -> Option<i64> {
     )
     .with_default_value(&current.to_string())
     .build();
-    if dialog.show_modal() != ID_OK {
+    if dialog.show_modal_tracked() != ID_OK {
         return None;
     }
     dialog
@@ -7992,7 +8129,7 @@ fn add_dvr_job(
             )
             .with_style(MessageDialogStyle::YesNo)
             .build()
-            .show_modal();
+            .show_modal_tracked();
             if answer != ID_YES {
                 return;
             }
@@ -8588,7 +8725,7 @@ fn choose_resume(player: &Rc<RefCell<PlayerState>>, position_ms: i64) -> ResumeC
     // "Play from Beginning" is the default button (Python's
     // NO_DEFAULT), so it takes the focus.
     beginning.set_focus();
-    if dialog.show_modal() == ID_OK {
+    if dialog.show_modal_tracked() == ID_OK {
         chosen.get()
     } else {
         ResumeChoice::Cancel
@@ -9303,7 +9440,7 @@ fn settle_session(player: &Rc<RefCell<PlayerState>>, persist: &Persist, status: 
             let _ = MessageDialog::builder(&frame, &report, "Stream Lost")
                 .with_style(MessageDialogStyle::OK)
                 .build()
-                .show_modal();
+                .show_modal_tracked();
         }
     }
 }
@@ -10122,7 +10259,7 @@ fn prompt_audio_device(
         )
         .with_style(MessageDialogStyle::OK)
         .build()
-        .show_modal();
+        .show_modal_tracked();
         return;
     }
     if devices.is_empty() {
@@ -10133,7 +10270,7 @@ fn prompt_audio_device(
         )
         .with_style(MessageDialogStyle::OK)
         .build()
-        .show_modal();
+        .show_modal_tracked();
         return;
     }
     let mut entries: Vec<(String, String)> = vec![(String::new(), "System default".to_string())];
@@ -10270,7 +10407,7 @@ fn prompt_sleep_timer(
     )
     .with_default_value(&current.map(|m| m.to_string()).unwrap_or_default())
     .build();
-    if dialog.show_modal() != ID_OK {
+    if dialog.show_modal_tracked() != ID_OK {
         return;
     }
     let text = dialog.get_value().unwrap_or_default();
@@ -10301,7 +10438,7 @@ fn prompt_sleep_timer(
     )
     .with_default_value(&saved_fade.clamp(0, fade_cap).to_string())
     .build();
-    if fade_dialog.show_modal() != ID_OK {
+    if fade_dialog.show_modal_tracked() != ID_OK {
         return;
     }
     let fade_text = fade_dialog.get_value().unwrap_or_default();
@@ -10843,7 +10980,7 @@ fn deliver_buffer_pending(player: &Rc<RefCell<PlayerState>>, persist: &Persist, 
                 )
                 .with_style(MessageDialogStyle::OK)
                 .build()
-                .show_modal();
+                .show_modal_tracked();
             }
             status.set_label("The local live buffer could not start.");
         }
@@ -11094,7 +11231,7 @@ fn prompt_live_buffer_config(
     )
     .with_default_value(&settings.dialog_minutes().to_string())
     .build();
-    if dialog.show_modal() != ID_OK {
+    if dialog.show_modal_tracked() != ID_OK {
         return;
     }
     let text = dialog.get_value().unwrap_or_default();
@@ -11127,7 +11264,7 @@ fn prompt_live_buffer_config(
             )
             .with_style(MessageDialogStyle::OK)
             .build()
-            .show_modal();
+            .show_modal_tracked();
             return;
         }
         settings.apply_dialog_choice(0, settings.mib);
@@ -11139,7 +11276,7 @@ fn prompt_live_buffer_config(
         )
         .with_default_value(&settings.mib.to_string())
         .build();
-        if dialog.show_modal() != ID_OK {
+        if dialog.show_modal_tracked() != ID_OK {
             return;
         }
         let text = dialog.get_value().unwrap_or_default();
@@ -11212,7 +11349,7 @@ fn prompt_rewind(
     )
     .with_default_value("0")
     .build();
-    if dialog.show_modal() != ID_OK {
+    if dialog.show_modal_tracked() != ID_OK {
         return;
     }
     let text = dialog.get_value().unwrap_or_default();
@@ -11252,7 +11389,7 @@ fn return_to_live(
     )
     .with_style(MessageDialogStyle::OK)
     .build()
-    .show_modal();
+    .show_modal_tracked();
 }
 
 /// Release a recording's buffer lease, if it held one.
@@ -12005,7 +12142,7 @@ fn prompt_subtitle_file(
         )
         .with_style(MessageDialogStyle::OK)
         .build()
-        .show_modal();
+        .show_modal_tracked();
         return;
     }
     let dialog = FileDialog::builder(&frame)
@@ -12015,7 +12152,7 @@ fn prompt_subtitle_file(
         )
         .with_style(FileDialogStyle::Open | FileDialogStyle::FileMustExist)
         .build();
-    if dialog.show_modal() != ID_OK {
+    if dialog.show_modal_tracked() != ID_OK {
         return;
     }
     let Some(path) = dialog.get_path() else {
@@ -12739,7 +12876,7 @@ fn manager_rename(manager_frame: Frame, list: ListBox, state: &ManagerState, mst
     let dialog = TextEntryDialog::builder(&manager_frame, "Name", "Rename")
         .with_default_value(&current)
         .build();
-    if dialog.show_modal() != ID_OK {
+    if dialog.show_modal_tracked() != ID_OK {
         return;
     }
     let Some(value) = dialog.get_value() else {
@@ -12791,7 +12928,7 @@ fn manager_remove(manager_frame: Frame, list: ListBox, state: &ManagerState, mst
     )
     .with_style(MessageDialogStyle::YesNo | MessageDialogStyle::NoDefault)
     .build()
-    .show_modal();
+    .show_modal_tracked();
     if answer != ID_YES {
         return;
     }
@@ -12930,7 +13067,7 @@ fn bind_playlist_manager_buttons(
             .with_wildcard("M3U playlists (*.m3u;*.m3u8)|*.m3u;*.m3u8|All files (*.*)|*.*")
             .with_style(FileDialogStyle::Open | FileDialogStyle::FileMustExist)
             .build();
-        if dialog.show_modal() != ID_OK {
+        if dialog.show_modal_tracked() != ID_OK {
             return;
         }
         if let Some(path) = dialog.get_path() {
@@ -12944,7 +13081,7 @@ fn bind_playlist_manager_buttons(
     let state_u = state.clone();
     add_url.on_click(move |_| {
         let dialog = TextEntryDialog::builder(&manager_frame, "Playlist URL:", "Add URL").build();
-        if dialog.show_modal() != ID_OK {
+        if dialog.show_modal_tracked() != ID_OK {
             return;
         }
         if let Some(url) = dialog.get_value() {
@@ -13072,7 +13209,7 @@ fn bind_manager_edit_buttons(
                     TextEntryDialog::builder(&manager_frame, "Playlist location:", "Edit Playlist")
                         .with_default_value(text)
                         .build();
-                if dialog.show_modal() != ID_OK {
+                if dialog.show_modal_tracked() != ID_OK {
                     return;
                 }
                 if let Some(value) = dialog.get_value() {
@@ -13390,7 +13527,7 @@ fn open_account_form(
             let _ = MessageDialog::builder(&form, &error, "Validation")
                 .with_style(MessageDialogStyle::OK)
                 .build()
-                .show_modal();
+                .show_modal_tracked();
             return;
         }
         let mut updates = serde_json::Map::new();
@@ -13521,7 +13658,7 @@ fn epg_rename_row(
     let dialog = TextEntryDialog::builder(&manager_frame, "Name", "Rename")
         .with_default_value(&current)
         .build();
-    if dialog.show_modal() != ID_OK {
+    if dialog.show_modal_tracked() != ID_OK {
         return;
     }
     if let Some(value) = dialog.get_value() {
@@ -13588,7 +13725,7 @@ fn open_epg_manager(wiring: &Wiring, status: Status) {
     add_url.on_click(move |_| {
         let dialog =
             TextEntryDialog::builder(&manager_frame, "EPG URL (XMLTV):", "Add EPG URL").build();
-        if dialog.show_modal() != ID_OK {
+        if dialog.show_modal_tracked() != ID_OK {
             return;
         }
         if let Some(url) = dialog.get_value() {
@@ -13606,7 +13743,7 @@ fn open_epg_manager(wiring: &Wiring, status: Status) {
             .with_wildcard("XMLTV (*.xml;*.xml.gz)|*.xml;*.xml.gz|All files (*.*)|*.*")
             .with_style(FileDialogStyle::Open | FileDialogStyle::FileMustExist)
             .build();
-        if dialog.show_modal() != ID_OK {
+        if dialog.show_modal_tracked() != ID_OK {
             return;
         }
         if let Some(path) = dialog.get_path() {
@@ -14317,7 +14454,7 @@ fn wire_continue_watching(
         )
         .with_style(MessageDialogStyle::YesNo)
         .build();
-        if dialog.show_modal() != ID_YES {
+        if dialog.show_modal_tracked() != ID_YES {
             return;
         }
         let removed = {
@@ -14342,7 +14479,7 @@ fn wire_continue_watching(
         )
         .with_style(MessageDialogStyle::YesNo)
         .build();
-        if dialog.show_modal() != ID_YES {
+        if dialog.show_modal_tracked() != ID_YES {
             return;
         }
         rows_a.borrow_mut().clear();
@@ -15547,16 +15684,16 @@ fn finish_staged_download(
     if complete && std::fs::rename(&finished.out_path, &staged.final_path).is_ok() {
         set_row(wiring, "Done".to_string(), true);
         status.set_label(&format!("Download finished: {}", staged.programme.title));
-        // N15: Python confirms a finished download in a box.
+        // N15: Python confirms a finished download in a box
+        // (queued behind any open modal, N18).
         let path = staged.final_path.to_string_lossy().into_owned();
-        let _ = MessageDialog::builder(
-            &frame,
+        show_or_queue_notification(
+            frame,
             &trf("Download complete:\n{path}", &[("path", &path)]),
             &tr("Catch-up Download"),
-        )
-        .with_style(MessageDialogStyle::OK | MessageDialogStyle::IconInformation)
-        .build()
-        .show_modal();
+            MessageDialogStyle::OK | MessageDialogStyle::IconInformation,
+            None,
+        );
     } else if staged.attempts <= iptv_core::catchup::CATCHUP_RETRY_MAX_ATTEMPTS
         && iptv_core::catchup::catchup_failure_is_retryable(
             finished.exit_code,
@@ -15625,10 +15762,13 @@ fn finish_truncated_download(
             ),
         ],
     );
-    let _ = MessageDialog::builder(&frame, &message, &tr("Catch-up Download"))
-        .with_style(MessageDialogStyle::OK | MessageDialogStyle::IconWarning)
-        .build()
-        .show_modal();
+    show_or_queue_notification(
+        frame,
+        &message,
+        &tr("Catch-up Download"),
+        MessageDialogStyle::OK | MessageDialogStyle::IconWarning,
+        None,
+    );
 }
 
 /// N14: Python explains a failed download in plain words when
@@ -15662,10 +15802,13 @@ fn report_download_failure(
             ],
         ),
     };
-    let _ = MessageDialog::builder(&frame, &message, &tr("Catch-up Download"))
-        .with_style(MessageDialogStyle::OK | MessageDialogStyle::IconError)
-        .build()
-        .show_modal();
+    show_or_queue_notification(
+        frame,
+        &message,
+        &tr("Catch-up Download"),
+        MessageDialogStyle::OK | MessageDialogStyle::IconError,
+        None,
+    );
 }
 
 /// Render the Downloads rows into a list (shared by the window
@@ -15809,7 +15952,7 @@ fn cancel_selected_download(wiring: &Wiring, frame: Frame, list: ListBox, dstatu
     )
     .with_style(MessageDialogStyle::YesNo | MessageDialogStyle::IconQuestion)
     .build();
-    if confirm.show_modal() != ID_YES {
+    if confirm.show_modal_tracked() != ID_YES {
         return;
     }
     match row {
@@ -15922,7 +16065,7 @@ fn poll_account_info(wiring: &Wiring, parent: &Frame, _status: Status) {
                         MessageDialogStyle::OK | MessageDialogStyle::IconInformation,
                     )
                     .build();
-                    dialog.show_modal();
+                    dialog.show_modal_tracked();
                 }
                 Err(error) => {
                     let dialog = MessageDialog::builder(
@@ -15932,7 +16075,7 @@ fn poll_account_info(wiring: &Wiring, parent: &Frame, _status: Status) {
                     )
                     .with_style(MessageDialogStyle::OK | MessageDialogStyle::IconError)
                     .build();
-                    dialog.show_modal();
+                    dialog.show_modal_tracked();
                 }
             }
         }
@@ -16378,7 +16521,7 @@ fn open_shortcuts_editor(wiring: &Wiring, status: Status) {
         )
         .with_default_value(binding)
         .build();
-        if dialog.show_modal() != ID_OK {
+        if dialog.show_modal_tracked() != ID_OK {
             return;
         }
         let Some(value) = dialog.get_value() else {

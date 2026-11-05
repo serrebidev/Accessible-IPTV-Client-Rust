@@ -1266,6 +1266,8 @@ Evidence for N01 to N06 is in docs/validation/0071-player-engine-cpu-and-ticks.m
 
 **N18, medium: messages arriving during a dialog.** Python queues notifications while a modal box is open and shows them afterward (`main.py:4071`, `modal_guard.py`). No equivalent was found in Rust. A second dialog can interrupt the first.
 
+**Fix:** Fixed 2026-11-04 — thread-local modal depth + a capped FIFO deferred-notification queue in the app (Python's `modal_guard` design); every modal call site (69) goes through a tracked `show_modal`, the queue drains when the depth returns to zero, and the async notification sources (recording outcomes, catch-up download complete/early/failure) show-or-queue with dismissal callbacks. See validation 0083 for residuals (ship-shape's out-of-process update UI; import-finished and DVR outcome boxes are status-line reports in Rust today).
+
 **N19, medium: installer and packages.** Python ships a Windows installer and a Debian package, verifies Authenticode, shows one update window through download, install and restart, and reports the result on the next start (`installer/`, `tools/build_deb.py`, `updater.py:909` to `:969`, `main.py:4774` to `:5191`). It also remembers `update_last_auto_check_epoch`. Rust ships zip, tar.gz and dmg through ship-shape, whose window may already cover part of this.
 
 **N20, medium: casting extras beyond the known protocol gap.** Windows firewall rule for the proxy port (`stream_proxy.py:1579`), the "Currently connected, disconnect?" prompt (`main.py:8703`), and refusals for saved positions and local buffering while casting (`main.py:6279`, `client_timeshift.py:98`).
