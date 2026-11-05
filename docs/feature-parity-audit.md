@@ -1262,6 +1262,8 @@ Evidence for N01 to N06 is in docs/validation/0071-player-engine-cpu-and-ticks.m
 
 **N17, medium: Account Info detection and copying.** Python finds accounts in plain playlists and stream URLs and lists them as detected, with their source, and offers Copy Details (`account_info.py:228`, `:472`, `dialogs_misc.py:332`, `:347`, `:459`). Its README lists detection as a feature.
 
+**Fix:** Fixed 2026-11-04 — core `account_info.rs` ports discovery (configured sources first, playlist-URL detection, the prefix-cached channel scan, host+username/MAC dedupe, detected labels) and the per-account fetch through the existing report formatter with the `Detected from` header line; File > Account Info now discovers on a worker thread with a playlist-identity guard, shows Python's No Accounts / discovery-error boxes, and the window auto-fetches on selection with per-account report caching, a request token, Refresh, and Copy Details with Python's status texts. See validation 0082. Residual: Brandon's NVDA pass on the window.
+
 **N18, medium: messages arriving during a dialog.** Python queues notifications while a modal box is open and shows them afterward (`main.py:4071`, `modal_guard.py`). No equivalent was found in Rust. A second dialog can interrupt the first.
 
 **N19, medium: installer and packages.** Python ships a Windows installer and a Debian package, verifies Authenticode, shows one update window through download, install and restart, and reports the result on the next start (`installer/`, `tools/build_deb.py`, `updater.py:909` to `:969`, `main.py:4774` to `:5191`). It also remembers `update_last_auto_check_epoch`. Rust ships zip, tar.gz and dmg through ship-shape, whose window may already cover part of this.
