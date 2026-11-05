@@ -1169,6 +1169,11 @@ fn bind_housekeeping(frame: Frame, wiring: &Wiring) {
             last_playlist_refresh.set(now);
             reload_sources(&tick_wiring);
         }
+        // N15: due download retries fire and the Downloads
+        // window's live figures advance on this 1 s tick, the
+        // same cadence as Python's download dialog timer.
+        process_download_retries(&tick_wiring);
+        refresh_downloads_window(&tick_wiring);
     });
     let _ = wiring.housekeeping.start(1000, false);
 }
@@ -5055,6 +5060,23 @@ const PLAYER_LABELS: [&str; 32] = [
 ];
 
 /// Append one item to a menu under construction.
+/// Delete a menu item only when it is actually in the menu.
+/// `wxMenu::Delete` on an absent id is invalid — debug builds
+/// stop on the "invalid item" assert for it. The
+/// Audio Track and Subtitles submenu rebuilds delete
+/// placeholder ids (`PM_NO_TRACKS`, `PM_SUB_BASE`) that an
+/// earlier rebuild may already have removed: the audio
+/// placeholder is dropped by the track refresh and only
+/// restored when the engine is applied, and the subtitle
+/// placeholder shares its id with the first radio item, so
+/// the drain on the next refresh removes that id and the
+/// unconditional delete that followed it hit nothing.
+fn menu_delete_if_present(menu: &Menu, id: i32) {
+    if menu.find_item(id).is_some() {
+        menu.delete(id);
+    }
+}
+
 fn menu_add(menu: &Menu, id: i32, label: &str, help: &str, kind: ItemKind) {
     menu.append(id, &tr(label), &tr(help), kind);
 }
@@ -8573,9 +8595,9 @@ fn apply_engine_to_playback_menu(player: &Rc<RefCell<PlayerState>>) {
             state.track_menu_ids.drain(..).collect()
         };
         for old in stale {
-            menu.delete(old);
+            menu_delete_if_present(&menu, old);
         }
-        menu.delete(PM_NO_TRACKS);
+        menu_delete_if_present(&menu, PM_NO_TRACKS);
         if full {
             menu_add(
                 &menu,
@@ -9290,12 +9312,14 @@ fn refresh_subtitle_menu(player: &Rc<RefCell<PlayerState>>) {
     };
     let mut state = player.borrow_mut();
     for old in state.spu_menu_ids.drain(..) {
-        menu.delete(old);
+        menu_delete_if_present(&menu, old);
     }
     // "No subtitle tracks available" holds the same id as the first
     // radio. Left in, checking that id hits the plain item: a wx
     // assert dialog whose nested loop trapped every player tick.
-    menu.delete(PM_SUB_BASE);
+    // The drain above already removed that id whenever the radios
+    // were in place, so this delete must tolerate its absence.
+    menu_delete_if_present(&menu, PM_SUB_BASE);
     for (index, spu) in choices.iter().enumerate() {
         let id = PM_SUB_BASE + i32::try_from(index).unwrap_or(0);
         let label = if *spu == -1 {
@@ -10991,9 +11015,9 @@ fn apply_vlc_tracks(player: &Rc<RefCell<PlayerState>>, persist: &Persist) {
         if let Some(menu) = audio_track_menu(player) {
             let mut state = player.borrow_mut();
             for old in state.track_menu_ids.drain(..) {
-                menu.delete(old);
+                menu_delete_if_present(&menu, old);
             }
-            menu.delete(PM_NO_TRACKS);
+            menu_delete_if_present(&menu, PM_NO_TRACKS);
             for (index, (_, name)) in tracks.iter().enumerate() {
                 let id = PM_TRACK_BASE + i32::try_from(index).unwrap_or(0);
                 menu_add(&menu, id, name, "", ItemKind::Radio);
@@ -13127,6 +13151,22 @@ struct StagedDownload {
     /// entry; the capture launches when its result lands.
     probing: bool,
     attempts: u32,
+    /// N15: when a failed capture is waiting out its retry
+    /// delay, the epoch at which the retry fires; the Cancel
+    /// button can still abort the wait.
+    retry_at: Option<f64>,
+    /// N15: when the current capture attempt launched (for the
+    /// Downloads window's Elapsed line).
+    started_at: f64,
+    /// N15: the current attempt's ffmpeg log, tailed for the
+    /// written-seconds progress.
+    log_path: Option<PathBuf>,
+    /// N15: the programme seconds a complete capture writes
+    /// (padded window minus padding), the progress denominator.
+    expected_seconds: f64,
+    /// N15: the failure detail block shown while a retry waits
+    /// (Python's `show_failure` lines), cleared on relaunch.
+    failure_detail: Option<String>,
     /// The user cancelled this capture: its finish removes the
     /// staged file and never retries (audit R06).
     cancelled: bool,
@@ -13139,6 +13179,65 @@ struct DownloadsUi {
     frame: Frame,
     list: ListBox,
     dstatus: Status,
+    /// N15: the detail block currently shown, so the 1 s tick
+    /// only rewrites the field when a figure actually changed.
+    details_text: String,
+}
+
+/// N15: the selected capture's detail block, in Python's order
+/// (progress, elapsed, time remaining, downloaded) — one text
+/// block a screen reader reads as a unit. While a retry waits,
+/// the block is Python's failure detail instead.
+#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)] // display figures, as in Python's floats
+fn staged_detail_text(wiring: &Wiring, key: &str) -> Option<String> {
+    let staged_map = wiring.staged_downloads.borrow();
+    let staged = staged_map.get(key)?;
+    if let Some(detail) = &staged.failure_detail {
+        return Some(detail.clone());
+    }
+    let written = staged
+        .log_path
+        .as_deref()
+        .and_then(iptv_core::recording_log::parse_ffmpeg_progress);
+    let expected = staged.expected_seconds;
+    let percent = written.map(|w| {
+        if expected > 0.0 {
+            format!("{}", (100.0 * w.min(expected) / expected).round() as i64)
+        } else {
+            "--".to_string()
+        }
+    });
+    let elapsed = (staged.started_at > 0.0).then(|| (now_seconds() - staged.started_at).max(0.0));
+    let remaining = written.map(|w| (expected - w).max(0.0));
+    let size = std::fs::metadata(iptv_core::downloads::part_path(&staged.final_path))
+        .map_or(0, |m| m.len());
+    Some(
+        [
+            trf(
+                "Progress: {percent}%",
+                &[("percent", percent.as_deref().unwrap_or("--"))],
+            ),
+            trf(
+                "Elapsed: {time}",
+                &[("time", &iptv_core::recording_log::format_duration(elapsed))],
+            ),
+            trf(
+                "Time remaining: {time}",
+                &[(
+                    "time",
+                    &iptv_core::recording_log::format_duration(remaining),
+                )],
+            ),
+            trf(
+                "Downloaded: {size}",
+                &[(
+                    "size",
+                    &iptv_core::recording_log::format_size(Some(size as f64)),
+                )],
+            ),
+        ]
+        .join("\n"),
+    )
 }
 
 /// Build a simple list dialog shell: frame, panel, list, status.
@@ -14380,6 +14479,35 @@ fn padding_seconds(wiring: &Wiring) -> i64 {
     (pre + post) * 60
 }
 
+/// Stage a catch-up capture for its direct-file probe (N13):
+/// the probe worker walks the padded window first, then the
+/// programme-exact one; `poll_direct_probes` launches the
+/// capture from the result. Used for the first attempt and for
+/// N15 retries, which re-run the whole probe flow like Python.
+fn stage_direct_probe(wiring: &Wiring, key: &str, mut staged: StagedDownload) {
+    let (padded_start, padded_stop) = padded_window(wiring, &staged.programme);
+    let programme = staged.programme.clone();
+    let url = staged.url.clone();
+    let headers = iptv_core::playback::StreamHeaders::for_channel(&staged.channel);
+    staged.probing = true;
+    wiring
+        .staged_downloads
+        .borrow_mut()
+        .insert(key.to_string(), staged);
+    wiring.direct_probe_pending.set(true);
+    wiring
+        .direct_probe_worker
+        .start(iptv_core::catchup_direct::DirectProbeRequest {
+            key: key.to_string(),
+            url,
+            windows: vec![
+                (padded_start, padded_stop - padded_start),
+                (programme.start, programme.stop - programme.start),
+            ],
+            headers,
+        });
+}
+
 /// Start a catch-up download once its URL is known (directly, or
 /// after a portal resolution).
 #[allow(clippy::too_many_lines)] // R02-R05 staged download flow
@@ -14474,7 +14602,6 @@ fn begin_catchup_download(
             // never opens the media itself and settles a
             // one-stream provider before ffmpeg asks; the
             // capture launches from `poll_direct_probes`.
-            let probe_url = url.clone();
             let staged = StagedDownload {
                 final_path: destination.clone(),
                 channel: channel.clone(),
@@ -14483,6 +14610,11 @@ fn begin_catchup_download(
                 headers: None,
                 probing: true,
                 attempts: 1,
+                retry_at: None,
+                started_at: 0.0,
+                log_path: None,
+                expected_seconds: 0.0,
+                failure_detail: None,
                 cancelled: false,
             };
             wiring.downloads.borrow_mut().push(DownloadRow {
@@ -14493,22 +14625,7 @@ fn begin_catchup_download(
                 progress: "Checking for a faster download...".to_string(),
                 done: false,
             });
-            wiring
-                .staged_downloads
-                .borrow_mut()
-                .insert(key.clone(), staged);
-            wiring.direct_probe_pending.set(true);
-            wiring
-                .direct_probe_worker
-                .start(iptv_core::catchup_direct::DirectProbeRequest {
-                    key: key.clone(),
-                    url: probe_url,
-                    windows: vec![
-                        (padded_start, padded_stop - padded_start),
-                        (programme.start, programme.stop - programme.start),
-                    ],
-                    headers: iptv_core::playback::StreamHeaders::for_channel(channel),
-                });
+            stage_direct_probe(wiring, &key, staged);
         }
         iptv_core::downloads::ArchivePlan::Direct => {
             let id = wiring.next_download_id.get();
@@ -14542,11 +14659,26 @@ fn begin_catchup_download(
 /// Launch (or relaunch) one staged ffmpeg catch-up capture:
 /// the media lands in a `.part` sibling and only earns the
 /// final name on a clean, complete finish (audit R05).
-fn launch_staged_capture(wiring: &Wiring, key: &str, staged: StagedDownload) -> Result<(), String> {
+fn launch_staged_capture(
+    wiring: &Wiring,
+    key: &str,
+    mut staged: StagedDownload,
+) -> Result<(), String> {
     let format = recording_format_for_channel(&wiring.persist, &staged.channel);
     let extension = recording::format_extension(&format);
     let part = iptv_core::downloads::part_path(&staged.final_path);
     let (padded_start, padded_stop) = padded_window(wiring, &staged.programme);
+    // N15: the Downloads window's live figures read this
+    // attempt's log and clock.
+    staged.started_at = now_seconds();
+    staged.log_path = part
+        .parent()
+        .map(|parent| iptv_core::recording_log::recording_log_path(parent, &part));
+    staged.expected_seconds = f64::from(
+        i32::try_from(((padded_stop - padded_start) - padding_seconds(wiring)).max(1)).unwrap_or(0),
+    );
+    staged.failure_detail = None;
+    staged.retry_at = None;
     let headers = staged
         .headers
         .clone()
@@ -14599,10 +14731,117 @@ fn launch_staged_capture(wiring: &Wiring, key: &str, staged: StagedDownload) -> 
     Ok(())
 }
 
+/// N15: fire any catch-up download retries whose delay has
+/// elapsed (the housekeeping tick calls this every second).
+/// A retry re-runs the whole probe flow, like Python, so a
+/// provider-stale direct URL is derived fresh.
+fn process_download_retries(wiring: &Wiring) {
+    let now = now_seconds();
+    let due: Vec<String> = wiring
+        .staged_downloads
+        .borrow()
+        .iter()
+        .filter(|(_, staged)| staged.retry_at.is_some_and(|at| at <= now))
+        .map(|(key, _)| key.clone())
+        .collect();
+    for key in due {
+        let Some(mut staged) = wiring.staged_downloads.borrow_mut().remove(&key) else {
+            continue;
+        };
+        if staged.cancelled {
+            continue;
+        }
+        staged.retry_at = None;
+        let mut rows = wiring.downloads.borrow_mut();
+        if let Some(row) = rows.iter_mut().find(|row| row.key == key) {
+            row.progress = "Checking for a faster download...".to_string();
+        }
+        drop(rows);
+        stage_direct_probe(wiring, &key, staged);
+        refresh_downloads_window(wiring);
+    }
+}
+
+/// N15: Python's `show_failure` detail block for a failed
+/// download: the plain-words reason (when the exit code has
+/// one), the code itself, and the log's first diagnostic line.
+fn download_failure_detail(
+    staged: &StagedDownload,
+    finished: &recording::RecordingFinished,
+) -> Option<String> {
+    if finished.success {
+        return None;
+    }
+    let mut lines: Vec<String> = Vec::new();
+    if let Some(reason) = iptv_core::catchup::ffmpeg_exit_reason(i64::from(finished.exit_code)) {
+        lines.push(reason.to_string());
+    }
+    lines.push(trf(
+        "ffmpeg exit code: {code}",
+        &[("code", &finished.exit_code.to_string())],
+    ));
+    let first = staged
+        .log_path
+        .as_deref()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .map(|text| iptv_core::recording_log::first_error_line(&text))
+        .unwrap_or_default();
+    if first.is_empty() {
+        lines.push(tr("No error details were reported."));
+    } else {
+        lines.push(first);
+    }
+    Some(lines.join("\n"))
+}
+
+/// N15: schedule the retry of a transiently failed download
+/// (Python `_maybe_retry_catchup_download`): the partial file
+/// goes, the row counts down the doubling delay (2 s, 4 s,
+/// 8 s), the failure detail stays on view, and
+/// `process_download_retries` re-runs the probe flow when the
+/// delay elapses. Cancel can still abort the wait.
+fn schedule_download_retry(
+    wiring: &Wiring,
+    key: &str,
+    staged: StagedDownload,
+    finished: &recording::RecordingFinished,
+) {
+    let _ = std::fs::remove_file(&finished.out_path);
+    let delay = iptv_core::catchup::CATCHUP_RETRY_BASE_DELAY_SECONDS
+        * 2_f64.powi(i32::try_from(staged.attempts - 1).unwrap_or(0));
+    let failure_detail = download_failure_detail(&staged, finished);
+    let mut rows = wiring.downloads.borrow_mut();
+    if let Some(row) = rows.iter_mut().find(|row| row.key == key) {
+        row.progress = trf(
+            "Download failed - retrying (attempt {attempt} of {total}) in {seconds} seconds...",
+            &[
+                ("attempt", &staged.attempts.to_string()),
+                (
+                    "total",
+                    &iptv_core::catchup::CATCHUP_RETRY_MAX_ATTEMPTS.to_string(),
+                ),
+                ("seconds", &format!("{delay:.0}")),
+            ],
+        );
+    }
+    drop(rows);
+    let mut retry = staged;
+    retry.attempts += 1;
+    retry.failure_detail = failure_detail;
+    retry.retry_at = Some(now_seconds() + delay);
+    wiring
+        .staged_downloads
+        .borrow_mut()
+        .insert(key.to_string(), retry);
+}
+
 /// Finalize one staged catch-up capture (audit R05): a clean
 /// finish with the whole programme renames the `.part` into
-/// place; a short or failed capture retries once, then fails
-/// honestly with no misleading completed file left behind.
+/// place; a short or failed capture retries under Python's
+/// rule (N15: up to three retries, doubling delay, only for
+/// retryable failures), then reports honestly — a truncated
+/// final attempt keeps its partial file like Python, a failed
+/// one leaves nothing misleading behind.
 fn finish_staged_download(
     wiring: &Wiring,
     frame: Frame,
@@ -14652,21 +14891,30 @@ fn finish_staged_download(
     if complete && std::fs::rename(&finished.out_path, &staged.final_path).is_ok() {
         set_row(wiring, "Done".to_string(), true);
         status.set_label(&format!("Download finished: {}", staged.programme.title));
-    } else if staged.attempts < 2 {
-        let _ = std::fs::remove_file(&finished.out_path);
-        set_row(wiring, "Retrying...".to_string(), false);
-        let mut retry = staged;
-        retry.attempts += 1;
-        let title = retry.programme.title.clone();
-        if let Err(error) = launch_staged_capture(wiring, key, retry) {
-            set_row(wiring, format!("Failed: {error}"), true);
-            status.set_label(&format!("Download failed: {title}"));
-        }
+        // N15: Python confirms a finished download in a box.
+        let path = staged.final_path.to_string_lossy().into_owned();
+        let _ = MessageDialog::builder(
+            &frame,
+            &trf("Download complete:\n{path}", &[("path", &path)]),
+            &tr("Catch-up Download"),
+        )
+        .with_style(MessageDialogStyle::OK | MessageDialogStyle::IconInformation)
+        .build()
+        .show_modal();
+    } else if staged.attempts <= iptv_core::catchup::CATCHUP_RETRY_MAX_ATTEMPTS
+        && iptv_core::catchup::catchup_failure_is_retryable(
+            finished.exit_code,
+            truncated,
+            &finished.stderr_tail.join("\n"),
+            finished.stopped_by_user,
+        )
+    {
+        schedule_download_retry(wiring, key, staged, finished);
+    } else if truncated {
+        finish_truncated_download(wiring, frame, status, key, &staged, finished, written);
     } else {
         let _ = std::fs::remove_file(&finished.out_path);
-        let reason = if truncated {
-            "Failed: download ended early"
-        } else if finished.success {
+        let reason = if finished.success {
             "Failed: nothing was recorded"
         } else {
             "Failed"
@@ -14674,42 +14922,94 @@ fn finish_staged_download(
         set_row(wiring, reason.to_string(), true);
         status.set_label(&format!("Download failed: {}", staged.programme.title));
         if !finished.success {
-            // N14: Python explains a failed download in plain words
-            // when the ffmpeg exit code is a known provider failure
-            // (`_ffmpeg_exit_reason`), with the failure detail after
-            // it; unknown codes keep the numeric form.
-            let tail_start = finished.stderr_tail.len().saturating_sub(6);
-            let tail = &finished.stderr_tail[tail_start..];
-            let detail = if tail.is_empty() {
-                recording_failure_detail(finished)
-            } else {
-                tail.join("\n")
-            };
-            let path = staged.final_path.to_string_lossy().into_owned();
-            let message =
-                match iptv_core::catchup::ffmpeg_exit_reason(i64::from(finished.exit_code)) {
-                    Some(reason) => trf(
-                        "Download failed:\n{path}\n\n{reason}\n\n{detail}",
-                        &[("path", &path), ("reason", reason), ("detail", &detail)],
-                    ),
-                    None => trf(
-                        "Download failed (code {code}):\n{path}\n\n{detail}",
-                        &[
-                            ("code", &finished.exit_code.to_string()),
-                            ("path", &path),
-                            ("detail", &detail),
-                        ],
-                    ),
-                };
-            let _ = MessageDialog::builder(&frame, &message, &tr("Catch-up Download"))
-                .with_style(MessageDialogStyle::OK | MessageDialogStyle::IconError)
-                .build()
-                .show_modal();
+            report_download_failure(frame, &staged, finished);
         }
     }
     let active = wiring.downloads.borrow().iter().any(|row| !row.done);
     wiring.downloads_active.set(active);
     refresh_downloads_window(wiring);
+}
+
+/// N15: a truncated download whose retry budget is spent keeps
+/// its partial file; the report says how much of the programme
+/// actually arrived (Python's ended-early box).
+fn finish_truncated_download(
+    wiring: &Wiring,
+    frame: Frame,
+    status: Status,
+    key: &str,
+    staged: &StagedDownload,
+    finished: &recording::RecordingFinished,
+    written: Option<f64>,
+) {
+    let (padded_start, padded_stop) = padded_window(wiring, &staged.programme);
+    let expected = f64::from(
+        i32::try_from(((padded_stop - padded_start) - padding_seconds(wiring)).max(1)).unwrap_or(0),
+    );
+    let _ = std::fs::rename(&finished.out_path, &staged.final_path);
+    let mut rows = wiring.downloads.borrow_mut();
+    if let Some(row) = rows.iter_mut().find(|row| row.key == key) {
+        row.progress = "Ended early".to_string();
+        row.done = true;
+    }
+    drop(rows);
+    status.set_label(&format!("Download ended early: {}", staged.programme.title));
+    let path = staged.final_path.to_string_lossy().into_owned();
+    let message = trf(
+        "Download ended early:\n{path}\n\nOnly {written} of {expected} arrived before the provider closed the connection. The incomplete file was kept.",
+        &[
+            ("path", &path),
+            (
+                "written",
+                &iptv_core::recording_log::format_duration(written),
+            ),
+            (
+                "expected",
+                &iptv_core::recording_log::format_duration(Some(expected)),
+            ),
+        ],
+    );
+    let _ = MessageDialog::builder(&frame, &message, &tr("Catch-up Download"))
+        .with_style(MessageDialogStyle::OK | MessageDialogStyle::IconWarning)
+        .build()
+        .show_modal();
+}
+
+/// N14: Python explains a failed download in plain words when
+/// the ffmpeg exit code is a known provider failure
+/// (`_ffmpeg_exit_reason`), with the failure detail after it;
+/// unknown codes keep the numeric form.
+fn report_download_failure(
+    frame: Frame,
+    staged: &StagedDownload,
+    finished: &recording::RecordingFinished,
+) {
+    let tail_start = finished.stderr_tail.len().saturating_sub(6);
+    let tail = &finished.stderr_tail[tail_start..];
+    let detail = if tail.is_empty() {
+        recording_failure_detail(finished)
+    } else {
+        tail.join("\n")
+    };
+    let path = staged.final_path.to_string_lossy().into_owned();
+    let message = match iptv_core::catchup::ffmpeg_exit_reason(i64::from(finished.exit_code)) {
+        Some(reason) => trf(
+            "Download failed:\n{path}\n\n{reason}\n\n{detail}",
+            &[("path", &path), ("reason", reason), ("detail", &detail)],
+        ),
+        None => trf(
+            "Download failed (code {code}):\n{path}\n\n{detail}",
+            &[
+                ("code", &finished.exit_code.to_string()),
+                ("path", &path),
+                ("detail", &detail),
+            ],
+        ),
+    };
+    let _ = MessageDialog::builder(&frame, &message, &tr("Catch-up Download"))
+        .with_style(MessageDialogStyle::OK | MessageDialogStyle::IconError)
+        .build()
+        .show_modal();
 }
 
 /// Render the Downloads rows into a list (shared by the window
@@ -14727,7 +15027,7 @@ fn download_row_labels(wiring: &Wiring) -> Vec<String> {
 /// keeping the selection where it was (audit R06: the window
 /// is live, not a snapshot).
 fn refresh_downloads_window(wiring: &Wiring) {
-    let Some(ui) = wiring.downloads_ui.borrow().as_ref().cloned() else {
+    let Some(mut ui) = wiring.downloads_ui.borrow().as_ref().cloned() else {
         return;
     };
     let selected = ui.list.get_selection();
@@ -14743,6 +15043,22 @@ fn refresh_downloads_window(wiring: &Wiring) {
         "{count} downloads.",
         &[("count", &labels.len().to_string())],
     ));
+    // N15: the selected capture's live detail block under the
+    // rows (progress, elapsed, remaining, size so far).
+    if let Some(index) = selected {
+        let key = wiring
+            .downloads
+            .borrow()
+            .get(usize::try_from(index).unwrap_or(usize::MAX))
+            .map(|row| row.key.clone());
+        if let Some(text) = key.and_then(|key| staged_detail_text(wiring, &key)) {
+            if ui.details_text != text {
+                ui.dstatus.details.set_value(&text);
+                ui.details_text = text;
+                *wiring.downloads_ui.borrow_mut() = Some(ui);
+            }
+        }
+    }
 }
 
 /// View > Show Downloads: tracked downloads with live progress
@@ -14769,6 +15085,7 @@ fn open_downloads_window(wiring: &Wiring, status: Status) {
         frame,
         list,
         dstatus,
+        details_text: String::new(),
     });
     let cancel = Button::builder(&panel)
         .with_label("&Cancel Download")
@@ -14776,40 +15093,107 @@ fn open_downloads_window(wiring: &Wiring, status: Status) {
     let close = Button::builder(&panel).with_label("&Close").build();
     let wiring_c = clone_wiring(wiring);
     cancel.on_click(move |_| {
-        // Cancel acts on the SELECTED request only; other
-        // downloads, running or queued, are untouched, and
-        // starting another download never revives this one.
-        let Some(index) = list.get_selection() else {
-            dstatus.set_label("Choose a download to cancel first.");
-            return;
-        };
-        let index = usize::try_from(index).unwrap_or(usize::MAX);
-        let row = wiring_c
-            .downloads
-            .borrow()
-            .get(index)
-            .map(|row| (row.id, row.key.clone(), row.done));
-        match row {
-            Some((_, _, true)) => dstatus.set_label("That download has already finished."),
-            Some((id, _, _)) if id != 0 => {
-                wiring_c.download_worker.cancel(id);
-                dstatus.set_label("Cancelling the selected download...");
-            }
-            Some((_, key, _)) => {
-                // An ffmpeg catch-up capture: flag it cancelled
-                // (its finish then cleans up without retrying)
-                // and ask the engine to stop it.
-                if let Some(staged) = wiring_c.staged_downloads.borrow_mut().get_mut(&key) {
-                    staged.cancelled = true;
-                }
-                wiring_c.recordings.borrow_mut().stop(&key);
-                dstatus.set_label("Cancelling the selected download...");
-            }
-            None => dstatus.set_label("Choose a download to cancel first."),
-        }
+        cancel_selected_download(&wiring_c, frame, list, dstatus);
     });
     close.on_click(move |_| frame.hide());
+    // N15: Escape hides the window while downloads continue
+    // (Python's download dialog rule); Show Downloads brings
+    // it back. Bound on the frame and the list, where focus
+    // normally sits.
+    frame.bind_internal(EventType::KEY_DOWN, move |event| {
+        if event.get_key_code() == Some(27) {
+            frame.hide();
+            event.skip(false);
+        } else {
+            event.skip(true);
+        }
+    });
+    list.bind_internal(EventType::KEY_DOWN, move |event| {
+        if event.get_key_code() == Some(27) {
+            frame.hide();
+            event.skip(false);
+        } else {
+            event.skip(true);
+        }
+    });
     frame.show(true);
+}
+
+/// The Downloads window's Cancel Download button: acts on the
+/// SELECTED request only; other downloads, running or queued,
+/// are untouched, and starting another download never revives
+/// this one. N15: cancelling asks first — a cancelled download
+/// cannot be resumed (Python's Cancel Download box).
+fn cancel_selected_download(wiring: &Wiring, frame: Frame, list: ListBox, dstatus: Status) {
+    let Some(index) = list.get_selection() else {
+        dstatus.set_label("Choose a download to cancel first.");
+        return;
+    };
+    let index = usize::try_from(index).unwrap_or(usize::MAX);
+    let row = wiring
+        .downloads
+        .borrow()
+        .get(index)
+        .map(|row| (row.id, row.key.clone(), row.done));
+    match row {
+        Some((_, _, true)) => {
+            dstatus.set_label("That download has already finished.");
+            return;
+        }
+        None => {
+            dstatus.set_label("Choose a download to cancel first.");
+            return;
+        }
+        _ => {}
+    }
+    let confirm = MessageDialog::builder(
+        &frame,
+        &tr("Do you really want to cancel this download? It cannot be resumed afterwards."),
+        &tr("Cancel Download"),
+    )
+    .with_style(MessageDialogStyle::YesNo | MessageDialogStyle::IconQuestion)
+    .build();
+    if confirm.show_modal() != ID_YES {
+        return;
+    }
+    match row {
+        Some((id, _, _)) if id != 0 => {
+            wiring.download_worker.cancel(id);
+            dstatus.set_label("Cancelling the selected download...");
+        }
+        Some((_, key, _)) => {
+            // An ffmpeg catch-up capture. Waiting out a retry
+            // delay, nothing is running: drop the staged entry
+            // and close the row out here. Probing or capturing:
+            // flag it cancelled (its finish then cleans up
+            // without retrying) and ask the engine to stop it.
+            let waiting = wiring
+                .staged_downloads
+                .borrow()
+                .get(&key)
+                .is_some_and(|staged| staged.retry_at.is_some());
+            if waiting {
+                wiring.staged_downloads.borrow_mut().remove(&key);
+                let mut rows = wiring.downloads.borrow_mut();
+                if let Some(row) = rows.iter_mut().find(|row| row.key == key) {
+                    row.progress = "Cancelled".to_string();
+                    row.done = true;
+                }
+                drop(rows);
+                let active = wiring.downloads.borrow().iter().any(|row| !row.done);
+                wiring.downloads_active.set(active);
+                refresh_downloads_window(wiring);
+                dstatus.set_label("Cancelled the selected download.");
+            } else {
+                if let Some(staged) = wiring.staged_downloads.borrow_mut().get_mut(&key) {
+                    staged.cancelled = true;
+                }
+                wiring.recordings.borrow_mut().stop(&key);
+                dstatus.set_label("Cancelling the selected download...");
+            }
+        }
+        _ => {}
+    }
 }
 
 /// File > Account Info: pick an account and fetch its info report

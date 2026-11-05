@@ -458,6 +458,92 @@ pub enum ShowResolution {
     },
 }
 
+/// How many automatic retries a failed catch-up download gets
+/// (Python `_CATCHUP_RETRY_MAX_ATTEMPTS`).
+pub const CATCHUP_RETRY_MAX_ATTEMPTS: u32 = 3;
+
+/// The first retry delay in seconds; each retry doubles it
+/// (Python `_CATCHUP_RETRY_BASE_DELAY_SECONDS`).
+pub const CATCHUP_RETRY_BASE_DELAY_SECONDS: f64 = 2.0;
+
+/// `403\b` / `429\b`: the digits with a word boundary after them
+/// (Python's `_CATCHUP_RETRYABLE_RE` status alternatives).
+fn status_code_hit(lowered: &str, code: &str) -> bool {
+    let chars: Vec<char> = lowered.chars().collect();
+    let needle: Vec<char> = code.chars().collect();
+    for i in 0..chars.len() {
+        if chars[i..].starts_with(&needle) {
+            let after = chars.get(i + needle.len());
+            if after.is_none_or(|c| !(c.is_alphanumeric() || *c == '_')) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// `50[0-9]\b`: a 5xx status with a word boundary after it.
+fn server_5xx_hit(lowered: &str) -> bool {
+    let chars: Vec<char> = lowered.chars().collect();
+    for i in 0..chars.len().saturating_sub(2) {
+        if chars[i] == '5'
+            && chars[i + 1] == '0'
+            && chars[i + 2].is_ascii_digit()
+            && chars
+                .get(i + 3)
+                .is_none_or(|c| !(c.is_alphanumeric() || *c == '_'))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether a text carries a retryable failure marker (Python's
+/// `_CATCHUP_RETRYABLE_RE`).
+fn retryable_text(text: &str) -> bool {
+    let lowered = text.to_lowercase();
+    status_code_hit(&lowered, "403")
+        || status_code_hit(&lowered, "429")
+        || server_5xx_hit(&lowered)
+        || [
+            "connection reset",
+            "connection refused",
+            "connection closed",
+            "temporarily unavailable",
+            "no route to host",
+            "server returned",
+            "timed out",
+            "timedout",
+            "tim out",
+            "timout",
+        ]
+        .iter()
+        .any(|phrase| lowered.contains(phrase))
+}
+
+/// True when a finished catch-up download failed for a reason
+/// retrying can fix (port of `_catchup_failure_is_retryable`).
+/// `truncated` stands in for Python's rc == 0.0 sentinel: the
+/// process exited clean but the transfer came up short, so the
+/// success rule must not short-circuit it. User cancellations
+/// are never retried.
+#[must_use]
+pub fn catchup_failure_is_retryable(
+    exit_code: i32,
+    truncated: bool,
+    stderr_text: &str,
+    stopped_by_user: bool,
+) -> bool {
+    if stopped_by_user {
+        return false;
+    }
+    if exit_code == 0 && !truncated {
+        return false;
+    }
+    retryable_text(stderr_text)
+}
+
 /// Plain words for an ffmpeg exit code, or None when the code is not
 /// a known provider failure (port of `_ffmpeg_exit_reason` in
 /// `catchup_urls.py`). ffmpeg exits with the `AVERROR` of whatever
@@ -549,6 +635,63 @@ pub fn resolve_show_url(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn retryable_failures_match_python() {
+        // Retryable markers from `_CATCHUP_RETRYABLE_RE`.
+        assert!(catchup_failure_is_retryable(
+            -858_797_304,
+            false,
+            "Server returned 403 Forbidden",
+            false
+        ));
+        assert!(catchup_failure_is_retryable(
+            1,
+            false,
+            "Connection reset by peer",
+            false
+        ));
+        assert!(catchup_failure_is_retryable(
+            1,
+            false,
+            "Connection timed out",
+            false
+        ));
+        assert!(catchup_failure_is_retryable(
+            1,
+            false,
+            "HTTP error 503 Service Unavailable",
+            false
+        ));
+        // The truncation sentinel: clean exit, short transfer.
+        assert!(catchup_failure_is_retryable(
+            0,
+            true,
+            "Server returned 403 Forbidden",
+            false
+        ));
+        // Not retryable: a clean finish, a user stop, an unknown
+        // failure, and a status code without a word boundary.
+        assert!(!catchup_failure_is_retryable(0, false, "403", false));
+        assert!(!catchup_failure_is_retryable(
+            1,
+            false,
+            "Server returned 403 Forbidden",
+            true
+        ));
+        assert!(!catchup_failure_is_retryable(
+            1,
+            false,
+            "moov atom not found",
+            false
+        ));
+        assert!(!catchup_failure_is_retryable(
+            1,
+            false,
+            "error 4030 happened",
+            false
+        ));
+    }
+
     #[test]
     fn ffmpeg_exit_reasons_match_python() {
         // Every code in Python's `_FFMPEG_EXIT_REASONS`, checked
