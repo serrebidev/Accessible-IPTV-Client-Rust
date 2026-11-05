@@ -614,6 +614,18 @@ struct Wiring {
     series_last_scan: Rc<std::cell::Cell<f64>>,
     account_text: Rc<RefCell<Option<TextCtrl>>>,
     buffers: Rc<RefCell<buffer::BufferRegistry>>,
+    /// N16: media-type classification state — the session
+    /// probe cache, in-flight probes and their ffmpeg handles.
+    media_probe: MediaProbe,
+    /// The debounced probe schedule: (token, channel, due
+    /// time) set by the channel highlight, fired by the
+    /// housekeeping tick once the selection settles.
+    media_probe_pending: Rc<RefCell<Option<(u64, Channel, f64)>>>,
+    media_probe_token: Rc<std::cell::Cell<u64>>,
+    /// The Recording Format submenu's last refilled state key
+    /// (N16): the menu-open refill is a no-op while nothing it
+    /// shows has changed.
+    format_menu_state: Rc<RefCell<String>>,
 }
 
 /// Built-in player window state, created lazily on first use.
@@ -1073,6 +1085,10 @@ fn bind_browser(
         series_last_scan: Rc::new(std::cell::Cell::new(0.0)),
         account_text: Rc::new(RefCell::new(None)),
         buffers: Rc::new(RefCell::new(buffer::BufferRegistry::default())),
+        media_probe: MediaProbe::new(),
+        media_probe_pending: Rc::new(RefCell::new(None)),
+        media_probe_token: Rc::new(std::cell::Cell::new(0)),
+        format_menu_state: Rc::new(RefCell::new(String::new())),
     };
     wiring.player.borrow_mut().shared = Some(PlayerShared {
         buffers: Rc::clone(&wiring.buffers),
@@ -1086,6 +1102,7 @@ fn bind_browser(
         timer: Rc::clone(&wiring.timer),
         guide_ui: Rc::clone(&wiring.guide_ui),
         i18n: Rc::clone(&wiring.i18n),
+        media_probe: wiring.media_probe.clone(),
     });
     *wiring.reminders.borrow_mut() = wiring.persist.reminders();
     init_speech(&wiring.player, &wiring.persist, controls.status);
@@ -1174,6 +1191,9 @@ fn bind_housekeeping(frame: Frame, wiring: &Wiring) {
         // same cadence as Python's download dialog timer.
         process_download_retries(&tick_wiring);
         refresh_downloads_window(&tick_wiring);
+        // N16: a media-type probe whose selection has settled
+        // for 1.5 s starts on this tick.
+        poll_media_probe_schedule(&tick_wiring);
     });
     let _ = wiring.housekeeping.start(1000, false);
 }
@@ -1960,7 +1980,13 @@ fn poll_providers(wiring: &Wiring, controls: Controls) {
                     Some(PendingResolve::Play(mut channel)) => match result {
                         Ok(url) => {
                             channel.url = url;
-                            play_channel(&wiring.player, &wiring.persist, &channel, status);
+                            play_channel(
+                                &wiring.player,
+                                &wiring.persist,
+                                &wiring.media_probe,
+                                &channel,
+                                status,
+                            );
                         }
                         Err(error) => status.set_label(&error),
                     },
@@ -2484,7 +2510,13 @@ fn open_reminder_window(wiring: &Wiring, status: Status, reminder: &Reminder) {
         match iptv_core::reminders::find_channel_for_reminder(&reminder_open, &channels) {
             Some(channel) => {
                 let channel = channel.clone();
-                play_channel(&wiring_o.player, &wiring_o.persist, &channel, status);
+                play_channel(
+                    &wiring_o.player,
+                    &wiring_o.persist,
+                    &wiring_o.media_probe,
+                    &channel,
+                    status,
+                );
             }
             None => status.set_label("Channel not found."),
         }
@@ -2614,6 +2646,344 @@ fn channel_audio_key(channel: &Channel) -> String {
     name.trim().to_lowercase()
 }
 
+/// N16 media-type probe state (Python's `_media_type_cache`,
+/// `_media_probe_inflight` and `_media_probe_procs`): the
+/// session cache is shared with the probe worker threads; the
+/// in-flight set and the live ffmpeg handles let a user
+/// session preempt a probe before it steals a one-stream
+/// provider's only connection.
+/// A probe's ffmpeg child handle, shared between the probe
+/// worker (owner) and any session preempting it.
+type ProbeChild = Arc<std::sync::Mutex<Option<std::process::Child>>>;
+type ProbeProcs = Arc<std::sync::Mutex<std::collections::HashMap<String, ProbeChild>>>;
+
+#[derive(Clone)]
+struct MediaProbe {
+    cache: Arc<iptv_core::media_type::MediaTypeCache>,
+    inflight: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    procs: ProbeProcs,
+    urls: Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>,
+}
+
+impl MediaProbe {
+    fn new() -> Self {
+        Self {
+            cache: Arc::new(iptv_core::media_type::MediaTypeCache::new()),
+            inflight: Arc::default(),
+            procs: Arc::default(),
+            urls: Arc::default(),
+        }
+    }
+
+    fn in_flight(&self, identity: &str) -> bool {
+        self.inflight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(identity)
+    }
+}
+
+/// Classification for one channel (Python
+/// `_classify_channel_media`): the channel's own metadata
+/// statement first, then the session probe cache; returns
+/// `(media, source)`. Never probes — probing is scheduled
+/// from the selection settle and runs off the UI thread.
+fn classify_channel_media(
+    cache: &iptv_core::media_type::MediaTypeCache,
+    channel: &Channel,
+) -> (String, String) {
+    use iptv_core::media_type::{MEDIA_AUDIO, MEDIA_UNKNOWN, MEDIA_VIDEO, SOURCE_METADATA};
+    match channel_media_is_audio(channel) {
+        Some(true) => return (MEDIA_AUDIO.to_string(), SOURCE_METADATA.to_string()),
+        Some(false) => return (MEDIA_VIDEO.to_string(), SOURCE_METADATA.to_string()),
+        None => {}
+    }
+    let identity = iptv_core::media_type::channel_record_key(channel);
+    if let Some(hit) = cache.lookup(&identity, &channel.url) {
+        return hit;
+    }
+    (MEDIA_UNKNOWN.to_string(), MEDIA_UNKNOWN.to_string())
+}
+
+/// Queue a classification probe for when the selection
+/// settles (Python `_schedule_media_probe`): each highlight
+/// re-arms the 1.5 s debounce, so arrowing through the list
+/// opens no streams; the housekeeping tick fires it.
+fn schedule_media_probe(wiring: &Wiring, channel: &Channel) {
+    let token = wiring.media_probe_token.get() + 1;
+    wiring.media_probe_token.set(token);
+    *wiring.media_probe_pending.borrow_mut() = Some((token, channel.clone(), now_seconds() + 1.5));
+}
+
+/// Fire a due scheduled probe (housekeeping tick).
+fn poll_media_probe_schedule(wiring: &Wiring) {
+    let due = {
+        let pending = wiring.media_probe_pending.borrow();
+        match &*pending {
+            Some((token, channel, deadline))
+                if *token == wiring.media_probe_token.get() && now_seconds() >= *deadline =>
+            {
+                Some(channel.clone())
+            }
+            _ => None,
+        }
+    };
+    if let Some(channel) = due {
+        *wiring.media_probe_pending.borrow_mut() = None;
+        probe_channel_media_now(wiring, &channel);
+    }
+}
+
+/// Start the worker-thread probe unless the type is known or
+/// already in flight (Python `_probe_channel_media_now`). The
+/// guards mirror Python's: a buffered channel needs no probe,
+/// only http(s) streams are probed, nothing probes while the
+/// player has media, and a busy one-stream provider is never
+/// stolen from.
+fn probe_channel_media_now(wiring: &Wiring, channel: &Channel) {
+    let probe = &wiring.media_probe;
+    if wiring.buffers.borrow().owns_source(&channel.url) {
+        return;
+    }
+    let (media, _) = classify_channel_media(&probe.cache, channel);
+    if media != iptv_core::media_type::MEDIA_UNKNOWN {
+        return;
+    }
+    let (fetch_url, _) = iptv_core::playback::split_stream_modifiers(&channel.url);
+    let lower = fetch_url.to_lowercase();
+    if !lower.starts_with("http://") && !lower.starts_with("https://") {
+        return;
+    }
+    if wiring.player.borrow().session.current().is_some() {
+        return;
+    }
+    if single_stream_busy(
+        &wiring.recordings,
+        &wiring.buffers,
+        Some(&wiring.player),
+        &fetch_url,
+        true,
+    ) {
+        return;
+    }
+    let identity = iptv_core::media_type::channel_record_key(channel);
+    {
+        let mut inflight = probe
+            .inflight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if inflight.contains(&identity) {
+            return;
+        }
+        inflight.insert(identity.clone());
+    }
+    let headers = iptv_core::playback::StreamHeaders::for_channel(channel);
+    let probe = probe.clone();
+    let channel_url = channel.url.clone();
+    std::thread::spawn(move || {
+        run_media_probe(&probe, &identity, &channel_url, &fetch_url, &headers);
+    });
+}
+
+/// The probe worker (Python `_probe_channel_media_worker`
+/// over recorder's `probe_stream_report`): one `ffmpeg -i`,
+/// its stderr classified into the session cache. The child
+/// handle is registered so a user session can preempt the
+/// probe; a probe preempted before registering kills itself
+/// rather than holding a provider slot unowned.
+fn run_media_probe(
+    probe: &MediaProbe,
+    identity: &str,
+    channel_url: &str,
+    fetch_url: &str,
+    headers: &iptv_core::playback::StreamHeaders,
+) {
+    let mut cmd: Vec<String> = vec![
+        "ffmpeg".to_string(),
+        "-hide_banner".to_string(),
+        "-nostdin".to_string(),
+        "-rw_timeout".to_string(),
+        "10000000".to_string(),
+        "-analyzeduration".to_string(),
+        "3000000".to_string(),
+    ];
+    cmd.extend(recording::header_input_args(headers));
+    cmd.push("-i".to_string());
+    cmd.push(fetch_url.to_string());
+    let mut media = iptv_core::media_type::MEDIA_UNKNOWN;
+    if let Ok(mut child) = std::process::Command::new(&cmd[0])
+        .args(&cmd[1..])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+    {
+        // Drain stderr on a side thread so a chatty stream
+        // cannot fill the pipe and stall the probe.
+        let mut pipe = child.stderr.take();
+        let drain = std::thread::spawn(move || {
+            use std::io::Read;
+            let mut buf = Vec::new();
+            if let Some(pipe) = &mut pipe {
+                let _ = pipe.read_to_end(&mut buf);
+            }
+            String::from_utf8_lossy(&buf).into_owned()
+        });
+        let handle = Arc::new(std::sync::Mutex::new(Some(child)));
+        let registered = register_probe_child(probe, identity, fetch_url, &handle);
+        if !registered {
+            if let Some(mut child) = handle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+            {
+                let _ = child.kill();
+            }
+        }
+        // Python's 20 s budget: after it, the probe counts as
+        // unanswered and nothing is cached.
+        let timed_out = wait_for_probe_child(&handle);
+        if let Some(mut child) = handle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            if timed_out {
+                let _ = child.kill();
+            }
+            let _ = child.wait();
+        }
+        let report = drain.join().unwrap_or_default();
+        if !timed_out {
+            media = iptv_core::media_type::classify_probe_report(&report);
+        }
+    }
+    // Cleanup, Python's worker finally: a registered probe
+    // releases the provider settle slot; only a classified
+    // result is cached (an unknown answer retries next time).
+    let had_proc = probe
+        .procs
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(identity)
+        .is_some();
+    probe
+        .urls
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(identity);
+    probe
+        .inflight
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(identity);
+    if had_proc {
+        iptv_core::catchup_direct::note_media_released(fetch_url);
+    }
+    if media != iptv_core::media_type::MEDIA_UNKNOWN {
+        probe.cache.store(
+            identity,
+            channel_url,
+            media,
+            iptv_core::media_type::SOURCE_PROBE,
+        );
+    }
+}
+
+/// Register a probe's child handle (Python's `on_popen`
+/// rule): only while the identity is still in flight —
+/// a session that preempted the probe between its guards
+/// and the spawn leaves it unregistered, and the worker
+/// kills it rather than holding the slot unowned.
+fn register_probe_child(
+    probe: &MediaProbe,
+    identity: &str,
+    fetch_url: &str,
+    handle: &ProbeChild,
+) -> bool {
+    let inflight = probe
+        .inflight
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !inflight.contains(identity) {
+        return false;
+    }
+    probe
+        .procs
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(identity.to_string(), Arc::clone(handle));
+    probe
+        .urls
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(identity.to_string(), fetch_url.to_string());
+    true
+}
+
+/// Wait for a probe child to exit within Python's 20 s
+/// budget; true when the budget ran out (the caller kills it
+/// and caches nothing). A handle emptied by preemption counts
+/// as finished.
+fn wait_for_probe_child(handle: &ProbeChild) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let done = {
+            let mut slot = handle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match slot.as_mut() {
+                Some(child) => matches!(child.try_wait(), Ok(Some(_))),
+                None => true,
+            }
+        };
+        if done {
+            return false;
+        }
+        if std::time::Instant::now() >= deadline {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+/// Preempt every in-flight classification probe (Python
+/// `_terminate_media_probe`): a user-initiated session
+/// (playback, recording, download) takes the provider
+/// connection — the probe is only advisory and must never
+/// hold a one-stream provider's slot against it.
+fn terminate_media_probes(probe: &MediaProbe) {
+    probe
+        .inflight
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clear();
+    let procs: Vec<(String, ProbeChild)> = probe
+        .procs
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .drain()
+        .collect();
+    let urls = probe
+        .urls
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    for (identity, handle) in procs {
+        if let Some(mut child) = handle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        if let Some(url) = urls.get(&identity) {
+            iptv_core::catchup_direct::note_media_released(url);
+        }
+    }
+}
+
 /// The media kind the channel's own metadata states (port of
 /// Python `media_hint_from_attributes`): `Some(true)` audio,
 /// `Some(false)` video, `None` unstated. Group names are never
@@ -2671,18 +3041,30 @@ fn resolve_format_for_media(persist: &Persist, audio: bool) -> String {
 }
 
 /// The recording format for a channel across every entry point
-/// (audit R11): manual, scheduled and archive recordings all
-/// classify the channel the same way and use the per-media
-/// preset; unclassified channels keep the video preset.
-fn recording_format_for_channel(persist: &Persist, channel: &Channel) -> String {
-    resolve_format_for_media(persist, channel_media_is_audio(channel) == Some(true))
+/// (audit R11, N16): manual, scheduled and archive recordings
+/// all classify the channel the same way — metadata, then the
+/// probe cache — and use the per-media preset; unclassified
+/// channels keep the video preset.
+fn recording_format_for_channel(
+    persist: &Persist,
+    cache: &iptv_core::media_type::MediaTypeCache,
+    channel: &Channel,
+) -> String {
+    let (media, _) = classify_channel_media(cache, channel);
+    resolve_format_for_media(persist, media == iptv_core::media_type::MEDIA_AUDIO)
 }
 
 /// Python `remap_format_for_media` at capture start: a stream
 /// positively identified as audio-only never records with a
 /// video preset; anything else keeps the requested format.
-fn remap_format_for_media(persist: &Persist, channel: &Channel, format: &str) -> String {
-    if channel_media_is_audio(channel) == Some(true) && recording::format_kind(format) == "video" {
+fn remap_format_for_media(
+    persist: &Persist,
+    cache: &iptv_core::media_type::MediaTypeCache,
+    channel: &Channel,
+    format: &str,
+) -> String {
+    let (media, _) = classify_channel_media(cache, channel);
+    if media == iptv_core::media_type::MEDIA_AUDIO && recording::format_kind(format) == "video" {
         resolve_format_for_media(persist, true)
     } else {
         format.to_string()
@@ -2956,10 +3338,13 @@ fn player_is_showing(player: &Rc<RefCell<PlayerState>>, channel: &Channel) -> bo
 /// Start or stop a manual recording of the channel. `player`,
 /// when the caller has it, witnesses the heard audio track
 /// (audit R10).
+#[allow(clippy::too_many_arguments)] // window parts, like prepare_recording
 fn toggle_recording(
+    parent: &dyn WxWidget,
     recordings: &Rc<RefCell<RecordingEngine>>,
     buffers: &Rc<RefCell<buffer::BufferRegistry>>,
     persist: &Persist,
+    media: &MediaProbe,
     channel: &Channel,
     status: Status,
     player: Option<&Rc<RefCell<PlayerState>>>,
@@ -2989,6 +3374,11 @@ fn toggle_recording(
         status.set_label("This channel's stream link must be resolved before recording.");
         return;
     }
+    // N16: a recording session preempts any classification
+    // probe — the probe must never hold a provider connection
+    // against the real session (Python `_terminate_media_probe`
+    // at the record entry points).
+    terminate_media_probes(media);
     // N13 (issue #13 in the reference): recording the channel
     // the player is showing takes one provider connection, not
     // two — the player lets go, the recording opens the stream,
@@ -3022,12 +3412,13 @@ fn toggle_recording(
         ));
         return;
     }
-    let format = recording_format_for_channel(persist, channel);
+    let format = recording_format_for_channel(persist, &media.cache, channel);
     let witness = player.and_then(|player| player_audio_witness(player, channel));
     match start_recording(
         recordings,
         buffers,
         persist,
+        &media.cache,
         &key,
         channel,
         &format,
@@ -3035,13 +3426,40 @@ fn toggle_recording(
         witness,
         None,
     ) {
-        Ok(path) => status.set_label(&trf(
-            "Recording {name} to {path}.",
-            &[
-                ("name", &channel.name),
-                ("path", &path.display().to_string()),
-            ],
-        )),
+        Ok(path) => {
+            status.set_label(&trf(
+                "Recording {name} to {path}.",
+                &[
+                    ("name", &channel.name),
+                    ("path", &path.display().to_string()),
+                ],
+            ));
+            // N16: Python reports the start in a box, and for
+            // an audio-only stream says so — the format was
+            // resolved from the audio preference, and the
+            // automatic choice is announced rather than silent.
+            let (media_kind, _) = classify_channel_media(&media.cache, channel);
+            let format_label = iptv_core::recording::RECORDING_FORMATS
+                .iter()
+                .find(|entry| entry.0 == format)
+                .map_or(format.as_str(), |entry| entry.1);
+            let path_text = path.display().to_string();
+            let message = if media_kind == iptv_core::media_type::MEDIA_AUDIO {
+                trf(
+                    "Audio-only stream detected. Recording started ({fmt}):\n{path}",
+                    &[("fmt", format_label), ("path", &path_text)],
+                )
+            } else {
+                trf(
+                    "Recording started ({fmt}):\n{path}",
+                    &[("fmt", format_label), ("path", &path_text)],
+                )
+            };
+            let _ = MessageDialog::builder(parent, &message, &tr("Recording"))
+                .with_style(MessageDialogStyle::OK | MessageDialogStyle::IconInformation)
+                .build()
+                .show_modal();
+        }
         Err(error) => status.set_label(&error),
     }
 }
@@ -3054,6 +3472,7 @@ fn prepare_recording(
     recordings: &Rc<RefCell<RecordingEngine>>,
     buffers: &Rc<RefCell<buffer::BufferRegistry>>,
     persist: &Persist,
+    cache: &iptv_core::media_type::MediaTypeCache,
     key: &str,
     channel: &Channel,
     format: &str,
@@ -3074,7 +3493,7 @@ fn prepare_recording(
     recording::check_destination(&dir, reserve)?;
     // Audit R11: an audio-only stream never records with a
     // video preset, whatever entry point asked.
-    let format = &remap_format_for_media(persist, channel, format);
+    let format = &remap_format_for_media(persist, cache, channel, format);
     let format = format.as_str();
     let stamp = chrono::Local::now().format("%Y-%m-%d %H-%M-%S").to_string();
     let in_use = recordings.borrow().in_use_paths();
@@ -3134,6 +3553,7 @@ fn start_recording(
     recordings: &Rc<RefCell<RecordingEngine>>,
     buffers: &Rc<RefCell<buffer::BufferRegistry>>,
     persist: &Persist,
+    cache: &iptv_core::media_type::MediaTypeCache,
     key: &str,
     channel: &Channel,
     format: &str,
@@ -3145,6 +3565,7 @@ fn start_recording(
         recordings,
         buffers,
         persist,
+        cache,
         key,
         channel,
         format,
@@ -3176,12 +3597,13 @@ fn start_shared_recording(
     key: &str,
     channel: &Channel,
 ) -> Result<(PathBuf, std::sync::Arc<relay::RecordingRelay>), String> {
-    let format = recording_format_for_channel(&wiring.persist, channel);
+    let format = recording_format_for_channel(&wiring.persist, &wiring.media_probe.cache, channel);
     let witness = player_audio_witness(&wiring.player, channel);
     let (out, cmd) = prepare_recording(
         &wiring.recordings,
         &wiring.buffers,
         &wiring.persist,
+        &wiring.media_probe.cache,
         key,
         channel,
         &format,
@@ -3381,10 +3803,14 @@ fn record_dvr_channel(
         );
         return;
     }
+    // N16: the scheduled session preempts classification
+    // probes like a manual one.
+    terminate_media_probes(&wiring.media_probe);
     match start_recording(
         &wiring.recordings,
         &wiring.buffers,
         &wiring.persist,
+        &wiring.media_probe.cache,
         &format!("dvr:{}", job.id),
         channel,
         &job.format.clone(),
@@ -4260,7 +4686,7 @@ fn ensure_vod_ui(wiring: &Wiring) -> VodUi {
             match item.kind {
                 VodKind::Movie => {
                     if let Some(channel) = &item.channel {
-                        play_channel(&player, &persist, channel, status);
+                        play_channel(&player, &persist, &wiring.media_probe, channel, status);
                     }
                 }
                 VodKind::Series => {
@@ -4810,6 +5236,10 @@ fn clone_wiring(wiring: &Wiring) -> Wiring {
         series_last_scan: Rc::clone(&wiring.series_last_scan),
         account_text: Rc::clone(&wiring.account_text),
         buffers: Rc::clone(&wiring.buffers),
+        media_probe: wiring.media_probe.clone(),
+        media_probe_pending: Rc::clone(&wiring.media_probe_pending),
+        media_probe_token: Rc::clone(&wiring.media_probe_token),
+        format_menu_state: Rc::clone(&wiring.format_menu_state),
     }
 }
 
@@ -5022,6 +5452,105 @@ pub const REC_OPEN_FOLDER: i32 = 5221;
 pub const REC_SET_FOLDER: i32 = 5222;
 pub const REC_SHUTDOWN_AFTER: i32 = 5223;
 pub const REC_PROBLEM_TIMES: i32 = 5224;
+pub const REC_FORMAT_CHECKING: i32 = 5225;
+
+/// The Recording Format submenu inside the Recordings menu
+/// (found by its label, the same fetch-by-parent pattern the
+/// player menu refreshes use).
+fn format_submenu(recordings_menu: &Menu) -> Option<Menu> {
+    for pos in 0..recordings_menu.get_item_count() {
+        let item = recordings_menu.find_item_by_position(pos)?;
+        if item.get_label().replace('&', "").contains("Format") {
+            if let Some(sub) = item.get_sub_menu() {
+                return Some(sub);
+            }
+        }
+    }
+    None
+}
+
+/// Refill the Recording Format submenu for the selected
+/// channel (N16, Python `_fill_recording_format_menu`): an
+/// audio-only channel offers the audio presets only, so a
+/// radio recording can never silently land in a video
+/// container; the checked item is the channel's effective
+/// format; while a probe is still classifying an unknown
+/// channel, a disabled "Checking stream type…" item says so
+/// instead of guessing.
+fn refill_recording_format_menu(wiring: &Wiring, recordings_menu: &Menu, list: ListCtrl) {
+    let channel = selected_channel(wiring, list);
+    let (media, current) = match &channel {
+        Some(channel) => {
+            let (media, _) = classify_channel_media(&wiring.media_probe.cache, channel);
+            let current =
+                recording_format_for_channel(&wiring.persist, &wiring.media_probe.cache, channel);
+            (media, current)
+        }
+        None => (
+            iptv_core::media_type::MEDIA_UNKNOWN.to_string(),
+            wiring.persist.config.borrow().string_or(
+                "recording_format_video",
+                recording::DEFAULT_RECORDING_FORMAT,
+            ),
+        ),
+    };
+    let checking = media == iptv_core::media_type::MEDIA_UNKNOWN
+        && channel.as_ref().is_some_and(|channel| {
+            wiring
+                .media_probe
+                .in_flight(&iptv_core::media_type::channel_record_key(channel))
+        });
+    // MENU_OPEN fires for every menu, the Format submenu
+    // included: while nothing the submenu shows has changed,
+    // the refill is a no-op.
+    let state_key = format!(
+        "{}|{}|{}|{}",
+        channel.as_ref().map_or("", |c| c.url.as_str()),
+        media,
+        current,
+        checking
+    );
+    if *wiring.format_menu_state.borrow() == state_key {
+        return;
+    }
+    let Some(menu) = format_submenu(recordings_menu) else {
+        return;
+    };
+    *wiring.format_menu_state.borrow_mut() = state_key;
+    while menu.get_item_count() > 0 {
+        let Some(item) = menu.find_item_by_position(0) else {
+            break;
+        };
+        menu_delete_if_present(&menu, item.get_item_id());
+    }
+    for key in iptv_core::media_type::formats_for_media(&media) {
+        let Some(index) = iptv_core::recording::RECORDING_FORMATS
+            .iter()
+            .position(|entry| entry.0 == key)
+        else {
+            continue;
+        };
+        let id = REC_FORMAT_BASE + i32::try_from(index).unwrap_or(0);
+        menu_add(
+            &menu,
+            id,
+            iptv_core::recording::RECORDING_FORMATS[index].1,
+            "",
+            ItemKind::Radio,
+        );
+        menu.check_item(id, key == current);
+    }
+    if checking {
+        menu_add(
+            &menu,
+            REC_FORMAT_CHECKING,
+            "Checking stream type…",
+            "",
+            ItemKind::Normal,
+        );
+        menu.enable_item(REC_FORMAT_CHECKING, false);
+    }
+}
 
 /// The "Media Player to Use" radio labels, in Python's order.
 const PLAYER_LABELS: [&str; 32] = [
@@ -5113,6 +5642,21 @@ fn build_menu(frame: Frame, wiring: &Wiring, controls: Controls) {
         .append(help_menu, "&Help")
         .build();
     frame.set_menu_bar(menu_bar);
+    // N16: refill the Recording Format submenu whenever a
+    // menu opens, so it always reflects the selected channel's
+    // media type before keyboard focus can enter it (Python
+    // binds EVT_MENU_OPEN on the Recordings menu; the refill
+    // is a no-op while the state it shows is unchanged).
+    let wiring_open = clone_wiring(wiring);
+    let list_open = controls.list;
+    frame.bind_internal(EventType::MENU_OPEN, move |event| {
+        if let Some(bar) = frame.get_menu_bar() {
+            if let Some(recordings_menu) = bar.get_menu(4) {
+                refill_recording_format_menu(&wiring_open, &recordings_menu, list_open);
+            }
+        }
+        event.skip(true);
+    });
     bind_menu_actions(frame, wiring, controls);
 }
 
@@ -6316,7 +6860,13 @@ fn bind_menu_actions(frame: Frame, wiring: &Wiring, controls: Controls) {
                 match recent.get(1) {
                     Some(channel) => {
                         let channel = channel.clone();
-                        play_channel(&wiring.player, persist, &channel, status);
+                        play_channel(
+                            &wiring.player,
+                            persist,
+                            &wiring.media_probe,
+                            &channel,
+                            status,
+                        );
                     }
                     None => status.set_label("No previous channel is available."),
                 }
@@ -6342,9 +6892,11 @@ fn menu_recordings_action(
         REC_START => {
             if let Some(channel) = selected_channel(wiring, list) {
                 toggle_recording(
+                    &frame,
                     &wiring.recordings,
                     &wiring.buffers,
                     &wiring.persist,
+                    &wiring.media_probe,
                     &channel,
                     status,
                     Some(&wiring.player),
@@ -6459,10 +7011,17 @@ fn menu_recordings_action(
                 wiring
                     .persist
                     .set_and_save("recording_format", serde_json::json!(format_id));
-                // R11: the menu choice also updates the per-media preset
-                // of its own kind, so radio and TV keep separate formats
-                // like Python's presets.
-                let key = if recording::format_kind(format_id) == "audio" {
+                // N16: the choice lands on the preference for
+                // the kind of channel it was made on (Python
+                // `_set_recording_format`): MP3 picked on a TV
+                // channel records TV soundtracks as MP3, and
+                // picking it on a radio channel must not leave
+                // TV recordings in MP3.
+                let audio = selected_channel(wiring, list).is_some_and(|channel| {
+                    classify_channel_media(&wiring.media_probe.cache, &channel).0
+                        == iptv_core::media_type::MEDIA_AUDIO
+                });
+                let key = if audio {
                     "recording_format_audio"
                 } else {
                     "recording_format_video"
@@ -7343,7 +7902,7 @@ fn add_dvr_job(
     status: Status,
     repeat: &str,
 ) {
-    let format = recording_format_for_channel(&wiring.persist, channel);
+    let format = recording_format_for_channel(&wiring.persist, &wiring.media_probe.cache, channel);
     let spec = iptv_core::dvr::NewJob {
         channel,
         programme_title: &programme.title,
@@ -7474,9 +8033,11 @@ fn bind_context_menu(frame: Frame, wiring: &Wiring, controls: Controls) {
             CTX_FAVORITE => toggle_selected_favorite(&wiring_menu, list, search, status),
             CTX_RECORD => {
                 toggle_recording(
+                    &frame,
                     &wiring_menu.recordings,
                     &wiring_menu.buffers,
                     &wiring_menu.persist,
+                    &wiring_menu.media_probe,
                     &channel,
                     status,
                     Some(&wiring_menu.player),
@@ -7554,12 +8115,24 @@ fn play_catchup_for(wiring: &Wiring, channel: &Channel, programme: &Programme, s
             iptv_core::catchup::ShowResolution::Live(_)
             | iptv_core::catchup::ShowResolution::StalkerLive,
         ) => {
-            play_channel(&wiring.player, &wiring.persist, channel, status);
+            play_channel(
+                &wiring.player,
+                &wiring.persist,
+                &wiring.media_probe,
+                channel,
+                status,
+            );
         }
         Ok(iptv_core::catchup::ShowResolution::Catchup(url)) => {
             let mut shifted = channel.clone();
             shifted.url = url;
-            play_channel(&wiring.player, &wiring.persist, &shifted, status);
+            play_channel(
+                &wiring.player,
+                &wiring.persist,
+                &wiring.media_probe,
+                &shifted,
+                status,
+            );
         }
         Ok(iptv_core::catchup::ShowResolution::StalkerCatchup {
             start_text,
@@ -7819,7 +8392,13 @@ fn activate_channel(wiring: &Wiring, list: ListCtrl, status: Status) {
         status.set_label("Resolving stream link...");
         return;
     }
-    play_channel(&wiring.player, &wiring.persist, &channel, status);
+    play_channel(
+        &wiring.player,
+        &wiring.persist,
+        &wiring.media_probe,
+        &channel,
+        status,
+    );
 }
 
 /// Moving through Channels fills the highlighted channel's info
@@ -7855,6 +8434,11 @@ fn bind_epg_highlight(
         let Some(channel) = wiring.browser.borrow().channel(index) else {
             return;
         };
+        // N16: warm the media-type cache once the selection
+        // settles, so the Recording Format menu and the
+        // recording paths know audio-only streams before they
+        // are used (Python's highlight handler).
+        schedule_media_probe(&wiring, &channel);
         stream_url.set_value(&channel.url);
         // The panel carries the full now/next context — current
         // title, times and description, then the next programme
@@ -7982,9 +8566,13 @@ fn choose_resume(player: &Rc<RefCell<PlayerState>>, position_ms: i64) -> ResumeC
 fn play_channel(
     player: &Rc<RefCell<PlayerState>>,
     persist: &Persist,
+    media: &MediaProbe,
     channel: &Channel,
     status: Status,
 ) {
+    // N16: playback preempts any classification probe
+    // (Python `_terminate_media_probe` at the play entry).
+    terminate_media_probes(media);
     {
         // A new play replaces any play waiting on libVLC, and may
         // retry a libVLC that failed to load earlier.
@@ -8788,6 +9376,10 @@ struct PlayerShared {
     /// own topic without the full wiring (S10).
     guide_ui: Rc<RefCell<Option<GuideUi>>>,
     i18n: Rc<RefCell<I18n>>,
+    /// N16: media-type classification, shared with the main
+    /// window's wiring so the player's record action classifies
+    /// and preempts probes the same way.
+    media_probe: MediaProbe,
 }
 
 /// Build the built-in player window once: video surface, seek and
@@ -9196,9 +9788,11 @@ fn dispatch_player_menu(
             let state = player.borrow();
             if let (Some(shared), Some(channel)) = (&state.shared, &state.current_channel) {
                 toggle_recording(
+                    &win.frame,
                     &shared.recordings,
                     &shared.buffers,
                     persist,
+                    &shared.media_probe,
                     channel,
                     status,
                     Some(player),
@@ -9843,13 +10437,17 @@ fn wire_player_events(
     let record_persist = persist.clone();
     buttons.record.on_click(move |_| {
         let state = record_player.borrow();
-        let (Some(shared), Some(channel)) = (&state.shared, &state.current_channel) else {
+        let (Some(shared), Some(channel), Some(win)) =
+            (&state.shared, &state.current_channel, &state.window)
+        else {
             return;
         };
         toggle_recording(
+            &win.frame,
             &shared.recordings,
             &shared.buffers,
             &record_persist,
+            &shared.media_probe,
             channel,
             status,
             Some(&record_player),
@@ -11185,11 +11783,15 @@ fn dispatch_player_key(
         "stop" | "exit" => player_stop(player, persist, status),
         "record" => {
             let state = player.borrow();
-            if let (Some(shared), Some(channel)) = (&state.shared, &state.current_channel) {
+            if let (Some(shared), Some(channel), Some(win)) =
+                (&state.shared, &state.current_channel, &state.window)
+            {
                 toggle_recording(
+                    &win.frame,
                     &shared.recordings,
                     &shared.buffers,
                     persist,
+                    &shared.media_probe,
                     channel,
                     status,
                     Some(player),
@@ -13331,7 +13933,13 @@ fn wire_whats_on_buttons(
             .get(usize::try_from(index).unwrap_or(usize::MAX))
             .copied();
         if let Some((channel, _)) = row_index.and_then(|i| rows_p.borrow().get(i).cloned()) {
-            play_channel(&wiring_p.player, &wiring_p.persist, &channel, status);
+            play_channel(
+                &wiring_p.player,
+                &wiring_p.persist,
+                &wiring_p.media_probe,
+                &channel,
+                status,
+            );
             frame.hide();
         }
     });
@@ -13643,7 +14251,13 @@ fn wire_continue_watching(
             .and_then(|row| row.channel.clone());
         match channel {
             Some(channel) => {
-                play_channel(&wiring_p.player, &wiring_p.persist, &channel, status);
+                play_channel(
+                    &wiring_p.player,
+                    &wiring_p.persist,
+                    &wiring_p.media_probe,
+                    &channel,
+                    status,
+                );
                 frame.hide();
             }
             None => dstatus.set_label("Unavailable or ambiguous"),
@@ -13757,7 +14371,13 @@ fn open_recent_channels(wiring: &Wiring, status: Status) {
             .borrow()
             .get(usize::try_from(index).unwrap_or(usize::MAX))
         {
-            play_channel(&wiring_p.player, &wiring_p.persist, channel, status);
+            play_channel(
+                &wiring_p.player,
+                &wiring_p.persist,
+                &wiring_p.media_probe,
+                channel,
+                status,
+            );
             frame.hide();
         }
     });
@@ -14531,6 +15151,9 @@ fn begin_catchup_download(
         status.set_label(&error);
         return;
     }
+    // N16: a download session preempts classification probes
+    // like a playback or recording session.
+    terminate_media_probes(&wiring.media_probe);
     // Audit R03: refuse a duplicate active capture of the same
     // programme instead of overwriting its output.
     let key = catchup_download_key(channel, programme);
@@ -14572,7 +15195,7 @@ fn begin_catchup_download(
     // Naming (R03): title - channel, stamped with the airtime
     // to the minute, collision-free against disk and in-flight
     // work. The extension follows the recording preset (R04).
-    let format = recording_format_for_channel(&wiring.persist, channel);
+    let format = recording_format_for_channel(&wiring.persist, &wiring.media_probe.cache, channel);
     let extension = recording::format_extension(&format);
     let display_name = format!("{} - {}", programme.title, channel.name);
     let stamp = chrono::TimeZone::timestamp_opt(&chrono::Local, programme.start, 0)
@@ -14664,7 +15287,8 @@ fn launch_staged_capture(
     key: &str,
     mut staged: StagedDownload,
 ) -> Result<(), String> {
-    let format = recording_format_for_channel(&wiring.persist, &staged.channel);
+    let format =
+        recording_format_for_channel(&wiring.persist, &wiring.media_probe.cache, &staged.channel);
     let extension = recording::format_extension(&format);
     let part = iptv_core::downloads::part_path(&staged.final_path);
     let (padded_start, padded_stop) = padded_window(wiring, &staged.programme);
@@ -15456,9 +16080,11 @@ fn dispatch_main_hotkey(
         Some("record") => {
             if let Some(channel) = selected_channel(wiring, controls.list) {
                 toggle_recording(
+                    &controls.list,
                     &wiring.recordings,
                     &wiring.buffers,
                     &wiring.persist,
+                    &wiring.media_probe,
                     &channel,
                     status,
                     Some(&wiring.player),
