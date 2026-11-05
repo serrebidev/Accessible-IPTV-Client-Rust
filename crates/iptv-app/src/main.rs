@@ -416,6 +416,53 @@ fn player_status(status: Status, persist: &Persist, message: &str, priority: i64
     }
 }
 
+/// The player status line (audit N23; Python's
+/// `_update_status_label`): rebuild the line from the state's
+/// parts and set it silently; when a prefix is given it
+/// becomes the line's remembered head and the WHOLE line is
+/// spoken while the announcement level allows the priority
+/// (that is how Python speaks a track change). A None prefix
+/// only refreshes the line, the way a volume change does.
+fn update_player_status(
+    player: &Rc<RefCell<PlayerState>>,
+    persist: &Persist,
+    status: Status,
+    prefix: Option<&str>,
+    priority: i64,
+) {
+    let line = {
+        let mut state = player.borrow_mut();
+        if let Some(prefix) = prefix {
+            state.status_prefix = prefix.to_string();
+        }
+        let volume = state
+            .window
+            .as_ref()
+            .map_or(0, |win| win.volume.get_value());
+        iptv_core::playback::player_status_line(
+            &state.status_prefix,
+            state.status_buffer_seconds,
+            state.status_bitrate_mbps,
+            volume,
+            &state.audio_track_label,
+        )
+    };
+    let line = &tr(&line);
+    status.set_silent(line);
+    if prefix.is_some() && !line.is_empty() {
+        let level = persist
+            .config
+            .borrow()
+            .value("announcement_level")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(2)
+            .clamp(0, 3);
+        if level >= priority {
+            live_region::announce_with_priority(status.label, line, live_region::Priority::Medium);
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct Controls {
     scope_choice: Choice,
@@ -681,6 +728,13 @@ struct PlayerState {
     player_timers: Vec<Rc<Timer<Frame>>>,
     shared: Option<PlayerShared>,
     desired_track: Option<String>,
+    /// N23: the player status line's parts (Python's
+    /// `_last_status_prefix`, `_last_buffer_seconds`,
+    /// `_last_bitrate_mbps`, `_audio_track_label`).
+    status_prefix: String,
+    status_buffer_seconds: f64,
+    status_bitrate_mbps: Option<f64>,
+    audio_track_label: String,
     track_menu_ids: Vec<i32>,
     sleep_deadline: Option<i64>,
     sleep_fade_secs: i64,
@@ -771,6 +825,10 @@ impl Default for PlayerState {
             vlc_track_ids: Vec::new(),
             shared: None,
             desired_track: None,
+            status_prefix: String::new(),
+            status_buffer_seconds: 0.0,
+            status_bitrate_mbps: None,
+            audio_track_label: String::new(),
             track_menu_ids: Vec::new(),
             sleep_deadline: None,
             sleep_fade_secs: 5,
@@ -9238,6 +9296,12 @@ fn play_builtin(
         state.video_visible,
     );
     state.track_attempts = 0;
+    // N23: the status line starts fresh for a new channel —
+    // no remembered prefix or track, and the bitrate hint is
+    // read from this stream's URL.
+    state.status_prefix.clear();
+    state.audio_track_label.clear();
+    state.status_bitrate_mbps = iptv_core::playback::bitrate_hint_from_url(&request.url);
     state.selected_spu = -2;
     state.file_subtitle_track = None;
     state.spu_ids.clear();
@@ -9390,15 +9454,21 @@ fn store_session_action(
 ) {
     match action {
         EngineAction::Reconnect(request, delay) => {
-            let mut state = player.borrow_mut();
-            // A failure recovery grows the cache base by one
-            // second for the retry (P01; Dispatcharr live and
-            // the rollover path never grow).
-            let live = request.live;
-            let dispatcharr = state.dispatcharr;
-            state.cache_plan.grow(dispatcharr, live);
-            state.reconnect_rollover = false;
-            state.pending_reconnect = Some((state.session.generation(), now_ms() + delay, request));
+            {
+                let mut state = player.borrow_mut();
+                // A failure recovery grows the cache base by one
+                // second for the retry (P01; Dispatcharr live and
+                // the rollover path never grow).
+                let live = request.live;
+                let dispatcharr = state.dispatcharr;
+                state.cache_plan.grow(dispatcharr, live);
+                state.reconnect_rollover = false;
+                state.pending_reconnect =
+                    Some((state.session.generation(), now_ms() + delay, request));
+            }
+            // N23: Python names every recovery attempt on the
+            // status line at priority 2.
+            update_player_status(player, persist, status, Some("Reconnecting..."), 2);
         }
         EngineAction::Rollover(request, delay) => {
             let mut state = player.borrow_mut();
@@ -9433,14 +9503,20 @@ fn settle_session(player: &Rc<RefCell<PlayerState>>, persist: &Persist, status: 
         queue_vlc_stop(player);
     }
     if let Some(report) = lost_report {
-        player_status(status, persist, "Stream lost", 1);
-        // Python shows the long form in its Stream Lost dialog.
+        // N23: Python's give-up — "Stream lost" on the status
+        // line at priority 1, and the long form in a queued
+        // Stream Lost warning box (it must not open inside
+        // another modal, N18).
+        update_player_status(player, persist, status, Some("Stream lost"), 1);
         let frame = player.borrow().window.as_ref().map(|win| win.frame);
         if let Some(frame) = frame {
-            let _ = MessageDialog::builder(&frame, &report, "Stream Lost")
-                .with_style(MessageDialogStyle::OK)
-                .build()
-                .show_modal_tracked();
+            show_or_queue_notification(
+                frame,
+                &report,
+                &tr("Stream Lost"),
+                MessageDialogStyle::OK | MessageDialogStyle::IconWarning,
+                None,
+            );
         }
     }
 }
@@ -9454,6 +9530,7 @@ fn engine_load(player: &Rc<RefCell<PlayerState>>, request: &PlaybackRequest) -> 
         let options = vlc_media_options(&player.borrow(), request.live, true, request.resume_ms);
         // Queued on the ops worker (P18); a refused load comes
         // back through deliver_vlc_load as a session error.
+        let cache_ms = options.cache_ms;
         let queued = queue_vlc_load(player, request, options, true);
         if queued {
             let mut state = player.borrow_mut();
@@ -9462,10 +9539,18 @@ fn engine_load(player: &Rc<RefCell<PlayerState>>, request: &PlaybackRequest) -> 
             state.track_attempts = 0;
             state.play_started_ms = now_ms();
             state.watchdog.reset();
+            // N23: the status line's buffer figure is the
+            // cache this load actually carries.
+            state.status_buffer_seconds = f64::from(cache_ms) / 1000.0;
         }
         queued
     } else {
-        let state = player.borrow_mut();
+        let mut state = player.borrow_mut();
+        state.status_buffer_seconds = f64::from(state.cache_plan.cache_ms(
+            request.live,
+            true,
+            state.reconnect_rollover,
+        )) / 1000.0;
         match &state.window {
             Some(win) => {
                 win.media.load_uri(&request.url);
@@ -10341,30 +10426,37 @@ fn choose_audio_track(
         .and_then(|win| win.tracks.get_string_selection())
         .unwrap_or_default();
     state.desired_track = Some(label.clone());
+    let mut refused = false;
     if state.vlc_active {
         if let Some(id) = state.vlc_track_ids.get(index as usize).copied() {
             if let Some(engine) = &mut state.vlc {
-                engine.set_audio_track(id);
+                refused = !engine.set_audio_track(id);
             }
         }
     }
+    if refused {
+        // Python's failed set reports and keeps the old
+        // track (audit N23).
+        drop(state);
+        update_player_status(player, persist, status, Some("Audio track unavailable"), 1);
+        return;
+    }
+    state.audio_track_label.clone_from(&label);
     let key = state.audio_key.clone();
     drop(state);
     if !key.is_empty() && !label.is_empty() {
         persist.save_audio_choice(&key, &label, i64::from(index));
     }
-    player_status(
-        status,
-        persist,
-        &format!("Audio track preference: {label}"),
-        2,
-    );
+    // N23: Python names the track on the status line at
+    // priority 2, which speaks the line (the old "Audio track
+    // preference:" wording was a Rust-only invention).
+    update_player_status(player, persist, status, Some(&format!("Audio: {label}")), 2);
 }
 
 /// Cycle to the next audio track (the player `A` key, P13):
 /// wraps through the published choice entries.
 fn cycle_audio_track(player: &Rc<RefCell<PlayerState>>, persist: &Persist, status: Status) {
-    let (count, current) = {
+    let (count, current, current_name) = {
         let state = player.borrow();
         let Some(win) = &state.window else {
             return;
@@ -10372,10 +10464,29 @@ fn cycle_audio_track(player: &Rc<RefCell<PlayerState>>, persist: &Persist, statu
         (
             state.vlc_track_ids.len(),
             win.tracks.get_selection().unwrap_or(0),
+            win.tracks.get_string_selection().unwrap_or_default(),
         )
     };
     if count == 0 {
-        status.set_label("No audio tracks available.");
+        // Python names these on the status line at the
+        // default priority (audit N23).
+        update_player_status(
+            player,
+            persist,
+            status,
+            Some("No audio tracks available"),
+            3,
+        );
+        return;
+    }
+    if count == 1 {
+        update_player_status(
+            player,
+            persist,
+            status,
+            Some(&format!("Audio: {current_name}")),
+            3,
+        );
         return;
     }
     let next = (current + 1) % u32::try_from(count).unwrap_or(1);
@@ -10723,12 +10834,62 @@ fn wire_player_events(
 }
 
 /// Seek/volume slider, track choice and player shortcut bindings.
+/// One mouse-wheel notch on the player (audit N23; Python's
+/// `_on_mouse_wheel`): 2% per notch, status line refreshed
+/// silently like a key-driven volume change.
+fn wheel_volume(
+    player: &Rc<RefCell<PlayerState>>,
+    persist: &Persist,
+    status: Status,
+    rotation: i32,
+) {
+    if rotation == 0 {
+        return;
+    }
+    let delta = if rotation > 0 { 2 } else { -2 };
+    let value = {
+        let state = player.borrow();
+        state
+            .window
+            .as_ref()
+            .map_or(0, |win| win.volume.get_value())
+            + delta
+    }
+    .clamp(0, 100);
+    player_set_volume(player, value);
+    update_player_status(player, persist, status, None, 3);
+}
+
 fn bind_player_controls(
     player: &Rc<RefCell<PlayerState>>,
     persist: &Persist,
     status: Status,
     win: &PlayerWindow,
 ) {
+    // N23: the wheel drives volume over the video surface
+    // and the controls panel (Python binds both panels).
+    let wheel_player = Rc::clone(player);
+    let wheel_persist = persist.clone();
+    win.media
+        .bind_internal(EventType::MOUSEWHEEL, move |event| {
+            wheel_volume(
+                &wheel_player,
+                &wheel_persist,
+                status,
+                event.get_wheel_rotation(),
+            );
+        });
+    let wheel_player = Rc::clone(player);
+    let wheel_persist = persist.clone();
+    win.controls_panel
+        .bind_internal(EventType::MOUSEWHEEL, move |event| {
+            wheel_volume(
+                &wheel_player,
+                &wheel_persist,
+                status,
+                event.get_wheel_rotation(),
+            );
+        });
     let seek_handle = win.seek;
     let seek_player = Rc::clone(player);
     seek_handle.bind_internal(EventType::SLIDER, move |_| {
@@ -11768,6 +11929,12 @@ fn apply_vlc_tracks(player: &Rc<RefCell<PlayerState>>, persist: &Persist) {
             if let Some(engine) = &mut state.vlc {
                 engine.set_audio_track(id);
             }
+            // N23: the applied track is the status line's
+            // Audio segment (Python sets its label when the
+            // wanted track lands).
+            if let Some((_, name)) = tracks.iter().find(|(track_id, _)| *track_id == id) {
+                state.audio_track_label.clone_from(name);
+            }
             if let Some(position) = state.vlc_track_ids.iter().position(|track| *track == id) {
                 win.tracks
                     .set_selection(u32::try_from(position).unwrap_or(0));
@@ -11989,7 +12156,10 @@ fn dispatch_player_key(
             let delta = if action == "volume_up" { step } else { -step };
             let value = (win.volume.get_value() + delta).clamp(0, 100);
             player_set_volume(player, value);
-            status.set_silent(&format!("Volume {value} percent."));
+            // N23: Python's volume change only refreshes the
+            // status line (its Vol segment) — no prefix, no
+            // speech.
+            update_player_status(player, persist, status, None, 3);
         }
         "audio_track" => cycle_audio_track(player, persist, status),
         "subtitles" => cycle_subtitle_track(player, persist, status),
@@ -12170,6 +12340,34 @@ fn prompt_subtitle_file(
         if !attached {
             player_status(status, persist, "Could not load subtitle file.", 1);
             return;
+        }
+        // N23: Python names the loaded file on the status
+        // line at priority 2, and — when the file's suffix is
+        // not a speakable text format and subtitle speech is
+        // on — says so at priority 1.
+        let name = std::path::Path::new(&path)
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        update_player_status(
+            player,
+            persist,
+            status,
+            Some(&format!("Subtitle file loaded: {name}")),
+            2,
+        );
+        let speakable = std::path::Path::new(&path)
+            .extension()
+            .map(|ext| ext.to_string_lossy().to_lowercase())
+            .is_some_and(|ext| matches!(ext.as_str(), "srt" | "vtt" | "ass" | "ssa"));
+        if !speakable && persist.config.borrow().bool_or("speak_subtitles", false) {
+            update_player_status(
+                player,
+                persist,
+                status,
+                Some("Subtitle speech needs a supported text subtitle file."),
+                1,
+            );
         }
     }
     let generation = {

@@ -1312,6 +1312,101 @@ impl ResumeGuard {
     }
 }
 
+/// Percent-decode a query component (Python's `parse_qsl`
+/// decoding): `+` is a space, invalid escapes stay literal.
+fn query_unquote(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' if i + 2 < bytes.len()
+                && bytes[i + 1].is_ascii_hexdigit()
+                && bytes[i + 2].is_ascii_hexdigit() =>
+            {
+                let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or("00");
+                out.push(u8::from_str_radix(hex, 16).unwrap_or(0));
+                i += 3;
+            }
+            byte => {
+                out.push(byte);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// A bitrate estimate (Mbps) from the stream URL's query
+/// hints only — no network (Python's
+/// `_extract_bitrate_from_query`): the first `bitrate` or
+/// `bandwidth` parameter wins, scaled by magnitude (raw
+/// bits/s above 10,000, kbit/s above 500, Mbps as-is).
+#[must_use]
+pub fn bitrate_hint_from_url(url: &str) -> Option<f64> {
+    let query = url.split_once('?')?.1.split('#').next().unwrap_or("");
+    if query.is_empty() {
+        return None;
+    }
+    for part in query.split('&') {
+        let (key, value) = part.split_once('=').unwrap_or((part, ""));
+        let key = query_unquote(key).to_lowercase();
+        if !key.contains("bitrate") && !key.contains("bandwidth") {
+            continue;
+        }
+        let Ok(numeric) = query_unquote(value).trim().parse::<f64>() else {
+            continue;
+        };
+        if numeric > 10_000.0 {
+            return Some(numeric / 1_000_000.0);
+        }
+        if numeric > 500.0 {
+            return Some(numeric / 1_000.0);
+        }
+        if numeric > 0.0 {
+            return Some(numeric);
+        }
+    }
+    None
+}
+
+/// The player status line (Python's `_update_status_label`
+/// format, audit N23): `{prefix} {buffer:.1}s buffer`
+/// plus ` | ~{mbps:.1} Mbps` when a bitrate is known, the
+/// always-present ` | Vol {volume}%`, and ` | Audio: {track}`
+/// when a track label is known. The whole line is stripped,
+/// like Python's.
+#[must_use]
+pub fn player_status_line(
+    prefix: &str,
+    buffer_seconds: f64,
+    bitrate_mbps: Option<f64>,
+    volume: i32,
+    audio_track: &str,
+) -> String {
+    use std::fmt::Write as _;
+    let mut line = String::new();
+    if !prefix.is_empty() {
+        line.push_str(prefix);
+        line.push(' ');
+    }
+    let _ = write!(line, "{buffer_seconds:.1}s buffer");
+    if let Some(mbps) = bitrate_mbps {
+        if mbps != 0.0 {
+            let _ = write!(line, " | ~{mbps:.1} Mbps");
+        }
+    }
+    let _ = write!(line, " | Vol {volume}%");
+    if !audio_track.is_empty() {
+        let _ = write!(line, " | Audio: {audio_track}");
+    }
+    line.trim().to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1819,5 +1914,45 @@ mod tests {
         });
         assert_eq!(cache.initial_ms, 500);
         assert_eq!(cache.target_ms, 25_000);
+    }
+
+    #[test]
+    fn bitrate_hint_scales_by_magnitude() {
+        assert_eq!(
+            bitrate_hint_from_url("http://h/s?bitrate=8000000"),
+            Some(8.0)
+        );
+        assert_eq!(
+            bitrate_hint_from_url("http://h/s?bandwidth=2500"),
+            Some(2.5)
+        );
+        assert_eq!(bitrate_hint_from_url("http://h/s?bitrate=12"), Some(12.0));
+        // The first matching key wins; junk values are skipped.
+        assert_eq!(
+            bitrate_hint_from_url("http://h/s?bitrate=abc&bandwidth=4000000"),
+            Some(4.0)
+        );
+        assert_eq!(bitrate_hint_from_url("http://h/s?token=9"), None);
+        assert_eq!(bitrate_hint_from_url("http://h/s"), None);
+        assert_eq!(bitrate_hint_from_url("http://h/s?bitrate=0"), None);
+    }
+
+    #[test]
+    fn status_line_matches_python_format() {
+        assert_eq!(
+            player_status_line("Audio: English", 25.0, Some(8.0), 40, "English"),
+            "Audio: English 25.0s buffer | ~8.0 Mbps | Vol 40% | Audio: English"
+        );
+        // No prefix, no bitrate, no track: buffer and Vol only.
+        assert_eq!(
+            player_status_line("", 0.5, None, 100, ""),
+            "0.5s buffer | Vol 100%"
+        );
+        // A zero bitrate omits the segment, like Python's
+        // truthiness check.
+        assert_eq!(
+            player_status_line("Reconnecting...", 25.0, Some(0.0), 40, ""),
+            "Reconnecting... 25.0s buffer | Vol 40%"
+        );
     }
 }
