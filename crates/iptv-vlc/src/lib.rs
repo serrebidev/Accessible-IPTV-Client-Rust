@@ -263,6 +263,11 @@ impl MediaOptions {
     }
 }
 
+/// Python's instance flags. `--intf=dummy` keeps libVLC from
+/// looking for an interface; `--quiet` stops it logging to a
+/// stderr nobody reads.
+const INSTANCE_ARGS: [&std::ffi::CStr; 3] = [c"--quiet", c"--no-video-title-show", c"--intf=dummy"];
+
 /// A loaded libVLC instance with one media player. The
 /// handles live behind an `Arc` (P18): transport operations
 /// (load/stop) run on a serialized worker thread — Python's
@@ -315,7 +320,12 @@ impl VlcEngine {
         if let Some(dir) = bundled_plugins_dir() {
             std::env::set_var("VLC_PLUGIN_PATH", dir);
         }
-        let instance = unsafe { new_instance(0, std::ptr::null()) };
+        let argv = INSTANCE_ARGS.map(std::ffi::CStr::as_ptr);
+        let mut instance = unsafe { new_instance(3, argv.as_ptr()) };
+        if instance.is_null() {
+            // Python's fallback: a libVLC rejecting the flags still plays.
+            instance = unsafe { new_instance(0, std::ptr::null()) };
+        }
         if instance.is_null() {
             return Err("libVLC instance creation failed.".to_string());
         }
