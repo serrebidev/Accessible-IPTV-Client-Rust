@@ -1828,6 +1828,12 @@ pub enum EpgReadKind {
         from: i64,
         to: i64,
     },
+    Search {
+        query: String,
+        now: i64,
+        limit: usize,
+        model: std::sync::Arc<crate::BrowseModel>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -1843,6 +1849,14 @@ pub enum EpgReadValue {
     UsableData(bool),
     NowNext(Option<NowNext>),
     Programmes(Vec<Programme>),
+    Search(Vec<EpgSearchHit>),
+}
+
+#[derive(Clone, Debug)]
+pub struct EpgSearchHit {
+    pub display_name: String,
+    pub programme: Programme,
+    pub playlist_index: Option<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -1918,6 +1932,41 @@ impl EpgReadWorker {
                                 }
                             }
                             Ok(EpgReadValue::Programmes(Vec::new()))
+                        }
+                        EpgReadKind::Search {
+                            query,
+                            now,
+                            limit,
+                            model,
+                        } => {
+                            if !matches!(indexes.as_ref(), Some((generation, _)) if *generation == job.guide_generation)
+                            {
+                                indexes = Some((
+                                    job.guide_generation,
+                                    std::sync::Arc::new(GuideIndexes::build(&db.channels()?)),
+                                ));
+                            }
+                            let indexes = &indexes.as_ref().expect("indexes just built").1;
+                            let mut by_guide = std::collections::HashMap::new();
+                            for (index, channel) in model.channels().iter().enumerate() {
+                                if let Some(id) =
+                                    match_guide_channel(channel, indexes, Some(&indexes.known_ids))
+                                {
+                                    by_guide.entry(id).or_insert(index);
+                                }
+                            }
+                            let hits = db.channels_with_show(&query, now, limit)?;
+                            Ok(EpgReadValue::Search(
+                                hits.into_iter()
+                                    .map(|(display_name, programme)| EpgSearchHit {
+                                        playlist_index: by_guide
+                                            .get(&programme.channel_id)
+                                            .copied(),
+                                        display_name,
+                                        programme,
+                                    })
+                                    .collect(),
+                            ))
                         }
                     }
                 })();
@@ -2120,7 +2169,7 @@ mod tests {
         use crate::{
             epg::{EpgChannel, EpgGuide, Programme},
             epgstore::EpgStore,
-            Channel,
+            parse_m3u, Channel,
         };
         use std::{
             collections::HashMap,
@@ -2183,9 +2232,22 @@ mod tests {
                 to: 300,
             },
         });
+        worker.submit(EpgReadJob {
+            request_id: 3,
+            guide_generation: 0,
+            store_path: path.clone(),
+            kind: EpgReadKind::Search {
+                query: "One".into(),
+                now: 150,
+                limit: 10,
+                model: std::sync::Arc::new(parse_m3u(
+                    "#EXTM3U\n#EXTINF:-1 tvg-id=\"guide.one\",One News\nhttp://one",
+                )),
+            },
+        });
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut results = Vec::new();
-        while results.len() < 2 && Instant::now() < deadline {
+        while results.len() < 3 && Instant::now() < deadline {
             if let Some(result) = worker.try_recv() {
                 results.push(result);
             } else {
@@ -2213,6 +2275,16 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["Evening News"]
         );
+        let search = results
+            .iter()
+            .find(|result| result.request_id == 3)
+            .unwrap();
+        let EpgReadValue::Search(hits) = search.result.as_ref().unwrap() else {
+            panic!("unexpected search result: {search:?}");
+        };
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].display_name, "One News");
+        assert_eq!(hits[0].playlist_index, Some(0));
         drop(worker);
         for _ in 0..100 {
             if std::fs::remove_file(&path).is_ok() {

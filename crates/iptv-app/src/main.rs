@@ -472,6 +472,13 @@ enum PendingEpgReadUi {
         rule: iptv_core::dvr::DvrJob,
         now: f64,
     },
+    SearchRows {
+        list: ListCtrl,
+        query: String,
+        model_ptr: usize,
+        channel_matches: usize,
+        in_all_channels: bool,
+    },
 }
 
 #[derive(Clone)]
@@ -2101,6 +2108,49 @@ fn drain_epg_reads(wiring: &Wiring) {
                 PendingEpgReadUi::SeriesProgrammes { rule, now },
                 Ok(iptv_core::epg::EpgReadValue::Programmes(rows)),
             ) => apply_series_programmes(wiring, &rule, now, rows),
+            (
+                PendingEpgReadUi::SearchRows {
+                    list,
+                    query,
+                    model_ptr,
+                    channel_matches,
+                    in_all_channels,
+                },
+                Ok(iptv_core::epg::EpgReadValue::Search(hits)),
+            ) => {
+                let current = wiring.model.borrow();
+                let enabled = wiring.persist.config.borrow().bool_or("epg_enabled", true);
+                let valid = current.query() == query
+                    && current.playlist_ptr() == model_ptr
+                    && (current.category() == &Category::All) == in_all_channels
+                    && should_run_epg_search(
+                        enabled,
+                        in_all_channels,
+                        wiring.epg_pending.get(),
+                        &query,
+                        channel_matches,
+                        true,
+                    );
+                if !valid {
+                    continue;
+                }
+                let rows: Vec<EpgSearchRow> = hits
+                    .into_iter()
+                    .map(|hit| EpgSearchRow {
+                        label: epg_row_label(&hit.display_name, &hit.programme),
+                        programme: hit.programme,
+                        playlist_index: hit.playlist_index,
+                    })
+                    .collect();
+                let base = i64::try_from(current.len()).unwrap_or(0);
+                let total = base + i64::try_from(rows.len()).unwrap_or(0);
+                drop(current);
+                *wiring.epg_rows.borrow_mut() = rows;
+                list.set_item_count(total);
+                if total > base {
+                    list.refresh_items(base, total - 1);
+                }
+            }
             (PendingEpgReadUi::ChannelProgrammes { status, .. }, Err(error))
             | (PendingEpgReadUi::CatchupProgrammes { status, .. }, Err(error)) => {
                 iptv_core::applog::error("epg", &format!("Cold guide read failed: {error}"));
@@ -2338,63 +2388,34 @@ fn append_epg_rows(
     in_all_channels: bool,
 ) {
     let enabled = wiring.persist.config.borrow().bool_or("epg_enabled", true);
-    let store_available = wiring.epg_store.borrow().is_some();
     if !should_run_epg_search(
         enabled,
         in_all_channels,
         wiring.epg_pending.get(),
         query,
         channel_matches,
-        store_available,
+        true,
     ) {
         return;
     }
-    let now = now_epoch();
-    let hits = {
-        let guard = wiring.epg_store.borrow();
-        guard
-            .as_ref()
-            .and_then(|store| {
-                store
-                    .channels_with_show(query, now, SEARCH_EPG_RESULT_LIMIT)
-                    .ok()
-            })
-            .unwrap_or_default()
-    };
-    if hits.is_empty() {
-        return;
-    }
-    let Some(indexes) = guide_indexes_any(wiring) else {
-        return;
-    };
-    // Route every hit to its playlist channel in one pass over
-    // the catalogue (Python builds the same match index before
-    // appending, off its search path).
-    let mut rows: Vec<EpgSearchRow> = Vec::new();
-    wiring.browser.borrow().with_all_channels(|channels| {
-        let mut by_guide: std::collections::HashMap<String, usize> =
-            std::collections::HashMap::new();
-        for (index, channel) in channels.iter().enumerate() {
-            if let Some(id) = match_guide_channel(channel, &indexes, Some(&indexes.known_ids)) {
-                by_guide.entry(id).or_insert(index);
-            }
-        }
-        for (name, programme) in &hits {
-            rows.push(EpgSearchRow {
-                label: epg_row_label(name, programme),
-                programme: programme.clone(),
-                playlist_index: by_guide.get(&programme.channel_id).copied(),
-            });
-        }
-    });
-    if rows.is_empty() {
-        return;
-    }
-    let base = i64::try_from(wiring.model.borrow().len()).unwrap_or(0);
-    let total = base + i64::try_from(rows.len()).unwrap_or(0);
-    *wiring.epg_rows.borrow_mut() = rows;
-    list.set_item_count(total);
-    list.refresh_items(base, total - 1);
+    let model = wiring.browser.borrow().catalogue_model();
+    let model_ptr = std::sync::Arc::as_ptr(&model) as usize;
+    submit_epg_read(
+        wiring,
+        iptv_core::epg::EpgReadKind::Search {
+            query: query.to_owned(),
+            now: now_epoch(),
+            limit: SEARCH_EPG_RESULT_LIMIT,
+            model,
+        },
+        PendingEpgReadUi::SearchRows {
+            list,
+            query: query.to_owned(),
+            model_ptr,
+            channel_matches,
+            in_all_channels,
+        },
+    );
 }
 
 /// The channel behind the list's current selection, if any.
