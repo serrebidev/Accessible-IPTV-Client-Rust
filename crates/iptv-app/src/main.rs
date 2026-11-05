@@ -4,6 +4,7 @@ mod relay;
 use iptv_core::guide::Guide;
 use iptv_core::i18n::I18n;
 use iptv_core::{
+    account_info::Account,
     bookmarks::Bookmarks,
     browser::{BrowseEvent, BrowserWorker},
     cast::{CastDevice, CastEvent, CastWorker},
@@ -612,7 +613,11 @@ struct Wiring {
     relay_worker: Rc<RelayWorker>,
     /// Last series-rule scan time, seconds (audit R16).
     series_last_scan: Rc<std::cell::Cell<f64>>,
-    account_text: Rc<RefCell<Option<TextCtrl>>>,
+    /// N17: the open Account Info window's state and the
+    /// pending account discovery result.
+    account_info_ui: Rc<RefCell<Option<AccountInfoUi>>>,
+    account_discovery: Rc<RefCell<Option<AccountDiscovery>>>,
+    account_discovery_key: Rc<std::cell::Cell<usize>>,
     buffers: Rc<RefCell<buffer::BufferRegistry>>,
     /// N16: media-type classification state — the session
     /// probe cache, in-flight probes and their ffmpeg handles.
@@ -1083,7 +1088,9 @@ fn bind_browser(
         pending_shares: Rc::new(RefCell::new(std::collections::HashSet::new())),
         relay_worker: Rc::new(RelayWorker::new()),
         series_last_scan: Rc::new(std::cell::Cell::new(0.0)),
-        account_text: Rc::new(RefCell::new(None)),
+        account_info_ui: Rc::new(RefCell::new(None)),
+        account_discovery: Rc::new(RefCell::new(None)),
+        account_discovery_key: Rc::new(std::cell::Cell::new(0)),
         buffers: Rc::new(RefCell::new(buffer::BufferRegistry::default())),
         media_probe: MediaProbe::new(),
         media_probe_pending: Rc::new(RefCell::new(None)),
@@ -1403,6 +1410,7 @@ fn bind_completion(frame: Frame, wiring: &Wiring, controls: Controls) {
         poll_vod(&completed, status);
         poll_cast(&completed, status);
         poll_downloads(&completed, status);
+        poll_account_info(&completed, &frame, status);
         poll_direct_probes(&completed, status);
         poll_relay_jobs(&completed, status);
         if !completed.browser.borrow().is_busy()
@@ -2035,9 +2043,6 @@ fn poll_providers(wiring: &Wiring, controls: Controls) {
                         if !background {
                             let first = report.lines().next().unwrap_or_default().to_string();
                             status.set_label(&first);
-                            if let Some(text) = wiring.account_text.borrow().as_ref() {
-                                text.set_value(&report);
-                            }
                         }
                     }
                     Err(error) => {
@@ -2652,6 +2657,31 @@ fn channel_audio_key(channel: &Channel) -> String {
 /// in-flight set and the live ffmpeg handles let a user
 /// session preempt a probe before it steals a one-stream
 /// provider's only connection.
+/// One finished account lookup: (request token, account
+/// index, report or error) — Python's dialog token guard.
+type AccountLookupMsg = (u64, usize, Result<String, String>);
+
+/// A finished account discovery: the accounts found, or the
+/// scan's failure text.
+type AccountDiscovery =
+    std::sync::mpsc::Receiver<Result<Vec<iptv_core::account_info::Account>, String>>;
+
+/// The open Account Info window's state (audit N17, Python's
+/// `AccountInfoDialog`): accounts with their cached reports,
+/// the request token that retires stale lookups, and the
+/// channel lookup workers report on.
+struct AccountInfoUi {
+    list: ListBox,
+    details: TextCtrl,
+    status: Status,
+    refresh: Button,
+    accounts: Vec<iptv_core::account_info::Account>,
+    reports: RefCell<std::collections::HashMap<usize, String>>,
+    token: std::cell::Cell<u64>,
+    sender: std::sync::mpsc::Sender<AccountLookupMsg>,
+    receiver: RefCell<std::sync::mpsc::Receiver<AccountLookupMsg>>,
+}
+
 /// A probe's ffmpeg child handle, shared between the probe
 /// worker (owner) and any session preempting it.
 type ProbeChild = Arc<std::sync::Mutex<Option<std::process::Child>>>;
@@ -5234,7 +5264,9 @@ fn clone_wiring(wiring: &Wiring) -> Wiring {
         pending_shares: Rc::clone(&wiring.pending_shares),
         relay_worker: Rc::clone(&wiring.relay_worker),
         series_last_scan: Rc::clone(&wiring.series_last_scan),
-        account_text: Rc::clone(&wiring.account_text),
+        account_info_ui: Rc::clone(&wiring.account_info_ui),
+        account_discovery: Rc::clone(&wiring.account_discovery),
+        account_discovery_key: Rc::clone(&wiring.account_discovery_key),
         buffers: Rc::clone(&wiring.buffers),
         media_probe: wiring.media_probe.clone(),
         media_probe_pending: Rc::clone(&wiring.media_probe_pending),
@@ -15820,42 +15852,235 @@ fn cancel_selected_download(wiring: &Wiring, frame: Frame, list: ListBox, dstatu
     }
 }
 
-/// File > Account Info: pick an account and fetch its info report
-/// from the provider; the report lands in the dialog's text.
+/// File > Account Info (audit N17): discovery runs on a
+/// worker because it walks every loaded channel URL to
+/// autodetect accounts that were never added through the
+/// Xtream dialog (Python's `show_account_info`). The result
+/// is presented by `poll_account_info` only while the
+/// playlist it was discovered from is still loaded.
 fn open_account_info(wiring: &Wiring, status: Status) {
-    let (_, accounts) = configured_entries(wiring);
-    if accounts.is_empty() {
-        status.set_label("No provider accounts are configured.");
+    let sources: Vec<serde_json::Value> =
+        match wiring.persist.config.borrow().value("playlists").cloned() {
+            Some(serde_json::Value::Array(entries)) => entries,
+            Some(serde_json::Value::String(_)) => wiring
+                .persist
+                .config
+                .borrow()
+                .string_list("playlists")
+                .into_iter()
+                .map(serde_json::Value::String)
+                .collect(),
+            _ => Vec::new(),
+        };
+    let channels: Vec<Channel> = wiring
+        .browser
+        .borrow()
+        .catalogue_model()
+        .channels()
+        .to_vec();
+    wiring
+        .account_discovery_key
+        .set(wiring.model.borrow().playlist_ptr());
+    let (sender, receiver) = std::sync::mpsc::channel();
+    *wiring.account_discovery.borrow_mut() = Some(receiver);
+    status.set_label("Looking for provider accounts...");
+    std::thread::spawn(move || {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            iptv_core::account_info::discover_accounts(&sources, &channels)
+        }))
+        .map_err(|_| "the account scan failed".to_string());
+        let _ = sender.send(result);
+    });
+}
+
+/// Present a finished account discovery and drain account
+/// lookups into the open Account Info window (audit N17).
+fn poll_account_info(wiring: &Wiring, parent: &Frame, _status: Status) {
+    let discovered = wiring
+        .account_discovery
+        .borrow()
+        .as_ref()
+        .and_then(|receiver| receiver.try_recv().ok());
+    if discovered.is_some() {
+        *wiring.account_discovery.borrow_mut() = None;
+    }
+    if let Some(result) = discovered {
+        // Python drops a discovery whose playlist changed
+        // underneath it, silently.
+        if wiring.model.borrow().playlist_ptr() == wiring.account_discovery_key.get() {
+            match result {
+                Ok(accounts) if !accounts.is_empty() => {
+                    open_account_info_dialog(wiring, accounts);
+                }
+                Ok(_) => {
+                    let dialog = MessageDialog::builder(
+                        parent,
+                        "No provider accounts were found.\n\nXtream Codes and Stalker Portal accounts added in the Playlist Manager are listed here, along with any account detected from a playlist or stream URL.",
+                        "No Accounts",
+                    )
+                    .with_style(
+                        MessageDialogStyle::OK | MessageDialogStyle::IconInformation,
+                    )
+                    .build();
+                    dialog.show_modal();
+                }
+                Err(error) => {
+                    let dialog = MessageDialog::builder(
+                        parent,
+                        &format!("Could not look for provider accounts: {error}"),
+                        "Error",
+                    )
+                    .with_style(MessageDialogStyle::OK | MessageDialogStyle::IconError)
+                    .build();
+                    dialog.show_modal();
+                }
+            }
+        }
+    }
+    let messages: Vec<AccountLookupMsg> = match wiring.account_info_ui.borrow().as_ref() {
+        Some(ui) => {
+            let receiver = ui.receiver.borrow();
+            let mut drained = Vec::new();
+            while let Ok(message) = receiver.try_recv() {
+                drained.push(message);
+            }
+            drained
+        }
+        None => Vec::new(),
+    };
+    if messages.is_empty() {
         return;
     }
-    let (frame, panel, list, dstatus) = list_dialog("Account Info", "Accounts");
-    let labels: Vec<String> = accounts.iter().map(ProviderAccount::describe).collect();
-    list.set_items(&labels.iter().map(String::as_str).collect::<Vec<_>>());
-    list.set_selection(0, true);
-    let fetch = Button::builder(&panel).with_label("&Fetch Info").build();
-    let close = Button::builder(&panel).with_label("&Close").build();
-    let text_slot = Rc::clone(&wiring.account_text);
-    let accounts = Rc::new(RefCell::new(accounts));
-    let wiring_f = clone_wiring(wiring);
-    fetch.on_click(move |_| {
-        let Some(index) = list.get_selection() else {
+    if let Some(ui) = wiring.account_info_ui.borrow().as_ref() {
+        for (token, index, result) in messages {
+            match result {
+                Ok(report) => {
+                    // Python caches every finished report,
+                    // even one whose display went stale.
+                    ui.reports.borrow_mut().insert(index, report.clone());
+                    apply_account_report(ui, token, &report, true);
+                }
+                Err(error) => {
+                    // Errors are not cached: re-selecting
+                    // the account retries it.
+                    if token == ui.token.get() {
+                        apply_account_report(
+                            ui,
+                            token,
+                            &format!("Could not check this account.\n\n{error}"),
+                            false,
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Show a finished lookup in the Account Info window when it
+/// is still the current request (Python's `_apply_report`).
+fn apply_account_report(ui: &AccountInfoUi, token: u64, report: &str, ok: bool) {
+    if token != ui.token.get() {
+        return;
+    }
+    ui.details.set_value(report);
+    // Reading starts at the top, not wherever the previous
+    // report ended.
+    ui.details.set_insertion_point(0);
+    ui.status
+        .set_label(if ok { "Ready." } else { "Check failed." });
+    ui.refresh.enable(true);
+}
+
+/// Start (or reuse) the lookup for the selected account
+/// (Python's `_start_lookup`): cached reports apply at once,
+/// Refresh forces a new fetch.
+fn start_account_lookup(ui: &AccountInfoUi, force: bool) {
+    let Some(selection) = ui.list.get_selection() else {
+        return;
+    };
+    let index = usize::try_from(selection).unwrap_or(usize::MAX);
+    let Some(account) = ui.accounts.get(index).cloned() else {
+        return;
+    };
+    ui.token.set(ui.token.get() + 1);
+    let token = ui.token.get();
+    if !force {
+        let cached = ui.reports.borrow().get(&index).cloned();
+        if let Some(report) = cached {
+            apply_account_report(ui, token, &report, true);
             return;
-        };
-        let id = accounts
-            .borrow()
-            .get(usize::try_from(index).unwrap_or(usize::MAX))
-            .and_then(ProviderAccount::provider_id);
-        let Some(id) = id else {
-            dstatus.set_label("This account has no provider id.");
-            return;
-        };
-        *text_slot.borrow_mut() = Some(dstatus.details);
-        wiring_f.provider_worker.account(id);
-        wiring_f.provider_pending.set(true);
-        assert!(wiring_f.timer.start(50, false));
-        dstatus.set_label("Fetching account info...");
+        }
+    }
+    ui.details.set_value("Checking account, please wait...");
+    ui.status
+        .set_label(&format!("Checking {}...", account.label()));
+    ui.refresh.enable(false);
+    let sender = ui.sender.clone();
+    std::thread::spawn(move || {
+        let result = iptv_core::account_info::fetch_account_report(&account);
+        let _ = sender.send((token, index, result));
     });
-    close.on_click(move |_| frame.hide());
+}
+
+/// The Account Info window itself (Python's
+/// `AccountInfoDialog`): accounts list, read-only details,
+/// Refresh and Copy Details.
+fn open_account_info_dialog(wiring: &Wiring, accounts: Vec<iptv_core::account_info::Account>) {
+    let (frame, panel, list, dstatus) = list_dialog("Account Info", "Accounts");
+    let labels: Vec<String> = accounts.iter().map(Account::label).collect();
+    list.set_items(&labels.iter().map(String::as_str).collect::<Vec<_>>());
+    let refresh = Button::builder(&panel).with_label("&Refresh").build();
+    let copy = Button::builder(&panel).with_label("Copy &Details").build();
+    let close = Button::builder(&panel).with_label("&Close").build();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    *wiring.account_info_ui.borrow_mut() = Some(AccountInfoUi {
+        list,
+        details: dstatus.details,
+        status: dstatus,
+        refresh,
+        accounts,
+        reports: RefCell::new(std::collections::HashMap::new()),
+        token: std::cell::Cell::new(0),
+        sender,
+        receiver: RefCell::new(receiver),
+    });
+    let ui_slot = Rc::clone(&wiring.account_info_ui);
+    list.bind_internal(EventType::COMMAND_LISTBOX_SELECTED, move |_| {
+        if let Some(ui) = ui_slot.borrow().as_ref() {
+            start_account_lookup(ui, false);
+        }
+    });
+    let ui_slot = Rc::clone(&wiring.account_info_ui);
+    refresh.on_click(move |_| {
+        if let Some(ui) = ui_slot.borrow().as_ref() {
+            start_account_lookup(ui, true);
+        }
+    });
+    let ui_slot = Rc::clone(&wiring.account_info_ui);
+    copy.on_click(move |_| {
+        if let Some(ui) = ui_slot.borrow().as_ref() {
+            let text = ui.details.get_value();
+            if text.is_empty() {
+                return;
+            }
+            if Clipboard::get().set_text(&text) {
+                ui.status
+                    .set_label("Account details copied to the clipboard.");
+            } else {
+                ui.status.set_label("Could not open the clipboard.");
+            }
+        }
+    });
+    let ui_slot = Rc::clone(&wiring.account_info_ui);
+    close.on_click(move |_| {
+        *ui_slot.borrow_mut() = None;
+        frame.hide();
+    });
+    if let Some(ui) = wiring.account_info_ui.borrow().as_ref() {
+        list.set_selection(0, true);
+        start_account_lookup(ui, false);
+    }
     frame.show(true);
 }
 

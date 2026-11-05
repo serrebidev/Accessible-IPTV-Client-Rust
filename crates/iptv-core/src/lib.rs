@@ -12,6 +12,7 @@ pub(crate) fn hex_lower(bytes: &[u8]) -> String {
         })
 }
 
+pub mod account_info;
 pub mod applog;
 pub mod audiotracks;
 pub mod bookmarks;
