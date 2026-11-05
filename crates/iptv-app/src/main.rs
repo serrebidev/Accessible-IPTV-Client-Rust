@@ -526,6 +526,10 @@ struct Wiring {
     dvr: Rc<RefCell<DvrSchedule>>,
     recorded: Rc<std::cell::Cell<bool>>,
     shutdown_attempted: Rc<std::cell::Cell<bool>>,
+    /// An explicit Exit (menu, tray) rather than a window close:
+    /// Minimize to System Tray must not swallow it, and the
+    /// exit warnings run (audit N07, Python's `_exit_requested`).
+    exit_requested: Rc<std::cell::Cell<bool>>,
     last_dvr_tick: Rc<std::cell::Cell<f64>>,
     scope_ids: Rc<RefCell<Vec<Option<String>>>>,
     download_worker: Rc<iptv_core::downloads::DownloadWorker>,
@@ -995,6 +999,7 @@ fn bind_browser(
         dvr: Rc::new(RefCell::new(DvrSchedule::load(dvr_path, now_seconds()))),
         recorded: Rc::new(std::cell::Cell::new(false)),
         shutdown_attempted: Rc::new(std::cell::Cell::new(false)),
+        exit_requested: Rc::new(std::cell::Cell::new(false)),
         last_dvr_tick: Rc::new(std::cell::Cell::new(0.0)),
         scope_ids: Rc::new(RefCell::new(vec![None])),
         download_worker: Rc::new(iptv_core::downloads::DownloadWorker::default()),
@@ -1052,12 +1057,15 @@ fn bind_browser(
 /// The always-on housekeeping tick (1 s), independent of the main
 /// tick timer that stops when idle: answer single-instance show
 /// requests by restoring the window (S01, Python's
-/// `watch_for_show_requests`), and run the automatic update check
+/// `watch_for_show_requests`), run the automatic update check
 /// hourly while the option is enabled (S07, Python's update-check
-/// timer, whose handler likewise re-reads the option each time).
+/// timer, whose handler likewise re-reads the option each time),
+/// and reload the playlists every 3 hours (audit N08, Python's
+/// refresh timer).
 fn bind_housekeeping(frame: Frame, wiring: &Wiring) {
     let tick_wiring = clone_wiring(wiring);
     let last_check = Rc::new(std::cell::Cell::new(now_seconds()));
+    let last_playlist_refresh = Rc::new(std::cell::Cell::new(now_seconds()));
     let config_dir = iptv_core::config::user_config_dir();
     wiring.housekeeping.on_tick(move |_| {
         if iptv_core::instance::take_show_request(&config_dir) {
@@ -1075,6 +1083,14 @@ fn bind_housekeeping(frame: Frame, wiring: &Wiring) {
             {
                 check_updates(&frame, ship_shape::ui::CheckTrigger::Automatic);
             }
+        }
+        // Playlists refresh on their own every 3 hours (audit
+        // N08, Python's refresh timer): the same full load cycle
+        // a manual refresh runs, so a long-running app does not
+        // sit on a stale catalogue forever.
+        if now - last_playlist_refresh.get() >= 3.0 * 3600.0 {
+            last_playlist_refresh.set(now);
+            reload_sources(&tick_wiring);
         }
     });
     let _ = wiring.housekeeping.start(1000, false);
@@ -1094,15 +1110,55 @@ fn bind_main_close(frame: Frame, wiring: &Wiring) {
     let close_player = Rc::clone(&wiring.player);
     let close_recordings = Rc::clone(&wiring.recordings);
     let close_dvr = Rc::clone(&wiring.dvr);
+    let close_reminders = Rc::clone(&wiring.reminders);
+    let close_downloads = Rc::clone(&wiring.downloads);
+    let close_exit_requested = Rc::clone(&wiring.exit_requested);
     frame.bind_internal(EventType::CLOSE_WINDOW, move |event| {
         if close_persist
             .config
             .borrow()
             .bool_or("minimize_to_tray", false)
+            && !close_exit_requested.get()
         {
+            // A plain close with Minimize to System Tray hides
+            // the app (and everything it is doing stays alive),
+            // so it needs no warning; an explicit Exit falls
+            // through to the checks below (audit N07).
             frame.hide();
             event.veto();
             return;
+        }
+        // Warn before an exit that would lose work (audit N07):
+        // pending reminders, scheduled recordings that have not
+        // started, and a download in flight each get Python's
+        // confirmation, in Python's order; declining any of
+        // them vetoes the exit.
+        let prompts = {
+            let dvr = close_dvr.borrow();
+            #[allow(clippy::cast_possible_truncation)] // epoch seconds for reminder expiry
+            let now_i64 = now_seconds() as i64;
+            iptv_core::exit_guard::exit_prompts(
+                &close_reminders.borrow(),
+                dvr.jobs(),
+                !close_recordings.borrow().active_keys().is_empty(),
+                close_downloads.borrow().iter().any(|row| !row.done),
+                now_i64,
+            )
+        };
+        for prompt in &prompts {
+            let mut style = MessageDialogStyle::YesNo;
+            if prompt.no_default {
+                style |= MessageDialogStyle::NoDefault;
+            }
+            let answer = MessageDialog::builder(&frame, &prompt.message, prompt.title)
+                .with_style(style)
+                .build()
+                .show_modal();
+            if answer != ID_YES {
+                close_exit_requested.set(false);
+                event.veto();
+                return;
+            }
         }
         browser.borrow_mut().cancel();
         let finished = close_recordings
@@ -3927,6 +3983,7 @@ fn clone_wiring(wiring: &Wiring) -> Wiring {
         dvr: Rc::clone(&wiring.dvr),
         recorded: Rc::clone(&wiring.recorded),
         shutdown_attempted: Rc::clone(&wiring.shutdown_attempted),
+        exit_requested: Rc::clone(&wiring.exit_requested),
         last_dvr_tick: Rc::clone(&wiring.last_dvr_tick),
         scope_ids: Rc::clone(&wiring.scope_ids),
         download_worker: Rc::clone(&wiring.download_worker),
@@ -4080,6 +4137,7 @@ fn dispatch_tray_menu(wiring: &Wiring, frame: Frame, status: Status, id: i32) {
             }
         }
         TRAY_EXIT => {
+            wiring.exit_requested.set(true);
             frame.close(false);
         }
         _ => {}
@@ -5246,7 +5304,10 @@ fn bind_menu_actions(frame: Frame, wiring: &Wiring, controls: Controls) {
             return;
         }
         match id {
-            4004 => frame.close(false),
+            4004 => {
+                wiring.exit_requested.set(true);
+                frame.close(false);
+            }
             // The Help menu opens the guide at the topic of the
             // control the user is actually on (S10), not always at
             // the top of the manual.
@@ -7158,7 +7219,7 @@ fn spawn_vlc_ops() -> std::sync::mpsc::Sender<VlcOp> {
                     options,
                     reply,
                 } => {
-                    let result = engine.play_url(&url, &headers, options);
+                    let result = engine.play_url(&url, &headers, &options);
                     if let Ok(mut guard) = reply.lock() {
                         *guard = Some(result);
                     }
@@ -7259,13 +7320,26 @@ fn run_pending_play(player: &Rc<RefCell<PlayerState>>, persist: &Persist, status
 /// The media options for one load. A retry load carries the cache
 /// plan's retry value, a rollover load the quick-start value
 /// (P01/P04), and every load keeps the stream's video choice.
-fn vlc_media_options(state: &PlayerState, live: bool, retry: bool) -> iptv_vlc::MediaOptions {
+/// The system proxy and an on-demand resume position ride along
+/// the way Python passes them (audit N10).
+fn vlc_media_options(
+    state: &PlayerState,
+    live: bool,
+    retry: bool,
+    resume_ms: Option<i64>,
+) -> iptv_vlc::MediaOptions {
     iptv_vlc::MediaOptions {
         cache_ms: state
             .cache_plan
             .cache_ms(live, retry, retry && state.reconnect_rollover),
         live,
         video_visible: state.video_visible,
+        proxy: iptv_core::playback::system_http_proxy(),
+        start_time_seconds: match (live, resume_ms) {
+            #[allow(clippy::cast_precision_loss)] // ms to f64 seconds, as Python's /1000
+            (false, Some(ms)) if ms > 0 => Some(ms as f64 / 1000.0),
+            _ => None,
+        },
     }
 }
 
@@ -7465,7 +7539,7 @@ fn play_builtin(
                 0
             });
         }
-        let options = vlc_media_options(&state, load.live, false);
+        let options = vlc_media_options(&state, load.live, false, load.resume_ms);
         let has_vlc = state.vlc.is_some();
         drop(state);
         // The load runs on the ops worker (P18); its result is
@@ -7642,7 +7716,7 @@ fn settle_session(player: &Rc<RefCell<PlayerState>>, persist: &Persist, status: 
 /// the quick-start value (P01/P04).
 fn engine_load(player: &Rc<RefCell<PlayerState>>, request: &PlaybackRequest) -> bool {
     if player.borrow().engine == ActiveEngine::Vlc {
-        let options = vlc_media_options(&player.borrow(), request.live, true);
+        let options = vlc_media_options(&player.borrow(), request.live, true, request.resume_ms);
         // Queued on the ops worker (P18); a refused load comes
         // back through deliver_vlc_load as a session error.
         let queued = queue_vlc_load(player, request, options, true);
@@ -14294,11 +14368,11 @@ mod tests {
             ..PlayerState::default()
         };
         for retry in [false, true] {
-            let options = vlc_media_options(&state, true, retry);
+            let options = vlc_media_options(&state, true, retry, None);
             assert!(options.option_strings().contains(&":no-video".to_string()));
         }
         state.video_visible = true;
-        let options = vlc_media_options(&state, true, true);
+        let options = vlc_media_options(&state, true, true, None);
         assert!(!options.option_strings().contains(&":no-video".to_string()));
     }
 

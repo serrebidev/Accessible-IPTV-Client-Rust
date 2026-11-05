@@ -8,10 +8,10 @@
 //!
 //! libVLC is dlopen'd at first use so its absence never breaks
 //! startup: the caller falls back to the wx `MediaCtrl` engine.
-//! Headers map to libVLC media options where libVLC has them
-//! (`http-user-agent`, `http-referrer`); libVLC 3 has no generic
-//! header option, so other headers are the external players' job,
-//! exactly as with Python's embedded player.
+//! Headers map to libVLC media options the way Python's embedded
+//! player sends them: dedicated options for the user agent,
+//! referrer and cookie, and `:http-header=` lines for the rest
+//! (second-round audit N10).
 
 use std::ffi::{c_char, c_int, c_void, CString};
 
@@ -230,8 +230,9 @@ struct Functions {
 /// The per-load media options the core's cache plan decides
 /// (P01): one cache value applied to all four libVLC caches,
 /// plus the live/on-demand clock behaviour. Python also always
-/// asks for HTTP reconnect and the adaptive access module.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// asks for HTTP reconnect, RTSP over TCP, and the adaptive
+/// access module (audit N10).
+#[derive(Clone, Debug, PartialEq)]
 pub struct MediaOptions {
     pub cache_ms: u32,
     pub live: bool,
@@ -239,6 +240,13 @@ pub struct MediaOptions {
     /// Enter off): Python's hidden play decodes no video at all,
     /// which is most of playback's CPU cost (validation 0071).
     pub video_visible: bool,
+    /// The detected system HTTP proxy, when one is configured
+    /// (Python's `_detect_system_http_proxy`, audit N10).
+    pub proxy: Option<String>,
+    /// Resume position for an on-demand stream, as libVLC's
+    /// `:start-time` in seconds (Python passes it at load;
+    /// audit N10). Live loads leave it unset.
+    pub start_time_seconds: Option<f64>,
 }
 
 impl MediaOptions {
@@ -251,8 +259,15 @@ impl MediaOptions {
             format!(":file-caching={}", self.cache_ms),
             format!(":disc-caching={}", self.cache_ms),
             ":http-reconnect=true".to_string(),
+            ":rtsp-tcp".to_string(),
             ":adaptive-use-access=1".to_string(),
         ];
+        if let Some(proxy) = &self.proxy {
+            options.push(format!(":http-proxy={proxy}"));
+        }
+        if let Some(start) = self.start_time_seconds {
+            options.push(format!(":start-time={start:.3}"));
+        }
         if self.live {
             options.push(":clock-jitter=1500".to_string());
         } else {
@@ -272,6 +287,48 @@ impl MediaOptions {
         }
         options
     }
+}
+
+/// The media options one load's stream headers become, in
+/// Python's `_apply_stream_headers` order (audit N10): the user
+/// agent always (the stream's own, else the browser-like
+/// default), then the referrer and cookie through their
+/// dedicated options, then Origin, Authorization, Accept (the
+/// stream's own, else the default), X-Forwarded-For and Range
+/// as `:http-header=` lines, and every extra header line last.
+#[must_use]
+pub fn header_option_strings(headers: &StreamHeaders) -> Vec<String> {
+    use iptv_core::playback::{DEFAULT_PLAYER_ACCEPT, DEFAULT_PLAYER_USER_AGENT};
+    let mut options = vec![format!(
+        ":http-user-agent={}",
+        headers
+            .get("User-Agent")
+            .unwrap_or(DEFAULT_PLAYER_USER_AGENT)
+    )];
+    if let Some(value) = headers.get("Referer") {
+        options.push(format!(":http-referrer={value}"));
+    }
+    if let Some(value) = headers.get("Cookie") {
+        options.push(format!(":http-cookie={value}"));
+    }
+    for name in ["Origin", "Authorization"] {
+        if let Some(value) = headers.get(name) {
+            options.push(format!(":http-header={name}: {value}"));
+        }
+    }
+    options.push(format!(
+        ":http-header=Accept: {}",
+        headers.get("Accept").unwrap_or(DEFAULT_PLAYER_ACCEPT)
+    ));
+    for name in ["X-Forwarded-For", "Range"] {
+        if let Some(value) = headers.get(name) {
+            options.push(format!(":http-header={name}: {value}"));
+        }
+    }
+    for line in &headers.extra {
+        options.push(format!(":http-header={line}"));
+    }
+    options
 }
 
 /// Python's instance flags. `--intf=dummy` keeps libVLC from
@@ -449,7 +506,7 @@ impl VlcEngine {
         &self,
         url: &str,
         headers: &StreamHeaders,
-        options: MediaOptions,
+        options: &MediaOptions,
     ) -> Result<(), String> {
         let c_url = CString::new(url).map_err(|_| "URL contains a NUL byte.".to_string())?;
         let media =
@@ -457,14 +514,9 @@ impl VlcEngine {
         if media.is_null() {
             return Err("libVLC could not create media.".to_string());
         }
-        for (option, header) in [
-            (":http-user-agent=", "User-Agent"),
-            (":http-referrer=", "Referer"),
-        ] {
-            if let Some(value) = headers.get(header) {
-                if let Ok(option) = CString::new(format!("{option}{value}")) {
-                    unsafe { (self.inner.fns.media_add_option)(media, option.as_ptr()) };
-                }
+        for option in header_option_strings(headers) {
+            if let Ok(option) = CString::new(option) {
+                unsafe { (self.inner.fns.media_add_option)(media, option.as_ptr()) };
             }
         }
         for option in options.option_strings() {
@@ -763,6 +815,8 @@ mod tests {
             cache_ms: 500,
             live: true,
             video_visible: true,
+            proxy: None,
+            start_time_seconds: None,
         }
         .option_strings();
         for name in ["network", "live", "file", "disc"] {
@@ -777,6 +831,8 @@ mod tests {
             cache_ms: 25_000,
             live: false,
             video_visible: true,
+            proxy: None,
+            start_time_seconds: None,
         }
         .option_strings();
         assert!(vod.contains(&":network-caching=25000".to_string()));
@@ -806,6 +862,8 @@ mod tests {
                 cache_ms: 500,
                 live: true,
                 video_visible,
+                proxy: None,
+                start_time_seconds: None,
             }
             .option_strings()
         };
@@ -816,6 +874,76 @@ mod tests {
         assert!(!options(true)
             .iter()
             .any(|o| o.contains("video=") || o == ":no-video"));
+    }
+
+    #[test]
+    fn media_options_carry_proxy_start_time_and_rtsp_tcp() {
+        let options = super::MediaOptions {
+            cache_ms: 500,
+            live: false,
+            video_visible: true,
+            proxy: Some("http://proxy.local:8080".to_string()),
+            start_time_seconds: Some(83.25),
+        }
+        .option_strings();
+        assert!(options.contains(&":rtsp-tcp".to_string()));
+        assert!(options.contains(&":http-proxy=http://proxy.local:8080".to_string()));
+        assert!(options.contains(&":start-time=83.250".to_string()));
+        let bare = super::MediaOptions {
+            cache_ms: 500,
+            live: true,
+            video_visible: true,
+            proxy: None,
+            start_time_seconds: None,
+        }
+        .option_strings();
+        assert!(bare.contains(&":rtsp-tcp".to_string()));
+        assert!(!bare.iter().any(|o| o.starts_with(":http-proxy=")));
+        assert!(!bare.iter().any(|o| o.starts_with(":start-time=")));
+    }
+
+    #[test]
+    fn headers_become_python_style_options() {
+        use iptv_core::playback::{
+            StreamHeaders, DEFAULT_PLAYER_ACCEPT, DEFAULT_PLAYER_USER_AGENT,
+        };
+        // Bare headers: the defaults fill the agent and Accept.
+        let bare = super::header_option_strings(&StreamHeaders::default());
+        assert_eq!(
+            bare,
+            vec![
+                format!(":http-user-agent={DEFAULT_PLAYER_USER_AGENT}"),
+                format!(":http-header=Accept: {DEFAULT_PLAYER_ACCEPT}"),
+            ]
+        );
+        let headers = StreamHeaders {
+            entries: vec![
+                ("User-Agent".to_string(), "My Agent".to_string()),
+                ("Referer".to_string(), "http://ref/".to_string()),
+                ("Cookie".to_string(), "session=abc".to_string()),
+                ("Origin".to_string(), "http://origin/".to_string()),
+                ("Authorization".to_string(), "Bearer tok".to_string()),
+                ("Accept".to_string(), "text/html".to_string()),
+                ("X-Forwarded-For".to_string(), "1.2.3.4".to_string()),
+                ("Range".to_string(), "bytes=0-".to_string()),
+            ],
+            extra: vec!["X-Custom: v".to_string()],
+        };
+        let full = super::header_option_strings(&headers);
+        assert_eq!(
+            full,
+            vec![
+                ":http-user-agent=My Agent",
+                ":http-referrer=http://ref/",
+                ":http-cookie=session=abc",
+                ":http-header=Origin: http://origin/",
+                ":http-header=Authorization: Bearer tok",
+                ":http-header=Accept: text/html",
+                ":http-header=X-Forwarded-For: 1.2.3.4",
+                ":http-header=Range: bytes=0-",
+                ":http-header=X-Custom: v",
+            ]
+        );
     }
 
     #[test]

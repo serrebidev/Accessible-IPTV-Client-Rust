@@ -14,6 +14,89 @@ use std::collections::BTreeMap;
 use crate::config::InternalPlayerSettings;
 use crate::Channel;
 
+/// Python's built-in player defaults (`internal_player.py`):
+/// sent when the stream itself does not name them, because some
+/// servers expect browser-like headers (second-round audit N10).
+pub const DEFAULT_PLAYER_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) \
+    AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36";
+pub const DEFAULT_PLAYER_ACCEPT: &str =
+    "application/x-mpegURL,application/vnd.apple.mpegurl,application/json,text/plain,*/*";
+
+/// The system HTTP proxy, detected the way Python's
+/// `_detect_system_http_proxy` does (urllib's `getproxies`):
+/// the environment first, then the Windows Internet Settings
+/// registry value. Detected once per process; a proxy change
+/// mid-session applies at the next start, where Python would
+/// pick it up at the next play.
+#[must_use]
+pub fn system_http_proxy() -> Option<String> {
+    static CACHED: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    CACHED.get_or_init(detect_system_http_proxy).clone()
+}
+
+fn detect_system_http_proxy() -> Option<String> {
+    for key in ["http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY"] {
+        if let Ok(value) = std::env::var(key) {
+            let value = value.trim();
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        windows_registry_proxy()
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
+/// The `ProxyServer` value from one `reg query` output: takes
+/// the `http=` entry of a per-protocol list, else the whole
+/// value, and gives it the scheme urllib adds.
+#[cfg(any(windows, test))]
+fn parse_registry_proxy(query_output: &str) -> Option<String> {
+    let line = query_output
+        .lines()
+        .find(|line| line.contains("ProxyServer"))?;
+    let value = line.rsplit("REG_SZ").next()?.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let server = value
+        .split(';')
+        .find_map(|part| part.trim().strip_prefix("http="))
+        .unwrap_or(value)
+        .trim();
+    if server.is_empty() {
+        return None;
+    }
+    if server.contains("://") {
+        Some(server.to_string())
+    } else {
+        Some(format!("http://{server}"))
+    }
+}
+
+#[cfg(windows)]
+fn windows_registry_proxy() -> Option<String> {
+    let key = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings";
+    let query = |value: &str| {
+        std::process::Command::new("reg")
+            .args(["query", key, "/v", value])
+            .output()
+            .ok()
+            .and_then(|out| String::from_utf8(out.stdout).ok())
+    };
+    let enabled = query("ProxyEnable")?;
+    if !enabled.contains("0x1") {
+        return None;
+    }
+    parse_registry_proxy(&query("ProxyServer")?)
+}
+
 /// Canonical headers for a channel: pipe modifiers on the URL fill the
 /// gaps left by the attribute headers (Python `merge_headers`: base wins).
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -1244,6 +1327,27 @@ mod tests {
             tvg_logo: String::new(),
             unknown_attributes: Map::new(),
         }
+    }
+
+    #[test]
+    fn registry_proxy_parsing() {
+        let plain = "    ProxyServer    REG_SZ    proxy.local:8080\r\n";
+        assert_eq!(
+            parse_registry_proxy(plain).as_deref(),
+            Some("http://proxy.local:8080")
+        );
+        let per_protocol =
+            "    ProxyServer    REG_SZ    http=proxy.local:8080;https=secure.local:8443\r\n";
+        assert_eq!(
+            parse_registry_proxy(per_protocol).as_deref(),
+            Some("http://proxy.local:8080")
+        );
+        let schemed = "    ProxyServer    REG_SZ    http://proxy.local:8080\r\n";
+        assert_eq!(
+            parse_registry_proxy(schemed).as_deref(),
+            Some("http://proxy.local:8080")
+        );
+        assert_eq!(parse_registry_proxy("no proxy here"), None);
     }
 
     #[test]
