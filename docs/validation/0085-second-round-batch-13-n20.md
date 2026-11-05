@@ -115,6 +115,13 @@ restored) and the shared target dir's wxWidgets tree had to be
 rebuilt under cross-lane contention, so the test gate took hours of
 wall time; the result above is the full shared-dir run, exit 0.
 
+Rebase note: before pushing, the branch was rebased onto main at
+891c6f6 (N19, N24, N25 and the i18n bundle had landed meanwhile;
+conflict-free). On the rebased tree, clippy was re-run clean and the
+iptv-app + iptv-core suites were re-run green: 373 passed, 0 failed
+(core's unit suite is 342 there — main's new batches added two core
+tests — so the rebased workspace total is 382).
+
 ## Unverified
 
 - Everything device-facing is compile- and code-verified only: there
