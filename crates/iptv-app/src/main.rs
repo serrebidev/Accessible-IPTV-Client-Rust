@@ -533,6 +533,10 @@ struct Wiring {
     last_dvr_tick: Rc<std::cell::Cell<f64>>,
     scope_ids: Rc<RefCell<Vec<Option<String>>>>,
     download_worker: Rc<iptv_core::downloads::DownloadWorker>,
+    /// The catch-up direct-file probe worker (N13): probes run
+    /// off the UI thread and settle one-stream providers.
+    direct_probe_worker: Rc<iptv_core::catchup_direct::DirectProbeWorker>,
+    direct_probe_pending: Rc<std::cell::Cell<bool>>,
     downloads: Rc<RefCell<Vec<DownloadRow>>>,
     downloads_active: Rc<std::cell::Cell<bool>>,
     /// The open Downloads window, refreshed live by the
@@ -1003,6 +1007,8 @@ fn bind_browser(
         last_dvr_tick: Rc::new(std::cell::Cell::new(0.0)),
         scope_ids: Rc::new(RefCell::new(vec![None])),
         download_worker: Rc::new(iptv_core::downloads::DownloadWorker::default()),
+        direct_probe_worker: Rc::new(iptv_core::catchup_direct::DirectProbeWorker::default()),
+        direct_probe_pending: Rc::new(std::cell::Cell::new(false)),
         downloads: Rc::new(RefCell::new(Vec::new())),
         downloads_active: Rc::new(std::cell::Cell::new(false)),
         downloads_ui: Rc::new(RefCell::new(None)),
@@ -1300,10 +1306,12 @@ fn bind_completion(wiring: &Wiring, controls: Controls) {
         poll_vod(&completed, status);
         poll_cast(&completed, status);
         poll_downloads(&completed, status);
+        poll_direct_probes(&completed, status);
         if !completed.browser.borrow().is_busy()
             && !completed.epg_pending.get()
             && !completed.suffix_pending.get()
             && !completed.provider_pending.get()
+            && !completed.direct_probe_pending.get()
             && !completed
                 .reminders
                 .borrow()
@@ -3987,6 +3995,8 @@ fn clone_wiring(wiring: &Wiring) -> Wiring {
         last_dvr_tick: Rc::clone(&wiring.last_dvr_tick),
         scope_ids: Rc::clone(&wiring.scope_ids),
         download_worker: Rc::clone(&wiring.download_worker),
+        direct_probe_worker: Rc::clone(&wiring.direct_probe_worker),
+        direct_probe_pending: Rc::clone(&wiring.direct_probe_pending),
         downloads: Rc::clone(&wiring.downloads),
         downloads_active: Rc::clone(&wiring.downloads_active),
         downloads_ui: Rc::clone(&wiring.downloads_ui),
@@ -12067,6 +12077,14 @@ struct StagedDownload {
     channel: Channel,
     programme: Programme,
     url: String,
+    /// N13: headers the direct-file probe verified for the
+    /// (possibly redirected) URL; `launch_staged_capture` uses
+    /// these instead of the channel's own when the probe found
+    /// a direct file, so credentials never follow a redirect.
+    headers: Option<iptv_core::playback::StreamHeaders>,
+    /// N13: the direct-file probe is still running for this
+    /// entry; the capture launches when its result lands.
+    probing: bool,
     attempts: u32,
     /// The user cancelled this capture: its finish removes the
     /// staged file and never retries (audit R06).
@@ -13261,7 +13279,7 @@ fn catchup_download_key(channel: &Channel, programme: &Programme) -> String {
 
 /// The programme window widened by the configured schedule
 /// padding (audit R04; Python `_padded_catchup_window`).
-fn padded_window(wiring: &Wiring, programme: &Programme) -> (i64, i64) {
+fn padding_minutes(wiring: &Wiring) -> (i64, i64) {
     let config = wiring.persist.config.borrow();
     let pre = config
         .value("recording_pre_padding_minutes")
@@ -13273,7 +13291,19 @@ fn padded_window(wiring: &Wiring, programme: &Programme) -> (i64, i64) {
         .and_then(serde_json::Value::as_i64)
         .unwrap_or(2)
         .max(0);
+    (pre, post)
+}
+
+fn padded_window(wiring: &Wiring, programme: &Programme) -> (i64, i64) {
+    let (pre, post) = padding_minutes(wiring);
     (programme.start - pre * 60, programme.stop + post * 60)
+}
+
+/// Total padding inside a padded window, in seconds (N13:
+/// Python's truncation expectation subtracts it back out).
+fn padding_seconds(wiring: &Wiring) -> i64 {
+    let (pre, post) = padding_minutes(wiring);
+    (pre + post) * 60
 }
 
 /// Start a catch-up download once its URL is known (directly, or
@@ -13350,11 +13380,21 @@ fn begin_catchup_download(
         // ffmpeg for the finite window instead of saving the
         // manifest text under a media extension.
         iptv_core::downloads::ArchivePlan::FfmpegCapture => {
+            // N13 (Python's catch-up direct flow): before the
+            // paced HLS capture, probe for the provider's direct
+            // file on the probe worker — padded window first,
+            // programme-exact second, in one walk. The probe
+            // never opens the media itself and settles a
+            // one-stream provider before ffmpeg asks; the
+            // capture launches from `poll_direct_probes`.
+            let probe_url = url.clone();
             let staged = StagedDownload {
                 final_path: destination.clone(),
                 channel: channel.clone(),
                 programme: programme.clone(),
                 url,
+                headers: None,
+                probing: true,
                 attempts: 1,
                 cancelled: false,
             };
@@ -13363,18 +13403,25 @@ fn begin_catchup_download(
                 key: key.clone(),
                 name: programme.title.clone(),
                 destination: destination.display().to_string(),
-                progress: "Capturing...".to_string(),
+                progress: "Checking for a faster download...".to_string(),
                 done: false,
             });
-            if let Err(error) = launch_staged_capture(wiring, &key, staged) {
-                let mut rows = wiring.downloads.borrow_mut();
-                if let Some(row) = rows.iter_mut().find(|row| row.key == key) {
-                    row.progress = format!("Failed: {error}");
-                    row.done = true;
-                }
-                status.set_label(&error);
-                return;
-            }
+            wiring
+                .staged_downloads
+                .borrow_mut()
+                .insert(key.clone(), staged);
+            wiring.direct_probe_pending.set(true);
+            wiring
+                .direct_probe_worker
+                .start(iptv_core::catchup_direct::DirectProbeRequest {
+                    key: key.clone(),
+                    url: probe_url,
+                    windows: vec![
+                        (padded_start, padded_stop - padded_start),
+                        (programme.start, programme.stop - programme.start),
+                    ],
+                    headers: iptv_core::playback::StreamHeaders::for_channel(channel),
+                });
         }
         iptv_core::downloads::ArchivePlan::Direct => {
             let id = wiring.next_download_id.get();
@@ -13413,7 +13460,10 @@ fn launch_staged_capture(wiring: &Wiring, key: &str, staged: StagedDownload) -> 
     let extension = recording::format_extension(&format);
     let part = iptv_core::downloads::part_path(&staged.final_path);
     let (padded_start, padded_stop) = padded_window(wiring, &staged.programme);
-    let headers = iptv_core::playback::StreamHeaders::for_channel(&staged.channel);
+    let headers = staged
+        .headers
+        .clone()
+        .unwrap_or_else(|| iptv_core::playback::StreamHeaders::for_channel(&staged.channel));
     let witness = player_audio_witness(&wiring.player, &staged.channel);
     let (audio_track, audio_track_count) = recording_audio_choice(
         &wiring.persist,
@@ -13459,11 +13509,19 @@ fn finish_staged_download(
     finished: &recording::RecordingFinished,
     produced: bool,
 ) {
-    let expected =
-        f64::from(i32::try_from(staged.programme.stop - staged.programme.start).unwrap_or(0));
+    // N13: Python's truncation expectation is the padded
+    // window minus its padding (the programme itself), and a
+    // capture counts as truncated below 95% of it
+    // (`_catchup_download_is_truncated`); the written seconds
+    // come from probing the produced file rather than parsing
+    // the ffmpeg log — the log route lands with N12.
+    let (padded_start, padded_stop) = padded_window(wiring, &staged.programme);
+    let expected_seconds = ((padded_stop - padded_start) - padding_seconds(wiring)).max(1);
+    let expected = f64::from(i32::try_from(expected_seconds).unwrap_or(0));
     let truncated = finished.success
         && produced
-        && media_duration_seconds(&finished.out_path).is_some_and(|actual| actual < expected * 0.9);
+        && media_duration_seconds(&finished.out_path)
+            .is_some_and(|actual| actual < expected * 0.95);
     let complete = !staged.cancelled && finished.success && produced && !truncated;
     if staged.cancelled {
         let _ = std::fs::remove_file(&finished.out_path);
@@ -13711,6 +13769,62 @@ fn poll_downloads(wiring: &Wiring, status: Status) {
     let active = wiring.downloads.borrow().iter().any(|row| !row.done);
     wiring.downloads_active.set(active);
     if changed {
+        refresh_downloads_window(wiring);
+    }
+}
+
+/// Drain catch-up direct-file probe results (N13): a verified
+/// direct file retargets the staged capture at it with the
+/// host-scoped headers the probe used; no file means the
+/// capture proceeds against the playlist URL as before. A
+/// capture cancelled while probing ends here, unlaunched.
+fn poll_direct_probes(wiring: &Wiring, status: Status) {
+    while let Some(result) = wiring.direct_probe_worker.try_recv() {
+        let key = result.key;
+        let Some(mut staged) = wiring.staged_downloads.borrow_mut().remove(&key) else {
+            continue;
+        };
+        staged.probing = false;
+        if staged.cancelled {
+            let mut rows = wiring.downloads.borrow_mut();
+            if let Some(row) = rows.iter_mut().find(|row| row.key == key) {
+                row.progress = "Cancelled".to_string();
+                row.done = true;
+            }
+            drop(rows);
+        } else {
+            if let Some(direct) = &result.direct_url {
+                // Python parity: headers are re-filtered for
+                // the file's host before ffmpeg sees them.
+                staged.headers = Some(iptv_core::catchup_direct::headers_for_host(
+                    &iptv_core::playback::StreamHeaders::for_channel(&staged.channel),
+                    &staged.url,
+                    direct,
+                ));
+                staged.url.clone_from(direct);
+            }
+            let mut rows = wiring.downloads.borrow_mut();
+            if let Some(row) = rows.iter_mut().find(|row| row.key == key) {
+                row.progress = "Capturing...".to_string();
+            }
+            drop(rows);
+            if let Err(error) = launch_staged_capture(wiring, &key, staged) {
+                let mut rows = wiring.downloads.borrow_mut();
+                if let Some(row) = rows.iter_mut().find(|row| row.key == key) {
+                    row.progress = format!("Failed: {error}");
+                    row.done = true;
+                }
+                status.set_label(&error);
+            }
+        }
+        let still_probing = wiring
+            .staged_downloads
+            .borrow()
+            .values()
+            .any(|staged| staged.probing);
+        wiring.direct_probe_pending.set(still_probing);
+        let active = wiring.downloads.borrow().iter().any(|row| !row.done);
+        wiring.downloads_active.set(active);
         refresh_downloads_window(wiring);
     }
 }

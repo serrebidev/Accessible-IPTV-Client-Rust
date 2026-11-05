@@ -19,6 +19,7 @@ pub mod browser;
 pub mod cache;
 pub mod cast;
 pub mod catchup;
+pub mod catchup_direct;
 pub mod categories;
 pub mod config;
 pub mod downloads;
