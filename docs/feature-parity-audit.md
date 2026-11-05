@@ -1107,12 +1107,15 @@ later validation fixed an older limitation, the later evidence takes precedence.
   remain outside the connected UPnP/Roku path. See validations 0017/0032 and
   `crates/iptv-core/src/cast.rs:869`. Protocol helper functions alone are not
   selectable devices. The repository requires porting/syncing Caster as the unit.
-- **Translation resources:** the Rust tree contains no `.mo` catalogues and
-  only English help, versus Python's 14 help languages. Validations 0018/0031
-  already record this resource limitation. `PACKAGING.md` describes locale
-  resources, but current release staging does not copy a locale directory.
-  Translation-engine tests do not prove translated packages. Workflows were not
-  changed during this audit.
+- **Translation resources:** closed by validation 0091 — the Python
+  catalogues (14 languages, both domains, byte-identical) are bundled at
+  the repo root and release staging copies `locale/` beside the
+  executable; the 13 translated help guides ship in `docs/help/`
+  alongside the newer Rust English guide. Bundled-asset tests in
+  `iptv-core` prove every shipped language's catalogue loads and every
+  guide renders. The translations remain synced to the English revision
+  the Python tree records; newer strings fall back to English, as in
+  Python.
 - **VOD:** the text filter and provider/movie/episode resume identity limits
   remain as recorded in validation 0015; catalogue-only bookmark resolution
   without provider locators remains as recorded in 0041. P21 adds the distinct

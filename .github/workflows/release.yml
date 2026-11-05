@@ -120,6 +120,7 @@ jobs:
           New-Item -ItemType Directory -Force $stage | Out-Null
           Copy-Item "target/release/${{ matrix.binary }}" $stage
           Copy-Item "docs/help" "$stage/docs/help" -Recurse
+          Copy-Item "locale" "$stage/locale" -Recurse
           Copy-Item "bundle/libvlc.dll", "bundle/libvlccore.dll" $stage
           Copy-Item "bundle/plugins" "$stage/plugins" -Recurse
           Compress-Archive -Path "$stage/*" -DestinationPath "accessible-iptv-client.zip"
@@ -132,6 +133,7 @@ jobs:
           mkdir -p "$stage/docs"
           cp "target/release/${{ matrix.binary }}" "$stage/"
           cp -R docs/help "$stage/docs/help"
+          cp -R locale "$stage/locale"
           cp -a bundle/. "$stage/"
           tar -czf accessible-iptv-client.tar.gz -C "$stage" .
 
@@ -143,6 +145,7 @@ jobs:
           mkdir -p "$stage/docs"
           cp "target/release/${{ matrix.binary }}" "$stage/"
           cp -R docs/help "$stage/docs/help"
+          cp -R locale "$stage/locale"
           cp -a bundle/. "$stage/"
           hdiutil create -volname "Accessible IPTV Client" -srcfolder "$stage" -ov -format UDZO accessible-iptv-client.dmg
 

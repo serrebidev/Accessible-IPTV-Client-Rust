@@ -561,6 +561,29 @@ mod tests {
     }
 
     #[test]
+    fn bundled_guides_cover_pythons_languages() {
+        // The repo's docs/help is what release staging ships
+        // (validation 0091): the Python guide languages must all
+        // be discoverable, English first, and each must render.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let dir = root.join("docs").join("help");
+        let languages = available_languages(Some(&dir));
+        assert_eq!(languages.len(), 14);
+        assert_eq!(
+            languages.first().map(String::as_str),
+            Some(FALLBACK_LANGUAGE)
+        );
+        for code in &languages {
+            let guide = load_guide(Some(code), Some(&dir));
+            assert_eq!(&guide.language, code);
+            assert!(
+                !guide.sections.is_empty(),
+                "bundled guide for {code} rendered no sections"
+            );
+        }
+    }
+
+    #[test]
     fn embedded_english_guide_renders() {
         let guide = load_guide(Some("xx"), None);
         assert_eq!(guide.language, "en");
