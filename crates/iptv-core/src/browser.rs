@@ -362,6 +362,12 @@ impl BrowserWorker {
         (Arc::clone(&self.playlist), self.extras.clone())
     }
 
+    /// Cheap snapshot of the merged catalogue for background builders.
+    #[must_use]
+    pub fn catalogue_model(&self) -> Arc<BrowseModel> {
+        Arc::clone(&self.playlist)
+    }
+
     /// The channel at a playlist index in the current projection's source.
     #[must_use]
     pub fn channel(&self, playlist_index: usize) -> Option<crate::Channel> {

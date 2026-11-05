@@ -3,11 +3,12 @@
 //!
 //! Ports `playlist.py`'s EPG import, `channel_identity.py` and the matching
 //! vocabulary of `channel_names.py` (pinned Python revision in the parity
-//! tool). Storage is in-memory; Python's `SQLite` guide database is the
-//! recorded scale endgame for multi-million-programme guides.
+//! tool). The app keeps an in-memory snapshot for fast reads and mirrors
+//! source data to `SQLite` for persistence and indexed queries.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::Read;
+use std::sync::Arc;
 
 use crate::Channel;
 
@@ -1481,6 +1482,16 @@ impl GuideIndexes {
     }
 }
 
+/// A completed guide and the indexes built for it. The snapshot is
+/// immutable so the UI and background workers can share it without
+/// cloning the guide or rebuilding its channel indexes.
+#[derive(Debug)]
+pub struct EpgSnapshot {
+    pub guide: EpgGuide,
+    pub indexes: std::sync::Arc<GuideIndexes>,
+    pub generation: u64,
+}
+
 /// Expand common XMLTV id variants (port of `expand_tvg_id_candidates`).
 #[must_use]
 pub fn expand_tvg_id_candidates(tvg_id: &str) -> Vec<String> {
@@ -1689,8 +1700,13 @@ enum EpgJob {
     },
 }
 
-enum EpgEvent {
+enum EpgLoadResult {
     Loaded(Box<EpgGuide>, String),
+    Failed(String),
+}
+
+enum EpgEvent {
+    Ready(std::sync::Arc<EpgSnapshot>, String),
     Failed(String),
 }
 
@@ -1712,8 +1728,29 @@ impl EpgWorker {
         let (job_sender, job_receiver) = std::sync::mpsc::channel::<EpgJob>();
         let (event_sender, event_receiver) = std::sync::mpsc::channel::<EpgEvent>();
         std::thread::spawn(move || {
+            let mut snapshot: Option<std::sync::Arc<EpgSnapshot>> = None;
             while let Ok(EpgJob::Fetch { sources, store }) = job_receiver.recv() {
-                let event = run_epg_load(&sources, store.as_deref());
+                let event = match run_epg_load(&sources, store.as_deref()) {
+                    EpgLoadResult::Loaded(guide, note) => {
+                        let mut guide = *guide;
+                        if let Some(previous) = &snapshot {
+                            let mut merged = previous.guide.clone();
+                            merged.merge(guide);
+                            guide = merged;
+                        }
+                        let generation = snapshot
+                            .as_ref()
+                            .map_or(1, |previous| previous.generation + 1);
+                        let next = std::sync::Arc::new(EpgSnapshot {
+                            indexes: std::sync::Arc::new(GuideIndexes::build(&guide.channels)),
+                            guide,
+                            generation,
+                        });
+                        snapshot = Some(std::sync::Arc::clone(&next));
+                        EpgEvent::Ready(next, note)
+                    }
+                    EpgLoadResult::Failed(error) => EpgEvent::Failed(error),
+                };
                 if event_sender.send(event).is_err() {
                     break;
                 }
@@ -1726,18 +1763,19 @@ impl EpgWorker {
     }
 
     /// Fetch and parse the given guide sources (URLs or file paths),
-    /// then mirror the merged guide into the `SQLite` store at `store`
-    /// (when given) on this worker's thread.
+    /// then merge it with the last successful guide, build its indexes,
+    /// and mirror it into the `SQLite` store at `store` (when given), all
+    /// on this worker's thread.
     pub fn load(&self, sources: Vec<String>, store: Option<std::path::PathBuf>) {
         let _ = self.jobs.send(EpgJob::Fetch { sources, store });
     }
 
     /// The next finished load, when one is waiting.
     #[must_use]
-    pub fn try_recv(&self) -> Option<Result<(EpgGuide, String), String>> {
+    pub fn try_recv(&self) -> Option<Result<(std::sync::Arc<EpgSnapshot>, String), String>> {
         let events = self.events.lock().ok()?;
         match events.try_recv().ok()? {
-            EpgEvent::Loaded(guide, note) => Some(Ok((*guide, note))),
+            EpgEvent::Ready(snapshot, note) => Some(Ok((snapshot, note))),
             EpgEvent::Failed(error) => Some(Err(error)),
         }
     }
@@ -1750,7 +1788,7 @@ impl EpgWorker {
 /// return): a run where every source failed is a failure, and a
 /// source that fails or is omitted never erases another source's
 /// stored guide (audit E04, E05).
-fn run_epg_load(sources: &[String], store_path: Option<&std::path::Path>) -> EpgEvent {
+fn run_epg_load(sources: &[String], store_path: Option<&std::path::Path>) -> EpgLoadResult {
     let mut merged = EpgGuide::default();
     let mut loaded = 0_usize;
     let mut failures: Vec<String> = Vec::new();
@@ -1789,7 +1827,7 @@ fn run_epg_load(sources: &[String], store_path: Option<&std::path::Path>) -> Epg
             .first()
             .cloned()
             .unwrap_or_else(|| "no guide sources were given".to_string());
-        return EpgEvent::Failed(first);
+        return EpgLoadResult::Failed(first);
     }
     let mut note = store_note;
     if !failures.is_empty() {
@@ -1802,7 +1840,7 @@ fn run_epg_load(sources: &[String], store_path: Option<&std::path::Path>) -> Epg
             failures[0]
         );
     }
-    EpgEvent::Loaded(Box::new(merged), note)
+    EpgLoadResult::Loaded(Box::new(merged), note)
 }
 
 // ---------------------------------------------------------------------------
@@ -1815,6 +1853,7 @@ fn run_epg_load(sources: &[String], store_path: Option<&std::path::Path>) -> Epg
 pub struct SuffixJob {
     pub generation: u64,
     pub guide_generation: u64,
+    pub indexes: Option<std::sync::Arc<GuideIndexes>>,
     pub model: std::sync::Arc<crate::BrowseModel>,
     pub store_path: std::path::PathBuf,
     pub at: i64,
@@ -1845,6 +1884,260 @@ pub struct SuffixResult {
 pub struct SuffixWorker {
     jobs: std::sync::mpsc::Sender<SuffixJob>,
     events: std::sync::Mutex<std::sync::mpsc::Receiver<SuffixResult>>,
+}
+
+/// A cold persisted-guide read, tagged so the UI can reject stale
+/// completions without sharing `SQLite` connections across threads.
+#[derive(Clone, Debug)]
+pub enum EpgReadKind {
+    UsableData {
+        at: i64,
+    },
+    NowNext {
+        channel: crate::Channel,
+        at: i64,
+    },
+    Programmes {
+        channel: crate::Channel,
+        from: i64,
+        to: i64,
+    },
+    Search {
+        query: String,
+        now: i64,
+        limit: usize,
+        model: std::sync::Arc<crate::BrowseModel>,
+    },
+    Snapshot {
+        at: i64,
+        model: std::sync::Arc<crate::BrowseModel>,
+        snapshot: Option<std::sync::Arc<EpgSnapshot>>,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub struct EpgReadJob {
+    pub request_id: u64,
+    pub guide_generation: u64,
+    pub store_path: std::path::PathBuf,
+    pub kind: EpgReadKind,
+}
+
+#[derive(Clone, Debug)]
+pub enum EpgReadValue {
+    UsableData(bool),
+    NowNext(Option<NowNext>),
+    Programmes(Vec<Programme>),
+    Search(Vec<EpgSearchHit>),
+    Snapshot(Vec<(usize, Programme)>),
+}
+
+#[derive(Clone, Debug)]
+pub struct EpgSearchHit {
+    pub display_name: String,
+    pub programme: Programme,
+    pub playlist_index: Option<usize>,
+}
+
+#[derive(Clone, Debug)]
+pub struct EpgReadResult {
+    pub request_id: u64,
+    pub guide_generation: u64,
+    pub result: Result<EpgReadValue, String>,
+}
+
+/// Worker-owned connection and indexes for cold `SQLite` guide reads.
+pub struct EpgReadWorker {
+    jobs: std::sync::mpsc::Sender<EpgReadJob>,
+    events: std::sync::Mutex<std::sync::mpsc::Receiver<EpgReadResult>>,
+}
+
+impl Default for EpgReadWorker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl EpgReadWorker {
+    /// Create a worker thread for cold guide reads.
+    /// # Panics
+    /// Panics if internal worker state violates its store or index initialization invariants.
+    #[must_use]
+    #[allow(clippy::too_many_lines)] // Keep the worker's ordered request dispatch in one place.
+    pub fn new() -> Self {
+        let (jobs, receiver) = std::sync::mpsc::channel::<EpgReadJob>();
+        let (sender, events) = std::sync::mpsc::channel::<EpgReadResult>();
+        std::thread::spawn(move || {
+            let mut store: Option<(std::path::PathBuf, crate::epgstore::EpgStore)> = None;
+            let mut indexes: Option<(u64, std::sync::Arc<GuideIndexes>)> = None;
+            while let Ok(job) = receiver.recv() {
+                let result = (|| {
+                    let loaded_snapshot = match &job.kind {
+                        EpgReadKind::Snapshot {
+                            snapshot: Some(snapshot),
+                            ..
+                        } => Some(Arc::clone(snapshot)),
+                        _ => None,
+                    };
+                    if loaded_snapshot.is_none()
+                        && !matches!(store.as_ref(), Some((path, _)) if *path == job.store_path)
+                    {
+                        store = Some((
+                            job.store_path.clone(),
+                            crate::epgstore::EpgStore::open(&job.store_path)?,
+                        ));
+                        indexes = None;
+                    }
+                    match job.kind {
+                        EpgReadKind::UsableData { at } => {
+                            let db = &store.as_ref().expect("store opened for read").1;
+                            Ok(EpgReadValue::UsableData(db.has_usable_data(at)?))
+                        }
+                        EpgReadKind::NowNext { channel, at } => {
+                            let db = &store.as_ref().expect("store opened for read").1;
+                            if !matches!(indexes.as_ref(), Some((generation, _)) if *generation == job.guide_generation)
+                            {
+                                indexes = Some((
+                                    job.guide_generation,
+                                    std::sync::Arc::new(GuideIndexes::build(&db.channels()?)),
+                                ));
+                            }
+                            let indexes = &indexes.as_ref().expect("indexes just built").1;
+                            let value = match match_guide_channel(
+                                &channel,
+                                indexes,
+                                Some(&indexes.known_ids),
+                            ) {
+                                Some(id) => {
+                                    let (current, next) = db.now_next(&id, at)?;
+                                    Some(NowNext { current, next })
+                                }
+                                None => None,
+                            };
+                            Ok(EpgReadValue::NowNext(value))
+                        }
+                        EpgReadKind::Programmes { channel, from, to } => {
+                            let db = &store.as_ref().expect("store opened for read").1;
+                            let mut candidates = expand_tvg_id_candidates(channel.tvg_id.trim());
+                            candidates.push(channel.tvg_id.trim().to_string());
+                            for id in candidates {
+                                let programmes = db.programmes_between(&id, from, to)?;
+                                if !programmes.is_empty() {
+                                    return Ok(EpgReadValue::Programmes(programmes));
+                                }
+                            }
+                            Ok(EpgReadValue::Programmes(Vec::new()))
+                        }
+                        EpgReadKind::Search {
+                            query,
+                            now,
+                            limit,
+                            model,
+                        } => {
+                            let db = &store.as_ref().expect("store opened for read").1;
+                            if !matches!(indexes.as_ref(), Some((generation, _)) if *generation == job.guide_generation)
+                            {
+                                indexes = Some((
+                                    job.guide_generation,
+                                    std::sync::Arc::new(GuideIndexes::build(&db.channels()?)),
+                                ));
+                            }
+                            let indexes = &indexes.as_ref().expect("indexes just built").1;
+                            let mut by_guide = std::collections::HashMap::new();
+                            for (index, channel) in model.channels().iter().enumerate() {
+                                if let Some(id) =
+                                    match_guide_channel(channel, indexes, Some(&indexes.known_ids))
+                                {
+                                    by_guide.entry(id).or_insert(index);
+                                }
+                            }
+                            let hits = db.channels_with_show(&query, now, limit)?;
+                            Ok(EpgReadValue::Search(
+                                hits.into_iter()
+                                    .map(|(display_name, programme)| EpgSearchHit {
+                                        playlist_index: by_guide
+                                            .get(&programme.channel_id)
+                                            .copied(),
+                                        display_name,
+                                        programme,
+                                    })
+                                    .collect(),
+                            ))
+                        }
+                        EpgReadKind::Snapshot {
+                            at,
+                            model,
+                            snapshot,
+                        } => {
+                            let (indexes_for_rows, bulk) = if let Some(snapshot) = snapshot {
+                                (
+                                    Arc::clone(&snapshot.indexes),
+                                    snapshot.guide.bulk_now_next(at),
+                                )
+                            } else {
+                                let db = &store.as_ref().expect("store opened for read").1;
+                                if !matches!(indexes.as_ref(), Some((generation, _)) if *generation == job.guide_generation)
+                                {
+                                    indexes = Some((
+                                        job.guide_generation,
+                                        Arc::new(GuideIndexes::build(&db.channels()?)),
+                                    ));
+                                }
+                                let bulk = db
+                                    .all_now_next(at)?
+                                    .into_iter()
+                                    .map(|(channel, entry)| (channel.id, entry))
+                                    .collect();
+                                (
+                                    Arc::clone(&indexes.as_ref().expect("indexes just built").1),
+                                    bulk,
+                                )
+                            };
+                            let mut rows = Vec::new();
+                            for (index, channel) in model.channels().iter().enumerate() {
+                                let Some(id) = match_guide_channel(
+                                    channel,
+                                    &indexes_for_rows,
+                                    Some(&indexes_for_rows.known_ids),
+                                ) else {
+                                    continue;
+                                };
+                                if let Some(current) =
+                                    bulk.get(&id).and_then(|entry| entry.current.clone())
+                                {
+                                    rows.push((index, current));
+                                }
+                            }
+                            Ok(EpgReadValue::Snapshot(rows))
+                        }
+                    }
+                })();
+                if sender
+                    .send(EpgReadResult {
+                        request_id: job.request_id,
+                        guide_generation: job.guide_generation,
+                        result,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        Self {
+            jobs,
+            events: std::sync::Mutex::new(events),
+        }
+    }
+
+    pub fn submit(&self, job: EpgReadJob) {
+        let _ = self.jobs.send(job);
+    }
+
+    #[must_use]
+    pub fn try_recv(&self) -> Option<EpgReadResult> {
+        self.events.lock().ok()?.try_recv().ok()
+    }
 }
 
 impl Default for SuffixWorker {
@@ -1890,7 +2183,7 @@ impl SuffixWorker {
 #[derive(Default)]
 struct SuffixWorkerState {
     store: Option<(std::path::PathBuf, crate::epgstore::EpgStore)>,
-    indexes: Option<(u64, GuideIndexes)>,
+    indexes: Option<(u64, std::sync::Arc<GuideIndexes>)>,
     matches: Option<(usize, u64, GuideMatchCache)>,
 }
 
@@ -1912,11 +2205,20 @@ impl SuffixWorkerState {
             self.matches = None;
         }
         let store = &self.store.as_ref().expect("store just ensured").1;
-        let Ok(channels) = store.channels() else {
-            return result(None);
-        };
-        if !matches!(self.indexes.as_ref(), Some((gen, _)) if *gen == job.guide_generation) {
-            self.indexes = Some((job.guide_generation, GuideIndexes::build(&channels)));
+        if let Some(indexes) = &job.indexes {
+            if !matches!(self.indexes.as_ref(), Some((gen, cached)) if *gen == job.guide_generation && std::sync::Arc::ptr_eq(cached, indexes))
+            {
+                self.indexes = Some((job.guide_generation, std::sync::Arc::clone(indexes)));
+                self.matches = None;
+            }
+        } else if !matches!(self.indexes.as_ref(), Some((gen, _)) if *gen == job.guide_generation) {
+            let Ok(channels) = store.channels() else {
+                return result(None);
+            };
+            self.indexes = Some((
+                job.guide_generation,
+                std::sync::Arc::new(GuideIndexes::build(&channels)),
+            ));
             self.matches = None;
         }
         let bulk: std::collections::HashMap<String, NowNext> = match store.all_now_next(job.at) {
@@ -2004,6 +2306,160 @@ fn fetch_epg_source_once(source: &str) -> Result<EpgGuide, String> {
 mod tests {
 
     #[test]
+    #[allow(clippy::too_many_lines)] // One end-to-end worker test covers all request variants.
+    fn cold_read_worker_returns_channel_now_next_and_programmes_from_store() {
+        use super::{EpgReadJob, EpgReadKind, EpgReadValue, EpgReadWorker};
+        use crate::{
+            epg::{EpgChannel, EpgGuide, Programme},
+            epgstore::EpgStore,
+            parse_m3u, Channel,
+        };
+        use std::{
+            collections::HashMap,
+            time::{Duration, Instant},
+        };
+
+        let path = std::env::temp_dir().join(format!(
+            "iptv-epg-read-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut store = EpgStore::open(&path).unwrap();
+        let guide = EpgGuide {
+            channels: vec![EpgChannel {
+                id: "guide.one".into(),
+                display_name: "One News".into(),
+            }],
+            programmes: HashMap::from([(
+                "guide.one".into(),
+                vec![Programme {
+                    channel_id: "guide.one".into(),
+                    start: 100,
+                    stop: 200,
+                    title: "Evening News".into(),
+                    description: "A full description.".into(),
+                }],
+            )]),
+        };
+        store.import_guide(&guide).unwrap();
+        drop(store);
+        let channel = Channel {
+            name: "One News".into(),
+            group: String::new(),
+            url: String::new(),
+            tvg_id: "guide.one".into(),
+            tvg_name: String::new(),
+            tvg_logo: String::new(),
+            unknown_attributes: std::collections::BTreeMap::default(),
+        };
+        let model = std::sync::Arc::new(crate::BrowseModel::from_parts(
+            parse_m3u("#EXTM3U\n#EXTINF:-1 tvg-id=\"guide.one\",One News\nhttp://one"),
+            0,
+        ));
+        let worker = EpgReadWorker::new();
+        worker.submit(EpgReadJob {
+            request_id: 1,
+            guide_generation: 0,
+            store_path: path.clone(),
+            kind: EpgReadKind::NowNext {
+                channel: channel.clone(),
+                at: 150,
+            },
+        });
+        worker.submit(EpgReadJob {
+            request_id: 2,
+            guide_generation: 0,
+            store_path: path.clone(),
+            kind: EpgReadKind::Programmes {
+                channel,
+                from: 0,
+                to: 300,
+            },
+        });
+        worker.submit(EpgReadJob {
+            request_id: 3,
+            guide_generation: 0,
+            store_path: path.clone(),
+            kind: EpgReadKind::Search {
+                query: "One".into(),
+                now: 150,
+                limit: 10,
+                model: std::sync::Arc::clone(&model),
+            },
+        });
+        worker.submit(EpgReadJob {
+            request_id: 4,
+            guide_generation: 0,
+            store_path: path.clone(),
+            kind: EpgReadKind::Snapshot {
+                at: 150,
+                model,
+                snapshot: None,
+            },
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut results = Vec::new();
+        while results.len() < 4 && Instant::now() < deadline {
+            if let Some(result) = worker.try_recv() {
+                results.push(result);
+            } else {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        let now_next = results
+            .iter()
+            .find(|result| result.request_id == 1)
+            .unwrap();
+        let EpgReadValue::NowNext(Some(entry)) = now_next.result.as_ref().unwrap() else {
+            panic!("unexpected now/next result: {now_next:?}");
+        };
+        assert_eq!(entry.current.as_ref().unwrap().title, "Evening News");
+        let programmes = results
+            .iter()
+            .find(|result| result.request_id == 2)
+            .unwrap();
+        let EpgReadValue::Programmes(rows) = programmes.result.as_ref().unwrap() else {
+            panic!("unexpected programme result: {programmes:?}");
+        };
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.title.as_str())
+                .collect::<Vec<_>>(),
+            ["Evening News"]
+        );
+        let search = results
+            .iter()
+            .find(|result| result.request_id == 3)
+            .unwrap();
+        let EpgReadValue::Search(hits) = search.result.as_ref().unwrap() else {
+            panic!("unexpected search result: {search:?}");
+        };
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].display_name, "One News");
+        assert_eq!(hits[0].playlist_index, Some(0));
+        let snapshot = results
+            .iter()
+            .find(|result| result.request_id == 4)
+            .unwrap();
+        let EpgReadValue::Snapshot(rows) = snapshot.result.as_ref().unwrap() else {
+            panic!("unexpected snapshot result: {snapshot:?}");
+        };
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, 0);
+        assert_eq!(rows[0].1.title, "Evening News");
+        drop(worker);
+        for _ in 0..100 {
+            if std::fs::remove_file(&path).is_ok() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
     fn worker_mirrors_the_guide_to_the_store_on_its_own_thread() {
         let dir = std::env::temp_dir().join(format!("iptv-epg-worker-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -2031,7 +2487,9 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(25));
         };
         let (guide, note) = outcome.unwrap();
-        assert_eq!(guide.programme_count(), 1);
+        assert_eq!(guide.guide.programme_count(), 1);
+        assert_eq!(guide.generation, 1);
+        assert!(guide.indexes.known_ids.contains("c1"));
         assert!(note.is_empty(), "{note}");
         let store = crate::epgstore::EpgStore::open(&store_path).unwrap();
         assert_eq!(store.counts().unwrap(), (1, 1));
@@ -2526,6 +2984,7 @@ mod tests {
         worker.build(SuffixJob {
             generation: 7,
             guide_generation: 3,
+            indexes: None,
             model: model.clone(),
             store_path: path.clone(),
             at,
@@ -2548,6 +3007,39 @@ mod tests {
         assert!(suffixes[&0].contains("News Hour"), "{suffixes:?}");
         assert!(suffixes[&0].contains("Next: Quiz"), "{suffixes:?}");
         assert!(!suffixes.contains_key(&1));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn suffix_worker_reuses_shared_guide_indexes() {
+        let dir =
+            std::env::temp_dir().join(format!("iptv-suffix-shared-indexes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("epg.db");
+        let guide = parse_xmltv(GUIDE);
+        let at = parse_xmltv_time("20261101183000 +0000").expect("time");
+        {
+            let mut store = crate::epgstore::EpgStore::open(&path).unwrap();
+            store.import_source("test", &guide, at).unwrap();
+        }
+        let indexes = std::sync::Arc::new(GuideIndexes::build(&guide.channels));
+        let model = std::sync::Arc::new(crate::BrowseModel::from_parts(
+            vec![channel("BBC Two", "bbc2.uk", "")],
+            0,
+        ));
+        let mut worker = SuffixWorkerState::default();
+        let result = worker.run(&SuffixJob {
+            generation: 1,
+            guide_generation: 1,
+            indexes: Some(std::sync::Arc::clone(&indexes)),
+            model,
+            store_path: path,
+            at,
+        });
+        assert!(result.suffixes.is_some());
+        let cached = &worker.indexes.as_ref().expect("indexes cached").1;
+        assert!(std::sync::Arc::ptr_eq(cached, &indexes));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2673,7 +3165,8 @@ mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(25));
         };
-        assert_eq!(guide.programme_count(), 2);
+        assert_eq!(guide.guide.programme_count(), 2);
+        assert_eq!(guide.generation, 1);
         assert!(note.contains("1 of 2 guide sources failed"), "{note}");
         // Second run imports the other source too; third run with
         // only the first must not erase the second from the store.
@@ -2682,31 +3175,35 @@ mod tests {
             Some(store_path.clone()),
         );
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        loop {
-            if worker.try_recv().is_some() {
-                break;
+        let (second, _) = loop {
+            if let Some(result) = worker.try_recv() {
+                break result.expect("second successful source load");
             }
             assert!(
                 std::time::Instant::now() < deadline,
                 "worker never delivered"
             );
             std::thread::sleep(std::time::Duration::from_millis(25));
-        }
+        };
+        assert_eq!(second.guide.programme_count(), 3);
+        assert_eq!(second.generation, 2);
         worker.load(
             vec![good.to_string_lossy().into_owned()],
             Some(store_path.clone()),
         );
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        loop {
-            if worker.try_recv().is_some() {
-                break;
+        let (third, _) = loop {
+            if let Some(result) = worker.try_recv() {
+                break result.expect("third successful source load");
             }
             assert!(
                 std::time::Instant::now() < deadline,
                 "worker never delivered"
             );
             std::thread::sleep(std::time::Duration::from_millis(25));
-        }
+        };
+        assert_eq!(third.guide.programme_count(), 3);
+        assert_eq!(third.generation, 3);
         let store = crate::epgstore::EpgStore::open(&store_path).unwrap();
         assert_eq!(store.counts().unwrap(), (3, 3));
         std::fs::remove_dir_all(&dir).ok();
