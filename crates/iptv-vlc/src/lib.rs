@@ -40,7 +40,7 @@ type TrackDescReleaseFn = unsafe extern "C" fn(*mut TrackDescription);
 type SetHwndFn = unsafe extern "C" fn(*mut c_void, *mut c_void);
 type AudioOutputEnumFn = unsafe extern "C" fn(*mut c_void) -> *mut AudioOutputDevice;
 type AudioOutputReleaseFn = unsafe extern "C" fn(*mut AudioOutputDevice);
-type AudioOutputSetFn = unsafe extern "C" fn(*mut c_void, *const c_char) -> c_int;
+type AudioOutputSetFn = unsafe extern "C" fn(*mut c_void, *const c_char, *const c_char);
 type SetNsObjectFn = unsafe extern "C" fn(*mut c_void, *mut c_void);
 type GetMediaFn = unsafe extern "C" fn(*mut c_void) -> *mut c_void;
 type MediaGetStatsFn = unsafe extern "C" fn(*mut c_void, *mut MediaStats) -> c_int;
@@ -49,7 +49,8 @@ type SetSpuFn = unsafe extern "C" fn(*mut c_void, c_int) -> c_int;
 type AddSlaveFn = unsafe extern "C" fn(*mut c_void, c_int, *const c_char, bool) -> c_int;
 type GetSpuDelayFn = unsafe extern "C" fn(*mut c_void) -> i64;
 
-/// `libvlc_media_stats_t` (field order per libvlc headers).
+/// `libvlc_media_stats_t` (field order per libvlc headers). libVLC
+/// writes the whole struct: a missing field overruns the stack.
 #[repr(C)]
 #[derive(Default)]
 struct MediaStats {
@@ -57,6 +58,8 @@ struct MediaStats {
     input_bitrate: f32,
     demux_read_bytes: c_int,
     demux_bitrate: f32,
+    demux_corrupted: c_int,
+    demux_discontinuity: c_int,
     decoded_video: c_int,
     decoded_audio: c_int,
     displayed_pictures: c_int,
@@ -71,9 +74,9 @@ struct MediaStats {
 /// `libvlc_audio_output_device_t` (linked list node).
 #[repr(C)]
 struct AudioOutputDevice {
+    next: *mut AudioOutputDevice,
     device: *mut c_char,
     description: *mut c_char,
-    next: *mut AudioOutputDevice,
 }
 
 #[repr(C)]
@@ -566,11 +569,12 @@ impl VlcEngine {
         pairs
     }
 
-    /// Point playback at one audio output device. Returns
-    /// libVLC's success flag; an empty id is the caller's
-    /// "system default" case and is not sent (Python's apply
-    /// returns early on empty, leaving a fresh player's
-    /// default in charge).
+    /// Point playback at one audio output device. libVLC reports
+    /// no result, so true only means the request was sent; an
+    /// empty id is the caller's "system default" case and is not
+    /// sent (Python's apply returns early on empty, leaving a
+    /// fresh player's default in charge). No module: libVLC keeps
+    /// the current output, as Python's `None` does.
     pub fn set_audio_output_device(&self, device_id: &str) -> bool {
         if device_id.is_empty() {
             return false;
@@ -581,7 +585,8 @@ impl VlcEngine {
         let Ok(c_id) = CString::new(device_id) else {
             return false;
         };
-        unsafe { set(self.inner.player, c_id.as_ptr()) == 0 }
+        unsafe { set(self.inner.player, std::ptr::null(), c_id.as_ptr()) };
+        true
     }
 
     /// Select an audio track by id.
@@ -760,6 +765,20 @@ mod tests {
         assert!(vod.contains(&":skip-frames=0".to_string()));
     }
 
+    /// The layouts libVLC 3's headers declare. A wrong one is a
+    /// stack overrun or a garbage pointer, not a wrong number.
+    #[test]
+    fn structs_match_the_libvlc_headers() {
+        use super::{AudioOutputDevice, MediaStats, TrackDescription};
+        use std::mem::{offset_of, size_of};
+        assert_eq!(size_of::<MediaStats>(), 15 * 4);
+        assert_eq!(offset_of!(MediaStats, decoded_video), 6 * 4);
+        assert_eq!(offset_of!(MediaStats, played_abuffers), 10 * 4);
+        assert_eq!(offset_of!(AudioOutputDevice, next), 0);
+        assert_eq!(offset_of!(AudioOutputDevice, device), size_of::<usize>());
+        assert_eq!(offset_of!(TrackDescription, next), 2 * size_of::<usize>());
+    }
+
     #[test]
     fn state_mapping_matches_libvlc() {
         assert_eq!(map_state(3), VlcState::Playing);
@@ -776,6 +795,8 @@ mod tests {
         match super::VlcEngine::new() {
             Ok(engine) => {
                 assert_eq!(engine.state(), VlcState::Nothing);
+                // Walks a real native list when an output offers one.
+                let _ = engine.audio_output_devices();
                 engine.stop();
             }
             Err(error) => assert!(!error.is_empty()),
