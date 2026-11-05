@@ -1286,6 +1286,8 @@ Evidence for N01 to N06 is in docs/validation/0071-player-engine-cpu-and-ticks.m
 
 **N25, low: smaller dialogs.** About's community links for Telegram and GitHub (`dialogs_misc.py:60` to `:66`), a typed path and Browse in Custom Player where Rust has a file picker only (`options.py:934` to `:954`), the exact What Is Playing wording (`main.py:1838`), and Go to Channel errors (`main.py:2974`, `:2983`).
 
+**Fix:** Fixed 2026-11-04 — About is now Python's dialog with the three community links (Telegram group, project GitHub, author GitHub; labels and URLs from `app_links.py`) as hyperlink tab stops opening in the default browser, with Enter/numpad Enter/Space routed to open and only those keys; Custom Player is Python's dialog (typed path seeded with the configured path, Browse... into the field, empty path saves nothing); What Is Playing speaks Python's exact sentence ("{channel}. Now: {current}. Next: {next}. Recording: {recording}.", "Guide information unavailable", display-name fallbacks) from the loaded guide or the cold-store read worker, with the playing/recent/selected channel chain, from both the main menu and the player window; Go to Channel uses Python's prompt and both error boxes, matches the channel's own `number`/`tvg-chno` before the positional fallback, and stays silent with nothing in scope. See validation 0090 for the recorded residuals (select-the-row kept from the G2 slice; answer surface is the invoking window).
+
 ### Still open from earlier records
 
 These were already documented and remain true:

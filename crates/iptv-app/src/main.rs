@@ -467,6 +467,10 @@ enum PendingEpgReadUi {
         channel: Channel,
         status: Status,
     },
+    WhatsPlaying {
+        channel: Channel,
+        status: Status,
+    },
     AutoImportCheck {
         sources: Vec<String>,
     },
@@ -1117,6 +1121,12 @@ fn bind_browser(
         guide_ui: Rc::clone(&wiring.guide_ui),
         i18n: Rc::clone(&wiring.i18n),
         media_probe: wiring.media_probe.clone(),
+        whats_playing: {
+            let hook_wiring = clone_wiring(&wiring);
+            Some(Rc::new(move |channel: Option<Channel>, status: Status| {
+                announce_what_is_playing(&hook_wiring, channel, None, status);
+            }))
+        },
     });
     *wiring.reminders.borrow_mut() = wiring.persist.reminders();
     init_speech(&wiring.player, &wiring.persist, controls.status);
@@ -2343,6 +2353,15 @@ fn drain_epg_reads(wiring: &Wiring) {
                 Ok(iptv_core::epg::EpgReadValue::NowNext(None)),
             ) => status.set_label("No current programme to catch up."),
             (
+                PendingEpgReadUi::WhatsPlaying { channel, status },
+                Ok(iptv_core::epg::EpgReadValue::NowNext(entry)),
+            ) => deliver_what_is_playing(wiring, &channel, status, entry.as_ref()),
+            (PendingEpgReadUi::WhatsPlaying { channel, status }, Err(_)) => {
+                // Python logs the failed guide read and still
+                // answers with the unavailable wording.
+                deliver_what_is_playing(wiring, &channel, status, None);
+            }
+            (
                 PendingEpgReadUi::SeriesProgrammes { rule, now },
                 Ok(iptv_core::epg::EpgReadValue::Programmes(rows)),
             ) => apply_series_programmes(wiring, &rule, now, rows),
@@ -2581,6 +2600,111 @@ fn guide_now_next(wiring: &Wiring, channel: &Channel) -> Option<NowNext> {
         return Some(NowNext { current, next });
     }
     None
+}
+
+/// Python's `_channel_display_name`: the first non-empty of
+/// the display name, the guide name, the guide id, else the
+/// generic stream label.
+fn channel_display_name(channel: &Channel) -> String {
+    for candidate in [&channel.name, &channel.tvg_name, &channel.tvg_id] {
+        if !candidate.is_empty() {
+            return candidate.clone();
+        }
+    }
+    "IPTV Stream".to_string()
+}
+
+/// Python's `describe` for one What Is Playing programme:
+/// title and local start/end times, or the unavailable line.
+fn playing_programme_text(programme: Option<&Programme>) -> String {
+    match programme {
+        None => tr("Guide information unavailable"),
+        Some(programme) => {
+            let title = if programme.title.is_empty() {
+                "Untitled Program"
+            } else {
+                programme.title.as_str()
+            };
+            trf(
+                "{title}, {start} to {end}",
+                &[
+                    ("title", title),
+                    ("start", &iptv_core::epg::local_hhmm(programme.start)),
+                    ("end", &iptv_core::epg::local_hhmm(programme.stop)),
+                ],
+            )
+        }
+    }
+}
+
+/// The What Is Playing sentence (audit N25, Python's exact
+/// format at `main.py:1838`).
+fn what_is_playing_text(channel: &Channel, now_next: Option<&NowNext>, recording: bool) -> String {
+    let (current, next) = match now_next {
+        Some(entry) => (entry.current.as_ref(), entry.next.as_ref()),
+        None => (None, None),
+    };
+    trf(
+        "{channel}. Now: {current}. Next: {next}. Recording: {recording}.",
+        &[
+            ("channel", &channel_display_name(channel)),
+            ("current", &playing_programme_text(current)),
+            ("next", &playing_programme_text(next)),
+            ("recording", &tr(if recording { "Yes" } else { "No" })),
+        ],
+    )
+}
+
+/// Deliver a What Is Playing answer on a status surface —
+/// setting the label also speaks it, Python's
+/// `_show_playing_info`.
+fn deliver_what_is_playing(
+    wiring: &Wiring,
+    channel: &Channel,
+    status: Status,
+    now_next: Option<&NowNext>,
+) {
+    let recording = wiring
+        .recordings
+        .borrow()
+        .is_recording(&channel_key(channel));
+    status.set_label(&what_is_playing_text(channel, now_next, recording));
+}
+
+/// What Is Playing (audit N25, Python's
+/// `_announce_what_is_playing`): the playing channel, else
+/// the most recent, else the selected one. The loaded guide
+/// answers at once; before it loads, the persisted store is
+/// read on the EPG read worker, like Python's executor read
+/// of the guide database.
+fn announce_what_is_playing(
+    wiring: &Wiring,
+    preferred: Option<Channel>,
+    list: Option<ListCtrl>,
+    status: Status,
+) {
+    let channel = preferred
+        .or_else(|| wiring.player.borrow().current_channel.clone())
+        .or_else(|| resolved_recent(wiring).into_iter().next())
+        .or_else(|| list.and_then(|list| selected_channel(wiring, list)));
+    let Some(channel) = channel else {
+        status.set_label("No channel is selected.");
+        return;
+    };
+    if wiring.epg.borrow().is_some() || !wiring.persist.config.borrow().bool_or("epg_enabled", true)
+    {
+        let now_next = guide_now_next(wiring, &channel);
+        deliver_what_is_playing(wiring, &channel, status, now_next.as_ref());
+        return;
+    }
+    submit_epg_read(
+        wiring,
+        iptv_core::epg::EpgReadKind::NowNext {
+            channel: channel.clone(),
+            at: now_epoch(),
+        },
+        PendingEpgReadUi::WhatsPlaying { channel, status },
+    );
 }
 
 /// The EPG search row at a list row, when the row is one of the
@@ -7018,15 +7142,7 @@ fn bind_menu_actions(frame: Frame, wiring: &Wiring, controls: Controls) {
                 frame.raise();
             }
             IMPORT_EPG => menu_import_epg(&wiring, frame, status),
-            WHAT_IS_PLAYING => {
-                let player = wiring.player.borrow();
-                match &player.current_channel {
-                    Some(channel) => {
-                        status.set_label(&trf("Now playing: {name}", &[("name", &channel.name)]));
-                    }
-                    None => status.set_label("Nothing is playing."),
-                }
-            }
+            WHAT_IS_PLAYING => announce_what_is_playing(&wiring, None, Some(list), status),
             CAST_TO | CAST_CONNECT => open_cast_window(&wiring, list),
             SHOW_PLAYER => {
                 let player = wiring.player.borrow();
@@ -7315,7 +7431,10 @@ fn bind_menu_option_actions(frame: Frame, wiring: &Wiring, controls: Controls) {
                 flip("minimize_to_tray");
             }
             SHOW_PLAYER_ON_ENTER => {
-                let next = !persist.config.borrow().bool_or("show_player_on_enter", true);
+                let next = !persist
+                    .config
+                    .borrow()
+                    .bool_or("show_player_on_enter", true);
                 persist.set_and_save("show_player_on_enter", serde_json::json!(next));
             }
             SHOW_STREAM_URL => {
@@ -7364,21 +7483,103 @@ fn bind_menu_option_actions(frame: Frame, wiring: &Wiring, controls: Controls) {
                 status.set_label("Opened the logs folder.");
             }
             COPY_DEBUG => copy_debug_information(&wiring, status),
-            ABOUT => {
-                let dialog = MessageDialog::builder(
-                    &frame,
-                    &format!(
-                        "Accessible IPTV Client\nVersion {}\nAccessible IPTV player — Rust port of the Python client.",
-                        env!("CARGO_PKG_VERSION")
-                    ),
-                    "About Accessible IPTV Client",
-                )
-                .build();
-                dialog.show_modal_tracked();
-            }
+            ABOUT => open_about(frame),
             _ => {}
         }
     });
+}
+
+/// Help > About (audit N25, Python's `AccessibleAboutDialog`):
+/// name and version, the feature summary, the community
+/// links as real tab stops opening in the default browser,
+/// and OK / Close buttons.
+fn open_about(frame: Frame) {
+    let dialog = Dialog::builder(&frame, &tr("About Accessible IPTV Client"))
+        .with_size(560, 380)
+        .build();
+    dialog.set_accessibility_label(&tr("About Accessible IPTV Client"));
+    let panel = Panel::builder(&dialog).build();
+    let heading = StaticText::builder(&panel)
+        .with_label(&trf(
+            "{name} {version}",
+            &[
+                ("name", "Accessible IPTV Client"),
+                ("version", env!("CARGO_PKG_VERSION")),
+            ],
+        ))
+        .build();
+    let _ = heading;
+    let description = StaticText::builder(&panel)
+        .with_label(&tr(
+            "A screen reader accessible IPTV client for Windows and Linux.\n\nSupports M3U/M3U Plus playlists, Stalker Portal, Xtream Codes, built-in VLC playback, casting, and XMLTV EPG.",
+        ))
+        .build();
+    let _ = description;
+    let support = StaticText::builder(&panel)
+        .with_label(&tr("Community and support"))
+        .build();
+    let _ = support;
+    let ok = Button::builder(&panel).with_label("&OK").build();
+    ok.set_accessibility_label("OK");
+    let close = Button::builder(&panel).with_label("&Close").build();
+    close.set_accessibility_label("Close");
+    let sizer = BoxSizer::builder(Orientation::Vertical).build();
+    sizer.add(&heading, 0, SizerFlag::All, 12);
+    sizer.add(&description, 0, SizerFlag::All, 12);
+    sizer.add(&support, 0, SizerFlag::All, 6);
+    // Python's three links, labels and URLs verbatim (its
+    // `app_links.py`): Telegram group, project page, author
+    // page.
+    for (label, url) in [
+        (
+            "Join the SerrebiProjects Telegram group",
+            "https://t.me/SerrebiProjects",
+        ),
+        (
+            "Open the Accessible IPTV Client project on GitHub",
+            "https://github.com/serrebidev/Accessible-IPTV-Client",
+        ),
+        ("Follow Serrebi on GitHub", "https://github.com/serrebidev"),
+    ] {
+        let label_text = tr(label);
+        let link = HyperlinkCtrl::builder(&panel)
+            .with_label(&label_text)
+            .with_url(url)
+            .build();
+        link.set_accessibility_label(&label_text);
+        link.on_clicked(move |_| {
+            launch_default_browser(url, BrowserLaunchFlags::Default);
+        });
+        // The native hyperlink control has no key handling of
+        // its own on wxMSW (Python's dialog documents the
+        // same fix): Enter, numpad Enter and Space open the
+        // link — and only those keys; everything else passes
+        // through untouched.
+        link.bind_internal(EventType::CHAR_HOOK, move |event| {
+            match event.get_key_code() {
+                Some(13 | 370 | 32) => {
+                    launch_default_browser(url, BrowserLaunchFlags::Default);
+                    event.skip(false);
+                }
+                _ => event.skip(true),
+            }
+        });
+        sizer.add(&link, 0, SizerFlag::All, 8);
+    }
+    let buttons = BoxSizer::builder(Orientation::Horizontal).build();
+    buttons.add(&ok, 0, SizerFlag::All, 4);
+    buttons.add(&close, 0, SizerFlag::All, 4);
+    sizer.add_sizer(&buttons, 0, SizerFlag::Expand, 0);
+    panel.set_sizer(sizer, true);
+    let dialog_ok = dialog;
+    ok.on_click(move |_| {
+        dialog_ok.end_modal(ID_OK);
+    });
+    let dialog_close = dialog;
+    close.on_click(move |_| {
+        dialog_close.end_modal(ID_CANCEL);
+    });
+    dialog.show_modal_tracked();
 }
 
 /// Real diagnostics (S05): operational facts plus the redacted,
@@ -7443,29 +7644,88 @@ fn menu_import_epg(wiring: &Wiring, frame: Frame, status: Status) {
     status.set_label("Importing EPG data...");
 }
 
-/// View > Go to Channel Number...: select the row by its 1-based
-/// number in the current view.
+/// View > Go to Channel Number...: select the row by its
+/// channel number or 1-based position in the current view.
+/// The prompt and the two error boxes are Python's (audit
+/// N25, `main.py:2962`): an entry that is not a positive
+/// number warns, and a number no channel carries and no
+/// position reaches reports not found.
 fn menu_go_to_channel_number(wiring: &Wiring, frame: Frame, list: ListCtrl, status: Status) {
-    let dialog =
-        TextEntryDialog::builder(&frame, "Go to channel number:", "Go to Channel Number").build();
-    if dialog.show_modal_tracked() != ID_OK {
-        return;
-    }
-    let Some(text) = dialog.get_value() else {
-        return;
-    };
-    let Ok(number) = text.trim().parse::<usize>() else {
-        status.set_label("That is not a channel number.");
-        return;
-    };
-    if number == 0 {
-        status.set_label("Channel numbers start at 1.");
-        return;
-    }
-    let row = number - 1;
-    let Some(index) = wiring.model.borrow().playlist_index(row) else {
-        status.set_label("That channel number is not in the current view.");
-        return;
+    let (row, index, number) = {
+        let model = wiring.model.borrow();
+        if model.is_empty() {
+            // Python returns silently when nothing is in scope.
+            return;
+        }
+        let row_count = model.len();
+        let dialog =
+            TextEntryDialog::builder(&frame, "Enter a channel number:", "Go to Channel Number")
+                .build();
+        if dialog.show_modal_tracked() != ID_OK {
+            return;
+        }
+        let Some(text) = dialog.get_value() else {
+            return;
+        };
+        let value = text.trim();
+        let number = if !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()) {
+            value.parse::<usize>().unwrap_or(usize::MAX)
+        } else {
+            0
+        };
+        if number == 0 {
+            let dialog = MessageDialog::builder(
+                &frame,
+                "Enter a positive channel number.",
+                "Go to Channel Number",
+            )
+            .with_style(MessageDialogStyle::OK | MessageDialogStyle::IconWarning)
+            .build();
+            dialog.show_modal_tracked();
+            return;
+        }
+        // Python matches the channel's own number first
+        // (`number`, then `tvg-chno`), then falls back to
+        // the 1-based position in the scoped list.
+        let mut row = None;
+        for candidate in 0..row_count {
+            let Some(channel) = model.channel(candidate) else {
+                continue;
+            };
+            let own = channel
+                .unknown_attributes
+                .get("number")
+                .filter(|own| !own.is_empty())
+                .or_else(|| channel.unknown_attributes.get("tvg-chno"));
+            if own.is_some_and(|own| own == value) {
+                row = Some(candidate);
+                break;
+            }
+        }
+        let row = row.or_else(|| (number <= row_count).then(|| number - 1));
+        let Some(row) = row else {
+            let number_text = if number == usize::MAX {
+                value.to_string()
+            } else {
+                number.to_string()
+            };
+            let dialog = MessageDialog::builder(
+                &frame,
+                &trf(
+                    "Channel number {number} was not found.",
+                    &[("number", &number_text)],
+                ),
+                "Go to Channel Number",
+            )
+            .with_style(MessageDialogStyle::OK | MessageDialogStyle::IconInformation)
+            .build();
+            dialog.show_modal_tracked();
+            return;
+        };
+        let Some(index) = model.playlist_index(row) else {
+            return;
+        };
+        (row, index, number)
     };
     let row_i64 = i64::try_from(row).unwrap_or(0);
     list.set_item_state(
@@ -7483,19 +7743,82 @@ fn menu_go_to_channel_number(wiring: &Wiring, frame: Frame, list: ListCtrl, stat
     }
 }
 
-/// Options > Custom Player...: pick the player executable and make
-/// it the media player.
-fn menu_custom_player(wiring: &Wiring, frame: Frame, status: Status) {
-    let dialog = FileDialog::builder(&frame)
-        .with_message("Choose the custom player executable")
-        .with_style(FileDialogStyle::Open | FileDialogStyle::FileMustExist)
+/// The Custom Player dialog (audit N25, Python's
+/// `CustomPlayerDialog` in `options.py`): a typed path with
+/// a Browse picker beside it, seeded with the configured
+/// path. Returns the field's text on OK.
+fn custom_player_dialog(frame: Frame, initial_path: &str) -> Option<String> {
+    let dialog = Dialog::builder(&frame, &tr("Select Custom Player"))
+        .with_size(520, 210)
         .build();
+    dialog.set_accessibility_label(&tr("Select Custom Player"));
+    let panel = Panel::builder(&dialog).build();
+    let label = StaticText::builder(&panel)
+        .with_label(&tr("Enter player executable or path:"))
+        .build();
+    label.set_accessibility_label(&tr("Enter player executable or path:"));
+    let text = TextCtrl::builder(&panel).with_value(initial_path).build();
+    text.set_accessibility_label(&tr("Enter player executable or path:"));
+    let browse = Button::builder(&panel).with_label(&tr("Browse...")).build();
+    browse.set_accessibility_label(&tr("Browse..."));
+    let ok = Button::builder(&panel).with_label("&OK").build();
+    ok.set_accessibility_label("OK");
+    let cancel = Button::builder(&panel).with_label("&Cancel").build();
+    cancel.set_accessibility_label("Cancel");
+    let sizer = BoxSizer::builder(Orientation::Vertical).build();
+    sizer.add(&label, 0, SizerFlag::All, 8);
+    sizer.add(&text, 0, SizerFlag::Expand | SizerFlag::All, 8);
+    sizer.add(&browse, 0, SizerFlag::All, 8);
+    let buttons = BoxSizer::builder(Orientation::Horizontal).build();
+    buttons.add(&ok, 0, SizerFlag::All, 4);
+    buttons.add(&cancel, 0, SizerFlag::All, 4);
+    sizer.add_sizer(&buttons, 0, SizerFlag::Expand, 0);
+    panel.set_sizer(sizer, true);
+    browse.on_click(move |_| {
+        let picker = FileDialog::builder(&dialog)
+            .with_message(&tr("Select Player Executable"))
+            .with_style(FileDialogStyle::Open | FileDialogStyle::FileMustExist)
+            .build();
+        if picker.show_modal_tracked() == ID_OK {
+            if let Some(path) = picker.get_path() {
+                text.set_value(&path);
+            }
+        }
+    });
+    let chosen = Rc::new(RefCell::new(None::<String>));
+    let chosen_ok = Rc::clone(&chosen);
+    let dialog_ok = dialog;
+    ok.on_click(move |_| {
+        *chosen_ok.borrow_mut() = Some(text.get_value());
+        dialog_ok.end_modal(ID_OK);
+    });
+    let dialog_cancel = dialog;
+    cancel.on_click(move |_| {
+        dialog_cancel.end_modal(ID_CANCEL);
+    });
     if dialog.show_modal_tracked() != ID_OK {
-        return;
+        return None;
     }
-    let Some(path) = dialog.get_path() else {
+    let result = chosen.borrow().as_ref().cloned();
+    result
+}
+
+/// Options > Custom Player...: type or browse to the player
+/// executable and make it the media player (audit N25).
+/// Python saves nothing for an empty path.
+fn menu_custom_player(wiring: &Wiring, frame: Frame, status: Status) {
+    let initial = wiring
+        .persist
+        .config
+        .borrow()
+        .string_or("custom_player_path", "");
+    let Some(path) = custom_player_dialog(frame, &initial) else {
         return;
     };
+    let path = path.trim();
+    if path.is_empty() {
+        return;
+    }
     wiring
         .persist
         .set_and_save("custom_player_path", serde_json::json!(path));
@@ -9605,7 +9928,16 @@ struct PlayerShared {
     /// window's wiring so the player's record action classifies
     /// and preempts probes the same way.
     media_probe: MediaProbe,
+    /// N25: What Is Playing routed back to the main wiring
+    /// (the player dispatch has no guide access of its own).
+    /// Carries the playing channel when there is one, else
+    /// None for the recent/selected fallbacks.
+    whats_playing: Option<WhatsPlayingHook>,
 }
+
+/// What Is Playing on the main wiring, callable from the
+/// player window (audit N25).
+type WhatsPlayingHook = Rc<dyn Fn(Option<Channel>, Status)>;
 
 /// Build the built-in player window once: video surface, seek and
 /// volume sliders, time and subtitle labels, the audio track
@@ -12069,12 +12401,24 @@ fn dispatch_player_key(
         "fullscreen" => set_fullscreen(player, !win.frame.is_full_screen()),
         "hide" => win.frame.hide(),
         "what_is_playing" => {
-            let state = player.borrow();
-            match &state.current_channel {
-                Some(channel) => {
-                    status.set_label(&trf("Now playing: {name}", &[("name", &channel.name)]));
-                }
-                None => status.set_label("Nothing is playing."),
+            let (hook, current) = {
+                let state = player.borrow();
+                (
+                    state
+                        .shared
+                        .as_ref()
+                        .and_then(|shared| shared.whats_playing.clone()),
+                    state.current_channel.clone(),
+                )
+            };
+            match hook {
+                Some(hook) => hook(current, status),
+                None => match &current {
+                    Some(channel) => {
+                        status.set_label(&trf("Now playing: {name}", &[("name", &channel.name)]));
+                    }
+                    None => status.set_label("No channel is selected."),
+                },
             }
         }
         _ => return false,
