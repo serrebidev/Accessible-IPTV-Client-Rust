@@ -1072,7 +1072,7 @@ fn bind_browser(
             Some(saved_scope)
         });
     fill_scope_choices(&wiring, controls.scope_choice);
-    bind_completion(&wiring, controls);
+    bind_completion(frame, &wiring, controls);
     bind_epg_timer(frame, &wiring, controls);
     build_menu(frame, &wiring, controls);
     bind_tray(frame, &wiring, controls.status);
@@ -1258,7 +1258,7 @@ fn ensure_polling(wiring: &Wiring) {
     let _ = wiring.timer.start(50, false);
 }
 
-fn bind_completion(wiring: &Wiring, controls: Controls) {
+fn bind_completion(frame: Frame, wiring: &Wiring, controls: Controls) {
     let search = controls.search;
     let list = controls.list;
     let status = controls.status;
@@ -1328,7 +1328,7 @@ fn bind_completion(wiring: &Wiring, controls: Controls) {
             }
         }
         poll_providers(&completed, controls);
-        poll_recordings(&completed, status);
+        poll_recordings(&completed, frame, status);
         poll_vod(&completed, status);
         poll_cast(&completed, status);
         poll_downloads(&completed, status);
@@ -2766,6 +2766,7 @@ fn toggle_recording(
         &format,
         &channel.name.clone(),
         witness,
+        None,
     ) {
         Ok(path) => status.set_label(&trf(
             "Recording {name} to {path}.",
@@ -2845,6 +2846,10 @@ fn prepare_recording(
         &input_headers,
         &recording::FfmpegOptions {
             show_stats: true,
+            // N12: time-stamped log lines are what place each
+            // problem in time in the recording's log summary;
+            // probed once per ffmpeg path.
+            log_datetime: iptv_core::recording_log::ffmpeg_supports_log_datetime("ffmpeg"),
             audio_track,
             audio_track_count,
             copy_to_stdout: shared,
@@ -2867,6 +2872,7 @@ fn start_recording(
     format: &str,
     display_name: &str,
     witness: Option<(i64, String)>,
+    planned_seconds: Option<f64>,
 ) -> Result<PathBuf, String> {
     let (out, cmd) = prepare_recording(
         recordings,
@@ -2879,7 +2885,12 @@ fn start_recording(
         witness,
         false,
     )?;
-    if let Err(error) = recordings.borrow_mut().start(key, &cmd, out.clone()) {
+    let meta = recording::RecordingStartMeta {
+        title: display_name.to_string(),
+        format: format.to_string(),
+        planned_seconds,
+    };
+    if let Err(error) = recordings.borrow_mut().start(key, &cmd, out.clone(), meta) {
         release_recording_lease(buffers, key);
         return Err(error);
     }
@@ -2911,10 +2922,15 @@ fn start_shared_recording(
         witness,
         true,
     )?;
+    let meta = recording::RecordingStartMeta {
+        title: channel.name.clone(),
+        format: format.clone(),
+        planned_seconds: None,
+    };
     let stdout = match wiring
         .recordings
         .borrow_mut()
-        .start_shared(key, &cmd, out.clone())
+        .start_shared(key, &cmd, out.clone(), meta)
     {
         Ok(stdout) => stdout,
         Err(error) => {
@@ -3107,6 +3123,8 @@ fn record_dvr_channel(
         &job.format.clone(),
         &display,
         None,
+        // N12: the job's span is the capture's planned length.
+        Some((job.stop_ts - job.start_ts).max(0.0)),
     ) {
         Ok(_) => status.set_label(&trf("Recording {display}.", &[("display", &display)])),
         Err(error) => {
@@ -3411,7 +3429,7 @@ fn media_duration_seconds(path: &std::path::Path) -> Option<f64> {
 /// Per-tick recording housekeeping: collect finishes, run the DVR
 /// state machine (every 10 s, like the reference poll), and apply the
 /// shutdown-after-recordings gate.
-fn poll_recordings(wiring: &Wiring, status: Status) {
+fn poll_recordings(wiring: &Wiring, frame: Frame, status: Status) {
     let now = now_seconds();
     for finished in wiring.recordings.borrow_mut().poll_finished() {
         release_recording_lease(&wiring.buffers, &finished.key);
@@ -3452,19 +3470,36 @@ fn poll_recordings(wiring: &Wiring, status: Status) {
             .unwrap_or("")
             .to_string();
         if let Some(job_id) = finished.key.strip_prefix("dvr:") {
-            let message = if finished.success && !produced {
-                "Nothing was recorded: the stream ended before it wrote anything."
+            // Python's DVR finish message: the failure detail
+            // when ffmpeg failed, the nothing-recorded sentence
+            // when it wrote nothing, empty when it saved.
+            let message = if finished.exit_code != 0 {
+                finished
+                    .stderr_tail
+                    .iter()
+                    .rev()
+                    .take(6)
+                    .rev()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            } else if !produced {
+                "Nothing was recorded: the stream ended before it wrote anything.".to_string()
             } else {
-                ""
+                String::new()
             };
             wiring.dvr.borrow_mut().mark_finished(
                 job_id,
                 success,
                 &finished.out_path.to_string_lossy(),
-                message,
+                &message,
                 now,
             );
         }
+        // N12: Python's outcome report (a dialog, in Python's
+        // four-way wording) for every recording the downloads
+        // window does not already report on.
+        report_recording_finished(frame, &finished, produced);
         if success {
             let size = std::fs::metadata(&finished.out_path).map_or(0, |m| m.len());
             let mb = format!("{}.{}", size / 1_000_000, (size % 1_000_000) / 100_000);
@@ -3502,6 +3537,110 @@ fn poll_recordings(wiring: &Wiring, status: Status) {
     {
         wiring.shutdown_attempted.set(true);
         open_shutdown_countdown(wiring, status);
+    }
+}
+
+/// What ffmpeg said, plus where the rest of what it said was
+/// written (N12; Python `_recording_failure_detail`): the totals
+/// line first when anything was logged, the last six problem
+/// lines, and the log's path when it exists.
+fn recording_failure_detail(finished: &recording::RecordingFinished) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    if let Some((warnings, errors, fatals)) = finished.problem_counts {
+        if warnings + errors + fatals > 0 {
+            lines.push(trf(
+                "{warnings} warnings, {errors} errors and {fatals} fatal errors were logged in total.",
+                &[
+                    ("warnings", &warnings.to_string()),
+                    ("errors", &errors.to_string()),
+                    ("fatals", &fatals.to_string()),
+                ],
+            ));
+        }
+    }
+    let tail: Vec<&String> = finished.stderr_tail.iter().rev().take(6).rev().collect();
+    if tail.is_empty() {
+        lines.push(tr("No ffmpeg details were reported."));
+    } else {
+        lines.extend(tail.iter().map(|line| (*line).clone()));
+    }
+    if let Some(log) = &finished.log_path {
+        if log.exists() {
+            lines.push(String::new());
+            lines.push(trf(
+                "Full ffmpeg log:\n{path}",
+                &[("path", &log.display().to_string())],
+            ));
+        }
+    }
+    lines.join("\n")
+}
+
+/// Python's recording outcome report (N12; `client_recording.py`):
+/// saved, nothing recorded, stopped-by-user warning, or error,
+/// each a dialog in Python's wording.
+fn report_recording_finished(
+    frame: Frame,
+    finished: &recording::RecordingFinished,
+    produced: bool,
+) {
+    let rc = finished.exit_code;
+    let code = rc.to_string();
+    let path = finished.out_path.to_string_lossy().into_owned();
+    let show = |message: String, title: &str, style: MessageDialogStyle| {
+        let _ = MessageDialog::builder(&frame, &message, &tr(title))
+            .with_style(style)
+            .build()
+            .show_modal();
+    };
+    if rc == 0 && produced {
+        show(
+            trf("Recording saved:\n{path}", &[("path", &path)]),
+            "Recording Complete",
+            MessageDialogStyle::OK | MessageDialogStyle::IconInformation,
+        );
+    } else if rc == 0 && !finished.stopped_by_user {
+        show(
+            tr("Nothing was recorded: the stream ended before it wrote anything."),
+            "Recording Warning",
+            MessageDialogStyle::OK | MessageDialogStyle::IconWarning,
+        );
+    } else if finished.stopped_by_user {
+        show(
+            trf(
+                "Recording stopped, but ffmpeg reported code {code}.\n\n{detail}\n\nFile:\n{path}",
+                &[
+                    ("code", &code),
+                    ("detail", &recording_failure_detail(finished)),
+                    ("path", &path),
+                ],
+            ),
+            "Recording Warning",
+            MessageDialogStyle::OK | MessageDialogStyle::IconWarning,
+        );
+    } else {
+        let mut detail = recording_failure_detail(finished);
+        if finished.format == "provider_mka" {
+            // The MKA preset copies the audio verbatim and never
+            // transcodes: say so plainly and point at another
+            // audio format instead of silently substituting one.
+            detail = trf(
+                "The audio could not be copied into an MKA container, so nothing was recorded and nothing was transcoded. Choose another audio format from Recordings > Recording Format and try again.\n\n{detail}",
+                &[("detail", &detail)],
+            );
+        }
+        show(
+            trf(
+                "Recording of {name} ended unexpectedly (code {code}).\n\n{detail}",
+                &[
+                    ("name", &finished.title),
+                    ("code", &code),
+                    ("detail", &detail),
+                ],
+            ),
+            "Recording Error",
+            MessageDialogStyle::OK | MessageDialogStyle::IconError,
+        );
     }
 }
 
@@ -4613,6 +4752,7 @@ pub const REC_PADDING: i32 = 5208;
 pub const REC_OPEN_FOLDER: i32 = 5221;
 pub const REC_SET_FOLDER: i32 = 5222;
 pub const REC_SHUTDOWN_AFTER: i32 = 5223;
+pub const REC_PROBLEM_TIMES: i32 = 5224;
 
 /// The "Media Player to Use" radio labels, in Python's order.
 const PLAYER_LABELS: [&str; 32] = [
@@ -4950,6 +5090,13 @@ fn build_recordings_menu(config: &Config) -> Menu {
         ItemKind::Normal,
     );
     menu.append_separator();
+    menu_add(
+        &menu,
+        REC_PROBLEM_TIMES,
+        "Recording Problem &Times...",
+        "",
+        ItemKind::Normal,
+    );
     menu_add(
         &menu,
         REC_OPEN_FOLDER,
@@ -5339,6 +5486,116 @@ fn show_recording_storage(wiring: &Wiring, frame: Frame, status: Status) {
     status.set_label("Recording storage shown.");
 }
 
+/// The newest recording log by modification time (Python
+/// `_latest_recording_log`).
+fn latest_recording_log(logs_dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    let entries = std::fs::read_dir(logs_dir).ok()?;
+    let mut best: Option<(std::time::SystemTime, std::path::PathBuf)> = None;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file()
+            || path
+                .extension()
+                .is_none_or(|ext| !ext.eq_ignore_ascii_case("log"))
+        {
+            continue;
+        }
+        let Ok(mtime) = entry.metadata().and_then(|meta| meta.modified()) else {
+            continue;
+        };
+        if best.as_ref().is_none_or(|(when, _)| mtime > *when) {
+            best = Some((mtime, path));
+        }
+    }
+    best.map(|(_, path)| path)
+}
+
+/// Recordings > Recording Problem Times... (N12; Python
+/// `_show_recording_problem_times` and
+/// `RecordingProblemTimesDialog`): the newest recording log's
+/// problems placed in time, with the VLC jump hint and a Copy
+/// Details button.
+fn show_recording_problem_times(wiring: &Wiring, frame: Frame) {
+    let logs_dir =
+        recordings_dir(&wiring.persist).join(iptv_core::recording_log::RECORDING_LOG_DIRNAME);
+    let latest = latest_recording_log(&logs_dir);
+    let (heading, problems) = match &latest {
+        Some(path) => (
+            path.file_stem().map_or_else(
+                || tr("Recordings"),
+                |stem| stem.to_string_lossy().into_owned(),
+            ),
+            iptv_core::recording_log::recording_problem_times(
+                path,
+                iptv_core::recording_log::PROBLEM_TIMES_LIMIT,
+            ),
+        ),
+        None => (tr("Recordings"), Vec::new()),
+    };
+    let mut lines: Vec<String> = Vec::new();
+    for problem in &problems {
+        let times = if problem.jump_times.is_empty() {
+            &problem.clock_times
+        } else {
+            &problem.jump_times
+        };
+        if !times.is_empty() {
+            lines.push(format!("{}: {}", times.join(", "), problem.message));
+        }
+    }
+    if lines.is_empty() {
+        lines.push(tr(
+            "No timed problems were found in the newest recording log.",
+        ));
+    }
+    let dialog = Dialog::builder(&frame, &tr("Recording Problem Times"))
+        .with_size(620, 460)
+        .build();
+    dialog.set_accessibility_label(&tr("Recording Problem Times"));
+    let panel = Panel::builder(&dialog).build();
+    let heading_text = StaticText::builder(&panel).with_label(&heading).build();
+    let list = ListBox::builder(&panel).build();
+    list.set_accessibility_label(&tr("Recording Problem Times"));
+    list.set_items(&lines.iter().map(String::as_str).collect::<Vec<_>>());
+    let hint = StaticText::builder(&panel)
+        .with_label(&tr(
+            "Open the recorded file in VLC, press Ctrl+T, and enter a listed time. Times use the file's media clock when FFmpeg reported it; otherwise they are elapsed recording time and may be slightly later after an interruption.",
+        ))
+        .build();
+    let copy = Button::builder(&panel).with_label("Copy &Details").build();
+    copy.set_accessibility_label("Copy Details");
+    let close = Button::builder(&panel).with_label("&Close").build();
+    close.set_accessibility_label("Close");
+    let sizer = BoxSizer::builder(Orientation::Vertical).build();
+    sizer.add(&heading_text, 0, SizerFlag::All, 12);
+    sizer.add(&list, 1, SizerFlag::Expand | SizerFlag::All, 12);
+    sizer.add(&hint, 0, SizerFlag::All, 12);
+    let buttons = BoxSizer::builder(Orientation::Horizontal).build();
+    buttons.add(&copy, 0, SizerFlag::All, 4);
+    buttons.add(&close, 0, SizerFlag::All, 4);
+    sizer.add_sizer(&buttons, 0, SizerFlag::Expand, 0);
+    panel.set_sizer(sizer, true);
+    let dialog_copy = dialog;
+    copy.on_click(move |_| {
+        if !Clipboard::get().set_text(&lines.join("\n")) {
+            let _ = MessageDialog::builder(
+                &dialog_copy,
+                &tr("Could not open the clipboard."),
+                &tr("Recording Problem Times"),
+            )
+            .with_style(MessageDialogStyle::OK | MessageDialogStyle::IconError)
+            .build()
+            .show_modal();
+        }
+    });
+    let dialog_close = dialog;
+    close.on_click(move |_| {
+        dialog_close.end_modal(ID_CANCEL);
+    });
+    list.set_focus();
+    dialog.show_modal();
+}
+
 /// Recordings > Minimum Free Space...
 fn prompt_min_free_space(wiring: &Wiring, frame: Frame, status: Status) {
     let current = recording::normalize_reserve_mib(
@@ -5668,7 +5925,7 @@ fn menu_item_topic(id: i32) -> Option<&'static str> {
         KEYBOARD_SHORTCUTS => "keyboard-shortcuts",
         WHATS_NEW => "updates",
         REC_START | REC_STOP | REC_STOP_ALL | REC_STORAGE | REC_MIN_FREE | REC_SET_FOLDER
-        | REC_OPEN_FOLDER | CTX_RECORD => "recordings",
+        | REC_OPEN_FOLDER | REC_PROBLEM_TIMES | CTX_RECORD => "recordings",
         REC_REMINDERS | CTX_REMINDER => "reminders",
         REC_SCHEDULED | CTX_SCHEDULE => "scheduled-recordings",
         REC_PADDING => "schedule-padding",
@@ -5867,6 +6124,7 @@ fn menu_recordings_action(
         REC_STORAGE => show_recording_storage(wiring, frame, status),
         REC_MIN_FREE => prompt_min_free_space(wiring, frame, status),
         REC_PADDING => prompt_schedule_padding(wiring, frame, status),
+        REC_PROBLEM_TIMES => show_recording_problem_times(wiring, frame),
         REC_OPEN_FOLDER => {
             let dir = recordings_dir(&wiring.persist);
             let _ = std::fs::create_dir_all(&dir);
@@ -13971,12 +14229,23 @@ fn launch_staged_capture(wiring: &Wiring, key: &str, staged: StagedDownload) -> 
             )),
             force_format: recording::format_muxer(extension).map(str::to_string),
             show_stats: true,
+            log_datetime: iptv_core::recording_log::ffmpeg_supports_log_datetime("ffmpeg"),
             audio_track,
             audio_track_count,
             ..recording::FfmpegOptions::default()
         },
     );
-    wiring.recordings.borrow_mut().start(key, &cmd, part)?;
+    let meta = recording::RecordingStartMeta {
+        title: staged.programme.title.clone(),
+        format: format.clone(),
+        planned_seconds: Some(f64::from(
+            i32::try_from(padded_stop - padded_start).unwrap_or(0),
+        )),
+    };
+    wiring
+        .recordings
+        .borrow_mut()
+        .start(key, &cmd, part, meta)?;
     wiring.recordings.borrow_mut().set_connection_key(
         key,
         &iptv_core::catchup_direct::single_stream_provider_key(&staged.url),
@@ -14003,16 +14272,19 @@ fn finish_staged_download(
     // N13: Python's truncation expectation is the padded
     // window minus its padding (the programme itself), and a
     // capture counts as truncated below 95% of it
-    // (`_catchup_download_is_truncated`); the written seconds
-    // come from probing the produced file rather than parsing
-    // the ffmpeg log — the log route lands with N12.
+    // (`_catchup_download_is_truncated`). N12: the written
+    // seconds are ffmpeg's own reported progress from the
+    // recording log (Python's `media_written_seconds`); probing
+    // the produced file is only the fallback for a capture
+    // whose log carried no stats.
     let (padded_start, padded_stop) = padded_window(wiring, &staged.programme);
     let expected_seconds = ((padded_stop - padded_start) - padding_seconds(wiring)).max(1);
     let expected = f64::from(i32::try_from(expected_seconds).unwrap_or(0));
-    let truncated = finished.success
-        && produced
-        && media_duration_seconds(&finished.out_path)
-            .is_some_and(|actual| actual < expected * 0.95);
+    let written = finished
+        .media_written_seconds
+        .or_else(|| media_duration_seconds(&finished.out_path));
+    let truncated =
+        finished.success && produced && written.is_some_and(|actual| actual < expected * 0.95);
     let complete = !staged.cancelled && finished.success && produced && !truncated;
     if staged.cancelled {
         let _ = std::fs::remove_file(&finished.out_path);

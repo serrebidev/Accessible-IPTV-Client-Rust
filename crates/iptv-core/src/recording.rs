@@ -4,11 +4,13 @@
 //! and the shutdown-after-recordings decision.
 
 use std::collections::BTreeMap;
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
 
 use crate::playback::StreamHeaders;
+use crate::recording_log;
 
 /// (key, English label, file extension, kind) — `RECORDING_FORMATS`.
 pub const RECORDING_FORMATS: &[(&str, &str, &str, &str)] = &[
@@ -338,6 +340,21 @@ fn format_args(format: &str, audio_track: Option<i64>) -> Vec<String> {
     out
 }
 
+/// What a recording is called and how long it was meant to run,
+/// for the finish report and the log's closing summary (N12;
+/// Python's `Recording` fields of the same names).
+#[derive(Clone, Debug, Default)]
+pub struct RecordingStartMeta {
+    /// Display title ("Recording of {title} ended unexpectedly").
+    pub title: String,
+    /// The recording format key (the MKA failure wording keys
+    /// off `provider_mka`).
+    pub format: String,
+    /// Seconds the capture was meant to run, when it had a
+    /// planned length (a download's window, a DVR job's span).
+    pub planned_seconds: Option<f64>,
+}
+
 /// One running recording.
 struct Active {
     child: Child,
@@ -345,6 +362,20 @@ struct Active {
     /// The one-stream provider key this recording's connection
     /// counts against (N13; empty for unrestricted providers).
     connection_key: String,
+    /// When the capture started, epoch seconds (the log summary's
+    /// "Started" / "ran for" lines).
+    started_epoch: f64,
+    meta: RecordingStartMeta,
+    /// The per-recording ffmpeg log (N12), when one could be
+    /// opened; ffmpeg's stderr is redirected into it.
+    log_path: Option<PathBuf>,
+    /// Problem lines drained from a piped stderr when no log
+    /// file could be opened (Python's `_drain_stderr` fallback).
+    fallback_tail: Option<Arc<Mutex<Vec<String>>>>,
+    /// The user asked for this stop (Python `stopped_by_user`).
+    stopped_by_user: bool,
+    /// The stop had to kill ffmpeg before it finished writing.
+    killed: bool,
 }
 
 /// A finished recording report.
@@ -353,6 +384,25 @@ pub struct RecordingFinished {
     pub key: String,
     pub out_path: PathBuf,
     pub success: bool,
+    /// ffmpeg's exit code (-1 when no status could be read).
+    pub exit_code: i32,
+    /// The user asked for the stop (Python `stopped_by_user`).
+    pub stopped_by_user: bool,
+    /// The recording's display title.
+    pub title: String,
+    /// The recording format key.
+    pub format: String,
+    /// The per-recording ffmpeg log (N12), when one was written.
+    pub log_path: Option<PathBuf>,
+    /// The last problem lines from the log, time stamps stripped
+    /// (Python `stderr_tail`).
+    pub stderr_tail: Vec<String>,
+    /// (warnings, errors, fatals) over the whole log, when a log
+    /// was written (Python `problem_counts`).
+    pub problem_counts: Option<(u64, u64, u64)>,
+    /// Media seconds ffmpeg reported writing (Python
+    /// `media_written_seconds`), from the log's `time=` lines.
+    pub media_written_seconds: Option<f64>,
 }
 
 /// The recording process manager: spawn ffmpeg, stop it gracefully,
@@ -401,8 +451,10 @@ impl RecordingEngine {
         key: &str,
         command: &[String],
         out_path: PathBuf,
+        meta: RecordingStartMeta,
     ) -> Result<(), String> {
-        self.start_inner(key, command, out_path, false).map(|_| ())
+        self.start_inner(key, command, out_path, false, meta)
+            .map(|_| ())
     }
 
     /// Start a recording whose ffmpeg stdout (the tee'd MPEG-TS
@@ -418,8 +470,9 @@ impl RecordingEngine {
         key: &str,
         command: &[String],
         out_path: PathBuf,
+        meta: RecordingStartMeta,
     ) -> Result<std::process::ChildStdout, String> {
-        self.start_inner(key, command, out_path, true)?
+        self.start_inner(key, command, out_path, true, meta)?
             .ok_or_else(|| "Recording failed: no shared output.".to_string())
     }
 
@@ -429,6 +482,7 @@ impl RecordingEngine {
         command: &[String],
         out_path: PathBuf,
         shared_stdout: bool,
+        meta: RecordingStartMeta,
     ) -> Result<Option<std::process::ChildStdout>, String> {
         if self.active.contains_key(key) {
             return Err("That recording is already running.".to_string());
@@ -436,6 +490,13 @@ impl RecordingEngine {
         if let Some(parent) = out_path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| format!("Recording failed: {e}"))?;
         }
+        // N12: ffmpeg's stderr goes to the per-recording log
+        // (Python `RecordingManager._open_log`); the child owns
+        // the descriptor once spawned. When the log cannot be
+        // opened, stderr is piped and drained for its problem
+        // lines instead, and the recording carries no log.
+        let log_file = open_recording_log(&out_path, command);
+        let log_path = log_file.as_ref().map(|(_, path)| path.clone());
         let mut cmd = Command::new(&command[0]);
         cmd.args(&command[1..])
             .stdin(Stdio::piped())
@@ -443,8 +504,15 @@ impl RecordingEngine {
                 Stdio::piped()
             } else {
                 Stdio::null()
-            })
-            .stderr(Stdio::null());
+            });
+        match log_file {
+            Some((file, _)) => {
+                cmd.stderr(Stdio::from(file));
+            }
+            None => {
+                cmd.stderr(Stdio::piped());
+            }
+        }
         let mut child = cmd.spawn().map_err(|e| format!("Recording failed: {e}"))?;
         let stdout = if shared_stdout {
             Some(
@@ -456,12 +524,45 @@ impl RecordingEngine {
         } else {
             None
         };
+        let fallback_tail = if log_path.is_none() {
+            child.stderr.take().map(|stderr| {
+                let tail: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+                let drain_tail = Arc::clone(&tail);
+                std::thread::spawn(move || {
+                    let reader = BufReader::new(stderr);
+                    for line in reader.lines() {
+                        let Ok(line) = line else {
+                            break;
+                        };
+                        let line = line.trim().to_string();
+                        if !line.is_empty() && recording_log::is_problem_line(&line) {
+                            let mut kept = drain_tail
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            kept.push(line);
+                            let excess =
+                                kept.len().saturating_sub(recording_log::STDERR_TAIL_LINES);
+                            kept.drain(..excess);
+                        }
+                    }
+                });
+                tail
+            })
+        } else {
+            None
+        };
         self.active.insert(
             key.to_string(),
             Active {
                 child,
                 out_path,
                 connection_key: String::new(),
+                started_epoch: epoch_seconds(),
+                meta,
+                log_path,
+                fallback_tail,
+                stopped_by_user: false,
+                killed: false,
             },
         );
         Ok(stdout)
@@ -491,6 +592,7 @@ impl RecordingEngine {
     /// process is collected by [`RecordingEngine::poll_finished`].
     pub fn stop(&mut self, key: &str) {
         if let Some(active) = self.active.get_mut(key) {
+            active.stopped_by_user = true;
             if let Some(stdin) = active.child.stdin.as_mut() {
                 let _ = stdin.write_all(b"q\n");
                 let _ = stdin.flush();
@@ -514,16 +616,15 @@ impl RecordingEngine {
         }
         self.stop(key);
         let deadline = std::time::Instant::now() + grace;
-        let mut success: Option<bool> = None;
+        let mut status: Option<std::process::ExitStatus> = None;
         while let Some(active) = self.active.get_mut(key) {
             match active.child.try_wait() {
-                Ok(Some(status)) => {
-                    success = Some(status.success());
+                Ok(Some(exited)) => {
+                    status = Some(exited);
                     break;
                 }
                 Ok(None) => {}
                 Err(_) => {
-                    success = Some(false);
                     break;
                 }
             }
@@ -532,28 +633,25 @@ impl RecordingEngine {
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        let success = match success {
-            Some(success) => success,
+        let (exit_code, success) = match status {
+            Some(exited) => (exited.code().unwrap_or(-1), exited.success()),
             None => {
                 // Still running past the grace deadline: kill and reap.
                 match self.active.get_mut(key) {
                     Some(active) => {
+                        active.killed = true;
                         let _ = active.child.kill();
                         match active.child.wait() {
-                            Ok(status) => status.success(),
-                            Err(_) => false,
+                            Ok(exited) => (exited.code().unwrap_or(-1), exited.success()),
+                            Err(_) => (-1, false),
                         }
                     }
-                    None => false,
+                    None => (-1, false),
                 }
             }
         };
         let active = self.active.remove(key)?;
-        Some(RecordingFinished {
-            key: key.to_string(),
-            out_path: active.out_path,
-            success,
-        })
+        Some(build_finished(key, active, exit_code, success))
     }
 
     /// Stop every active recording with escalation (R07), returning a
@@ -576,22 +674,116 @@ impl RecordingEngine {
         for key in keys {
             let done = match self.active.get_mut(&key) {
                 Some(active) => match active.child.try_wait() {
-                    Ok(Some(status)) => Some(status.success()),
+                    Ok(Some(status)) => Some((status.code().unwrap_or(-1), status.success())),
                     _ => None,
                 },
                 None => None,
             };
-            if let Some(success) = done {
+            if let Some((exit_code, success)) = done {
                 if let Some(active) = self.active.remove(&key) {
-                    finished.push(RecordingFinished {
-                        key,
-                        out_path: active.out_path,
-                        success,
-                    });
+                    finished.push(build_finished(&key, active, exit_code, success));
                 }
             }
         }
         finished
+    }
+}
+
+/// Epoch seconds now, for recording start/finish stamps.
+fn epoch_seconds() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0.0, |d| d.as_secs_f64())
+}
+
+/// Open the per-recording ffmpeg log and write its header
+/// (Python `RecordingManager._open_log`): `# <date>` and
+/// `# ffmpeg <args>`, deliberately unmasked — the log exists for
+/// troubleshooting, and masking the input URL hides the details
+/// a 403 or a timeout diagnosis needs. `None` when the log
+/// cannot be written; the recording then drains a piped stderr.
+fn open_recording_log(out_path: &Path, command: &[String]) -> Option<(std::fs::File, PathBuf)> {
+    let parent = out_path.parent()?;
+    let log_path = recording_log::recording_log_path(parent, out_path);
+    std::fs::create_dir_all(log_path.parent()?).ok()?;
+    let mut file = std::fs::File::create(&log_path).ok()?;
+    let header = format!(
+        "# {}\n# ffmpeg {}\n\n",
+        chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
+        command[1..].join(" ")
+    );
+    let _ = file.write_all(header.as_bytes());
+    let _ = file.flush();
+    Some((file, log_path))
+}
+
+/// Build the finish report for one exited recording (N12;
+/// Python `RecordingManager._watch`'s finish work): the problem
+/// tail and totals come back out of the log, the written seconds
+/// from its `time=` lines, and the log is closed with the
+/// readable summary.
+fn build_finished(key: &str, active: Active, exit_code: i32, success: bool) -> RecordingFinished {
+    let Active {
+        out_path,
+        meta,
+        log_path,
+        fallback_tail,
+        stopped_by_user,
+        killed,
+        started_epoch,
+        ..
+    } = active;
+    let mut stderr_tail: Vec<String> = Vec::new();
+    let mut problem_counts = None;
+    let mut media_written_seconds = None;
+    if let Some(log) = &log_path {
+        stderr_tail = recording_log::read_log_problems(log, recording_log::STDERR_TAIL_LINES);
+        problem_counts = Some(recording_log::count_log_problems(log));
+        media_written_seconds = recording_log::parse_ffmpeg_progress(log);
+        let ending = if killed {
+            format!(
+                "ffmpeg had to be stopped before it finished writing the file \
+                 (exit code {exit_code}); the file may be incomplete."
+            )
+        } else if stopped_by_user {
+            format!("stopped on request (exit code {exit_code}).")
+        } else if exit_code == 0 {
+            "finished normally.".to_string()
+        } else {
+            format!("ffmpeg failed (exit code {exit_code}).")
+        };
+        let summary = recording_log::summarize_log(log);
+        let lines = recording_log::format_recording_summary(
+            &out_path.to_string_lossy(),
+            started_epoch,
+            epoch_seconds(),
+            meta.planned_seconds,
+            media_written_seconds,
+            std::fs::metadata(&out_path).ok().map(|m| m.len()),
+            &ending,
+            &summary,
+        );
+        if let Ok(mut handle) = std::fs::OpenOptions::new().append(true).open(log) {
+            let _ = handle.write_all(format!("\n{}\n", lines.join("\n")).as_bytes());
+        }
+    } else if let Some(tail) = &fallback_tail {
+        let kept = tail
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        stderr_tail.clone_from(&kept);
+    }
+    RecordingFinished {
+        key: key.to_string(),
+        out_path,
+        success,
+        exit_code,
+        stopped_by_user,
+        title: meta.title.clone(),
+        format: meta.format.clone(),
+        log_path,
+        stderr_tail,
+        problem_counts,
+        media_written_seconds,
     }
 }
 
@@ -879,7 +1071,12 @@ mod tests {
         let command = test_process_command(0);
         let mut engine = RecordingEngine::new();
         engine
-            .start("channel", &command, output.clone())
+            .start(
+                "channel",
+                &command,
+                output.clone(),
+                RecordingStartMeta::default(),
+            )
             .expect("start");
 
         let finished = wait_for_finished(&mut engine);
@@ -899,7 +1096,12 @@ mod tests {
         let command = test_process_command(7);
         let mut engine = RecordingEngine::new();
         engine
-            .start("channel", &command, output.clone())
+            .start(
+                "channel",
+                &command,
+                output.clone(),
+                RecordingStartMeta::default(),
+            )
             .expect("start");
 
         let finished = wait_for_finished(&mut engine);
@@ -1045,7 +1247,12 @@ mod tests {
         let output = dir.join("coop.ts");
         let mut engine = RecordingEngine::new();
         engine
-            .start("coop", &stdin_cooperative_command(), output.clone())
+            .start(
+                "coop",
+                &stdin_cooperative_command(),
+                output.clone(),
+                RecordingStartMeta::default(),
+            )
             .expect("start");
         let started = std::time::Instant::now();
         let finished = engine
@@ -1066,7 +1273,12 @@ mod tests {
         let output = dir.join("sleeper.ts");
         let mut engine = RecordingEngine::new();
         engine
-            .start("sleeper", &sleeper_command(), output)
+            .start(
+                "sleeper",
+                &sleeper_command(),
+                output,
+                RecordingStartMeta::default(),
+            )
             .expect("start");
         let started = std::time::Instant::now();
         let finished = engine
@@ -1097,10 +1309,20 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("iptv-rec-shutdown-{}", std::process::id()));
         let mut engine = RecordingEngine::new();
         engine
-            .start("one", &sleeper_command(), dir.join("one.ts"))
+            .start(
+                "one",
+                &sleeper_command(),
+                dir.join("one.ts"),
+                RecordingStartMeta::default(),
+            )
             .expect("start one");
         engine
-            .start("two", &sleeper_command(), dir.join("two.ts"))
+            .start(
+                "two",
+                &sleeper_command(),
+                dir.join("two.ts"),
+                RecordingStartMeta::default(),
+            )
             .expect("start two");
         let started = std::time::Instant::now();
         let finished = engine.shutdown_all(std::time::Duration::from_millis(200));
@@ -1124,6 +1346,52 @@ mod tests {
             );
             std::thread::yield_now();
         }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn finish_report_reads_the_ffmpeg_log() {
+        let dir = std::env::temp_dir().join(format!("iptv-rec-log-{}", std::process::id()));
+        let output = dir.join("show.mkv");
+        let script = "echo '2026-11-04 10:00:01.000 [mpegts @ 0x1] [warning] first frame is no keyframe' >&2; \
+                      echo '2026-11-04 10:00:02.000 [info] Output #0, matroska, to x:' >&2; \
+                      echo '2026-11-04 10:00:03.500 [h264 @ 0x2] [error] decode error' >&2; \
+                      echo '2026-11-04 10:00:04.000 [info] frame= 1 time=00:00:02.00 bitrate=1.0kbits/s' >&2; \
+                      exit 3";
+        let command = vec!["sh".to_string(), "-c".to_string(), script.to_string()];
+        let mut engine = RecordingEngine::new();
+        engine
+            .start(
+                "channel",
+                &command,
+                output.clone(),
+                RecordingStartMeta {
+                    title: "Show".to_string(),
+                    format: "provider_mkv".to_string(),
+                    planned_seconds: Some(60.0),
+                },
+            )
+            .expect("start");
+        let finished = wait_for_finished(&mut engine);
+        assert_eq!(finished.len(), 1);
+        let report = &finished[0];
+        assert!(!report.success);
+        assert_eq!(report.exit_code, 3);
+        assert_eq!(report.title, "Show");
+        assert_eq!(report.problem_counts, Some((1, 1, 0)));
+        assert_eq!(report.media_written_seconds, Some(2.0));
+        assert_eq!(report.stderr_tail.len(), 2);
+        let log_path = report.log_path.clone().expect("log path");
+        assert_eq!(
+            log_path,
+            crate::recording_log::recording_log_path(&dir, &output)
+        );
+        let log_text = std::fs::read_to_string(&log_path).expect("log readable");
+        assert!(log_text.contains("# ffmpeg"));
+        assert!(log_text.contains("# ===== Recording summary ====="));
+        assert!(log_text.contains("# How it ended: ffmpeg failed (exit code 3)."));
+        assert!(log_text.contains("# Planned length: 0:01:00"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(windows)]
