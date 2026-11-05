@@ -1238,6 +1238,8 @@ Evidence for N01 to N06 is in docs/validation/0071-player-engine-cpu-and-ticks.m
 
 **N13, high: catch-up on one-connection providers.** Python probes direct files, follows redirects with HEAD per hop, waits for the provider to release the stream, and handles a provider that truncates files (`catchup_direct.py`, `main.py:8524`, `_catchup_download_is_truncated`). It shares the playing channel's connection with a recording, and refuses or warns when one-stream accounts are busy (`recording_relay.py`, `_single_stream_provider_busy`, `_end_shared_playback`). None of these names exist in Rust. Validation 0045 records part of this.
 
+**Fix (partial), 2026-11-04:** the probing half is fixed — core `catchup_direct` (candidates, no-redirect HEAD walk, host-scoped headers, 2.5 s settle, probe worker) wired into `begin_catchup_download`, and the truncation check aligned to Python (padded window minus padding, 0.95). See validation 0073. Still open: the recording relay (`recording_relay.py`) and the one-stream busy refusal.
+
 **N14, medium: provider errors in plain words.** Python turns HTTP 401, 403, 404, 4xx, 5xx, timeouts, refused connections and bad data into sentences saying what to do (`catchup_urls.py:71` to `:91`).
 
 **N15, medium: Download window detail.** Python shows size so far, time remaining, retry attempts with a countdown, "ended early" with the bytes received, a cancel confirmation, and Escape to hide while the download continues (`main.py:8524`, `:8773` to `:8891`).
