@@ -29,6 +29,8 @@ pub mod epgstore;
 pub mod exit_guard;
 pub mod favorites;
 pub mod guide;
+pub mod guide_match;
+mod guide_match_data;
 pub mod i18n;
 pub mod instance;
 pub mod loading;

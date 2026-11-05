@@ -1195,13 +1195,13 @@ pub fn epg_row_label(channel_name: &str, programme: &Programme) -> String {
 // Channel-name vocabulary (port of channel_names.py matching subset)
 // ---------------------------------------------------------------------------
 
-const STRIP_TAGS: &[&str] = &[
+pub(crate) const STRIP_TAGS: &[&str] = &[
     "hd", "sd", "hevc", "fhd", "uhd", "4k", "8k", "hdr", "dash", "hq", "st", "us", "usa", "ca",
     "canada", "uk", "u.k.", "u.k", "uk.", "u.s.", "u.s", "us.", "au", "aus", "nz", "ukhd", "uksd",
     "h.265", "h265", "h.264", "h264", "50fps", "60fps", "eu",
 ];
 
-const NOISE_WORDS: &[&str] = &[
+pub(crate) const NOISE_WORDS: &[&str] = &[
     "backup", "alt", "feed", "main", "extra", "mirror", "test", "temp", "1", "2", "3", "4", "5",
     "6", "7", "8", "9", "0", "sd", "hd", "fhd", "uhd", "4k", "8k", "plus", "live", "network",
 ];
@@ -1223,13 +1223,13 @@ const IGNORED_NUMBERS: &[&str] = &[
     "240", "360", "480", "540", "576", "720", "1080", "1440", "2160", "4320", "50", "60",
 ];
 
-fn is_word_char(c: char) -> bool {
+pub(crate) fn is_word_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
 
 /// Replace whole-word occurrences of `word` (case-insensitive, `\b`
 /// semantics like the Python regexes) with `replacement`.
-fn replace_word(text: &str, word: &str, replacement: &str) -> String {
+pub(crate) fn replace_word(text: &str, word: &str, replacement: &str) -> String {
     let lower = text.to_lowercase();
     let needle = word.to_lowercase();
     let mut out = String::with_capacity(text.len());
@@ -1402,9 +1402,16 @@ pub struct GuideIndexes {
     /// indexes: callers pass it to `match_guide_channel` instead of
     /// rebuilding the set per channel (audit E12).
     pub known_ids: HashSet<String>,
+    /// Per-channel region/group tag (Python stores `group_tag` on each
+    /// guide channel at import; see `guide_match::guide_group_tag`).
+    pub group_tags: HashMap<String, String>,
     by_id_lower: HashMap<String, String>,
     name_index: HashMap<String, Vec<String>>,
     stripped_index: HashMap<String, Vec<String>>,
+    /// Significant display-name token -> ids, the pool source for the
+    /// scored matcher (Python gathers its fuzzy rows with token `LIKE`
+    /// queries over the guide's normalized names).
+    token_index: HashMap<String, Vec<String>>,
 }
 
 /// Add one id to a name index bucket, keeping guide order, no duplicates.
@@ -1426,15 +1433,28 @@ impl GuideIndexes {
                 .map(|c| (c.id.clone(), c.display_name.clone()))
                 .collect(),
             known_ids: channels.iter().map(|c| c.id.to_lowercase()).collect(),
+            group_tags: channels
+                .iter()
+                .map(|c| {
+                    (
+                        c.id.clone(),
+                        crate::guide_match::guide_group_tag(&c.id, &c.display_name),
+                    )
+                })
+                .collect(),
             by_id_lower: channels
                 .iter()
                 .map(|c| (c.id.to_lowercase(), c.id.clone()))
                 .collect(),
             name_index: HashMap::new(),
             stripped_index: HashMap::new(),
+            token_index: HashMap::new(),
         };
         for channel in channels {
             let display = channel.display_name.as_str();
+            for token in crate::guide_match::channel_tokens(display) {
+                push_index(&mut indexes.token_index, token, &channel.id);
+            }
             let spelled = replace_word_numbers(display);
             push_index(
                 &mut indexes.name_index,
@@ -1571,38 +1591,91 @@ pub fn match_guide_channel<S: std::hash::BuildHasher>(
             return None;
         }
     }
-    let playlist_numbers =
-        significant_channel_numbers(&[channel.tvg_name.as_str(), channel.name.as_str()]);
-    for source in [&channel.name, &channel.tvg_name] {
+    // Name phase (audit N11): pool the candidates from the name indexes,
+    // remember which ones are Python's exact stripped-name hits (base 96
+    // via the tvg-name, 92 via the name), then let the scored matcher
+    // (call signs, brands, HBO variants, time shifts, zones, regions,
+    // numbers) pick the winner instead of the first bucket hit.
+    let side = crate::guide_match::PlaylistSide::new(channel);
+    let mut pool: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut exact_base: HashMap<String, i32> = HashMap::new();
+    for (source, base) in [(&channel.name, 92), (&channel.tvg_name, 96)] {
         let text = source.trim();
         if text.is_empty() {
             continue;
         }
         let spelled = replace_word_numbers(text);
-        for (key, index) in [
-            (canonicalize_name(text), &indexes.name_index),
-            (canonicalize_name(&spelled), &indexes.name_index),
-            (
-                canonicalize_name(&strip_noise_words(text)),
-                &indexes.stripped_index,
-            ),
-            (
-                canonicalize_name(&strip_noise_words(&spelled)),
-                &indexes.stripped_index,
-            ),
-        ] {
-            if let Some(bucket) = index.get(&key) {
+        for key in [canonicalize_name(text), canonicalize_name(&spelled)] {
+            if let Some(bucket) = indexes.name_index.get(&key) {
                 for id in bucket {
-                    let display = indexes.display_names.get(id).map_or("", String::as_str);
-                    let guide_numbers = significant_channel_numbers(&[display]);
-                    if !numbers_disagree(&playlist_numbers, &guide_numbers) {
-                        return Some(id.clone());
+                    if seen.insert(id.clone()) {
+                        pool.push(id.clone());
+                    }
+                }
+            }
+        }
+        for key in [
+            canonicalize_name(&strip_noise_words(text)),
+            canonicalize_name(&strip_noise_words(&spelled)),
+        ] {
+            if let Some(bucket) = indexes.stripped_index.get(&key) {
+                for id in bucket {
+                    if seen.insert(id.clone()) {
+                        pool.push(id.clone());
+                    }
+                    let entry = exact_base.entry(id.clone()).or_insert(base);
+                    *entry = (*entry).max(base);
+                }
+            }
+        }
+        // Python's fuzzy rows come from token matches over the guide's
+        // names; pool the same way (first five tokens, as in Python).
+        for token in crate::guide_match::channel_tokens(text).into_iter().take(5) {
+            if let Some(bucket) = indexes.token_index.get(&token) {
+                for id in bucket {
+                    if seen.insert(id.clone()) {
+                        pool.push(id.clone());
                     }
                 }
             }
         }
     }
-    None
+    let mut best: Option<(i32, i32, String)> = None;
+    for id in &pool {
+        let display = indexes.display_names.get(id).map_or("", String::as_str);
+        let group_tag = indexes.group_tags.get(id).map_or("", String::as_str);
+        let fuzzy = side.score_candidate(id, display, group_tag);
+        let exact = exact_base
+            .get(id)
+            .map(|base| side.exact_name_score(*base, id, display, group_tag));
+        let (score, tiebreak) = match (exact, fuzzy) {
+            (Some(exact_score), Some(fuzzy_score)) if fuzzy_score > exact_score => (fuzzy_score, 4),
+            (Some(exact_score), _) => (
+                exact_score,
+                if exact_base.get(id) == Some(&96) {
+                    2
+                } else {
+                    3
+                },
+            ),
+            (None, Some(fuzzy_score)) => (fuzzy_score, 4),
+            (None, None) => continue,
+        };
+        if exact.is_none() && score <= 0 {
+            continue;
+        }
+        let better = match &best {
+            None => true,
+            Some((best_score, best_tiebreak, _)) => {
+                score > *best_score || (score == *best_score && tiebreak < *best_tiebreak)
+            }
+        };
+        if better {
+            best = Some((score, tiebreak, id.clone()));
+        }
+    }
+    best.map(|(_, _, id)| id)
 }
 
 // ---------------------------------------------------------------------------
@@ -2093,6 +2166,61 @@ mod tests {
         assert_eq!(hit.as_deref(), Some("bbc2.uk"));
         let cands = expand_tvg_id_candidates("ESPNHD.us");
         assert!(cands.iter().any(|c| c == "ESPN.us"), "{cands:?}");
+    }
+
+    #[test]
+    fn plus_sibling_wins_on_numbers() {
+        // Audit N11: "+1" siblings strip to the same name, so the
+        // channel numbers (and the time-shift score) must decide.
+        let guide = vec![
+            EpgChannel {
+                id: "skyone1.uk".to_string(),
+                display_name: "Sky One +1".to_string(),
+            },
+            EpgChannel {
+                id: "skyone2.uk".to_string(),
+                display_name: "Sky One +2".to_string(),
+            },
+        ];
+        let indexes = GuideIndexes::build(&guide);
+        let hit = match_guide_channel(
+            &channel("Sky One +1 HD", "", ""),
+            &indexes,
+            None::<&HashSet<String>>,
+        );
+        assert_eq!(hit.as_deref(), Some("skyone1.uk"));
+        let hit2 = match_guide_channel(
+            &channel("Sky One +2 HD", "", ""),
+            &indexes,
+            None::<&HashSet<String>>,
+        );
+        assert_eq!(hit2.as_deref(), Some("skyone2.uk"));
+    }
+
+    #[test]
+    fn regional_name_matches_via_scored_tokens() {
+        // Audit N11: a bare regional name ("Granada") has no exact
+        // bucket; Python finds "ITV Granada" through its token rows.
+        let guide = vec![
+            EpgChannel {
+                id: "itv.uk".to_string(),
+                display_name: "ITV".to_string(),
+            },
+            EpgChannel {
+                id: "itvgranada.uk".to_string(),
+                display_name: "ITV Granada".to_string(),
+            },
+        ];
+        let indexes = GuideIndexes::build(&guide);
+        let hit = match_guide_channel(
+            &channel("Granada", "", ""),
+            &indexes,
+            None::<&HashSet<String>>,
+        );
+        assert_eq!(hit.as_deref(), Some("itvgranada.uk"));
+        // The plain name still lands on the plain channel.
+        let hit = match_guide_channel(&channel("ITV", "", ""), &indexes, None::<&HashSet<String>>);
+        assert_eq!(hit.as_deref(), Some("itv.uk"));
     }
 
     #[test]
