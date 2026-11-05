@@ -836,6 +836,43 @@ mod tests {
     }
 
     #[test]
+    fn bundled_catalogues_cover_shipped_languages() {
+        // The bundle in the repo root is what release staging
+        // ships beside the executable (validation 0091): every
+        // shipped language must load a real main catalogue, and
+        // its release-notes catalogue must at least parse (the
+        // notes translations lag by design, so an effectively
+        // header-only file is valid there).
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let dir = root.join("locale");
+        for code in SHIPPED_CATALOGS {
+            let candidates = vec![code.to_string()];
+            let main = Catalogue::load(&dir, DOMAIN, &candidates);
+            assert!(
+                !main.is_empty(),
+                "bundled {DOMAIN} catalogue for {code} did not load"
+            );
+            let notes_path = dir
+                .join(code)
+                .join("LC_MESSAGES")
+                .join(format!("{NOTES_DOMAIN}.mo"));
+            let notes =
+                Catalogue::parse(&std::fs::read(&notes_path).expect("bundled notes catalogue"));
+            assert!(
+                notes.plural_forms.is_some() || !notes.messages.is_empty(),
+                "bundled {NOTES_DOMAIN} catalogue for {code} did not parse"
+            );
+        }
+        // Known strings resolve through the bundle itself.
+        let mut german = I18n::default();
+        german.set_language(&dir, "de");
+        assert_eq!(german.gettext("Cancel"), "Abbrechen");
+        let mut hungarian = I18n::default();
+        hungarian.set_language(&dir, "hu");
+        assert_eq!(hungarian.gettext("User Guide"), "Felhasználói útmutató");
+    }
+
+    #[test]
     fn preference_resolution_matches_python() {
         assert_eq!(normalize_preference(" Automatic "), "auto");
         assert_eq!(normalize_preference("HU"), "hu");
