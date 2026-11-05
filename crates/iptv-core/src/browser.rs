@@ -39,6 +39,11 @@ pub struct BrowserWorker {
     searching: bool,
     category: Category,
     scope: Option<String>,
+    /// Configured source scope ids in picker order (N22): in the
+    /// All-playlists view the category list becomes one branch per
+    /// playlist, and scopes the channels carry beyond this list form
+    /// the "Other playlists" branch.
+    branch_sources: Vec<String>,
     favorites: FavoriteSet,
     extras: Vec<crate::Channel>,
     raw: Option<Arc<BrowseModel>>,
@@ -162,12 +167,26 @@ impl BrowserWorker {
         &self.category
     }
 
+    /// Record the configured sources' scope ids, in picker order
+    /// (N22): the All-playlists category list branches per playlist.
+    pub fn set_branch_sources(&mut self, scopes: Vec<String>) {
+        self.branch_sources = scopes;
+    }
+
     /// Categories of the last usable playlist, in deterministic order.
     /// When a playlist scope is set, only that playlist's groups are
-    /// listed (Python's Playlist view behavior).
+    /// listed (Python's Playlist view behavior). In the All-playlists
+    /// view with configured sources, the list branches per playlist
+    /// (Python's `_refresh_group_ui` branch mode, N22).
     #[must_use]
     pub fn categories(&self) -> Vec<Category> {
         if self.scope.is_none() {
+            if !self.branch_sources.is_empty() {
+                return crate::categories::branch_categories(
+                    self.playlist.channels(),
+                    &self.branch_sources,
+                );
+            }
             return categories(self.playlist.channels());
         }
         // B19: with the navigation index installed for this model,
@@ -448,13 +467,26 @@ impl BrowserWorker {
         })
     }
 
+    /// The projected playlist rows for `category` on `model`: the
+    /// category's rows with the playlist scope applied.
+    fn rows_for(&self, model: &Arc<BrowseModel>, category: &Category) -> Vec<usize> {
+        self.scoped_rows(
+            model,
+            category_rows(model.channels(), category, &self.favorites),
+        )
+    }
+
+    /// How many channels `category` currently shows (N22: the
+    /// per-playlist branch leaves carry Python's channel counts).
+    #[must_use]
+    pub fn category_row_count(&self, category: &Category) -> usize {
+        self.rows_for(&self.playlist, category).len()
+    }
+
     /// Submit the current category scope of the last usable playlist.
     fn submit_current(&mut self, query: String) {
         let model = Arc::clone(&self.playlist);
-        let scope = self.scoped_rows(
-            &model,
-            category_rows(model.channels(), &self.category, &self.favorites),
-        );
+        let scope = self.rows_for(&model, &self.category);
         let nav_index = self.nav_index_for(&model);
         self.searcher
             .submit_scoped(model, scope, self.category.clone(), query, nav_index);
@@ -554,15 +586,22 @@ impl BrowserWorker {
     fn apply_model(&mut self, loaded: &Arc<BrowseModel>, query: &str) {
         // A group that vanished from the replacement cannot stay active;
         // the sentinels always exist. Favorites survive by stable key.
-        if matches!(self.category, Category::Group(_))
-            && !categories(loaded.channels()).contains(&self.category)
-        {
+        let category_gone = match &self.category {
+            Category::Group(_) => !categories(loaded.channels()).contains(&self.category),
+            Category::PlaylistAll(scope) => !loaded
+                .channels()
+                .iter()
+                .any(|channel| crate::categories::playlist_id(channel) == scope),
+            Category::PlaylistGroup(scope, group) => !loaded.channels().iter().any(|channel| {
+                crate::categories::playlist_id(channel) == scope
+                    && crate::categories::group_name(channel) == group
+            }),
+            _ => false,
+        };
+        if category_gone {
             self.category = Category::All;
         }
-        let scope = self.scoped_rows(
-            loaded,
-            category_rows(loaded.channels(), &self.category, &self.favorites),
-        );
+        let scope = self.rows_for(loaded, &self.category);
         let nav_index = self.nav_index_for(loaded);
         self.searcher.submit_scoped(
             Arc::clone(loaded),
@@ -691,6 +730,77 @@ mod tests {
         assert!(!groups.iter().any(|g| g == "Sport"), "{groups:?}");
         browser.set_scope(None, "");
         assert_eq!(wait_results(&mut browser, "").len(), 3);
+    }
+
+    #[test]
+    fn branch_categories_split_the_all_view_per_playlist() {
+        let dir = std::env::temp_dir().join("iptv-branch-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let first = dir.join("first.m3u");
+        let second = dir.join("second.m3u");
+        std::fs::write(
+            &first,
+            "#EXTM3U\n#EXTINF:-1 group-title=\"News\",Alpha One\nhttp://example.com/a1\n#EXTINF:-1 group-title=\"News\",Alpha Two\nhttp://example.com/a2\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &second,
+            "#EXTM3U\n#EXTINF:-1 group-title=\"Sport\",Beta One\nhttp://example.com/b1\n",
+        )
+        .unwrap();
+        let sources = vec![
+            crate::sources::PlaylistSource::new(first.to_string_lossy()),
+            crate::sources::PlaylistSource::new(second.to_string_lossy()),
+        ];
+        let first_id = sources[0].scope_id();
+        let second_id = sources[1].scope_id();
+        let mut browser = BrowserWorker::default();
+        browser.set_branch_sources(vec![first_id.clone(), second_id.clone()]);
+        browser.load_sources(sources);
+        assert_eq!(wait_results(&mut browser, "").len(), 3);
+        assert_eq!(
+            browser.categories(),
+            [
+                Category::All,
+                Category::Favorites,
+                Category::PlaylistAll(first_id.clone()),
+                Category::PlaylistGroup(first_id.clone(), "News".to_string()),
+                Category::PlaylistAll(second_id.clone()),
+                Category::PlaylistGroup(second_id.clone(), "Sport".to_string()),
+            ]
+        );
+        assert_eq!(
+            browser.category_row_count(&Category::PlaylistAll(first_id.clone())),
+            2
+        );
+        // A branch leaf projects exactly its own playlist's group.
+        browser.select_category(
+            Category::PlaylistGroup(first_id.clone(), "News".to_string()),
+            "",
+        );
+        assert_eq!(wait_results(&mut browser, "").len(), 2);
+        browser.select_category(Category::All, "");
+        assert_eq!(wait_results(&mut browser, "").len(), 3);
+        // Channels no configured source owns form the leftover
+        // branch (the adapter labels it "Other playlists").
+        let stray = crate::parse_m3u("#EXTINF:-1 group-title=\"Films\",Stray\nhttp://e/s\n")
+            .into_iter()
+            .next()
+            .unwrap();
+        browser.add_channels(vec![stray], "");
+        assert_eq!(wait_results(&mut browser, "").len(), 4);
+        assert!(browser
+            .categories()
+            .contains(&Category::PlaylistAll(String::new())));
+        assert!(browser
+            .categories()
+            .contains(&Category::PlaylistGroup(String::new(), "Films".to_string())));
+        // Without known sources the All view stays the flat list.
+        browser.set_branch_sources(Vec::new());
+        assert_eq!(
+            browser.categories()[..2],
+            [Category::All, Category::Favorites]
+        );
     }
 
     fn provider_channel(name: &str, account: &str) -> crate::Channel {

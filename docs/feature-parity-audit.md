@@ -1276,6 +1276,8 @@ Evidence for N01 to N06 is in docs/validation/0071-player-engine-cpu-and-ticks.m
 
 **N22, low: browsing details.** Group synonyms (`channel_names.py`: `group_synonyms`, `extract_group`), the "Other playlists" branch (`main.py:6180`), account-type scope labels (`main.py:1414` to `:1417`), and the empty-Favorites and removal messages (`main.py:1762`, `:1869`, `:1927`). Also confirm Delete removes a favorite from the channel list (`main.py:2664`).
 
+**Fix:** Fixed 2026-11-04 — group synonyms and `extract_group` were already ported (N11, core `guide_match`); the All-playlists category list now branches per playlist in picker order with Python's counts and an "Other playlists" leftover branch, the scope picker uses the "Xtream Codes – {name}" / "Stalker Portal – {name}" labels, the three Favorites messages are modal boxes with Python's exact text, and a plain Delete on a favorite row now runs the favorite toggle (it was missing entirely). See validation 0087.
+
 **N23, low: player details.** "Vol" and "Mbps" in the status (`internal_player.py:2046`, `:2050`), speaking the track name on change (`:2455`), Reconnecting and Stream disconnected messages (`:1567`, `:1203`), subtitle loaded and unsupported messages (`:2624`, `:2630`), and mouse-wheel volume.
 
 **N24, low: explanatory text in forms and dialogs.** Provider field descriptions (`playlist.py:3440` to `:3445`, `:3558` to `:3562`), the Preferred Audio Track and padding explanations (`dialogs_misc.py:644` to `:662`, `:704`), the catch-up hint (`:491`), and the storage check report (`planning_ui.py:307`). Screen-reader users rely on this text, so it is worth more than its size suggests.
