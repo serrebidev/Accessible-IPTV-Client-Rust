@@ -589,6 +589,8 @@ struct PlayerState {
     vlc_tracks_ready: bool,
     vlc_track_ids: Vec<i32>,
     vlc_error: Option<String>,
+    /// The player window's 1 s and 150 ms ticks, held for its life.
+    player_timers: Vec<Rc<Timer<Frame>>>,
     shared: Option<PlayerShared>,
     desired_track: Option<String>,
     track_menu_ids: Vec<i32>,
@@ -674,6 +676,7 @@ impl Default for PlayerState {
             vlc_active: false,
             vlc_tracks_ready: false,
             vlc_error: None,
+            player_timers: Vec::new(),
             vlc_track_ids: Vec::new(),
             shared: None,
             desired_track: None,
@@ -1113,6 +1116,9 @@ fn bind_main_close(frame: Frame, wiring: &Wiring) {
         }
         close_buffers.borrow_mut().close_all();
         close_player.borrow_mut().app_voice.close();
+        for timer in close_player.borrow_mut().player_timers.drain(..) {
+            timer.stop();
+        }
         release_engine_off_thread(&close_player);
         timer.stop();
         event.skip(true);
@@ -8670,6 +8676,9 @@ fn wire_player_events(
         subtitle_tick(&sub_player, &sub_persist, status);
     });
     let _ = sub_timer.start(150, false);
+    // Dropping a wxDragon timer destroys it: these must outlive this
+    // function, or the player never ticks (validation 0071).
+    player.borrow_mut().player_timers = vec![timer, sub_timer];
 
     bind_subtitle_load(buttons.subs, player, frame, persist, status);
     let pause_player = Rc::clone(player);
