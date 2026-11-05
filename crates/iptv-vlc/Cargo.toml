@@ -1,6 +1,6 @@
 [package]
 name = "iptv-vlc"
-version = "0.4.14"
+version = "0.4.15"
 edition = "2021"
 rust-version = "1.97.1"
 description = "Dynamically loaded libVLC playback engine for Accessible IPTV Client."
