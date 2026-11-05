@@ -589,6 +589,16 @@ struct PlayerState {
     vlc_tracks_ready: bool,
     vlc_track_ids: Vec<i32>,
     vlc_error: Option<String>,
+    /// libVLC starting on its own thread: the first run after an
+    /// install scans every plugin for about 16 s (validation 0071).
+    vlc_loader: Option<std::sync::mpsc::Receiver<Result<iptv_vlc::VlcEngine, String>>>,
+    /// The play waiting for that start; a later play replaces it.
+    pending_play: Option<(Channel, PlaybackRequest)>,
+    /// Whether this stream was started with video. Reconnects keep
+    /// it, so a hidden channel never comes back decoding video.
+    video_visible: bool,
+    /// The player window's 1 s and 150 ms ticks, held for its life.
+    player_timers: Vec<Rc<Timer<Frame>>>,
     shared: Option<PlayerShared>,
     desired_track: Option<String>,
     track_menu_ids: Vec<i32>,
@@ -674,6 +684,10 @@ impl Default for PlayerState {
             vlc_active: false,
             vlc_tracks_ready: false,
             vlc_error: None,
+            vlc_loader: None,
+            pending_play: None,
+            video_visible: true,
+            player_timers: Vec::new(),
             vlc_track_ids: Vec::new(),
             shared: None,
             desired_track: None,
@@ -1008,6 +1022,7 @@ fn bind_browser(
     });
     *wiring.reminders.borrow_mut() = wiring.persist.reminders();
     init_speech(&wiring.player, &wiring.persist, controls.status);
+    preload_vlc_engine(&wiring.player, &wiring.persist);
     if wiring.dvr.borrow().pending_count() > 0
         || wiring
             .reminders
@@ -1113,6 +1128,9 @@ fn bind_main_close(frame: Frame, wiring: &Wiring) {
         }
         close_buffers.borrow_mut().close_all();
         close_player.borrow_mut().app_voice.close();
+        for timer in close_player.borrow_mut().player_timers.drain(..) {
+            timer.stop();
+        }
         release_engine_off_thread(&close_player);
         timer.stop();
         event.skip(true);
@@ -6928,6 +6946,13 @@ fn play_channel(
     channel: &Channel,
     status: Status,
 ) {
+    {
+        // A new play replaces any play waiting on libVLC, and may
+        // retry a libVLC that failed to load earlier.
+        let mut state = player.borrow_mut();
+        state.pending_play = None;
+        state.vlc_error = None;
+    }
     let probe = PlaybackRequest::for_channel(channel, None);
     let mut resume = None;
     if !probe.live {
@@ -7168,6 +7193,82 @@ fn release_engine_off_thread(player: &Rc<RefCell<PlayerState>>) {
     });
 }
 
+/// Start libVLC on its own thread.
+fn spawn_vlc_loader() -> std::sync::mpsc::Receiver<Result<iptv_vlc::VlcEngine, String>> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = sender.send(iptv_vlc::VlcEngine::new());
+    });
+    receiver
+}
+
+/// Warm libVLC at startup when the built-in player is the choice,
+/// so the first play does not wait for it.
+fn preload_vlc_engine(player: &Rc<RefCell<PlayerState>>, persist: &Persist) {
+    let built_in = {
+        let config = persist.config.borrow();
+        player_choice(
+            &config.string_or("media_player", "Built-in Player"),
+            &config.string_or("custom_player_path", ""),
+        ) == PlayerChoice::BuiltIn
+    };
+    if built_in {
+        player.borrow_mut().vlc_loader = Some(spawn_vlc_loader());
+    }
+}
+
+/// Whether the libVLC start has settled, in either direction. A
+/// failure stays in `vlc_error` (the caller falls back to the basic
+/// player) until the next user play clears it to retry. Never blocks.
+fn vlc_engine_settled(state: &mut PlayerState) -> bool {
+    use std::sync::mpsc::TryRecvError;
+    if state.vlc.is_some() || state.vlc_error.is_some() {
+        return true;
+    }
+    let loader = state.vlc_loader.get_or_insert_with(spawn_vlc_loader);
+    let outcome = match loader.try_recv() {
+        Ok(outcome) => outcome,
+        Err(TryRecvError::Empty) => return false,
+        Err(TryRecvError::Disconnected) => Err("libVLC start was interrupted.".to_string()),
+    };
+    state.vlc_loader = None;
+    match outcome {
+        Ok(engine) => {
+            state.vlc = Some(engine);
+            state.vlc_ops = Some(spawn_vlc_ops());
+        }
+        Err(error) => state.vlc_error = Some(error),
+    }
+    true
+}
+
+/// Run the play that was waiting for libVLC, once libVLC settled.
+fn run_pending_play(player: &Rc<RefCell<PlayerState>>, persist: &Persist, status: Status) {
+    let pending = {
+        let mut state = player.borrow_mut();
+        if state.pending_play.is_none() || !vlc_engine_settled(&mut state) {
+            return;
+        }
+        state.pending_play.take()
+    };
+    if let Some((channel, request)) = pending {
+        play_builtin(player, persist, &channel, request, status);
+    }
+}
+
+/// The media options for one load. A retry load carries the cache
+/// plan's retry value, a rollover load the quick-start value
+/// (P01/P04), and every load keeps the stream's video choice.
+fn vlc_media_options(state: &PlayerState, live: bool, retry: bool) -> iptv_vlc::MediaOptions {
+    iptv_vlc::MediaOptions {
+        cache_ms: state
+            .cache_plan
+            .cache_ms(live, retry, retry && state.reconnect_rollover),
+        live,
+        video_visible: state.video_visible,
+    }
+}
+
 /// Queue a load on the ops worker; the result lands in the
 /// state's reply slot for `deliver_vlc_load`. False when no
 /// engine or worker exists (the caller falls back).
@@ -7271,6 +7372,18 @@ fn play_builtin(
     mut request: PlaybackRequest,
     status: Status,
 ) {
+    ensure_player_window(player, persist, status);
+    {
+        let mut state = player.borrow_mut();
+        if !vlc_engine_settled(&mut state) {
+            // libVLC is still starting: subtitle_tick runs this
+            // play when it settles. The UI thread never waits.
+            state.pending_play = Some((channel.clone(), request));
+            drop(state);
+            player_status(status, persist, "Preparing the player...", 3);
+            return;
+        }
+    }
     if !request.buffer_bypass && buffer_intercept(player, persist, channel, &request, status) {
         return;
     }
@@ -7307,12 +7420,13 @@ fn play_builtin(
     state.supply_audio_name = names.get(&audio_key).cloned();
     state.supply_audio_index = indices.get(&audio_key).copied();
     state.audio_key = audio_key;
+    state.video_visible = persist
+        .config
+        .borrow()
+        .bool_or("show_player_on_enter", true);
     state.watchdog = iptv_core::playback::FreezeWatchdog::new(
         is_audio_only_channel(channel),
-        persist
-            .config
-            .borrow()
-            .bool_or("show_player_on_enter", true),
+        state.video_visible,
     );
     state.track_attempts = 0;
     state.selected_spu = -2;
@@ -7342,25 +7456,16 @@ fn play_builtin(
     };
     if let EngineAction::Load(load) = action {
         state.vlc_active = false;
-        if state.vlc.is_none() {
-            match iptv_vlc::VlcEngine::new() {
-                Ok(engine) => {
-                    state.vlc = Some(engine);
-                    state.vlc_error = None;
-                }
-                Err(error) => state.vlc_error = Some(error),
-            }
-            if let Some(engine) = &state.vlc {
-                engine.set_window_handle(win.media.get_handle() as usize);
-            }
-            if state.vlc.is_some() && state.vlc_ops.is_none() {
-                state.vlc_ops = Some(spawn_vlc_ops());
-            }
+        if let Some(engine) = &state.vlc {
+            // Python's hidden play detaches the window, so libVLC
+            // cannot open a video window of its own.
+            engine.set_window_handle(if state.video_visible {
+                win.media.get_handle() as usize
+            } else {
+                0
+            });
         }
-        let options = iptv_vlc::MediaOptions {
-            cache_ms: state.cache_plan.cache_ms(load.live, false, false),
-            live: load.live,
-        };
+        let options = vlc_media_options(&state, load.live, false);
         let has_vlc = state.vlc.is_some();
         drop(state);
         // The load runs on the ops worker (P18); its result is
@@ -7537,15 +7642,7 @@ fn settle_session(player: &Rc<RefCell<PlayerState>>, persist: &Persist, status: 
 /// the quick-start value (P01/P04).
 fn engine_load(player: &Rc<RefCell<PlayerState>>, request: &PlaybackRequest) -> bool {
     if player.borrow().engine == ActiveEngine::Vlc {
-        let options = {
-            let state = player.borrow();
-            iptv_vlc::MediaOptions {
-                cache_ms: state
-                    .cache_plan
-                    .cache_ms(request.live, true, state.reconnect_rollover),
-                live: request.live,
-            }
-        };
+        let options = vlc_media_options(&player.borrow(), request.live, true);
         // Queued on the ops worker (P18); a refused load comes
         // back through deliver_vlc_load as a session error.
         let queued = queue_vlc_load(player, request, options, true);
@@ -8162,6 +8259,10 @@ fn refresh_subtitle_menu(player: &Rc<RefCell<PlayerState>>) {
     for old in state.spu_menu_ids.drain(..) {
         menu.delete(old);
     }
+    // "No subtitle tracks available" holds the same id as the first
+    // radio. Left in, checking that id hits the plain item: a wx
+    // assert dialog whose nested loop trapped every player tick.
+    menu.delete(PM_SUB_BASE);
     for (index, spu) in choices.iter().enumerate() {
         let id = PM_SUB_BASE + i32::try_from(index).unwrap_or(0);
         let label = if *spu == -1 {
@@ -8666,6 +8767,9 @@ fn wire_player_events(
         subtitle_tick(&sub_player, &sub_persist, status);
     });
     let _ = sub_timer.start(150, false);
+    // Dropping a wxDragon timer destroys it: these must outlive this
+    // function, or the player never ticks (validation 0071).
+    player.borrow_mut().player_timers = vec![timer, sub_timer];
 
     bind_subtitle_load(buttons.subs, player, frame, persist, status);
     let pause_player = Rc::clone(player);
@@ -8776,6 +8880,7 @@ fn wire_player_events(
         state.active_cue_index = None;
         state.last_shown_cue = None;
         state.shown_cues.clear();
+        state.pending_play = None;
         state.session.stop();
         let stop_vlc = state.vlc_active;
         state.vlc_active = false;
@@ -8874,6 +8979,7 @@ fn stop_engines_keep_window(player: &Rc<RefCell<PlayerState>>) {
     let mut state = player.borrow_mut();
     state.pending_reconnect = None;
     state.app_voice.stop();
+    state.pending_play = None;
     state.session.stop();
     let stop_vlc = state.vlc_active;
     state.vlc_active = false;
@@ -9498,6 +9604,7 @@ fn player_stop(player: &Rc<RefCell<PlayerState>>, persist: &Persist, status: Sta
     state.active_cue_index = None;
     state.last_shown_cue = None;
     state.shown_cues.clear();
+    state.pending_play = None;
     state.session.stop();
     let stop_vlc = state.vlc_active;
     state.vlc_active = false;
@@ -10313,6 +10420,7 @@ fn deliver_subtitles(player: &Rc<RefCell<PlayerState>>, persist: &Persist, statu
 /// the active cue for the label and for speech — a cue lying
 /// entirely between one-second ticks is still presented.
 fn subtitle_tick(player: &Rc<RefCell<PlayerState>>, persist: &Persist, status: Status) {
+    run_pending_play(player, persist, status);
     deliver_vlc_load(player, persist, status);
     deliver_subtitles(player, persist, status);
     {
@@ -14178,6 +14286,41 @@ mod tests {
     use super::*;
     use iptv_core::{search::SearchWorker, BrowseModel};
     use std::sync::Arc;
+
+    #[test]
+    fn hidden_stream_keeps_video_off_across_a_reconnect() {
+        let mut state = PlayerState {
+            video_visible: false,
+            ..PlayerState::default()
+        };
+        for retry in [false, true] {
+            let options = vlc_media_options(&state, true, retry);
+            assert!(options.option_strings().contains(&":no-video".to_string()));
+        }
+        state.video_visible = true;
+        let options = vlc_media_options(&state, true, true);
+        assert!(!options.option_strings().contains(&":no-video".to_string()));
+    }
+
+    #[test]
+    fn a_starting_libvlc_defers_the_play_instead_of_blocking() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let mut state = PlayerState {
+            vlc_loader: Some(receiver),
+            ..PlayerState::default()
+        };
+        assert!(!vlc_engine_settled(&mut state), "still starting");
+        assert!(state.vlc_loader.is_some(), "the start must not be repeated");
+        sender.send(Err("no libVLC".to_string())).unwrap();
+        assert!(vlc_engine_settled(&mut state), "a failure settles");
+        assert_eq!(state.vlc_error.as_deref(), Some("no libVLC"));
+        assert!(state.vlc_loader.is_none());
+        assert!(
+            vlc_engine_settled(&mut state),
+            "no second start until a new play"
+        );
+        assert!(state.vlc_loader.is_none());
+    }
 
     fn no_suffixes() -> (i64, usize, std::collections::HashMap<usize, String>) {
         (0, 0, std::collections::HashMap::new())

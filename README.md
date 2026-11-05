@@ -3,8 +3,8 @@
 Rust port of Accessible-IPTV-Client, released in parallel while the
 Python app remains the shipping product. The port has a wxDragon
 desktop interface and core implementations, but the
-[current feature parity audit](docs/feature-parity-audit.md) records
-remaining behavior gaps against Python v1.150.58. The Rust port is
+[second-round parity audit](docs/feature-parity-audit.md#second-round-audit-2026-11-04)
+records open behavior gaps against Python v1.150.58. The Rust port is
 not yet feature-complete against that reference.
 
 ## What it does
@@ -99,4 +99,6 @@ Design and parity records live under `docs/`:
   owner's to record.
 - Validation notes `docs/validation/0001` onward document each
   slice with automated evidence kept separate from owner-heard
-  evidence.
+  evidence. Note 0071 records the player tick and CPU fixes.
+- `tools/smoke-player-recovery.py` checks the running app's stream
+  recovery, which unit tests cannot see.

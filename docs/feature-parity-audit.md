@@ -1,6 +1,6 @@
 # Feature parity audit: current Python reference versus Rust
 
-Date: 2026-11-03. Status: **closed 2026-11-03** — every entry below carries its fix and regression evidence, and all 85 findings are fully closed: the consolidated record is docs/validation/0063-parity-audit-closure.md, and the eight entries that closed with partials there (B19, E12, E10, P18, R10, R19, S05, S10) were completed the same day in docs/validation/0064-finish-parity-completion.md. Owner-heard NVDA acceptance remains separate under ADR 0004.
+Date: 2026-11-03, extended 2026-11-04. Status: **the 85 findings below (E, B, P, R, S) closed 2026-11-03; the second-round findings (N) are open unless marked fixed.** Start with [Second-round audit](#second-round-audit-2026-11-04), which also corrects what those closures meant in the running app. The consolidated first-round record is docs/validation/0063-parity-audit-closure.md, and the eight entries that closed with partials there (B19, E12, E10, P18, R10, R19, S05, S10) were completed the same day in docs/validation/0064-finish-parity-completion.md. Owner-heard NVDA acceptance remains separate under ADR 0004.
 
 ## Reference and scope
 
@@ -1186,4 +1186,88 @@ untracked audit file. The separate Rust 2021 borrow probe passed as described in
 R21. No application build or full-suite pass is claimed.
 
 **Fix:** Fixed. Completed 2026-11-03: the recorded limit was wrong — wxdragon 0.9.24 exposes MENU_HIGHLIGHT with the item id; highlights now route F1 to the highlighted item's topic. See docs/validation/batch-platform.md and docs/validation/0064-finish-parity-completion.md.
+
+## Second-round audit (2026-11-04)
+
+Same references: Python v1.150.58 (`6afe6014`, confirmed current with origin) against Rust v0.4.12 plus branch `fix/hidden-player-no-video`.
+
+Method: all 797 strings in Python's `locale/iptvclient.pot`, every definition in its top-level modules, its config defaults, its user guide and README were compared with the Rust tree. 335 strings had no Rust match. The ones that named a behavior were grouped below. Most of the rest are wording differences or Python-only updater and installer errors, which are not listed one by one.
+
+The guide comparison found little: Rust's `docs/help/en.md` covers every Python section, so it describes features the code does not fully have. All 35 option defaults exist in Rust. The evidence level is stated per group, because a string missing from Rust suggests a gap but does not prove one.
+
+### Correction to the first-round closures
+
+The player's 1 s and 150 ms timers were destroyed at creation in every shipped build (N02), so these fixes passed their core tests but never ran in the app: P01 (retry and rollover cache), P03, P04, P06 and P07 (track restore and retry), P09, P10, P11, P12, P14, P16, plus validations 0038 (sleep timer), 0045 (buffer polling), 0052 (bounded recovery), 0055 and 0056 (subtitle speech and device loss).
+
+Treat those as untested in real use until heard. No first-round entry that depends only on core logic or menus is affected by this.
+
+Lesson for future closures: a passing core test does not show that an adapter calls the code. tools/smoke-player-recovery.py now exercises the real app.
+
+### Fixed on this branch
+
+Evidence for N01 to N06 is in docs/validation/0071-player-engine-cpu-and-ticks.md.
+
+- **N01, high:** hidden play decoded video (Python `internal_player.py:830`, `:753`). Hidden 1080i H.264 fell from 23.6% to 0.9% of a core in libVLC.
+- **N02, high:** player timers destroyed at creation, so no recovery, resume, subtitles or sleep timer ran.
+- **N03, high:** `MediaStats` was two fields short, overrunning the stack on every stats call.
+- **N04, high:** libVLC started on the UI thread, freezing the window for about 16 s on the first run after an install or update.
+- **N05, medium:** `AudioOutputDevice` field order and the device setter's signature did not match libVLC, which affects the Audio Output Device dialog and saved devices. Corrected against the header. Neither has been exercised in the running app with a real device choice, so test that dialog by hand.
+- **N06, medium:** the Subtitles placeholder shared id 5400 with the first radio, raising a wx assertion.
+
+### Open, verified by reading both sides
+
+**N07, high: exit does not warn about work it will lose.** Python asks before exiting while a download runs, while recordings run or are scheduled, and while reminders are pending, each defaulting to staying open (`main.py:5610`, `:5616`, `:5633`, `planning_ui.py:237`). Rust's `bind_main_close` stops everything without asking. Check: try to exit in each state; each asks, and No keeps the app and the work.
+
+**N08, medium: playlists never refresh on their own.** Python reloads every 3 hours (`main.py:2218`). Rust has no such timer. Check: leave the app open across the interval; the catalogue refreshes without moving focus.
+
+**N09, medium: the Playlist view choice acts on every arrow press and forgets the scope.** Python treats arrow keys as a preview and commits on activation or a mouse choice. Committing clears the search, resets to All Channels, and saves `playlist_scope` (`main.py:1442`, `:1467`). Rust commits on each selection event, re-runs the current search, and does not save the scope (`bind_scope_choice`). This matters for screen-reader users: arrowing through scopes reloads the lists each time. Check: arrow through scopes with no reload, press Enter, restart, and the scope is kept.
+
+**N10, medium: stream headers and options do not all reach libVLC.** Python also passes `:http-cookie`, `:http-header=` for Origin, Authorization, Accept, X-Forwarded-For, Range and custom headers, `:rtsp-tcp`, `:http-proxy` from the system proxy, and `:start-time` for resume (`internal_player.py:827`, `:946`, `:961`, `:1029` to `:1048`, `:100`). Rust sends only the user agent and referrer, and resumes by seeking after Playing. The comment at the top of `crates/iptv-vlc/src/lib.rs` saying this matches Python is wrong. Check: capture requests for a header-protected channel; they match Python's. An RTSP channel uses TCP, and a system proxy is honored.
+
+**N11, medium: guide matching is simpler than Python's fuzzy matcher.** Python also scores call signs, brands, HBO variants, time-shift and zone markers, and regions (`playlist.py`: `extract_callsigns`, `_brand_key`, `_extract_hbo_variant`, `_detect_timeshift`, `_detect_zone`, `_derive_playlist_region`, `resolve_best_channel_id`). Rust's tvg, word-number and canonical-name matching has none of these names, though `split_name_region` covers one region shape. Check: run Python's matcher tests through the Rust matcher, focusing on regional and +1 sibling channels.
+
+### Open, found by text search (confirm by reading before fixing)
+
+**N12, high: recording outcome reports and diagnostics.** Python reports Recording Complete, Warning and Error with ffmpeg's details, a problem summary and the log path, explains the MKA copy failure, and has a Recording Problem Times dialog (`client_recording.py:47` to `:137`, `main.py:4496`, `:8972`, `recorder.py`: `summarize_log`, `recording_problem_times`). Rust discards ffmpeg's stderr and reports only saved or nothing recorded. Validation 0014 deferred part of this.
+
+**N13, high: catch-up on one-connection providers.** Python probes direct files, follows redirects with HEAD per hop, waits for the provider to release the stream, and handles a provider that truncates files (`catchup_direct.py`, `main.py:8524`, `_catchup_download_is_truncated`). It shares the playing channel's connection with a recording, and refuses or warns when one-stream accounts are busy (`recording_relay.py`, `_single_stream_provider_busy`, `_end_shared_playback`). None of these names exist in Rust. Validation 0045 records part of this.
+
+**N14, medium: provider errors in plain words.** Python turns HTTP 401, 403, 404, 4xx, 5xx, timeouts, refused connections and bad data into sentences saying what to do (`catchup_urls.py:71` to `:91`).
+
+**N15, medium: Download window detail.** Python shows size so far, time remaining, retry attempts with a countdown, "ended early" with the bytes received, a cancel confirmation, and Escape to hide while the download continues (`main.py:8524`, `:8773` to `:8891`).
+
+**N16, medium: stream type probing.** Python probes a channel's streams to tell radio from TV, caches the result, says "Checking stream type", and reports an audio-only recording (`media_type.py`, `main.py:3719`, `:4128`, `:4281`). Rust decides from playlist metadata only.
+
+**N17, medium: Account Info detection and copying.** Python finds accounts in plain playlists and stream URLs and lists them as detected, with their source, and offers Copy Details (`account_info.py:228`, `:472`, `dialogs_misc.py:332`, `:347`, `:459`). Its README lists detection as a feature.
+
+**N18, medium: messages arriving during a dialog.** Python queues notifications while a modal box is open and shows them afterward (`main.py:4071`, `modal_guard.py`). No equivalent was found in Rust. A second dialog can interrupt the first.
+
+**N19, medium: installer and packages.** Python ships a Windows installer and a Debian package, verifies Authenticode, shows one update window through download, install and restart, and reports the result on the next start (`installer/`, `tools/build_deb.py`, `updater.py:909` to `:969`, `main.py:4774` to `:5191`). It also remembers `update_last_auto_check_epoch`. Rust ships zip, tar.gz and dmg through ship-shape, whose window may already cover part of this.
+
+**N20, medium: casting extras beyond the known protocol gap.** Windows firewall rule for the proxy port (`stream_proxy.py:1579`), the "Currently connected, disconnect?" prompt (`main.py:8703`), and refusals for saved positions and local buffering while casting (`main.py:6279`, `client_timeshift.py:98`).
+
+**N21, low: EPG import details.** Resume for interrupted gzip downloads (`playlist.py`: `_http_download_gz_with_resume`), a cross-process import lock, background thread priority so imports do not starve the UI or NVDA (`main.py:746`), the old-schema repair prompt (`main.py:2825`), and the import started and finished messages (`main.py:6724` to `:6729`, `:6863`).
+
+**N22, low: browsing details.** Group synonyms (`channel_names.py`: `group_synonyms`, `extract_group`), the "Other playlists" branch (`main.py:6180`), account-type scope labels (`main.py:1414` to `:1417`), and the empty-Favorites and removal messages (`main.py:1762`, `:1869`, `:1927`). Also confirm Delete removes a favorite from the channel list (`main.py:2664`).
+
+**N23, low: player details.** "Vol" and "Mbps" in the status (`internal_player.py:2046`, `:2050`), speaking the track name on change (`:2455`), Reconnecting and Stream disconnected messages (`:1567`, `:1203`), subtitle loaded and unsupported messages (`:2624`, `:2630`), and mouse-wheel volume.
+
+**N24, low: explanatory text in forms and dialogs.** Provider field descriptions (`playlist.py:3440` to `:3445`, `:3558` to `:3562`), the Preferred Audio Track and padding explanations (`dialogs_misc.py:644` to `:662`, `:704`), the catch-up hint (`:491`), and the storage check report (`planning_ui.py:307`). Screen-reader users rely on this text, so it is worth more than its size suggests.
+
+**N25, low: smaller dialogs.** About's community links for Telegram and GitHub (`dialogs_misc.py:60` to `:66`), a typed path and Browse in Custom Player where Rust has a file picker only (`options.py:934` to `:954`), the exact What Is Playing wording (`main.py:1838`), and Go to Channel errors (`main.py:2974`, `:2983`).
+
+### Still open from earlier records
+
+These were already documented and remain true:
+
+- Translations: `docs/help` holds English only and the tree has no `locale` folder, against Python's 14 languages. `agents.md` lists every language as required.
+- Casting protocols: Chromecast, AirPlay, Sonos, Yamaha and Kodi discovery, and relay or transcode. See "Previously documented limits" above.
+- MPV's application-owned subtitle session, per validation 0010.
+
+### Suggested order
+
+1. Have Brandon hear the fixes on this branch first, because the tick-driven behavior has never run for real.
+2. N07, since it can lose recordings and downloads.
+3. N10 and N13, since they stop streams or downloads from working at all.
+4. N09 and N12, then the rest by severity.
 
