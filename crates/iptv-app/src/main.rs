@@ -631,6 +631,12 @@ struct Wiring {
     /// (N16): the menu-open refill is a no-op while nothing it
     /// shows has changed.
     format_menu_state: Rc<RefCell<String>>,
+    /// N19: when the delayed startup update check falls due
+    /// (unix seconds; 0 = not scheduled). Python runs the
+    /// startup check 5 s after it is scheduled so playlist
+    /// loading is not disturbed; the housekeeping tick fires
+    /// it when the time comes.
+    auto_check_due: Rc<std::cell::Cell<f64>>,
 }
 
 /// Built-in player window state, created lazily on first use.
@@ -1096,6 +1102,7 @@ fn bind_browser(
         media_probe_pending: Rc::new(RefCell::new(None)),
         media_probe_token: Rc::new(std::cell::Cell::new(0)),
         format_menu_state: Rc::new(RefCell::new(String::new())),
+        auto_check_due: Rc::new(std::cell::Cell::new(0.0)),
     };
     wiring.player.borrow_mut().shared = Some(PlayerShared {
         buffers: Rc::clone(&wiring.buffers),
@@ -1145,7 +1152,7 @@ fn bind_browser(
     bind_epg_timer(frame, &wiring, controls);
     build_menu(frame, &wiring, controls);
     bind_tray(frame, &wiring, controls.status);
-    maybe_auto_check_updates(&wiring, frame);
+    maybe_auto_check_updates(&wiring);
     bind_actions(frame, &wiring, controls);
     bind_context_menu(frame, &wiring, controls);
     wiring
@@ -1158,11 +1165,12 @@ fn bind_browser(
 /// The always-on housekeeping tick (1 s), independent of the main
 /// tick timer that stops when idle: answer single-instance show
 /// requests by restoring the window (S01, Python's
-/// `watch_for_show_requests`), run the automatic update check
-/// hourly while the option is enabled (S07, Python's update-check
-/// timer, whose handler likewise re-reads the option each time),
-/// and reload the playlists every 3 hours (audit N08, Python's
-/// refresh timer).
+/// `watch_for_show_requests`), fire the delayed startup update
+/// check when it falls due (N19, Python's 5-second `CallLater`),
+/// run the automatic update check hourly while the option is
+/// enabled (S07, Python's update-check timer, whose handler
+/// likewise re-reads the option each time), and reload the
+/// playlists every 3 hours (audit N08, Python's refresh timer).
 fn bind_housekeeping(frame: Frame, wiring: &Wiring) {
     let tick_wiring = clone_wiring(wiring);
     let last_check = Rc::new(std::cell::Cell::new(now_seconds()));
@@ -1174,6 +1182,23 @@ fn bind_housekeeping(frame: Frame, wiring: &Wiring) {
             frame.raise();
         }
         let now = now_seconds();
+        // N19: the delayed startup check falls due once,
+        // 5 s after it was scheduled at frame build (Python's
+        // `_AUTO_UPDATE_DELAY_AFTER_PLAYLIST_MS` CallLater, so
+        // playlist loading is not disturbed). Like the hourly
+        // handler below, it re-reads the option at fire time.
+        let due = tick_wiring.auto_check_due.get();
+        if due > 0.0 && now >= due {
+            tick_wiring.auto_check_due.set(0.0);
+            if tick_wiring
+                .persist
+                .config
+                .borrow()
+                .bool_or("auto_check_updates", false)
+            {
+                run_auto_update_check(&tick_wiring, &frame);
+            }
+        }
         if now - last_check.get() >= 3600.0 {
             last_check.set(now);
             if tick_wiring
@@ -1182,7 +1207,7 @@ fn bind_housekeeping(frame: Frame, wiring: &Wiring) {
                 .borrow()
                 .bool_or("auto_check_updates", false)
             {
-                check_updates(&frame, ship_shape::ui::CheckTrigger::Automatic);
+                run_auto_update_check(&tick_wiring, &frame);
             }
         }
         // Playlists refresh on their own every 3 hours (audit
@@ -5409,6 +5434,7 @@ fn clone_wiring(wiring: &Wiring) -> Wiring {
         media_probe_pending: Rc::clone(&wiring.media_probe_pending),
         media_probe_token: Rc::clone(&wiring.media_probe_token),
         format_menu_state: Rc::clone(&wiring.format_menu_state),
+        auto_check_due: Rc::clone(&wiring.auto_check_due),
     }
 }
 
@@ -7809,16 +7835,36 @@ fn check_updates(frame: &Frame, trigger: ship_shape::ui::CheckTrigger) {
     );
 }
 
-/// Start a background update check at launch when the user enabled
-/// auto-check in Options.
-fn maybe_auto_check_updates(wiring: &Wiring, frame: Frame) {
+/// One automatic update-check attempt: fire the signed check
+/// and record the attempt (Python's non-interactive
+/// `_start_update_check`, whose worker ends with
+/// `_record_auto_update_check_attempt`). Manual checks never
+/// touch the epoch. Python records after its worker finishes;
+/// ship-shape reports no completion back, so the attempt is
+/// recorded as it is launched — the key records when the last
+/// automatic check was attempted either way.
+fn run_auto_update_check(wiring: &Wiring, frame: &Frame) {
+    check_updates(frame, ship_shape::ui::CheckTrigger::Automatic);
+    wiring.persist.set_and_save(
+        "update_last_auto_check_epoch",
+        serde_json::json!(now_epoch()),
+    );
+}
+
+/// Schedule the launch update check when the user enabled
+/// auto-check in Options (Python's
+/// `_schedule_auto_update_check`): the check itself is
+/// delayed 5 s (Python's `_AUTO_UPDATE_DELAY_AFTER_PLAYLIST_MS`)
+/// so playlist loading is not disturbed, and the
+/// housekeeping tick fires it when it falls due.
+fn maybe_auto_check_updates(wiring: &Wiring) {
     if wiring
         .persist
         .config
         .borrow()
         .bool_or("auto_check_updates", false)
     {
-        check_updates(&frame, ship_shape::ui::CheckTrigger::Automatic);
+        wiring.auto_check_due.set(now_seconds() + 5.0);
     }
 }
 
