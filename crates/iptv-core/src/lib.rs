@@ -37,6 +37,7 @@ pub mod playback;
 pub mod providers;
 pub mod proxy;
 pub mod recording;
+pub mod recording_log;
 pub mod reminders;
 pub mod search;
 pub mod settings_backup;
