@@ -1781,6 +1781,37 @@ impl EpgWorker {
     }
 }
 
+/// Best-effort: drop the OS scheduling priority of the
+/// *calling* thread only (port of Python's
+/// `_lower_current_thread_priority`, `main.py:746`), so a long
+/// guide import competes less aggressively with the UI thread
+/// and the screen reader, without touching the whole process's
+/// priority class. Windows uses THREAD_MODE_BACKGROUND_BEGIN —
+/// it lowers CPU, disk-I/O and memory priority together, which
+/// is what keeps the interface responsive while a
+/// multi-gigabyte import churns the page cache — with
+/// THREAD_PRIORITY_LOWEST as the fallback. A harmless no-op
+/// everywhere else or if the call fails.
+#[cfg(windows)]
+fn lower_current_thread_priority() {
+    const THREAD_MODE_BACKGROUND_BEGIN: i32 = 0x0001_0000;
+    const THREAD_PRIORITY_LOWEST: i32 = -2;
+    extern "system" {
+        fn GetCurrentThread() -> *mut std::ffi::c_void;
+        fn SetThreadPriority(thread: *mut std::ffi::c_void, priority: i32) -> i32;
+    }
+    // GetCurrentThread's pseudo-handle is exactly what
+    // THREAD_MODE_BACKGROUND_BEGIN is valid on.
+    unsafe {
+        if SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN) == 0 {
+            let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn lower_current_thread_priority() {}
+
 /// One load run, on the worker thread: fetch and check each
 /// source, merge the good ones, and mirror each into the store
 /// under its own source key. A source counts as loaded only when
@@ -1789,6 +1820,20 @@ impl EpgWorker {
 /// source that fails or is omitted never erases another source's
 /// stored guide (audit E04, E05).
 fn run_epg_load(sources: &[String], store_path: Option<&std::path::Path>) -> EpgLoadResult {
+    // The import runs at background priority, like Python's
+    // worker, and holds the cross-process import lock for the
+    // whole run, exactly where Python's importer takes it: two
+    // copies of the app must never write the guide store at
+    // once. A lock that never frees fails the load with
+    // Python's timeout message.
+    lower_current_thread_priority();
+    let _import_lock = match store_path {
+        Some(path) => match crate::epgstore::wait_for_import_lock(path) {
+            Ok(guard) => Some(guard),
+            Err(error) => return EpgLoadResult::Failed(error),
+        },
+        None => None,
+    };
     let mut merged = EpgGuide::default();
     let mut loaded = 0_usize;
     let mut failures: Vec<String> = Vec::new();
@@ -2273,6 +2318,20 @@ pub fn is_transient_epg_error(message: &str) -> bool {
 /// decode and parse as XMLTV — an HTML error page or a truncated
 /// document fails the source (audit E05).
 fn fetch_epg_source(source: &str) -> Result<EpgGuide, String> {
+    // Python's robust path for `.gz` sources over HTTP
+    // (`_http_download_gz_with_resume`): download to a temp
+    // file with Range resume and verify integrity, instead of
+    // restarting a multi-hundred-MB transfer from zero after
+    // every interruption. `EPG_GZ_DOWNLOAD=0` opts out, as in
+    // Python.
+    if (source.starts_with("http://") || source.starts_with("https://"))
+        && source.to_lowercase().ends_with(".gz")
+        && gz_download_enabled()
+    {
+        let bytes = download_gz_with_resume(source).map_err(|e| format!("{source}: {e}"))?;
+        let text = decode_epg_bytes(&bytes).map_err(|e| format!("{source}: {e}"))?;
+        return parse_xmltv_checked(&text).map_err(|e| format!("{source}: {e}"));
+    }
     let mut attempt = 0;
     loop {
         attempt += 1;
@@ -2285,6 +2344,226 @@ fn fetch_epg_source(source: &str) -> Result<EpgGuide, String> {
                 std::thread::sleep(std::time::Duration::from_millis(400 * attempt));
             }
         }
+    }
+}
+
+/// Python's `EPG_GZ_DOWNLOAD` switch: anything but 0/false
+/// keeps the robust download.
+fn gz_download_enabled() -> bool {
+    !matches!(
+        std::env::var("EPG_GZ_DOWNLOAD").unwrap_or_default().trim(),
+        "0" | "false" | "False"
+    )
+}
+
+/// A partial download is only resumed while it is fresh
+/// (Python's `_EPG_PARTIAL_MAX_AGE_SECONDS`): resuming an old
+/// partial against a feed that has since been regenerated
+/// splices two different files.
+const GZ_PARTIAL_MAX_AGE: std::time::Duration = std::time::Duration::from_mins(30);
+
+/// The stable temp path for one guide URL, so a partial
+/// download can be resumed by a later attempt or run.
+fn gz_temp_path(url: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("epg_{}.xml.gz", crate::cache::cache_key(&[url])))
+}
+
+/// One in-process lock per temp download (Python's
+/// `_DOWNLOAD_LOCKS`): two imports of the same source in this
+/// process must never mutate the same partial file at once.
+fn gz_download_lock(path: &std::path::Path) -> std::sync::Arc<std::sync::Mutex<()>> {
+    static LOCKS: std::sync::OnceLock<
+        std::sync::Mutex<
+            std::collections::HashMap<std::path::PathBuf, std::sync::Arc<std::sync::Mutex<()>>>,
+        >,
+    > = std::sync::OnceLock::new();
+    let locks = LOCKS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let mut locks = locks
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    std::sync::Arc::clone(
+        locks
+            .entry(path.to_path_buf())
+            .or_insert_with(|| std::sync::Arc::new(std::sync::Mutex::new(()))),
+    )
+}
+
+/// Download a gzip guide to its temp path with HTTP Range
+/// resume and verify its integrity (port of
+/// `_http_download_gz_with_resume`): up to four attempts,
+/// each resuming where the last stopped, with a brief backoff
+/// that grows per attempt. Returns the verified bytes; the
+/// temp file is deleted on success unless `EPG_KEEP_TEMP_GZ`
+/// asks to keep it (Python's stream-close rule).
+fn download_gz_with_resume(url: &str) -> Result<Vec<u8>, String> {
+    let temp_path = gz_temp_path(url);
+    let lock = gz_download_lock(&temp_path);
+    let _guard = lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Ok(metadata) = std::fs::metadata(&temp_path) {
+        let fresh = metadata
+            .modified()
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age <= GZ_PARTIAL_MAX_AGE);
+        if !fresh {
+            let _ = std::fs::remove_file(&temp_path);
+        }
+    }
+    let mut last_err: Option<String> = None;
+    for attempt in 1..=4_u64 {
+        match gz_download_attempt(url, &temp_path) {
+            Ok(bytes) => {
+                let keep = matches!(
+                    std::env::var("EPG_KEEP_TEMP_GZ").unwrap_or_default().trim(),
+                    "1" | "true" | "True"
+                );
+                if !keep {
+                    let _ = std::fs::remove_file(&temp_path);
+                }
+                return Ok(bytes);
+            }
+            Err(error) => {
+                last_err = Some(error);
+                std::thread::sleep(std::time::Duration::from_millis(500 * attempt));
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| "Failed to download gzip with resume".to_string()))
+}
+
+/// One resume attempt: download (or finish downloading) the
+/// temp file, verify it, and return its bytes. A failed
+/// attempt leaves the partial file in place for the next one.
+fn gz_download_attempt(url: &str, temp_path: &std::path::Path) -> Result<Vec<u8>, String> {
+    use std::io::{Read as _, Write as _};
+    let mut existing = std::fs::metadata(temp_path).map_or(0, |meta| meta.len());
+    if existing > 0 && !has_gzip_magic(temp_path) {
+        // A leftover that is not gzip at all: start over.
+        let _ = std::fs::remove_file(temp_path);
+        existing = 0;
+    }
+    let mut use_range = existing > 0;
+    // A 416 means the saved offset is past the end of what the
+    // server has now: drop the partial and restart clean,
+    // inside this same attempt, as Python does.
+    let mut response = loop {
+        let mut request = ureq::get(url)
+            .header("User-Agent", "Mozilla/5.0")
+            .header("Accept", "application/gzip, application/xml, text/xml, */*");
+        if use_range {
+            request = request.header("Range", format!("bytes={existing}-"));
+        }
+        match request.call() {
+            Ok(response) => break response,
+            Err(ureq::Error::StatusCode(416)) if use_range => {
+                let _ = std::fs::remove_file(temp_path);
+                existing = 0;
+                use_range = false;
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+    };
+    let status = response.status().as_u16();
+    if status == 200 && use_range {
+        // The server ignored the Range request entirely;
+        // restart clean rather than appending a second copy.
+        use_range = false;
+        existing = 0;
+    }
+    // The server-declared size, so completeness is proven by
+    // byte count rather than trusting the gzip probe alone: a
+    // truncated multi-hundred-MB download can still leave a
+    // structurally valid gzip header and first block.
+    let header = |name: &str| {
+        response
+            .headers()
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string)
+    };
+    let content_length = header("content-length").and_then(|v| v.trim().parse::<u64>().ok());
+    let expected_total = if use_range {
+        header("content-range")
+            .and_then(|range| range.rsplit('/').next().map(str::to_string))
+            .and_then(|total| total.trim().parse::<u64>().ok())
+            .or_else(|| content_length.map(|length| existing + length))
+    } else {
+        content_length
+    };
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .append(use_range)
+        .truncate(!use_range)
+        .open(temp_path)
+        .map_err(|e| e.to_string())?;
+    let mut reader = response.body_mut().as_reader();
+    let mut buffer = vec![0_u8; 64 * 1024];
+    loop {
+        let read = reader.read(&mut buffer).map_err(|e| e.to_string())?;
+        if read == 0 {
+            break;
+        }
+        file.write_all(&buffer[..read]).map_err(|e| e.to_string())?;
+    }
+    file.flush().map_err(|e| e.to_string())?;
+    drop(file);
+    let final_size = std::fs::metadata(temp_path).map_or(0, |meta| meta.len());
+    if let Some(expected) = expected_total {
+        if final_size < expected {
+            return Err(format!(
+                "incomplete gzip download: {final_size}/{expected} bytes"
+            ));
+        }
+    }
+    // Verify gzip integrity. When the server declared a size
+    // the byte count proves completeness and only a quick
+    // header probe is needed; when it did not (chunked
+    // encoding), stream the whole file to EOF so a truncation
+    // cannot masquerade as a valid stream.
+    let verified = if expected_total.is_none() {
+        gzip_probe(temp_path, true)
+    } else {
+        gzip_probe(temp_path, false)
+    };
+    if !verified {
+        return Err("gzip verify failed; resuming download".to_string());
+    }
+    std::fs::read(temp_path).map_err(|e| e.to_string())
+}
+
+fn has_gzip_magic(path: &std::path::Path) -> bool {
+    use std::io::Read as _;
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut magic = [0_u8; 2];
+    file.read_exact(&mut magic).is_ok() && magic == [0x1f, 0x8b]
+}
+
+/// Probe a downloaded gzip: `full` streams the whole file to
+/// EOF checking the end-of-stream marker; otherwise only the
+/// first 16 KiB are read (Python's two probes).
+fn gzip_probe(path: &std::path::Path, full: bool) -> bool {
+    use std::io::Read as _;
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut decoder = flate2::read::GzDecoder::new(file);
+    if full {
+        let mut buffer = vec![0_u8; 1 << 20];
+        loop {
+            match decoder.read(&mut buffer) {
+                Ok(0) => return true,
+                Ok(_) => {}
+                Err(_) => return false,
+            }
+        }
+    } else {
+        let mut buffer = vec![0_u8; 1 << 14];
+        decoder.read(&mut buffer).is_ok()
     }
 }
 
@@ -2535,6 +2814,105 @@ mod tests {
         });
         let guide = fetch_epg_source(&format!("http://127.0.0.1:{port}/guide.xml")).unwrap();
         assert_eq!(guide.programme_count(), 1);
+    }
+
+    fn gz_guide_bytes() -> Vec<u8> {
+        use std::io::Write as _;
+        let xml = "<?xml version=\"1.0\"?><tv><channel id=\"c1\"><display-name>One</display-name></channel><programme channel=\"c1\" start=\"20261101180000 +0000\" stop=\"20261101190000 +0000\"><title>Show</title></programme></tv>";
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(xml.as_bytes()).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    fn read_request(stream: &mut std::net::TcpStream) -> String {
+        use std::io::Read as _;
+        let mut request = Vec::new();
+        let mut byte = [0_u8; 1];
+        while !request.ends_with(b"\r\n\r\n") {
+            if stream.read(&mut byte).unwrap() == 0 {
+                break;
+            }
+            request.push(byte[0]);
+        }
+        String::from_utf8_lossy(&request).into_owned()
+    }
+
+    #[test]
+    fn gz_download_resumes_an_interrupted_transfer() {
+        // Python's robust gzip path: the first response stops
+        // mid-body with a larger Content-Length promised, and
+        // the retry resumes with a Range request instead of
+        // starting the transfer over.
+        use std::io::Write as _;
+        let gz = gz_guide_bytes();
+        let part = gz.len() / 3;
+        assert!(part > 0 && part < gz.len());
+        let full = gz.len();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let server_port = listener.local_addr().unwrap().port();
+        let range_seen = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let range_clone = std::sync::Arc::clone(&range_seen);
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _request = read_request(&mut stream);
+            let head =
+                format!("HTTP/1.1 200 OK\r\nContent-Length: {full}\r\nConnection: close\r\n\r\n");
+            stream.write_all(head.as_bytes()).unwrap();
+            stream.write_all(&gz[..part]).unwrap();
+            drop(stream);
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_request(&mut stream);
+            *range_clone.lock().unwrap() = request;
+            let head = format!(
+                "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {part}-{}/{full}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                full - 1,
+                full - part
+            );
+            stream.write_all(head.as_bytes()).unwrap();
+            stream.write_all(&gz[part..]).unwrap();
+        });
+        let url = format!("http://127.0.0.1:{server_port}/guide.xml.gz");
+        let guide = fetch_epg_source(&url).unwrap();
+        assert_eq!(guide.programme_count(), 1);
+        server.join().unwrap();
+        let request = range_seen.lock().unwrap().to_lowercase();
+        assert!(
+            request.contains(&format!("range: bytes={part}-")),
+            "the retry must resume at {part}: {request}"
+        );
+        assert!(
+            !gz_temp_path(&url).exists(),
+            "a verified download deletes its temp file"
+        );
+    }
+
+    #[test]
+    fn gz_download_restarts_when_the_server_ignores_range() {
+        // A partial from an earlier attempt is on disk, but the
+        // server answers the Range request with a plain 200:
+        // the download restarts clean instead of appending a
+        // second copy of the body.
+        use std::io::Write as _;
+        let gz = gz_guide_bytes();
+        let part = gz.len() / 3;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let server_port = listener.local_addr().unwrap().port();
+        let full = gz.len();
+        let url = format!("http://127.0.0.1:{server_port}/guide.xml.gz");
+        let temp = gz_temp_path(&url);
+        std::fs::write(&temp, &gz[..part]).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _request = read_request(&mut stream);
+            let head =
+                format!("HTTP/1.1 200 OK\r\nContent-Length: {full}\r\nConnection: close\r\n\r\n");
+            stream.write_all(head.as_bytes()).unwrap();
+            stream.write_all(&gz).unwrap();
+        });
+        let guide = fetch_epg_source(&url).unwrap();
+        assert_eq!(guide.programme_count(), 1);
+        server.join().unwrap();
+        assert!(!temp.exists());
     }
     use super::*;
     use crate::Channel;
