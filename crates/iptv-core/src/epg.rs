@@ -1834,6 +1834,11 @@ pub enum EpgReadKind {
         limit: usize,
         model: std::sync::Arc<crate::BrowseModel>,
     },
+    Snapshot {
+        at: i64,
+        model: std::sync::Arc<crate::BrowseModel>,
+        snapshot: Option<std::sync::Arc<EpgSnapshot>>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -1850,6 +1855,7 @@ pub enum EpgReadValue {
     NowNext(Option<NowNext>),
     Programmes(Vec<Programme>),
     Search(Vec<EpgSearchHit>),
+    Snapshot(Vec<(usize, Programme)>),
 }
 
 #[derive(Clone, Debug)]
@@ -1888,19 +1894,29 @@ impl EpgReadWorker {
             let mut indexes: Option<(u64, std::sync::Arc<GuideIndexes>)> = None;
             while let Ok(job) = receiver.recv() {
                 let result = (|| {
-                    if !matches!(store.as_ref(), Some((path, _)) if *path == job.store_path) {
+                    let loaded_snapshot = match &job.kind {
+                        EpgReadKind::Snapshot {
+                            snapshot: Some(snapshot),
+                            ..
+                        } => Some(Arc::clone(snapshot)),
+                        _ => None,
+                    };
+                    if loaded_snapshot.is_none()
+                        && !matches!(store.as_ref(), Some((path, _)) if *path == job.store_path)
+                    {
                         store = Some((
                             job.store_path.clone(),
                             crate::epgstore::EpgStore::open(&job.store_path)?,
                         ));
                         indexes = None;
                     }
-                    let db = &store.as_ref().expect("store just opened").1;
                     match job.kind {
                         EpgReadKind::UsableData { at } => {
+                            let db = &store.as_ref().expect("store opened for read").1;
                             Ok(EpgReadValue::UsableData(db.has_usable_data(at)?))
                         }
                         EpgReadKind::NowNext { channel, at } => {
+                            let db = &store.as_ref().expect("store opened for read").1;
                             if !matches!(indexes.as_ref(), Some((generation, _)) if *generation == job.guide_generation)
                             {
                                 indexes = Some((
@@ -1923,6 +1939,7 @@ impl EpgReadWorker {
                             Ok(EpgReadValue::NowNext(value))
                         }
                         EpgReadKind::Programmes { channel, from, to } => {
+                            let db = &store.as_ref().expect("store opened for read").1;
                             let mut candidates = expand_tvg_id_candidates(channel.tvg_id.trim());
                             candidates.push(channel.tvg_id.trim().to_string());
                             for id in candidates {
@@ -1939,6 +1956,7 @@ impl EpgReadWorker {
                             limit,
                             model,
                         } => {
+                            let db = &store.as_ref().expect("store opened for read").1;
                             if !matches!(indexes.as_ref(), Some((generation, _)) if *generation == job.guide_generation)
                             {
                                 indexes = Some((
@@ -1967,6 +1985,32 @@ impl EpgReadWorker {
                                     })
                                     .collect(),
                             ))
+                        }
+                        EpgReadKind::Snapshot { at, model, snapshot } => {
+                            let (indexes_for_rows, bulk) = if let Some(snapshot) = snapshot {
+                                (Arc::clone(&snapshot.indexes), snapshot.guide.bulk_now_next(at))
+                            } else {
+                                let db = &store.as_ref().expect("store opened for read").1;
+                                if !matches!(indexes.as_ref(), Some((generation, _)) if *generation == job.guide_generation)
+                                {
+                                    indexes = Some((
+                                        job.guide_generation,
+                                        Arc::new(GuideIndexes::build(&db.channels()?)),
+                                    ));
+                                }
+                                let bulk = db.all_now_next(at)?.into_iter().map(|(channel, entry)| (channel.id, entry)).collect();
+                                (Arc::clone(&indexes.as_ref().expect("indexes just built").1), bulk)
+                            };
+                            let mut rows = Vec::new();
+                            for (index, channel) in model.channels().iter().enumerate() {
+                                let Some(id) = match_guide_channel(channel, &indexes_for_rows, Some(&indexes_for_rows.known_ids)) else {
+                                    continue;
+                                };
+                                if let Some(current) = bulk.get(&id).and_then(|entry| entry.current.clone()) {
+                                    rows.push((index, current));
+                                }
+                            }
+                            Ok(EpgReadValue::Snapshot(rows))
                         }
                     }
                 })();
@@ -2212,6 +2256,9 @@ mod tests {
             tvg_logo: String::new(),
             unknown_attributes: Default::default(),
         };
+        let model = std::sync::Arc::new(parse_m3u(
+            "#EXTM3U\n#EXTINF:-1 tvg-id=\"guide.one\",One News\nhttp://one",
+        ));
         let worker = EpgReadWorker::new();
         worker.submit(EpgReadJob {
             request_id: 1,
@@ -2240,14 +2287,22 @@ mod tests {
                 query: "One".into(),
                 now: 150,
                 limit: 10,
-                model: std::sync::Arc::new(parse_m3u(
-                    "#EXTM3U\n#EXTINF:-1 tvg-id=\"guide.one\",One News\nhttp://one",
-                )),
+                model: std::sync::Arc::clone(&model),
+            },
+        });
+        worker.submit(EpgReadJob {
+            request_id: 4,
+            guide_generation: 0,
+            store_path: path.clone(),
+            kind: EpgReadKind::Snapshot {
+                at: 150,
+                model,
+                snapshot: None,
             },
         });
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut results = Vec::new();
-        while results.len() < 3 && Instant::now() < deadline {
+        while results.len() < 4 && Instant::now() < deadline {
             if let Some(result) = worker.try_recv() {
                 results.push(result);
             } else {
@@ -2285,6 +2340,13 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].display_name, "One News");
         assert_eq!(hits[0].playlist_index, Some(0));
+        let snapshot = results.iter().find(|result| result.request_id == 4).unwrap();
+        let EpgReadValue::Snapshot(rows) = snapshot.result.as_ref().unwrap() else {
+            panic!("unexpected snapshot result: {snapshot:?}");
+        };
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, 0);
+        assert_eq!(rows[0].1.title, "Evening News");
         drop(worker);
         for _ in 0..100 {
             if std::fs::remove_file(&path).is_ok() {
