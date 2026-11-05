@@ -581,6 +581,60 @@ fn describe_kind(kind: &ProblemKind) -> String {
     text
 }
 
+/// `h:mm:ss` / `mm:ss` for a duration, or "--:--" when unknown
+/// (Python `format_duration`; the rounding is Python's
+/// half-to-even).
+#[must_use]
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // durations are non-negative
+pub fn format_duration(seconds: Option<f64>) -> String {
+    let Some(seconds) = seconds.filter(|v| *v > 0.0) else {
+        return "--:--".to_string();
+    };
+    let total = seconds.round_ties_even() as i64;
+    let hours = total / 3600;
+    let minutes = (total % 3600) / 60;
+    let secs = total % 60;
+    if hours > 0 {
+        format!("{hours}:{minutes:02}:{secs:02}")
+    } else {
+        format!("{minutes:02}:{secs:02}")
+    }
+}
+
+/// Whether a log line looks like an ffmpeg diagnostic (the
+/// download window's `_ERROR_LINE_RE`): a bracketed level tag,
+/// or one of the failure words.
+fn is_error_line(line: &str) -> bool {
+    let lowered = line.to_lowercase();
+    ["[error]", "[fatal]", "[panic]", "[warning]"]
+        .iter()
+        .any(|tag| lowered.contains(tag))
+        || ["http error", "failed", "refused", "reset"]
+            .iter()
+            .any(|word| lowered.contains(word))
+        || ["timed out", "timedout", "tim out", "timout"]
+            .iter()
+            .any(|word| lowered.contains(word))
+}
+
+/// The first diagnostic line in a recording log, its timestamp
+/// stripped (the download window's `_first_error_line`): our
+/// own `#` header and summary lines never count, even though
+/// the header's command line can contain failure words.
+#[must_use]
+pub fn first_error_line(log_text: &str) -> String {
+    for line in log_text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if is_error_line(line) {
+            return strip_log_timestamp(line);
+        }
+    }
+    String::new()
+}
+
 /// Human-readable byte size, or a placeholder when unknown
 /// (Python `format_size`).
 #[must_use]
@@ -1040,6 +1094,24 @@ Last message repeated 2 times
     }
 
     #[test]
+    fn first_error_line_skips_our_own_header() {
+        // The `#` command header can itself contain failure words
+        // ("-rw_timeout" holds "time out"); Python skips it.
+        let log = "# ffmpeg -rw_timeout 5000000 -i https://x/y.m3u8\n\
+                   2026-11-04 10:00:00.1 [https @ 0x1] [error] Server returned 403 Forbidden\n\
+                   frame= 10 fps= 5 time=00:00:02.00 bitrate=1kbits/s\n";
+        assert_eq!(
+            first_error_line(log),
+            "[https @ 0x1] [error] Server returned 403 Forbidden"
+        );
+        assert_eq!(first_error_line("# only a header\nframe= 1\n"), "");
+        assert_eq!(
+            first_error_line("Connection refused by the provider\n"),
+            "Connection refused by the provider"
+        );
+    }
+
+    #[test]
     fn summary_lines_cover_the_outcome() {
         let path = temp_log("format", SAMPLE);
         let summary = summarize_log(&path);
@@ -1070,5 +1142,12 @@ Last message repeated 2 times
         assert_eq!(format_size(None), "--");
         assert_eq!(format_size(Some(512.0)), "512 B");
         assert_eq!(format_size(Some(2048.0)), "2.0 KB");
+        assert_eq!(format_duration(None), "--:--");
+        assert_eq!(format_duration(Some(0.0)), "--:--");
+        assert_eq!(format_duration(Some(65.0)), "01:05");
+        assert_eq!(format_duration(Some(3661.0)), "1:01:01");
+        // Python rounds half to even: 2.5 s reads as 2, 3.5 as 4.
+        assert_eq!(format_duration(Some(2.5)), "00:02");
+        assert_eq!(format_duration(Some(3.5)), "00:04");
     }
 }
