@@ -8162,6 +8162,10 @@ fn refresh_subtitle_menu(player: &Rc<RefCell<PlayerState>>) {
     for old in state.spu_menu_ids.drain(..) {
         menu.delete(old);
     }
+    // "No subtitle tracks available" holds the same id as the first
+    // radio. Left in, checking that id hits the plain item: a wx
+    // assert dialog whose nested loop trapped every player tick.
+    menu.delete(PM_SUB_BASE);
     for (index, spu) in choices.iter().enumerate() {
         let id = PM_SUB_BASE + i32::try_from(index).unwrap_or(0);
         let label = if *spu == -1 {
