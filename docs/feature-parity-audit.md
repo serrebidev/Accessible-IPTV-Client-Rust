@@ -1240,6 +1240,8 @@ Evidence for N01 to N06 is in docs/validation/0071-player-engine-cpu-and-ticks.m
 
 **Fix (partial), 2026-11-04:** the probing half is fixed — core `catchup_direct` (candidates, no-redirect HEAD walk, host-scoped headers, 2.5 s settle, probe worker) wired into `begin_catchup_download`, and the truncation check aligned to Python (padded window minus padding, 0.95). See validation 0073. Still open: the recording relay (`recording_relay.py`) and the one-stream busy refusal.
 
+**Fix (complete), 2026-11-04:** the relay half is fixed — app `relay` module (pump, 2 MB / 2 s backlog, token path, bounded drain on close), engine connection keys + `start_shared`, the share flow in `toggle_recording` with settle-worker start/end, and `single_stream_busy` refusals at manual record, DVR start and catch-up. See validation 0074. Recorded residuals there: the caster arm of the busy check is not ported (Rust retains no cast source URL), and resume uses the channel's own URL.
+
 **N14, medium: provider errors in plain words.** Python turns HTTP 401, 403, 404, 4xx, 5xx, timeouts, refused connections and bad data into sentences saying what to do (`catchup_urls.py:71` to `:91`).
 
 **N15, medium: Download window detail.** Python shows size so far, time remaining, retry attempts with a countdown, "ended early" with the bytes received, a cancel confirmation, and Escape to hide while the download continues (`main.py:8524`, `:8773` to `:8891`).

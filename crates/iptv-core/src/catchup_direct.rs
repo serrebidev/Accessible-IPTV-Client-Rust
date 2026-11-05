@@ -23,6 +23,44 @@ use crate::playback::StreamHeaders;
 /// against the account (Python's `_MEDIA_SESSION_SETTLE_SECONDS`).
 pub const MEDIA_SESSION_SETTLE_SECONDS: f64 = 2.5;
 
+/// The plain-words refusal shown when a one-stream provider's
+/// only connection is already in use (Python's
+/// `_ffmpeg_exit_reason(-858797304)` text, reused by its
+/// `_single_stream_provider_refusal`).
+pub const ONE_STREAM_REFUSAL: &str = "The provider refused access (HTTP 403 Forbidden). Many providers allow only one stream per account at a time: stop other playback or downloads from this account and try again.";
+
+/// Hosts whose accounts allow exactly one media connection.
+/// Deliberately narrow, exactly as Python's
+/// `_ONE_STREAM_PROVIDER_SUFFIXES`: `timeshift` in a host name
+/// alone does not say an unrelated provider restricts accounts.
+const ONE_STREAM_PROVIDER_SUFFIXES: [&str; 1] = ["teleelevidenie.com"];
+
+/// The exclusive-connection key for a known one-stream
+/// provider — the matched suffix — or an empty string for any
+/// other URL (Python's `single_stream_provider_key`).
+#[must_use]
+pub fn single_stream_provider_key(url: &str) -> String {
+    if url.is_empty() {
+        return String::new();
+    }
+    let (base, _) = crate::playback::split_stream_modifiers(url);
+    let Some(parts) = split_url(&base) else {
+        return String::new();
+    };
+    let authority = parts.netloc.rsplit('@').next().unwrap_or(&parts.netloc);
+    let host = authority
+        .rsplit_once(':')
+        .map_or(authority, |(host, _)| host)
+        .to_lowercase();
+    let host = host.trim_end_matches('.');
+    for suffix in ONE_STREAM_PROVIDER_SUFFIXES {
+        if host == suffix || host.ends_with(&format!(".{suffix}")) {
+            return suffix.to_string();
+        }
+    }
+    String::new()
+}
+
 /// Redirect chains are short; anything longer is a loop.
 const MAX_REDIRECT_HOPS: usize = 5;
 
@@ -736,6 +774,29 @@ mod tests {
             "http://prov.example/x",
             "http://prov.example:8080/x"
         ));
+    }
+
+    #[test]
+    fn one_stream_key_matches_only_the_known_provider() {
+        assert_eq!(
+            single_stream_provider_key("http://tv.teleelevidenie.com:8080/live/x.m3u8"),
+            "teleelevidenie.com"
+        );
+        assert_eq!(
+            single_stream_provider_key("https://teleelevidenie.com./x"),
+            "teleelevidenie.com"
+        );
+        // A lookalike host and an unrelated timeshift host are
+        // not the restricted provider.
+        assert_eq!(
+            single_stream_provider_key("http://noteleelevidenie.com/x"),
+            ""
+        );
+        assert_eq!(
+            single_stream_provider_key("http://timeshift.other.example/x"),
+            ""
+        );
+        assert_eq!(single_stream_provider_key(""), "");
     }
 
     #[test]

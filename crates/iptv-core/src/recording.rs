@@ -342,6 +342,9 @@ fn format_args(format: &str, audio_track: Option<i64>) -> Vec<String> {
 struct Active {
     child: Child,
     out_path: PathBuf,
+    /// The one-stream provider key this recording's connection
+    /// counts against (N13; empty for unrestricted providers).
+    connection_key: String,
 }
 
 /// A finished recording report.
@@ -399,6 +402,34 @@ impl RecordingEngine {
         command: &[String],
         out_path: PathBuf,
     ) -> Result<(), String> {
+        self.start_inner(key, command, out_path, false).map(|_| ())
+    }
+
+    /// Start a recording whose ffmpeg stdout (the tee'd MPEG-TS
+    /// copy built by `copy_to_stdout`) the caller serves to the
+    /// player through the recording relay (N13): one provider
+    /// connection for watching and recording the same channel.
+    ///
+    /// # Errors
+    ///
+    /// Returns the spawn failure text, or the duplicate-key refusal.
+    pub fn start_shared(
+        &mut self,
+        key: &str,
+        command: &[String],
+        out_path: PathBuf,
+    ) -> Result<std::process::ChildStdout, String> {
+        self.start_inner(key, command, out_path, true)?
+            .ok_or_else(|| "Recording failed: no shared output.".to_string())
+    }
+
+    fn start_inner(
+        &mut self,
+        key: &str,
+        command: &[String],
+        out_path: PathBuf,
+        shared_stdout: bool,
+    ) -> Result<Option<std::process::ChildStdout>, String> {
         if self.active.contains_key(key) {
             return Err("That recording is already running.".to_string());
         }
@@ -408,12 +439,52 @@ impl RecordingEngine {
         let mut cmd = Command::new(&command[0]);
         cmd.args(&command[1..])
             .stdin(Stdio::piped())
-            .stdout(Stdio::null())
+            .stdout(if shared_stdout {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
             .stderr(Stdio::null());
-        let child = cmd.spawn().map_err(|e| format!("Recording failed: {e}"))?;
-        self.active
-            .insert(key.to_string(), Active { child, out_path });
-        Ok(())
+        let mut child = cmd.spawn().map_err(|e| format!("Recording failed: {e}"))?;
+        let stdout = if shared_stdout {
+            Some(
+                child
+                    .stdout
+                    .take()
+                    .ok_or_else(|| "Recording failed: no shared output.".to_string())?,
+            )
+        } else {
+            None
+        };
+        self.active.insert(
+            key.to_string(),
+            Active {
+                child,
+                out_path,
+                connection_key: String::new(),
+            },
+        );
+        Ok(stdout)
+    }
+
+    /// Record which one-stream provider a running recording's
+    /// connection counts against (N13), once its URL is known.
+    pub fn set_connection_key(&mut self, key: &str, provider_key: &str) {
+        if let Some(active) = self.active.get_mut(key) {
+            active.connection_key = provider_key.to_string();
+        }
+    }
+
+    /// Whether any running recording holds a connection against
+    /// this one-stream provider key (Python recorder's
+    /// `has_active_connection`).
+    #[must_use]
+    pub fn has_active_connection(&self, provider_key: &str) -> bool {
+        !provider_key.is_empty()
+            && self
+                .active
+                .values()
+                .any(|active| active.connection_key == provider_key)
     }
 
     /// Ask ffmpeg to finish: `q` on stdin, like the reference; the

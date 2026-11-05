@@ -1,4 +1,5 @@
 mod buffer;
+mod relay;
 
 use iptv_core::guide::Guide;
 use iptv_core::i18n::I18n;
@@ -555,6 +556,11 @@ struct Wiring {
     /// recording key, with the final path they earn on a clean
     /// finish (audit R05).
     staged_downloads: Rc<RefCell<std::collections::HashMap<String, StagedDownload>>>,
+    /// Recordings the player watches through the relay, and
+    /// share starts still settling (N13).
+    shared_playback: Rc<RefCell<std::collections::HashMap<String, SharedPlayback>>>,
+    pending_shares: Rc<RefCell<std::collections::HashSet<String>>>,
+    relay_worker: Rc<RelayWorker>,
     /// Last series-rule scan time, seconds (audit R16).
     series_last_scan: Rc<std::cell::Cell<f64>>,
     account_text: Rc<RefCell<Option<TextCtrl>>>,
@@ -1016,6 +1022,9 @@ fn bind_browser(
         reminder_seen: Rc::new(RefCell::new(std::collections::HashSet::new())),
         reminder_window_open: Rc::new(std::cell::Cell::new(false)),
         staged_downloads: Rc::new(RefCell::new(std::collections::HashMap::new())),
+        shared_playback: Rc::new(RefCell::new(std::collections::HashMap::new())),
+        pending_shares: Rc::new(RefCell::new(std::collections::HashSet::new())),
+        relay_worker: Rc::new(RelayWorker::new()),
         series_last_scan: Rc::new(std::cell::Cell::new(0.0)),
         account_text: Rc::new(RefCell::new(None)),
         buffers: Rc::new(RefCell::new(buffer::BufferRegistry::default())),
@@ -1023,6 +1032,8 @@ fn bind_browser(
     wiring.player.borrow_mut().shared = Some(PlayerShared {
         buffers: Rc::clone(&wiring.buffers),
         recordings: Rc::clone(&wiring.recordings),
+        pending_shares: Rc::clone(&wiring.pending_shares),
+        relay_worker: Rc::clone(&wiring.relay_worker),
         cast_ui: Rc::clone(&wiring.cast_ui),
         proxy: Rc::clone(&wiring.proxy),
         cast_worker: Rc::clone(&wiring.cast_worker),
@@ -1307,11 +1318,13 @@ fn bind_completion(wiring: &Wiring, controls: Controls) {
         poll_cast(&completed, status);
         poll_downloads(&completed, status);
         poll_direct_probes(&completed, status);
+        poll_relay_jobs(&completed, status);
         if !completed.browser.borrow().is_busy()
             && !completed.epg_pending.get()
             && !completed.suffix_pending.get()
             && !completed.provider_pending.get()
             && !completed.direct_probe_pending.get()
+            && !completed.relay_worker.pending()
             && !completed
                 .reminders
                 .borrow()
@@ -2521,6 +2534,74 @@ fn recording_audio_choice(
     }
 }
 
+impl Wiring {
+    fn share_ctx(&self) -> ShareCtx {
+        ShareCtx {
+            pending_shares: Rc::clone(&self.pending_shares),
+            relay_worker: Rc::clone(&self.relay_worker),
+        }
+    }
+}
+
+impl PlayerShared {
+    fn share_ctx(&self) -> ShareCtx {
+        ShareCtx {
+            pending_shares: Rc::clone(&self.pending_shares),
+            relay_worker: Rc::clone(&self.relay_worker),
+        }
+    }
+}
+
+/// Whether another app-owned media operation holds this
+/// provider's one-stream slot (N13; Python's
+/// `_single_stream_provider_busy`). Only known one-stream
+/// providers have a key at all; everyone else is never busy.
+fn single_stream_busy(
+    recordings: &Rc<RefCell<RecordingEngine>>,
+    buffers: &Rc<RefCell<buffer::BufferRegistry>>,
+    player: Option<&Rc<RefCell<PlayerState>>>,
+    url: &str,
+    include_player: bool,
+) -> bool {
+    let key = iptv_core::catchup_direct::single_stream_provider_key(url);
+    if key.is_empty() {
+        return false;
+    }
+    if recordings.borrow().has_active_connection(&key) {
+        return true;
+    }
+    {
+        let registry = buffers.borrow();
+        if registry.has_provider(&key) && !registry.owns_source(url) {
+            return true;
+        }
+    }
+    if include_player {
+        if let Some(player) = player {
+            let state = player.borrow();
+            if let Some(request) = state.session.current() {
+                if iptv_core::catchup_direct::single_stream_provider_key(&request.url) == key {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// True while the built-in player is playing this live channel
+/// (N13; Python's `_player_is_showing`).
+fn player_is_showing(player: &Rc<RefCell<PlayerState>>, channel: &Channel) -> bool {
+    let state = player.borrow();
+    let Some(current) = &state.current_channel else {
+        return false;
+    };
+    if channel_key(current) != channel_key(channel) {
+        return false;
+    }
+    state.session.current().is_some_and(|request| request.live)
+}
+
 /// Start or stop a manual recording of the channel. `player`,
 /// when the caller has it, witnesses the heard audio track
 /// (audit R10).
@@ -2531,8 +2612,19 @@ fn toggle_recording(
     channel: &Channel,
     status: Status,
     player: Option<&Rc<RefCell<PlayerState>>>,
+    share: &ShareCtx,
 ) {
     let key = channel_key(channel);
+    // N13: a second press while a shared start is still
+    // settling cancels it, like Python's pending-start toggle;
+    // the settle result then gives the channel back.
+    if share.pending_shares.borrow_mut().remove(&key) {
+        status.set_label(&trf(
+            "Stopping recording for {name}...",
+            &[("name", &channel.name)],
+        ));
+        return;
+    }
     if recordings.borrow().is_recording(&key) {
         recordings.borrow_mut().stop(&key);
         release_recording_lease(buffers, &key);
@@ -2544,6 +2636,39 @@ fn toggle_recording(
     }
     if channel.url.is_empty() {
         status.set_label("This channel's stream link must be resolved before recording.");
+        return;
+    }
+    // N13 (issue #13 in the reference): recording the channel
+    // the player is showing takes one provider connection, not
+    // two — the player lets go, the recording opens the stream,
+    // and the player watches the recording's own copy through
+    // the relay. A channel already feeding a live buffer needs
+    // no share: the recording reads the buffer's view instead.
+    let headers = iptv_core::playback::StreamHeaders::for_channel(channel);
+    let share_with_player = player.is_some_and(|p| player_is_showing(p, channel))
+        && buffers.borrow_mut().find(&channel.url, &headers).is_none();
+    if single_stream_busy(
+        recordings,
+        buffers,
+        player,
+        &channel.url,
+        !share_with_player,
+    ) {
+        status.set_label(iptv_core::catchup_direct::ONE_STREAM_REFUSAL);
+        return;
+    }
+    if share_with_player {
+        let player = player.expect("share implies a player");
+        player_stop(player, persist, status);
+        share.pending_shares.borrow_mut().insert(key.clone());
+        share.relay_worker.start(RelayJob::StartShare {
+            key,
+            channel: channel.clone(),
+        });
+        status.set_label(&trf(
+            "Starting recording of {name}...",
+            &[("name", &channel.name)],
+        ));
         return;
     }
     let format = recording_format_for_channel(persist, channel);
@@ -2569,11 +2694,11 @@ fn toggle_recording(
     }
 }
 
-/// Spawn ffmpeg for one recording; returns the output path.
-/// `witness` is the audio track the built-in player is hearing
-/// for this channel, when a caller has it (audit R10).
+/// Prepare one recording: destination gate, output path and
+/// the ffmpeg command. `shared` adds the tee'd MPEG-TS copy on
+/// stdout the recording relay serves (N13).
 #[allow(clippy::too_many_arguments)] // channel, programme context and the audio witness
-fn start_recording(
+fn prepare_recording(
     recordings: &Rc<RefCell<RecordingEngine>>,
     buffers: &Rc<RefCell<buffer::BufferRegistry>>,
     persist: &Persist,
@@ -2582,7 +2707,8 @@ fn start_recording(
     format: &str,
     display_name: &str,
     witness: Option<(i64, String)>,
-) -> Result<PathBuf, String> {
+    shared: bool,
+) -> Result<(PathBuf, Vec<String>), String> {
     let dir = recordings_dir(persist);
     // Audit R08: Python's pre-start destination check on every
     // platform — the folder must exist, accept a real write,
@@ -2637,14 +2763,157 @@ fn start_recording(
             show_stats: true,
             audio_track,
             audio_track_count,
+            copy_to_stdout: shared,
             ..recording::FfmpegOptions::default()
         },
     );
+    Ok((out, cmd))
+}
+
+/// Spawn ffmpeg for one recording; returns the output path.
+/// `witness` is the audio track the built-in player is hearing
+/// for this channel, when a caller has it (audit R10).
+#[allow(clippy::too_many_arguments)] // channel, programme context and the audio witness
+fn start_recording(
+    recordings: &Rc<RefCell<RecordingEngine>>,
+    buffers: &Rc<RefCell<buffer::BufferRegistry>>,
+    persist: &Persist,
+    key: &str,
+    channel: &Channel,
+    format: &str,
+    display_name: &str,
+    witness: Option<(i64, String)>,
+) -> Result<PathBuf, String> {
+    let (out, cmd) = prepare_recording(
+        recordings,
+        buffers,
+        persist,
+        key,
+        channel,
+        format,
+        display_name,
+        witness,
+        false,
+    )?;
     if let Err(error) = recordings.borrow_mut().start(key, &cmd, out.clone()) {
         release_recording_lease(buffers, key);
         return Err(error);
     }
+    recordings.borrow_mut().set_connection_key(
+        key,
+        &iptv_core::catchup_direct::single_stream_provider_key(&channel.url),
+    );
     Ok(out)
+}
+
+/// Spawn the shared recording behind the relay (N13): ffmpeg
+/// tees a copy of the stream to its stdout, the relay serves
+/// it, and the caller points the player at the relay URL.
+fn start_shared_recording(
+    wiring: &Wiring,
+    key: &str,
+    channel: &Channel,
+) -> Result<(PathBuf, std::sync::Arc<relay::RecordingRelay>), String> {
+    let format = recording_format_for_channel(&wiring.persist, channel);
+    let witness = player_audio_witness(&wiring.player, channel);
+    let (out, cmd) = prepare_recording(
+        &wiring.recordings,
+        &wiring.buffers,
+        &wiring.persist,
+        key,
+        channel,
+        &format,
+        &channel.name.clone(),
+        witness,
+        true,
+    )?;
+    let stdout = match wiring
+        .recordings
+        .borrow_mut()
+        .start_shared(key, &cmd, out.clone())
+    {
+        Ok(stdout) => stdout,
+        Err(error) => {
+            release_recording_lease(&wiring.buffers, key);
+            return Err(error);
+        }
+    };
+    wiring.recordings.borrow_mut().set_connection_key(
+        key,
+        &iptv_core::catchup_direct::single_stream_provider_key(&channel.url),
+    );
+    match relay::RecordingRelay::new(stdout) {
+        Ok(relay) => Ok((out, std::sync::Arc::new(relay))),
+        Err(error) => {
+            wiring.recordings.borrow_mut().stop(key);
+            release_recording_lease(&wiring.buffers, key);
+            Err(error)
+        }
+    }
+}
+
+/// Play a channel straight from the provider again after a
+/// shared recording (N13), when the player is idle: something
+/// the user started meanwhile is never displaced.
+fn resume_direct_playback(wiring: &Wiring, channel: &Channel, status: Status) {
+    if wiring.player.borrow().session.current().is_some() {
+        return;
+    }
+    let request = iptv_core::playback::PlaybackRequest::for_channel(channel, None);
+    play_builtin(&wiring.player, &wiring.persist, channel, request, status);
+}
+
+/// Drain shared-playback settle results (N13): start the relay
+/// recording once the player's connection has settled, hand
+/// the player the relay URL, and resume direct playback when a
+/// shared recording ends or a share start was cancelled.
+fn poll_relay_jobs(wiring: &Wiring, status: Status) {
+    while let Some(job) = wiring.relay_worker.try_recv() {
+        match job {
+            RelayJob::StartShare { key, channel } => {
+                if !wiring.pending_shares.borrow_mut().remove(&key) {
+                    // Cancelled while settling: give the
+                    // channel back to the player directly.
+                    resume_direct_playback(wiring, &channel, status);
+                    continue;
+                }
+                match start_shared_recording(wiring, &key, &channel) {
+                    Ok((path, relay)) => {
+                        let relay_url = relay.url.clone();
+                        wiring.shared_playback.borrow_mut().insert(
+                            key,
+                            SharedPlayback {
+                                channel: channel.clone(),
+                                relay_url: relay_url.clone(),
+                                relay,
+                            },
+                        );
+                        let mut request =
+                            iptv_core::playback::PlaybackRequest::for_channel(&channel, None);
+                        request.url = relay_url;
+                        request.headers = iptv_core::playback::StreamHeaders::default();
+                        request.live = true;
+                        request.buffer_bypass = true;
+                        play_builtin(&wiring.player, &wiring.persist, &channel, request, status);
+                        status.set_label(&trf(
+                            "Recording {name} to {path}.",
+                            &[
+                                ("name", &channel.name),
+                                ("path", &path.display().to_string()),
+                            ],
+                        ));
+                    }
+                    Err(error) => {
+                        status.set_label(&error);
+                        resume_direct_playback(wiring, &channel, status);
+                    }
+                }
+            }
+            RelayJob::EndShare { channel } => {
+                resume_direct_playback(wiring, &channel, status);
+            }
+        }
+    }
 }
 
 /// The recordings folder: the configured path, else
@@ -2726,6 +2995,25 @@ fn record_dvr_channel(
     } else {
         job.title.clone()
     };
+    // N13: a one-stream provider whose only connection is in
+    // use refuses the scheduled recording with the plain-words
+    // reason, like Python's `_start_scheduled_recording`.
+    if single_stream_busy(
+        &wiring.recordings,
+        &wiring.buffers,
+        Some(&wiring.player),
+        &channel.url,
+        true,
+    ) {
+        wiring.dvr.borrow_mut().mark_finished(
+            &job.id,
+            false,
+            "",
+            iptv_core::catchup_direct::ONE_STREAM_REFUSAL,
+            now,
+        );
+        return;
+    }
     match start_recording(
         &wiring.recordings,
         &wiring.buffers,
@@ -3052,6 +3340,26 @@ fn poll_recordings(wiring: &Wiring, status: Status) {
         if let Some(staged) = wiring.staged_downloads.borrow_mut().remove(&finished.key) {
             finish_staged_download(wiring, status, &finished.key, staged, &finished, produced);
             continue;
+        }
+        // N13: a shared recording ended. Close its relay, and
+        // if the player is still watching through it, stop and
+        // resume the channel directly once the recording's
+        // connection has settled (Python's `_end_shared_playback`).
+        if let Some(shared) = wiring.shared_playback.borrow_mut().remove(&finished.key) {
+            shared.relay.close();
+            let on_relay = {
+                let state = wiring.player.borrow();
+                state
+                    .session
+                    .current()
+                    .is_some_and(|request| request.url == shared.relay_url)
+            };
+            if on_relay {
+                player_stop(&wiring.player, &wiring.persist, status);
+                wiring.relay_worker.start(RelayJob::EndShare {
+                    channel: shared.channel.clone(),
+                });
+            }
         }
         let name = finished
             .out_path
@@ -4004,6 +4312,9 @@ fn clone_wiring(wiring: &Wiring) -> Wiring {
         reminder_seen: Rc::clone(&wiring.reminder_seen),
         reminder_window_open: Rc::clone(&wiring.reminder_window_open),
         staged_downloads: Rc::clone(&wiring.staged_downloads),
+        shared_playback: Rc::clone(&wiring.shared_playback),
+        pending_shares: Rc::clone(&wiring.pending_shares),
+        relay_worker: Rc::clone(&wiring.relay_worker),
         series_last_scan: Rc::clone(&wiring.series_last_scan),
         account_text: Rc::clone(&wiring.account_text),
         buffers: Rc::clone(&wiring.buffers),
@@ -5410,6 +5721,7 @@ fn menu_recordings_action(
                     &channel,
                     status,
                     Some(&wiring.player),
+                    &wiring.share_ctx(),
                 );
             } else {
                 status.set_label("Select a channel to record first.");
@@ -6560,6 +6872,7 @@ fn bind_context_menu(frame: Frame, wiring: &Wiring, controls: Controls) {
                     &channel,
                     status,
                     Some(&wiring_menu.player),
+                    &wiring_menu.share_ctx(),
                 );
                 assert!(wiring_menu.timer.start(50, false));
             }
@@ -7809,6 +8122,8 @@ struct PlayerWindow {
 struct PlayerShared {
     buffers: Rc<RefCell<buffer::BufferRegistry>>,
     recordings: Rc<RefCell<RecordingEngine>>,
+    pending_shares: Rc<RefCell<std::collections::HashSet<String>>>,
+    relay_worker: Rc<RelayWorker>,
     cast_ui: Rc<RefCell<Option<CastUi>>>,
     proxy: Rc<RefCell<Option<iptv_core::proxy::ProxyServer>>>,
     cast_worker: Rc<CastWorker>,
@@ -8232,6 +8547,7 @@ fn dispatch_player_menu(
                     channel,
                     status,
                     Some(player),
+                    &shared.share_ctx(),
                 );
                 assert!(shared.timer.start(50, false));
             }
@@ -8880,6 +9196,7 @@ fn wire_player_events(
             channel,
             status,
             Some(&record_player),
+            &shared.share_ctx(),
         );
         assert!(shared.timer.start(50, false));
     });
@@ -10219,6 +10536,7 @@ fn dispatch_player_key(
                     channel,
                     status,
                     Some(player),
+                    &shared.share_ctx(),
                 );
                 assert!(shared.timer.start(50, false));
             }
@@ -12069,6 +12387,78 @@ struct DownloadRow {
     done: bool,
 }
 
+/// One recording the built-in player is watching through the
+/// recording relay (N13): when it ends, playback resumes
+/// directly if the player is still on the relay URL.
+struct SharedPlayback {
+    channel: Channel,
+    relay_url: String,
+    relay: std::sync::Arc<relay::RecordingRelay>,
+}
+
+/// A shared-playback step that must wait out the media settle
+/// off the UI thread (N13): start a relay recording after the
+/// player lets go, or resume direct playback after one ends.
+#[derive(Clone)]
+enum RelayJob {
+    StartShare { key: String, channel: Channel },
+    EndShare { channel: Channel },
+}
+
+/// The settle worker for shared playback: jobs sleep out the
+/// media settle, then come back as results for the completion
+/// tick (Python's stop-wait + settle threads).
+struct RelayWorker {
+    jobs: std::sync::mpsc::Sender<RelayJob>,
+    results: std::sync::Mutex<std::sync::mpsc::Receiver<RelayJob>>,
+    outstanding: Rc<std::cell::Cell<usize>>,
+}
+
+impl RelayWorker {
+    fn new() -> Self {
+        let (job_sender, job_receiver) = std::sync::mpsc::channel::<RelayJob>();
+        let (result_sender, result_receiver) = std::sync::mpsc::channel::<RelayJob>();
+        std::thread::spawn(move || {
+            while let Ok(job) = job_receiver.recv() {
+                iptv_core::catchup_direct::settle_media_session();
+                if result_sender.send(job).is_err() {
+                    break;
+                }
+            }
+        });
+        Self {
+            jobs: job_sender,
+            results: std::sync::Mutex::new(result_receiver),
+            outstanding: Rc::new(std::cell::Cell::new(0)),
+        }
+    }
+
+    fn start(&self, job: RelayJob) {
+        self.outstanding.set(self.outstanding.get() + 1);
+        let _ = self.jobs.send(job);
+    }
+
+    fn try_recv(&self) -> Option<RelayJob> {
+        let job = self.results.lock().ok()?.try_recv().ok()?;
+        self.outstanding
+            .set(self.outstanding.get().saturating_sub(1));
+        Some(job)
+    }
+
+    fn pending(&self) -> bool {
+        self.outstanding.get() > 0
+    }
+}
+
+/// The pieces recording start/stop needs for one-stream
+/// sharing (N13), reachable from both the main wiring and the
+/// player window's shared handles.
+#[derive(Clone)]
+struct ShareCtx {
+    pending_shares: Rc<RefCell<std::collections::HashSet<String>>>,
+    relay_worker: Rc<RelayWorker>,
+}
+
 /// One in-flight ffmpeg catch-up capture: everything needed to
 /// finalize it (rename the staged `.part` on a clean, complete
 /// finish) or retry it once when it comes up short (audit R05).
@@ -13342,6 +13732,19 @@ fn begin_catchup_download(
         status.set_label("This catch-up programme is already downloading.");
         return;
     }
+    // N13: on a one-stream provider whose only connection is
+    // in use, refuse before any probing — the probes are media
+    // requests too and would consume the slot ffmpeg needs.
+    if single_stream_busy(
+        &wiring.recordings,
+        &wiring.buffers,
+        Some(&wiring.player),
+        &url,
+        true,
+    ) {
+        status.set_label(iptv_core::catchup_direct::ONE_STREAM_REFUSAL);
+        return;
+    }
     // Audit R04: ask the provider for the padded window,
     // falling back to the programme-exact URL the caller
     // resolved when the padded one cannot be built.
@@ -13490,6 +13893,10 @@ fn launch_staged_capture(wiring: &Wiring, key: &str, staged: StagedDownload) -> 
         },
     );
     wiring.recordings.borrow_mut().start(key, &cmd, part)?;
+    wiring.recordings.borrow_mut().set_connection_key(
+        key,
+        &iptv_core::catchup_direct::single_stream_provider_key(&staged.url),
+    );
     wiring
         .staged_downloads
         .borrow_mut()
@@ -13939,6 +14346,7 @@ fn dispatch_main_hotkey(
                     &channel,
                     status,
                     Some(&wiring.player),
+                    &wiring.share_ctx(),
                 );
             } else {
                 status.set_label("Select a channel to record first.");
