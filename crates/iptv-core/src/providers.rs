@@ -927,6 +927,35 @@ impl ProviderAccount {
         }
     }
 
+    /// The playlist-scope picker label (Python `_scope_choice_label`):
+    /// "Xtream Codes – {name}" / "Stalker Portal – {name}", the name
+    /// falling back name → username → base URL → "Provider". Distinct
+    /// from [`Self::describe`], which keys provider state and keeps
+    /// its parenthesised form.
+    #[must_use]
+    pub fn scope_label(&self) -> String {
+        let (kind, name, username, base_url) = match self {
+            Self::Xtream(cfg) => (
+                "Xtream Codes",
+                cfg.name.as_deref(),
+                cfg.username.as_str(),
+                cfg.base_url.as_str(),
+            ),
+            Self::Stalker(cfg) => (
+                "Stalker Portal",
+                cfg.name.as_deref(),
+                cfg.username.as_str(),
+                cfg.base_url.as_str(),
+            ),
+        };
+        let who = name
+            .filter(|value| !value.is_empty())
+            .or_else(|| (!username.is_empty()).then_some(username))
+            .or_else(|| (!base_url.is_empty()).then_some(base_url))
+            .unwrap_or("Provider");
+        format!("{kind} – {who}")
+    }
+
     /// Parse one config dict entry; None for non-provider entries.
     #[must_use]
     pub fn from_config(entry: &Value) -> Option<Self> {
@@ -2043,6 +2072,30 @@ mod tests {
         let name = string_field(&row, "name").expect("name");
         assert_eq!(name, "Portal News");
         assert!(truthy(row.get("archive")));
+    }
+
+    #[test]
+    fn scope_label_uses_python_form_and_fallbacks() {
+        let named = ProviderAccount::Xtream(XtreamConfig {
+            base_url: "http://example.com".to_string(),
+            username: "u".to_string(),
+            name: Some("Home line".to_string()),
+            ..XtreamConfig::default()
+        });
+        assert_eq!(named.scope_label(), "Xtream Codes – Home line");
+        let unnamed = ProviderAccount::Xtream(XtreamConfig {
+            base_url: "http://example.com".to_string(),
+            username: "u".to_string(),
+            ..XtreamConfig::default()
+        });
+        assert_eq!(unnamed.scope_label(), "Xtream Codes – u");
+        let bare = ProviderAccount::Stalker(StalkerConfig {
+            base_url: "http://portal.example".to_string(),
+            ..StalkerConfig::default()
+        });
+        assert_eq!(bare.scope_label(), "Stalker Portal – http://portal.example");
+        let empty = ProviderAccount::Stalker(StalkerConfig::default());
+        assert_eq!(empty.scope_label(), "Stalker Portal – Provider");
     }
 
     #[test]

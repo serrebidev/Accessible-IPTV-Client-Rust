@@ -546,7 +546,7 @@ enum PendingEpgReadUi {
 #[derive(Clone)]
 struct Wiring {
     browser: Rc<RefCell<BrowserWorker>>,
-    categories: Rc<RefCell<Vec<Category>>>,
+    categories: Rc<RefCell<CategoryTreeState>>,
     /// The favorite count the category tree currently displays
     /// (B20: a count change alone must rebuild the Favorites label).
     category_fav_count: Rc<std::cell::Cell<usize>>,
@@ -634,6 +634,10 @@ struct Wiring {
     exit_requested: Rc<std::cell::Cell<bool>>,
     last_dvr_tick: Rc<std::cell::Cell<f64>>,
     scope_ids: Rc<RefCell<Vec<Option<String>>>>,
+    /// N22: category-tree branch labels by scope id, filled with
+    /// the scope picker; a scope missing here is a leftover and
+    /// its branch reads "Other playlists".
+    branch_labels: Rc<RefCell<std::collections::BTreeMap<String, String>>>,
     download_worker: Rc<iptv_core::downloads::DownloadWorker>,
     /// The catch-up direct-file probe worker (N13): probes run
     /// off the UI thread and settle one-stream providers.
@@ -1086,7 +1090,7 @@ fn bind_browser(
     browser_worker.set_source_cache_dir(config::user_config_dir().join("playlist-cache"));
     let wiring = Wiring {
         browser: Rc::new(RefCell::new(browser_worker)),
-        categories: Rc::new(RefCell::new(vec![Category::All, Category::Favorites])),
+        categories: Rc::new(RefCell::new(CategoryTreeState::default())),
         category_fav_count: Rc::new(std::cell::Cell::new(0)),
         timer: Rc::new(Timer::new(&frame)),
         model,
@@ -1142,6 +1146,7 @@ fn bind_browser(
         exit_requested: Rc::new(std::cell::Cell::new(false)),
         last_dvr_tick: Rc::new(std::cell::Cell::new(0.0)),
         scope_ids: Rc::new(RefCell::new(vec![None])),
+        branch_labels: Rc::new(RefCell::new(std::collections::BTreeMap::new())),
         download_worker: Rc::new(iptv_core::downloads::DownloadWorker::default()),
         direct_probe_worker: Rc::new(iptv_core::catchup_direct::DirectProbeWorker::default()),
         direct_probe_pending: Rc::new(std::cell::Cell::new(false)),
@@ -1463,6 +1468,7 @@ fn bind_completion(frame: Frame, wiring: &Wiring, controls: Controls) {
                     &completed.categories,
                     &completed.category_fav_count,
                     &completed.browser,
+                    &completed.branch_labels.borrow(),
                 );
             }
             Some(BrowseEvent::Recovery(error)) => {
@@ -1671,11 +1677,28 @@ fn bind_actions(_frame: Frame, wiring: &Wiring, controls: Controls) {
             event.skip(true);
             return;
         };
-        let Some(position) = tree_item_index(category, &selection) else {
-            event.skip(true);
-            return;
+        // N22: after a sync, the selected item maps to the first
+        // row whose text path matches its own — a branch header
+        // owns no row and changes nothing. Before the first sync
+        // the tree still shows its two placeholder rows, which the
+        // top-level position maps onto the sentinel categories.
+        let chosen = {
+            let state = category_choices.borrow();
+            if state.rows.is_empty() {
+                tree_item_index(category, &selection).and_then(|position| {
+                    [Category::All, Category::Favorites].get(position).cloned()
+                })
+            } else {
+                tree_item_text_path(category, u64::from(&selection)).and_then(|path| {
+                    state
+                        .rows
+                        .iter()
+                        .find(|row| category_row_text_path(row) == path)
+                        .map(|row| row.category.clone())
+                })
+            }
         };
-        let Some(chosen) = category_choices.borrow().get(position).cloned() else {
+        let Some(chosen) = chosen else {
             event.skip(true);
             return;
         };
@@ -1689,7 +1712,14 @@ fn bind_actions(_frame: Frame, wiring: &Wiring, controls: Controls) {
         event.skip(true);
     });
     bind_scope_choice(wiring, scope_choice, search, status);
-    bind_playback(wiring, list, status, episode_description, stream_url);
+    bind_playback(
+        wiring,
+        list,
+        search,
+        status,
+        episode_description,
+        stream_url,
+    );
     bind_f1_help(&scope_choice, wiring, "playlist-view", status);
     bind_f1_help(&category, wiring, "categories", status);
     bind_f1_help(&search, wiring, "search", status);
@@ -1725,19 +1755,55 @@ fn toggle_selected_favorite(wiring: &Wiring, list: ListCtrl, search: TextCtrl, s
         status.set_label("No channel selected. Choose a channel in Channels first.");
         return;
     };
+    // N22: Python's removal box names the channel when a removal
+    // inside the Favorites view empties it (main.py:1869), so
+    // capture the view and name before the toggle.
+    let (in_favorites_view, removed_name) = {
+        let browser = wiring.browser.borrow();
+        (
+            browser.active_category() == &Category::Favorites,
+            browser
+                .channel(index)
+                .map(|channel| iptv_core::favorites::display_name(&channel).to_owned()),
+        )
+    };
     match wiring
         .browser
         .borrow_mut()
         .toggle_favorite(index, &search.get_value())
     {
         Some(outcome) if outcome.toggle == Toggle::Unchanged => {
-            status.set_label("This channel cannot be marked as a favorite.");
+            // Python's warning box (main.py:1762) for an entry with
+            // no channel key, not a status-line note.
+            let dialog = MessageDialog::builder(
+                &list,
+                "This entry cannot be added to Favorites.",
+                "Favorites",
+            )
+            .with_style(MessageDialogStyle::OK | MessageDialogStyle::IconWarning)
+            .build();
+            dialog.show_modal_tracked();
         }
         Some(outcome) => {
             status.set_label(&outcome.announcement);
             let keys = wiring.browser.borrow().favorites().keys().to_vec();
             wiring.persist.save_favorites(&keys);
             assert!(wiring.timer.start(50, false));
+            if outcome.toggle == Toggle::Removed
+                && in_favorites_view
+                && wiring.browser.borrow().favorite_count() == 0
+            {
+                if let Some(name) = &removed_name {
+                    let dialog = MessageDialog::builder(
+                        &list,
+                        &format!("{name} was removed. Favorites is now empty."),
+                        "Favorites",
+                    )
+                    .with_style(MessageDialogStyle::OK | MessageDialogStyle::IconInformation)
+                    .build();
+                    dialog.show_modal_tracked();
+                }
+            }
         }
         None => status.set_label("No channel selected. Choose a channel in Channels first."),
     }
@@ -1751,18 +1817,31 @@ fn fill_scope_choices(wiring: &Wiring, choice: Choice) {
     let (sources, accounts) = configured_entries(wiring);
     let names = playlist_names(wiring);
     let mut ids: Vec<Option<String>> = vec![None];
+    let mut branch_labels: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
     for source in &sources {
         // B13: the friendly name wins over the host/file label.
-        choice.append(&iptv_core::sources::source_display_label(
-            source.location(),
-            &names,
-        ));
+        let label = iptv_core::sources::source_display_label(source.location(), &names);
+        choice.append(&label);
+        branch_labels.insert(source.scope_id(), label);
         ids.push(Some(source.scope_id()));
     }
     for account in &accounts {
-        choice.append(&account.describe());
+        // N22: the picker label is Python's `_scope_choice_label`
+        // ("Xtream Codes – {name}"), not the provider `describe()`
+        // form that keys provider state.
+        let label = account.scope_label();
+        choice.append(&label);
+        if let Some(id) = account.provider_id() {
+            branch_labels.insert(id, label);
+        }
         ids.push(account.provider_id());
     }
+    // N22: the browser branches the All-playlists category list
+    // per configured source, in this picker order.
+    let branch_ids: Vec<String> = ids.iter().flatten().cloned().collect();
+    wiring.browser.borrow_mut().set_branch_sources(branch_ids);
+    *wiring.branch_labels.borrow_mut() = branch_labels;
     // N09: the picker shows the committed scope (restored at
     // startup, committed on activation), not always All.
     let committed = wiring.browser.borrow().scope().map(str::to_owned);
@@ -5596,6 +5675,7 @@ fn clone_wiring(wiring: &Wiring) -> Wiring {
         exit_requested: Rc::clone(&wiring.exit_requested),
         last_dvr_tick: Rc::clone(&wiring.last_dvr_tick),
         scope_ids: Rc::clone(&wiring.scope_ids),
+        branch_labels: Rc::clone(&wiring.branch_labels),
         download_worker: Rc::clone(&wiring.download_worker),
         direct_probe_worker: Rc::clone(&wiring.direct_probe_worker),
         direct_probe_pending: Rc::clone(&wiring.direct_probe_pending),
@@ -7156,6 +7236,48 @@ fn menu_item_topic(id: i32) -> Option<&'static str> {
     })
 }
 
+/// Go to Favorites (View menu). With no favorites there is
+/// nowhere to go: Python shows its box (main.py:1927) and does
+/// not switch category.
+fn go_to_favorites(
+    frame: Frame,
+    wiring: &Wiring,
+    category_box: TreeCtrl,
+    search: TextCtrl,
+    status: Status,
+) {
+    if wiring.browser.borrow().favorite_count() == 0 {
+        let dialog = MessageDialog::builder(
+            &frame,
+            "You have not added any favorites yet. Select a channel and press Ctrl+D to add it.",
+            "Favorites",
+        )
+        .with_style(MessageDialogStyle::OK | MessageDialogStyle::IconInformation)
+        .build();
+        dialog.show_modal_tracked();
+        return;
+    }
+    let favorites_item = {
+        let state = wiring.categories.borrow();
+        state
+            .rows
+            .iter()
+            .find(|row| row.category == Category::Favorites)
+            .and_then(|row| tree_item_at_text_path(category_box, &category_row_text_path(row)))
+    };
+    if let Some(item) = favorites_item.or_else(|| tree_item_at(category_box, 1)) {
+        category_box.select_item(&item);
+    }
+    if wiring
+        .browser
+        .borrow_mut()
+        .select_category(Category::Favorites, &search.get_value())
+    {
+        status.set_label("Load cancelled. Browsing previous channels...");
+    }
+    assert!(wiring.timer.start(50, false));
+}
+
 /// Dispatch for the parity menu tree.
 fn bind_menu_actions(frame: Frame, wiring: &Wiring, controls: Controls) {
     bind_menu_option_actions(frame, wiring, controls);
@@ -7218,19 +7340,7 @@ fn bind_menu_actions(frame: Frame, wiring: &Wiring, controls: Controls) {
             VIEW_LIVE => status.set_label("Live TV and catch-up view."),
             VIEW_VOD => open_vod_window(&wiring, status),
             FAVORITE => toggle_selected_favorite(&wiring, list, search, status),
-            GO_TO_FAVORITES => {
-                if let Some(item) = tree_item_at(category_box, 1) {
-                    category_box.select_item(&item);
-                }
-                if wiring
-                    .browser
-                    .borrow_mut()
-                    .select_category(Category::Favorites, &search.get_value())
-                {
-                    status.set_label("Load cancelled. Browsing previous channels...");
-                }
-                assert!(wiring.timer.start(50, false));
-            }
+            GO_TO_FAVORITES => go_to_favorites(frame, &wiring, category_box, search, status),
             PREVIOUS_CHANNEL => {
                 // The second entry of the persisted MRU
                 // (P17): playing it promotes it to the front,
@@ -8935,13 +9045,34 @@ fn open_channel_epg(wiring: &Wiring, channel: &Channel, _main_status: Status) {
 fn bind_playback(
     wiring: &Wiring,
     list: ListCtrl,
+    search: TextCtrl,
     status: Status,
     episode_description: TextCtrl,
     stream_url: TextCtrl,
 ) {
     bind_epg_highlight(wiring, list, episode_description, stream_url);
-    let wiring = clone_wiring(wiring);
-    list.on_item_activated(move |_| activate_channel(&wiring, list, status));
+    let activation = clone_wiring(wiring);
+    list.on_item_activated(move |_| activate_channel(&activation, list, status));
+    // N22: Delete removes the picked channel from Favorites, and
+    // only then (Python main.py:2664 runs the favorite toggle for
+    // a favorite row); any other Delete passes through untouched.
+    let keys = clone_wiring(wiring);
+    list.bind_internal(EventType::KEY_DOWN, move |event| {
+        let plain_delete = event.get_key_code() == Some(127)
+            && !event.control_down()
+            && !event.alt_down()
+            && !event.shift_down();
+        let remove = plain_delete
+            && selected_row(list)
+                .and_then(|row| row_playlist_index(&keys, row))
+                .is_some_and(|index| keys.browser.borrow().is_favorite(index));
+        if remove {
+            toggle_selected_favorite(&keys, list, search, status);
+            event.skip(false);
+        } else {
+            event.skip(true);
+        }
+    });
 }
 
 /// Play the channel behind the selected or focused Channels row
@@ -17430,46 +17561,255 @@ fn category_display(category: &Category, favorite_count: usize) -> String {
     }
 }
 
+/// One segment of a category's tree path (N22): `key` is the node's
+/// identity (a playlist branch keys on its scope, so two branches
+/// with the same label stay separate, as Python's
+/// `("playlist", scope, label)` path tuples do), `text` is what the
+/// node shows.
+#[derive(Clone, PartialEq)]
+struct CategoryPathPart {
+    key: String,
+    text: String,
+}
+
+fn category_path_part(text: &str) -> CategoryPathPart {
+    CategoryPathPart {
+        key: text.to_owned(),
+        text: text.to_owned(),
+    }
+}
+
+/// One category-tree row (N22): the category it selects, its full
+/// label (with Python's count where the reference carries one), and
+/// its tree path — the playlist branch first, then the group name's
+/// own path parts.
+#[derive(Clone, PartialEq)]
+struct CategoryRow {
+    category: Category,
+    label: String,
+    path: Vec<CategoryPathPart>,
+}
+
+/// The category tree's display state: the rows in display order.
+/// Tree items are found by walking text paths (wxdragon's
+/// `TreeItemId` owns its pointer and cannot be cloned into the
+/// state); a row's text path is its path parts' texts with the leaf
+/// carrying the row label's count. Branch header nodes own no row —
+/// selecting one changes nothing (Python's tree reports no category
+/// index for them).
+#[derive(Default)]
+struct CategoryTreeState {
+    rows: Vec<CategoryRow>,
+}
+
+/// A row's tree text path: its parts' texts, the last one carrying
+/// the label's count suffix when it has one.
+fn category_row_text_path(row: &CategoryRow) -> Vec<String> {
+    let mut texts: Vec<String> = row.path.iter().map(|part| part.text.clone()).collect();
+    if let (Some(text), Some(part)) = (texts.last_mut(), row.path.last()) {
+        *text = iptv_core::categories::category_leaf_text(&row.label, &part.text);
+    }
+    texts
+}
+
+/// The text path from the hidden root to the tree item with this
+/// id value, or None when it is not in the tree.
+fn tree_item_text_path(control: TreeCtrl, target: u64) -> Option<Vec<String>> {
+    fn walk(control: TreeCtrl, parent: &TreeItemId, target: u64, path: &mut Vec<String>) -> bool {
+        let Some((first, mut cookie)) = control.get_first_child(parent) else {
+            return false;
+        };
+        let mut child = Some(first);
+        while let Some(item) = child {
+            path.push(control.get_item_text(&item).unwrap_or_default());
+            if u64::from(&item) == target || walk(control, &item, target, path) {
+                return true;
+            }
+            path.pop();
+            child = control.get_next_child(parent, &mut cookie);
+        }
+        false
+    }
+    let root = control.get_root_item()?;
+    let mut path = Vec::new();
+    walk(control, &root, target, &mut path).then_some(path)
+}
+
+/// The tree item at a text path below the hidden root; the first
+/// sibling with matching text wins, mirroring how duplicate labels
+/// collapse in Python's tree too.
+fn tree_item_at_text_path(control: TreeCtrl, texts: &[String]) -> Option<TreeItemId> {
+    let mut parent = control.get_root_item()?;
+    for text in texts {
+        let (first, mut cookie) = control.get_first_child(&parent)?;
+        let mut child = Some(first);
+        let mut found = None;
+        while let Some(item) = child {
+            if control.get_item_text(&item).as_deref() == Some(text.as_str()) {
+                found = Some(item);
+                break;
+            }
+            child = control.get_next_child(&parent, &mut cookie);
+        }
+        parent = found?;
+    }
+    Some(parent)
+}
+
+/// The branch header segment for one playlist scope: labeled from
+/// the scope picker, or "Other playlists" for a scope no configured
+/// source owns (Python `main.py:6180`).
+fn branch_path_part(
+    scope: &str,
+    branch_labels: &std::collections::BTreeMap<String, String>,
+) -> CategoryPathPart {
+    CategoryPathPart {
+        key: format!("playlist:{scope}"),
+        text: branch_labels
+            .get(scope)
+            .cloned()
+            .unwrap_or_else(|| "Other playlists".to_string()),
+    }
+}
+
+/// Build the category tree's rows from the browser's current
+/// category list (N22): flat rows keep their settled labels, and
+/// the All-playlists branch leaves carry Python's counts
+/// ("All Channels (n)" under the branch, "Group (n)").
+fn category_rows_display(
+    browser: &BrowserWorker,
+    branch_labels: &std::collections::BTreeMap<String, String>,
+) -> Vec<CategoryRow> {
+    let favorite_count = browser.favorite_count();
+    browser
+        .categories()
+        .iter()
+        .map(|category| match category {
+            Category::PlaylistAll(scope) => CategoryRow {
+                category: category.clone(),
+                label: format!("All Channels ({})", browser.category_row_count(category)),
+                path: vec![
+                    branch_path_part(scope, branch_labels),
+                    category_path_part("All Channels"),
+                ],
+            },
+            Category::PlaylistGroup(scope, group) => {
+                let mut path = vec![branch_path_part(scope, branch_labels)];
+                path.extend(
+                    iptv_core::categories::category_path_parts(group)
+                        .into_iter()
+                        .map(|part| category_path_part(&part)),
+                );
+                CategoryRow {
+                    category: category.clone(),
+                    label: format!("{group} ({})", browser.category_row_count(category)),
+                    path,
+                }
+            }
+            Category::Group(name) => CategoryRow {
+                category: category.clone(),
+                label: category_display(category, favorite_count),
+                path: iptv_core::categories::category_path_parts(name)
+                    .into_iter()
+                    .map(|part| category_path_part(&part))
+                    .collect(),
+            },
+            _ => {
+                let label = category_display(category, favorite_count);
+                CategoryRow {
+                    category: category.clone(),
+                    path: iptv_core::categories::category_path_parts(&label)
+                        .into_iter()
+                        .map(|part| category_path_part(&part))
+                        .collect(),
+                    label,
+                }
+            }
+        })
+        .collect()
+}
+
 /// Refresh the category control from the browser's current playlist without
 /// moving keyboard focus: rebuild rows only when the set changed, and keep
 /// the selection on the active category.
+///
+/// N22: the rebuild follows Python's category tree — rows nest by
+/// their path (per-playlist branches in the All view, group names
+/// split on " > " or "/"), nodes are shared by path prefix, a
+/// category that is also a branch keeps its own leaf text, and
+/// every branch starts expanded. The hidden root is never expanded
+/// (see `category_controls`).
 fn sync_category_control(
     control: TreeCtrl,
-    state: &RefCell<Vec<Category>>,
+    state: &RefCell<CategoryTreeState>,
     last_count: &std::cell::Cell<usize>,
     browser: &RefCell<BrowserWorker>,
+    branch_labels: &std::collections::BTreeMap<String, String>,
 ) {
     let browser = browser.borrow();
-    let current = browser.categories();
+    let current = category_rows_display(&browser, branch_labels);
     let favorite_count = browser.favorite_count();
     let favorites_active = browser.active_category() == &Category::Favorites;
     // B20: a changed favorite count alone (toggle from All Channels,
     // a scope switch) must rebuild the label too — it used to stay
     // stale unless the category set changed or Favorites was active.
+    // The count rides in the row label now, so the row comparison
+    // covers it; the explicit triggers stay as before.
     let count_changed = favorite_count != last_count.get();
-    if *state.borrow() != current || favorites_active || count_changed {
-        // Rebuild the tree rows (the Favorites count can change the
-        // label without a set change, as with the old list).
+    if state.borrow().rows != current || favorites_active || count_changed {
         if let Some(root) = control.get_root_item() {
             control.delete_children(&root);
-            for category in &current {
-                control.append_item(
-                    &root,
-                    &category_display(category, favorite_count),
-                    None,
-                    None,
-                );
+            let mut path_items: std::collections::HashMap<Vec<String>, TreeItemId> =
+                std::collections::HashMap::new();
+            let mut built = true;
+            'rows: for row in &current {
+                let mut parent: &TreeItemId = &root;
+                let mut key_path: Vec<String> = Vec::new();
+                for (index, part) in row.path.iter().enumerate() {
+                    key_path.push(part.key.clone());
+                    let last = index + 1 == row.path.len();
+                    if !path_items.contains_key(&key_path) {
+                        let text = if last {
+                            iptv_core::categories::category_leaf_text(&row.label, &part.text)
+                        } else {
+                            part.text.clone()
+                        };
+                        if let Some(item) = control.append_item(parent, &text, None, None) {
+                            path_items.insert(key_path.clone(), item);
+                        } else {
+                            built = false;
+                            break 'rows;
+                        }
+                    }
+                    let item = &path_items[&key_path];
+                    if last {
+                        // The category itself may also be a branch:
+                        // its own label (with its count) wins.
+                        control.set_item_text(
+                            item,
+                            &iptv_core::categories::category_leaf_text(&row.label, &part.text),
+                        );
+                    }
+                    parent = item;
+                }
             }
-            // See category_controls: never expand the hidden root.
-        }
-        if *state.borrow() != current {
-            *state.borrow_mut() = current;
+            if built {
+                // A source's categories are visible immediately
+                // under its branch (Python expands them all).
+                for item in path_items.values() {
+                    if control.item_has_children(item) {
+                        control.expand(item);
+                    }
+                }
+                state.borrow_mut().rows = current;
+            }
         }
         last_count.set(favorite_count);
     }
     let active = browser.active_category().clone();
-    if let Some(position) = state.borrow().iter().position(|item| item == &active) {
-        if let Some(item) = tree_item_at(control, position) {
+    let state = state.borrow();
+    if let Some(row) = state.rows.iter().find(|row| row.category == active) {
+        if let Some(item) = tree_item_at_text_path(control, &category_row_text_path(row)) {
             let selected = control.get_selection();
             let already = selected
                 .as_ref()
