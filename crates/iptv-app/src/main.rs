@@ -1056,6 +1056,21 @@ fn bind_browser(
     }
     reload_sources(&wiring);
     reload_epg(&wiring);
+    // N09: restore the saved playlist scope before the first
+    // load lands; loads apply scoped, and the picker shows it.
+    let saved_scope = wiring
+        .persist
+        .config
+        .borrow()
+        .string_or("playlist_scope", "");
+    wiring
+        .browser
+        .borrow_mut()
+        .set_scope_silent(if saved_scope.is_empty() {
+            None
+        } else {
+            Some(saved_scope)
+        });
     fill_scope_choices(&wiring, controls.scope_choice);
     bind_completion(&wiring, controls);
     bind_epg_timer(frame, &wiring, controls);
@@ -1345,28 +1360,90 @@ fn bind_completion(wiring: &Wiring, controls: Controls) {
 
 /// The Playlist view picker: switching scope re-runs the current
 /// query inside the chosen playlist (or all of them).
+/// Commit the Playlist view picker's current selection
+/// (N09; Python's `on_playlist_scope_changed`): the scope is
+/// saved, the search clears, and the category resets to All
+/// Channels. Choosing the already-committed scope is a no-op.
+fn commit_scope_selection(wiring: &Wiring, scope_choice: Choice, search: TextCtrl, status: Status) {
+    let Some(selection) = scope_choice.get_selection() else {
+        return;
+    };
+    let id = wiring
+        .scope_ids
+        .borrow()
+        .get(usize::try_from(selection).unwrap_or(usize::MAX))
+        .cloned()
+        .flatten();
+    if wiring.browser.borrow().scope() == id.as_deref() {
+        return;
+    }
+    wiring.persist.set_and_save(
+        "playlist_scope",
+        serde_json::json!(id.clone().unwrap_or_default()),
+    );
+    search.set_value("");
+    if wiring.browser.borrow_mut().commit_scope(id) {
+        status.set_label("Load cancelled. Browsing previous channels...");
+    }
+    assert!(wiring.timer.start(50, false));
+}
+
+/// Put the Playlist view picker's selection back on the
+/// committed scope (N09: Escape abandons a preview).
+fn revert_scope_selection(wiring: &Wiring, scope_choice: Choice) {
+    let committed = wiring.browser.borrow().scope().map(str::to_owned);
+    let ids = wiring.scope_ids.borrow();
+    let index = ids
+        .iter()
+        .position(|id| id.as_deref() == committed.as_deref())
+        .unwrap_or(0);
+    scope_choice.set_selection(u32::try_from(index).unwrap_or(0));
+}
+
 fn bind_scope_choice(wiring: &Wiring, scope_choice: Choice, search: TextCtrl, status: Status) {
-    let scope_browser = Rc::clone(&wiring.browser);
-    let scope_timer = Rc::clone(&wiring.timer);
-    let scope_ids = Rc::clone(&wiring.scope_ids);
-    scope_choice.bind_internal(EventType::COMMAND_CHOICE_SELECTED, move |event| {
-        let Some(selection) = scope_choice.get_selection() else {
+    // N09 (Python's on_playlist_scope_choice / on_playlist_scope_key):
+    // arrow keys only preview a scope — NVDA announces each one
+    // without reloading the lists. Enter or Tab commits, a mouse
+    // choice commits, and Escape reverts to the committed scope.
+    let mouse_armed = Rc::new(std::cell::Cell::new(false));
+    {
+        let armed = Rc::clone(&mouse_armed);
+        scope_choice.bind_internal(EventType::LEFT_DOWN, move |event| {
+            armed.set(true);
             event.skip(true);
-            return;
-        };
-        let id = scope_ids
-            .borrow()
-            .get(usize::try_from(selection).unwrap_or(usize::MAX))
-            .cloned()
-            .flatten();
-        if scope_browser
-            .borrow_mut()
-            .set_scope(id, &search.get_value())
-        {
-            status.set_label("Load cancelled. Browsing previous channels...");
+        });
+    }
+    {
+        let armed = Rc::clone(&mouse_armed);
+        let commit_wiring = clone_wiring(wiring);
+        scope_choice.bind_internal(EventType::COMMAND_CHOICE_SELECTED, move |event| {
+            if armed.replace(false) {
+                commit_scope_selection(&commit_wiring, scope_choice, search, status);
+            }
+            event.skip(true);
+        });
+    }
+    let key_wiring = clone_wiring(wiring);
+    scope_choice.bind_internal(EventType::KEY_DOWN, move |event| {
+        mouse_armed.set(false);
+        match event.get_key_code() {
+            // WXK_RETURN / WXK_NUMPAD_ENTER: commit here.
+            Some(13 | 370) => {
+                commit_scope_selection(&key_wiring, scope_choice, search, status);
+                event.skip(false);
+            }
+            // WXK_ESCAPE: abandon the preview.
+            Some(27) => {
+                revert_scope_selection(&key_wiring, scope_choice);
+                event.skip(false);
+            }
+            // WXK_TAB: commit, then let focus move on.
+            Some(9) => {
+                commit_scope_selection(&key_wiring, scope_choice, search, status);
+                event.skip(true);
+            }
+            _ => event.skip(true),
         }
-        assert!(scope_timer.start(50, false));
-        event.skip(true);
     });
 }
 
@@ -1498,7 +1575,6 @@ fn toggle_selected_favorite(wiring: &Wiring, list: ListCtrl, search: TextCtrl, s
 fn fill_scope_choices(wiring: &Wiring, choice: Choice) {
     choice.clear();
     choice.append("All playlists");
-    choice.set_selection(0);
     let (sources, accounts) = configured_entries(wiring);
     let names = playlist_names(wiring);
     let mut ids: Vec<Option<String>> = vec![None];
@@ -1514,7 +1590,15 @@ fn fill_scope_choices(wiring: &Wiring, choice: Choice) {
         choice.append(&account.describe());
         ids.push(account.provider_id());
     }
+    // N09: the picker shows the committed scope (restored at
+    // startup, committed on activation), not always All.
+    let committed = wiring.browser.borrow().scope().map(str::to_owned);
+    let index = ids
+        .iter()
+        .position(|id| id.as_deref() == committed.as_deref())
+        .unwrap_or(0);
     *wiring.scope_ids.borrow_mut() = ids;
+    choice.set_selection(u32::try_from(index).unwrap_or(0));
 }
 
 /// The configured `playlists` entries split into plain sources (strings)

@@ -212,6 +212,26 @@ impl BrowserWorker {
         cancelled
     }
 
+    /// Set the scope without submitting or cancelling anything
+    /// (N09: the saved scope is restored before the first load
+    /// lands, and the load itself applies scoped).
+    pub fn set_scope_silent(&mut self, scope: Option<String>) {
+        self.scope = scope;
+        self.category = Category::All;
+    }
+
+    /// Commit a playlist-scope change the way Python's
+    /// `on_playlist_scope_changed` does (N09): the category
+    /// resets to All Channels and the search restarts empty
+    /// inside the new scope. Returns whether a load was cancelled.
+    pub fn commit_scope(&mut self, scope: Option<String>) -> bool {
+        let cancelled = self.cancel_load();
+        self.scope = scope;
+        self.category = Category::All;
+        self.submit_current(String::new());
+        cancelled
+    }
+
     fn in_scope(&self, channel: &crate::Channel) -> bool {
         match &self.scope {
             None => true,
