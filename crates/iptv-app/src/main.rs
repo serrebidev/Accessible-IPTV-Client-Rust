@@ -442,6 +442,31 @@ struct EpgSearchRow {
     playlist_index: Option<usize>,
 }
 
+enum PendingEpgReadUi {
+    Highlight {
+        channel: Channel,
+        list: ListCtrl,
+        text: TextCtrl,
+        model_ptr: usize,
+    },
+    ChannelProgrammes {
+        list: ListBox,
+        description: TextCtrl,
+        programmes: Rc<RefCell<Vec<Programme>>>,
+        status: Status,
+    },
+    CatchupProgrammes {
+        channel: Channel,
+        list: ListBox,
+        programmes: Rc<RefCell<Vec<Programme>>>,
+        status: Status,
+    },
+    CatchupCurrent {
+        channel: Channel,
+        status: Status,
+    },
+}
+
 #[derive(Clone)]
 struct Wiring {
     browser: Rc<RefCell<BrowserWorker>>,
@@ -465,6 +490,9 @@ struct Wiring {
     guide_generation: Rc<std::cell::Cell<u64>>,
     epg_store: Rc<RefCell<Option<iptv_core::epgstore::EpgStore>>>,
     epg_worker: Rc<EpgWorker>,
+    epg_read_worker: Rc<iptv_core::epg::EpgReadWorker>,
+    epg_read_seq: Rc<std::cell::Cell<u64>>,
+    pending_epg_reads: Rc<RefCell<std::collections::HashMap<u64, PendingEpgReadUi>>>,
     epg_pending: Rc<std::cell::Cell<bool>>,
     epg_deferred: Rc<std::cell::Cell<bool>>,
     /// Programme rows appended below the channel rows by the
@@ -948,6 +976,9 @@ fn bind_browser(
             iptv_core::epgstore::EpgStore::open(&epg_store_path()).ok(),
         )),
         epg_worker: Rc::new(EpgWorker::new()),
+        epg_read_worker: Rc::new(iptv_core::epg::EpgReadWorker::new()),
+        epg_read_seq: Rc::new(std::cell::Cell::new(0)),
+        pending_epg_reads: Rc::new(RefCell::new(std::collections::HashMap::new())),
         epg_pending: Rc::new(std::cell::Cell::new(false)),
         epg_deferred: Rc::new(std::cell::Cell::new(false)),
         epg_rows,
@@ -1211,6 +1242,7 @@ fn bind_completion(wiring: &Wiring, controls: Controls) {
             reload_epg(&completed);
         }
         poll_epg(&completed, status);
+        drain_epg_reads(&completed);
         drain_suffix_results(&completed, list);
         {
             let stale = {
@@ -1230,6 +1262,7 @@ fn bind_completion(wiring: &Wiring, controls: Controls) {
         if !completed.browser.borrow().is_busy()
             && !completed.epg_pending.get()
             && !completed.suffix_pending.get()
+            && completed.pending_epg_reads.borrow().is_empty()
             && !completed.provider_pending.get()
             && !completed
                 .reminders
@@ -1899,6 +1932,168 @@ fn poll_epg(wiring: &Wiring, status: Status) {
     }
 }
 
+fn submit_epg_read(wiring: &Wiring, kind: iptv_core::epg::EpgReadKind, ui: PendingEpgReadUi) {
+    let request_id = wiring.epg_read_seq.get().wrapping_add(1);
+    wiring.epg_read_seq.set(request_id);
+    let guide_generation = wiring
+        .epg
+        .borrow()
+        .as_ref()
+        .map_or(wiring.guide_generation.get(), |snapshot| {
+            snapshot.generation
+        });
+    wiring.pending_epg_reads.borrow_mut().insert(request_id, ui);
+    wiring.epg_read_worker.submit(iptv_core::epg::EpgReadJob {
+        request_id,
+        guide_generation,
+        store_path: epg_store_path(),
+        kind,
+    });
+    ensure_polling(wiring);
+}
+
+fn drain_epg_reads(wiring: &Wiring) {
+    while let Some(result) = wiring.epg_read_worker.try_recv() {
+        let Some(ui) = wiring
+            .pending_epg_reads
+            .borrow_mut()
+            .remove(&result.request_id)
+        else {
+            continue;
+        };
+        if !epg_read_generation_matches(result.guide_generation, wiring.guide_generation.get()) {
+            continue;
+        }
+        match (ui, result.result) {
+            (
+                PendingEpgReadUi::Highlight {
+                    channel,
+                    list,
+                    text,
+                    model_ptr,
+                },
+                Ok(iptv_core::epg::EpgReadValue::NowNext(entry)),
+            ) if model_ptr == wiring.model.borrow().playlist_ptr()
+                && selected_channel(wiring, list).as_ref() == Some(&channel) =>
+            {
+                if let Some(entry) = entry {
+                    text.set_value(&epg_info_message(
+                        entry.current.as_ref(),
+                        entry.next.as_ref(),
+                    ));
+                } else {
+                    text.set_value("");
+                }
+            }
+            (
+                PendingEpgReadUi::ChannelProgrammes {
+                    list,
+                    description,
+                    programmes,
+                    status,
+                },
+                Ok(iptv_core::epg::EpgReadValue::Programmes(rows)),
+            ) => {
+                let now = now_epoch();
+                let rows: Vec<Programme> = rows
+                    .into_iter()
+                    .filter(|p| p.stop > now && p.start < now + 7 * 86_400)
+                    .collect();
+                if rows.is_empty() {
+                    status.set_label("No guide information for this channel.");
+                    continue;
+                }
+                let initial = airing_index(&rows, now).unwrap_or(0);
+                let labels: Vec<String> = rows
+                    .iter()
+                    .map(|p| format!("{} {}", epg_time_range(p, now), p.title))
+                    .collect();
+                list.set_items(&labels.iter().map(String::as_str).collect::<Vec<_>>());
+                list.set_selection(u32::try_from(initial).unwrap_or(0), true);
+                description.set_value(rows.get(initial).map_or("", |p| p.description.as_str()));
+                *programmes.borrow_mut() = rows;
+                status.set_silent("Guide information loaded.");
+            }
+            (
+                PendingEpgReadUi::CatchupProgrammes {
+                    channel,
+                    list,
+                    programmes,
+                    status,
+                },
+                Ok(iptv_core::epg::EpgReadValue::Programmes(rows)),
+            ) => {
+                let now = now_epoch();
+                let rows: Vec<Programme> = rows
+                    .into_iter()
+                    .filter(|p| {
+                        p.stop <= now
+                            && iptv_core::catchup::within_catchup_window(&channel, p.start, now)
+                    })
+                    .collect();
+                if rows.is_empty() {
+                    status.set_label("No catch-up programmes available for this channel.");
+                    continue;
+                }
+                let labels: Vec<String> = rows
+                    .iter()
+                    .map(|p| {
+                        let day = chrono::TimeZone::timestamp_opt(&chrono::Local, p.start, 0)
+                            .single()
+                            .map(|dt| dt.format("%Y-%m-%d").to_string())
+                            .unwrap_or_default();
+                        format!(
+                            "{} {}-{} {}",
+                            day,
+                            local_hhmm(p.start),
+                            local_hhmm(p.stop),
+                            p.title
+                        )
+                    })
+                    .collect();
+                list.set_items(&labels.iter().map(String::as_str).collect::<Vec<_>>());
+                list.set_selection(0, true);
+                status.set_label(&trf(
+                    "{count} catch-up programmes.",
+                    &[("count", &rows.len().to_string())],
+                ));
+                *programmes.borrow_mut() = rows;
+            }
+            (
+                PendingEpgReadUi::CatchupCurrent { channel, status },
+                Ok(iptv_core::epg::EpgReadValue::NowNext(Some(entry))),
+            ) => {
+                if let Some(programme) = entry.current {
+                    play_catchup_for(wiring, &channel, &programme, status);
+                } else {
+                    status.set_label("No current programme to catch up.");
+                }
+            }
+            (
+                PendingEpgReadUi::CatchupCurrent { status, .. },
+                Ok(iptv_core::epg::EpgReadValue::NowNext(None)),
+            ) => status.set_label("No current programme to catch up."),
+            (PendingEpgReadUi::ChannelProgrammes { status, .. }, Err(error))
+            | (PendingEpgReadUi::CatchupProgrammes { status, .. }, Err(error)) => {
+                iptv_core::applog::error("epg", &format!("Cold guide read failed: {error}"));
+                status.set_label("Could not load guide information.");
+            }
+            (PendingEpgReadUi::CatchupCurrent { status, .. }, Err(error)) => {
+                iptv_core::applog::error("epg", &format!("Cold guide read failed: {error}"));
+                status.set_label("Could not load the current programme.");
+            }
+            (_, Err(error)) => {
+                iptv_core::applog::error("epg", &format!("Cold guide read failed: {error}"))
+            }
+            _ => {}
+        }
+    }
+}
+
+fn epg_read_generation_matches(result_generation: u64, current_generation: u64) -> bool {
+    result_generation == current_generation
+}
+
 /// Mark one reminder delivered and persist (Python's
 /// `acknowledge`, called when the delivery window is answered).
 fn acknowledge_reminder(wiring: &Wiring, id: &str) {
@@ -2009,11 +2204,7 @@ fn guide_now_next(wiring: &Wiring, channel: &Channel) -> Option<NowNext> {
         let (current, next) = snapshot.guide.now_next(&id, now);
         return Some(NowNext { current, next });
     }
-    let indexes = store_indexes(wiring)?;
-    let id = match_guide_channel(channel, &indexes, Some(&indexes.known_ids))?;
-    let store = wiring.epg_store.borrow();
-    let (current, next) = store.as_ref()?.now_next(&id, now).ok()?;
-    Some(NowNext { current, next })
+    None
 }
 
 /// An owned bulk snapshot (indexes + now/next per guide channel)
@@ -3872,6 +4063,9 @@ fn clone_wiring(wiring: &Wiring) -> Wiring {
         guide_generation: Rc::clone(&wiring.guide_generation),
         epg_store: Rc::clone(&wiring.epg_store),
         epg_worker: Rc::clone(&wiring.epg_worker),
+        epg_read_worker: Rc::clone(&wiring.epg_read_worker),
+        epg_read_seq: Rc::clone(&wiring.epg_read_seq),
+        pending_epg_reads: Rc::clone(&wiring.pending_epg_reads),
         epg_pending: Rc::clone(&wiring.epg_pending),
         epg_deferred: Rc::clone(&wiring.epg_deferred),
         epg_rows: Rc::clone(&wiring.epg_rows),
@@ -6223,10 +6417,7 @@ fn guide_programmes(wiring: &Wiring, channel: &Channel) -> Vec<Programme> {
             None => Vec::new(),
         }
     };
-    if !in_memory.is_empty() {
-        return in_memory;
-    }
-    store_programmes(wiring, channel)
+    in_memory
 }
 
 /// Programmes from the `SQLite` store for a channel (tvg-id
@@ -6519,6 +6710,22 @@ fn bind_context_menu(frame: Frame, wiring: &Wiring, controls: Controls) {
 /// Resolve and play the catch-up stream for the channel's current
 /// programme (Python's Catch-up context action).
 fn play_catchup(wiring: &Wiring, channel: &Channel, status: Status) {
+    if wiring.epg.borrow().is_none() {
+        let now = now_epoch();
+        submit_epg_read(
+            wiring,
+            iptv_core::epg::EpgReadKind::NowNext {
+                channel: channel.clone(),
+                at: now,
+            },
+            PendingEpgReadUi::CatchupCurrent {
+                channel: channel.clone(),
+                status,
+            },
+        );
+        status.set_label("Loading current programme...");
+        return;
+    }
     let Some(programme) = current_programme(wiring, channel) else {
         status.set_label("No current programme to catch up.");
         return;
@@ -6585,7 +6792,7 @@ fn bind_epg_description(
 }
 
 #[allow(clippy::too_many_lines)] // grew with R16 repeat buttons
-fn open_channel_epg(wiring: &Wiring, channel: &Channel, main_status: Status) {
+fn open_channel_epg(wiring: &Wiring, channel: &Channel, _main_status: Status) {
     let now = now_epoch();
     // Python's Channel EPG query: from the programme on air now
     // through seven days of upcoming programmes, uncapped —
@@ -6594,10 +6801,6 @@ fn open_channel_epg(wiring: &Wiring, channel: &Channel, main_status: Status) {
         .into_iter()
         .filter(|p| p.stop > now && p.start < now + 7 * 86_400)
         .collect();
-    if programmes.is_empty() {
-        main_status.set_label("No guide information for this channel.");
-        return;
-    }
     // Begin on the programme airing now, not row zero.
     let initial = airing_index(&programmes, now).unwrap_or(0);
     let frame = Frame::builder()
@@ -6613,7 +6816,9 @@ fn open_channel_epg(wiring: &Wiring, channel: &Channel, main_status: Status) {
         .map(|p| format!("{} {}", epg_time_range(p, now), p.title))
         .collect();
     list.set_items(&labels.iter().map(String::as_str).collect::<Vec<_>>());
-    list.set_selection(u32::try_from(initial).unwrap_or(0), true);
+    if !programmes.is_empty() {
+        list.set_selection(u32::try_from(initial).unwrap_or(0), true);
+    }
     let reminder_button = Button::builder(&panel).with_label("Set &Reminder").build();
     let schedule_button = Button::builder(&panel)
         .with_label("Schedule &Recording")
@@ -6715,6 +6920,24 @@ fn open_channel_epg(wiring: &Wiring, channel: &Channel, main_status: Status) {
     bind_f1_help(&list, wiring, "channel-epg", status);
     bind_f1_help(&details, wiring, "channel-epg", status);
     frame.show(true);
+    if programmes.borrow().is_empty() {
+        status.set_label("Loading guide information...");
+        let now = now_epoch();
+        submit_epg_read(
+            wiring,
+            iptv_core::epg::EpgReadKind::Programmes {
+                channel: channel.clone(),
+                from: now - 7 * 86_400,
+                to: now + 7 * 86_400,
+            },
+            PendingEpgReadUi::ChannelProgrammes {
+                list,
+                description,
+                programmes: Rc::clone(&programmes),
+                status,
+            },
+        );
+    }
 }
 
 fn bind_playback(
@@ -6825,13 +7048,28 @@ fn bind_epg_highlight(
         // and its description (audit E10) — not just a bare
         // description or a placeholder when a next programme
         // exists.
-        let text = match guide_now_next(&wiring, &channel) {
-            Some(entry) => epg_info_message(entry.current.as_ref(), entry.next.as_ref()),
-            // No guide match at all: Python's description cache
-            // leaves the panel empty (audit E10, exact behavior).
-            None => String::new(),
-        };
-        episode_description.set_value(&text);
+        if let Some(entry) = guide_now_next(&wiring, &channel) {
+            episode_description.set_value(&epg_info_message(
+                entry.current.as_ref(),
+                entry.next.as_ref(),
+            ));
+        } else if wiring.epg.borrow().is_none() {
+            submit_epg_read(
+                &wiring,
+                iptv_core::epg::EpgReadKind::NowNext {
+                    channel: channel.clone(),
+                    at: now_epoch(),
+                },
+                PendingEpgReadUi::Highlight {
+                    channel,
+                    list,
+                    text: episode_description,
+                    model_ptr: wiring.model.borrow().playlist_ptr(),
+                },
+            );
+        } else {
+            episode_description.set_value("");
+        }
     });
 }
 
@@ -12904,10 +13142,6 @@ fn open_catchup_dialog(wiring: &Wiring, channel: &Channel, main_status: Status) 
             p.stop <= now && iptv_core::catchup::within_catchup_window(channel, p.start, now)
         })
         .collect();
-    if programmes.is_empty() {
-        main_status.set_label("No catch-up programmes available for this channel.");
-        return;
-    }
     let (frame, panel, list, dstatus) = list_dialog(
         &format!("Catch-up — {}", channel.name),
         "Catch-up programmes",
@@ -12931,11 +13165,13 @@ fn open_catchup_dialog(wiring: &Wiring, channel: &Channel, main_status: Status) 
         })
         .collect();
     list.set_items(&labels.iter().map(String::as_str).collect::<Vec<_>>());
-    list.set_selection(0, true);
-    dstatus.set_label(&trf(
-        "{count} catch-up programmes.",
-        &[("count", &programmes.len().to_string())],
-    ));
+    if !programmes.is_empty() {
+        list.set_selection(0, true);
+        dstatus.set_label(&trf(
+            "{count} catch-up programmes.",
+            &[("count", &programmes.len().to_string())],
+        ));
+    }
     let programmes = Rc::new(RefCell::new(programmes));
     // The selected programme's description is readable in the
     // details text (audit R20), starting with the first row.
@@ -13014,6 +13250,24 @@ fn open_catchup_dialog(wiring: &Wiring, channel: &Channel, main_status: Status) 
     });
     close.on_click(move |_| frame.hide());
     frame.show(true);
+    if programmes.borrow().is_empty() {
+        dstatus.set_label("Loading catch-up programmes...");
+        let now = now_epoch();
+        submit_epg_read(
+            wiring,
+            iptv_core::epg::EpgReadKind::Programmes {
+                channel: channel.clone(),
+                from: now - 7 * 86_400,
+                to: now + 7 * 86_400,
+            },
+            PendingEpgReadUi::CatchupProgrammes {
+                channel: channel.clone(),
+                list,
+                programmes: Rc::clone(&programmes),
+                status: dstatus,
+            },
+        );
+    }
 }
 
 /// Resolve a catch-up programme URL and queue its download.
@@ -14220,6 +14474,12 @@ mod tests {
         assert!(!suffix_result_matches(2, 2, 3, 4, 10, 10));
         assert!(!suffix_result_matches(1, 2, 4, 4, 10, 10));
         assert!(!suffix_result_matches(2, 2, 4, 4, 9, 10));
+    }
+
+    #[test]
+    fn cold_guide_results_are_rejected_after_a_guide_generation_changes() {
+        assert!(epg_read_generation_matches(4, 4));
+        assert!(!epg_read_generation_matches(3, 4));
     }
 
     #[test]
