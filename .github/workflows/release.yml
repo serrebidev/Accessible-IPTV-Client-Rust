@@ -79,7 +79,8 @@ jobs:
         shell: pwsh
         run: |
           $index = (Invoke-WebRequest -UseBasicParsing "https://download.videolan.org/pub/videolan/vlc/").Content
-          $ver = ([regex]::Matches($index, 'href="([0-9]+\.[0-9]+\.[0-9]+)/"') | ForEach-Object { [version]$_.Groups[1].Value } | Sort-Object -Descending | Select-Object -First 1).ToString()
+          # Newest 3.x only: the engine binds the libVLC 3 API (validation 0071).
+          $ver = ([regex]::Matches($index, 'href="(3\.[0-9]+\.[0-9]+)/"') | ForEach-Object { [version]$_.Groups[1].Value } | Sort-Object -Descending | Select-Object -First 1).ToString()
           Write-Host "Bundling libVLC from VLC $ver"
           New-Item -ItemType Directory -Force vlc-src | Out-Null
           Invoke-WebRequest -UseBasicParsing "https://download.videolan.org/pub/videolan/vlc/$ver/win64/vlc-$ver-win64.zip" -OutFile vlc-src/vlc.zip
@@ -99,7 +100,8 @@ jobs:
       - name: Bundle libVLC (macOS)
         if: runner.os == 'macOS'
         run: |
-          ver="$(curl -s https://download.videolan.org/pub/videolan/vlc/ | sed -n 's/.*href="\([0-9][0-9.]*\)\/".*/\1/p' | sort -V | tail -1)"
+          # Newest 3.x only: the engine binds the libVLC 3 API (validation 0071).
+          ver="$(curl -s https://download.videolan.org/pub/videolan/vlc/ | sed -n 's/.*href="\(3\.[0-9.]*\)\/".*/\1/p' | sort -V | tail -1)"
           echo "Bundling libVLC from VLC $ver"
           mkdir -p vlc-src
           curl -sL -o vlc-src/vlc.dmg "https://download.videolan.org/pub/videolan/vlc/$ver/macosx/vlc-$ver-arm64.dmg"
