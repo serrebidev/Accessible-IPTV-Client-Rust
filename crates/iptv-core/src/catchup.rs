@@ -458,6 +458,39 @@ pub enum ShowResolution {
     },
 }
 
+/// Plain words for an ffmpeg exit code, or None when the code is not
+/// a known provider failure (port of `_ffmpeg_exit_reason` in
+/// `catchup_urls.py`). ffmpeg exits with the `AVERROR` of whatever
+/// stopped it, and Windows reports that as an unsigned 32-bit number
+/// (a refused download reads "code 3436169992", which is HTTP 403),
+/// so an over-large code is wrapped back to signed first.
+#[must_use]
+pub fn ffmpeg_exit_reason(code: i64) -> Option<&'static str> {
+    let mut code = code;
+    if code > i64::from(i32::MAX) {
+        code -= 1 << 32;
+    }
+    Some(match code {
+        -858_797_304 => {
+            "The provider refused access (HTTP 403 Forbidden). Many providers allow only one stream per account at a time: stop other playback or downloads from this account and try again."
+        }
+        -825_242_872 => {
+            "The provider asked for a login (HTTP 401 Unauthorized). Check the playlist's user name and password."
+        }
+        -875_574_520 => {
+            "The provider does not have this programme (HTTP 404 Not Found). It may be older than the provider's archive."
+        }
+        -808_465_656 | -959_591_672 | -1_482_175_736 => {
+            "The provider rejected the request (HTTP 4xx error)."
+        }
+        -1_482_175_992 => "The provider's server had an error (HTTP 5xx). Try again later.",
+        -1_094_995_529 => "The stream sent data that could not be read.",
+        -138 | -110 | -10060 => "The connection to the provider timed out.",
+        -107 | -111 | -10061 => "The provider's server refused the connection.",
+        _ => return None,
+    })
+}
+
 /// Resolve a programme against the channel's catch-up capability.
 ///
 /// # Errors
@@ -516,6 +549,57 @@ pub fn resolve_show_url(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ffmpeg_exit_reasons_match_python() {
+        // Every code in Python's `_FFMPEG_EXIT_REASONS`, checked
+        // against the oracle's own answers.
+        assert!(ffmpeg_exit_reason(-858_797_304)
+            .is_some_and(|r| r.starts_with("The provider refused access (HTTP 403")));
+        // The same code as Windows reports it (unsigned 32-bit).
+        assert_eq!(
+            ffmpeg_exit_reason(3_436_169_992),
+            ffmpeg_exit_reason(-858_797_304)
+        );
+        assert!(
+            ffmpeg_exit_reason(-825_242_872).is_some_and(|r| r.contains("HTTP 401 Unauthorized"))
+        );
+        assert!(ffmpeg_exit_reason(-875_574_520).is_some_and(|r| r.contains("HTTP 404 Not Found")));
+        for code in [-808_465_656, -959_591_672, -1_482_175_736] {
+            assert_eq!(
+                ffmpeg_exit_reason(code),
+                Some("The provider rejected the request (HTTP 4xx error)."),
+                "{code}"
+            );
+        }
+        assert!(ffmpeg_exit_reason(-1_482_175_992).is_some_and(|r| r.contains("HTTP 5xx")));
+        assert_eq!(
+            ffmpeg_exit_reason(-1_094_995_529),
+            Some("The stream sent data that could not be read.")
+        );
+        for code in [-138, -110, -10060] {
+            assert_eq!(
+                ffmpeg_exit_reason(code),
+                Some("The connection to the provider timed out."),
+                "{code}"
+            );
+        }
+        for code in [-107, -111, -10061] {
+            assert_eq!(
+                ffmpeg_exit_reason(code),
+                Some("The provider's server refused the connection."),
+                "{code}"
+            );
+        }
+        assert_eq!(ffmpeg_exit_reason(-1), None);
+        assert_eq!(ffmpeg_exit_reason(1), None);
+        assert_eq!(ffmpeg_exit_reason(0), None);
+        // The one-stream refusal is the 403 sentence, word for word.
+        assert_eq!(
+            ffmpeg_exit_reason(-858_797_304),
+            Some(crate::catchup_direct::ONE_STREAM_REFUSAL)
+        );
+    }
+
     use super::*;
     use std::collections::BTreeMap;
 

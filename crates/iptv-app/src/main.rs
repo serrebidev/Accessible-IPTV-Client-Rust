@@ -3426,6 +3426,30 @@ fn media_duration_seconds(path: &std::path::Path) -> Option<f64> {
     parse_ffmpeg_duration(&String::from_utf8_lossy(&output.stderr))
 }
 
+/// N13: when a shared recording (one whose stream the player is
+/// watching through the relay) ends, close its relay; if the player
+/// is still on the relay URL, stop it and resume the channel
+/// directly once the connection has settled.
+fn end_shared_playback(wiring: &Wiring, status: Status, key: &str) {
+    let Some(shared) = wiring.shared_playback.borrow_mut().remove(key) else {
+        return;
+    };
+    shared.relay.close();
+    let on_relay = {
+        let state = wiring.player.borrow();
+        state
+            .session
+            .current()
+            .is_some_and(|request| request.url == shared.relay_url)
+    };
+    if on_relay {
+        player_stop(&wiring.player, &wiring.persist, status);
+        wiring.relay_worker.start(RelayJob::EndShare {
+            channel: shared.channel.clone(),
+        });
+    }
+}
+
 /// Per-tick recording housekeeping: collect finishes, run the DVR
 /// state machine (every 10 s, like the reference poll), and apply the
 /// shutdown-after-recordings gate.
@@ -3440,29 +3464,21 @@ fn poll_recordings(wiring: &Wiring, frame: Frame, status: Status) {
         let produced = recording::output_has_media(&finished.out_path);
         let success = finished.success && produced;
         if let Some(staged) = wiring.staged_downloads.borrow_mut().remove(&finished.key) {
-            finish_staged_download(wiring, status, &finished.key, staged, &finished, produced);
+            finish_staged_download(
+                wiring,
+                frame,
+                status,
+                &finished.key,
+                staged,
+                &finished,
+                produced,
+            );
             continue;
         }
-        // N13: a shared recording ended. Close its relay, and
-        // if the player is still watching through it, stop and
-        // resume the channel directly once the recording's
-        // connection has settled (Python's `_end_shared_playback`).
-        if let Some(shared) = wiring.shared_playback.borrow_mut().remove(&finished.key) {
-            shared.relay.close();
-            let on_relay = {
-                let state = wiring.player.borrow();
-                state
-                    .session
-                    .current()
-                    .is_some_and(|request| request.url == shared.relay_url)
-            };
-            if on_relay {
-                player_stop(&wiring.player, &wiring.persist, status);
-                wiring.relay_worker.start(RelayJob::EndShare {
-                    channel: shared.channel.clone(),
-                });
-            }
-        }
+        // N13: a shared recording ended; close its relay and
+        // resume direct playback if the player was watching
+        // through it (Python's `_end_shared_playback`).
+        end_shared_playback(wiring, status, &finished.key);
         let name = finished
             .out_path
             .file_name()
@@ -14263,6 +14279,7 @@ fn launch_staged_capture(wiring: &Wiring, key: &str, staged: StagedDownload) -> 
 /// honestly with no misleading completed file left behind.
 fn finish_staged_download(
     wiring: &Wiring,
+    frame: Frame,
     status: Status,
     key: &str,
     staged: StagedDownload,
@@ -14330,6 +14347,39 @@ fn finish_staged_download(
         };
         set_row(wiring, reason.to_string(), true);
         status.set_label(&format!("Download failed: {}", staged.programme.title));
+        if !finished.success {
+            // N14: Python explains a failed download in plain words
+            // when the ffmpeg exit code is a known provider failure
+            // (`_ffmpeg_exit_reason`), with the failure detail after
+            // it; unknown codes keep the numeric form.
+            let tail_start = finished.stderr_tail.len().saturating_sub(6);
+            let tail = &finished.stderr_tail[tail_start..];
+            let detail = if tail.is_empty() {
+                recording_failure_detail(finished)
+            } else {
+                tail.join("\n")
+            };
+            let path = staged.final_path.to_string_lossy().into_owned();
+            let message =
+                match iptv_core::catchup::ffmpeg_exit_reason(i64::from(finished.exit_code)) {
+                    Some(reason) => trf(
+                        "Download failed:\n{path}\n\n{reason}\n\n{detail}",
+                        &[("path", &path), ("reason", reason), ("detail", &detail)],
+                    ),
+                    None => trf(
+                        "Download failed (code {code}):\n{path}\n\n{detail}",
+                        &[
+                            ("code", &finished.exit_code.to_string()),
+                            ("path", &path),
+                            ("detail", &detail),
+                        ],
+                    ),
+                };
+            let _ = MessageDialog::builder(&frame, &message, &tr("Catch-up Download"))
+                .with_style(MessageDialogStyle::OK | MessageDialogStyle::IconError)
+                .build()
+                .show_modal();
+        }
     }
     let active = wiring.downloads.borrow().iter().any(|row| !row.done);
     wiring.downloads_active.set(active);

@@ -1250,6 +1250,8 @@ Evidence for N01 to N06 is in docs/validation/0071-player-engine-cpu-and-ticks.m
 
 **N14, medium: provider errors in plain words.** Python turns HTTP 401, 403, 404, 4xx, 5xx, timeouts, refused connections and bad data into sentences saying what to do (`catchup_urls.py:71` to `:91`).
 
+**Fix:** Fixed 2026-11-04 — core `catchup::ffmpeg_exit_reason` ports the whole `_FFMPEG_EXIT_REASONS` table with the unsigned-code wrap (codes verified against the oracle), and a finally-failed catch-up download shows Python's failure box with the reason (or the numeric form for unknown codes) and the failure detail. See validation 0078. The Downloads-window failure detail and the retry rule stay with N15.
+
 **N15, medium: Download window detail.** Python shows size so far, time remaining, retry attempts with a countdown, "ended early" with the bytes received, a cancel confirmation, and Escape to hide while the download continues (`main.py:8524`, `:8773` to `:8891`).
 
 **N16, medium: stream type probing.** Python probes a channel's streams to tell radio from TV, caches the result, says "Checking stream type", and reports an audio-only recording (`media_type.py`, `main.py:3719`, `:4128`, `:4281`). Rust decides from playlist metadata only.
