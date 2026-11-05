@@ -12,8 +12,8 @@ use iptv_core::{
     epg::{
         airing_index, epg_info_message, epg_row_label, epg_time_range, hash_epg_sources,
         local_datetime, local_hhmm, match_guide_channel, merged_epg_sources,
-        should_auto_import_epg, should_run_epg_search, EpgGuide, EpgWorker, GuideIndexes, NowNext,
-        Programme, SuffixJob, SuffixWorker, SEARCH_EPG_RESULT_LIMIT,
+        should_auto_import_epg, should_run_epg_search, EpgSnapshot, EpgWorker, GuideIndexes,
+        NowNext, Programme, SuffixJob, SuffixWorker, SEARCH_EPG_RESULT_LIMIT,
     },
     favorites::{channel_key, remember_recent, FavoriteSet, Toggle},
     playback::{
@@ -33,7 +33,9 @@ use iptv_core::{
     vod::{item_details, VodCatalog, VodEvent, VodItem, VodKind, VodSearchHit, VodWorker},
     Channel,
 };
-use std::{cell::RefCell, collections::BTreeMap, path::PathBuf, process::Command, rc::Rc};
+use std::{
+    cell::RefCell, collections::BTreeMap, path::PathBuf, process::Command, rc::Rc, sync::Arc,
+};
 use wxdragon::event::EventType;
 use wxdragon::prelude::*;
 use wxdragon::timer::Timer;
@@ -451,13 +453,12 @@ struct Wiring {
     model: Rc<RefCell<SearchResults>>,
     persist: Persist,
     player: Rc<RefCell<PlayerState>>,
-    epg: Rc<RefCell<Option<(EpgGuide, GuideIndexes)>>>,
+    epg: Rc<RefCell<Option<Arc<EpgSnapshot>>>>,
     epg_suffixes: Rc<EpgSuffixes>,
     /// The row-suffix rebuild pipeline (validation 0070): the
-    /// worker owns the guide indexes and the playlist match
-    /// cache; the UI only dispatches jobs and applies results.
-    /// `guide_generation` bumps whenever a guide load lands, so
-    /// the worker rebuilds its caches for the new guide.
+    /// worker reuses the shared guide indexes and owns the
+    /// playlist match cache; the UI only dispatches jobs and
+    /// applies results. Guide generations reject stale suffixes.
     suffix_worker: Rc<SuffixWorker>,
     suffix_pending: Rc<std::cell::Cell<bool>>,
     suffix_generation: Rc<std::cell::Cell<u64>>,
@@ -486,7 +487,7 @@ struct Wiring {
     epg_timer: Rc<Timer<Frame>>,
     /// Guide indexes built from the store alone (after a restart,
     /// before any load), invalidated when a load lands.
-    epg_store_indexes: Rc<RefCell<Option<GuideIndexes>>>,
+    epg_store_indexes: Rc<RefCell<Option<Arc<GuideIndexes>>>>,
     reminders: Rc<RefCell<Vec<Reminder>>>,
     provider_worker: Rc<ProviderWorker>,
     provider_pending: Rc<std::cell::Cell<bool>>,
@@ -1800,32 +1801,18 @@ fn poll_epg(wiring: &Wiring, status: Status) {
     if let Some(result) = wiring.epg_worker.try_recv() {
         wiring.epg_pending.set(false);
         match result {
-            Ok((guide, store_note)) => {
-                // Merge into the guide already in memory: a run
-                // that loaded one source must not drop the rows of
-                // the sources it did not touch (audit E04).
-                let counts = {
-                    let mut slot = wiring.epg.borrow_mut();
-                    match slot.as_mut() {
-                        Some((existing, _)) => existing.merge(guide),
-                        None => *slot = Some((guide, GuideIndexes::default())),
-                    }
-                    match slot.as_mut() {
-                        Some((merged, indexes)) => {
-                            *indexes = GuideIndexes::build(&merged.channels);
-                            (merged.channels.len(), merged.programme_count())
-                        }
-                        None => (0, 0),
-                    }
-                };
+            Ok((snapshot, store_note)) => {
+                let counts = (
+                    snapshot.guide.channels.len(),
+                    snapshot.guide.programme_count(),
+                );
+                *wiring.epg.borrow_mut() = Some(Arc::clone(&snapshot));
                 // The store changed under the cached indexes.
                 *wiring.epg_store_indexes.borrow_mut() = None;
                 // The guide changed under the suffix worker's
                 // caches (validation 0070): bump its generation
                 // and mark the on-screen suffixes stale.
-                wiring
-                    .guide_generation
-                    .set(wiring.guide_generation.get() + 1);
+                wiring.guide_generation.set(snapshot.generation);
                 wiring.epg_suffixes.borrow_mut().0 = 0;
                 // Python records the import stamp and the hash of
                 // the sources actually imported, so the next
@@ -1982,7 +1969,7 @@ fn open_reminder_window(wiring: &Wiring, status: Status, reminder: &Reminder) {
 
 /// Guide indexes from the store alone (after a restart, before
 /// any load), built once and cached until a load lands.
-fn store_indexes(wiring: &Wiring) -> Option<GuideIndexes> {
+fn store_indexes(wiring: &Wiring) -> Option<Arc<GuideIndexes>> {
     if let Some(indexes) = wiring.epg_store_indexes.borrow().as_ref() {
         return Some(indexes.clone());
     }
@@ -1991,16 +1978,16 @@ fn store_indexes(wiring: &Wiring) -> Option<GuideIndexes> {
         .borrow()
         .as_ref()
         .and_then(|store| store.channels().ok())?;
-    let indexes = GuideIndexes::build(&channels);
-    *wiring.epg_store_indexes.borrow_mut() = Some(indexes.clone());
+    let indexes = Arc::new(GuideIndexes::build(&channels));
+    *wiring.epg_store_indexes.borrow_mut() = Some(Arc::clone(&indexes));
     Some(indexes)
 }
 
 /// The guide indexes to match against: the in-memory guide's
 /// when a load has landed, otherwise the store's.
-fn guide_indexes_any(wiring: &Wiring) -> Option<GuideIndexes> {
-    if let Some((_, indexes)) = wiring.epg.borrow().as_ref() {
-        return Some(indexes.clone());
+fn guide_indexes_any(wiring: &Wiring) -> Option<Arc<GuideIndexes>> {
+    if let Some(snapshot) = wiring.epg.borrow().as_ref() {
+        return Some(Arc::clone(&snapshot.indexes));
     }
     store_indexes(wiring)
 }
@@ -2013,9 +2000,13 @@ fn guide_now_next(wiring: &Wiring, channel: &Channel) -> Option<NowNext> {
         return None;
     }
     let now = now_epoch();
-    if let Some((guide, indexes)) = wiring.epg.borrow().as_ref() {
-        let id = match_guide_channel(channel, indexes, Some(&indexes.known_ids))?;
-        let (current, next) = guide.now_next(&id, now);
+    if let Some(snapshot) = wiring.epg.borrow().as_ref() {
+        let id = match_guide_channel(
+            channel,
+            &snapshot.indexes,
+            Some(&snapshot.indexes.known_ids),
+        )?;
+        let (current, next) = snapshot.guide.now_next(&id, now);
         return Some(NowNext { current, next });
     }
     let indexes = store_indexes(wiring)?;
@@ -2030,9 +2021,15 @@ fn guide_now_next(wiring: &Wiring, channel: &Channel) -> Option<NowNext> {
 fn guide_snapshot(
     wiring: &Wiring,
     now: i64,
-) -> Option<(GuideIndexes, std::collections::HashMap<String, NowNext>)> {
-    if let Some((guide, indexes)) = wiring.epg.borrow().as_ref() {
-        return Some((indexes.clone(), guide.bulk_now_next(now)));
+) -> Option<(
+    Arc<GuideIndexes>,
+    std::collections::HashMap<String, NowNext>,
+)> {
+    if let Some(snapshot) = wiring.epg.borrow().as_ref() {
+        return Some((
+            Arc::clone(&snapshot.indexes),
+            snapshot.guide.bulk_now_next(now),
+        ));
     }
     let indexes = store_indexes(wiring)?;
     let store = wiring.epg_store.borrow();
@@ -6208,9 +6205,18 @@ fn guide_programmes(wiring: &Wiring, channel: &Channel) -> Vec<Programme> {
     let in_memory = {
         let guard = wiring.epg.borrow();
         match guard.as_ref() {
-            Some((guide, indexes)) => {
-                match match_guide_channel(channel, indexes, Some(&indexes.known_ids)) {
-                    Some(id) => guide.programmes.get(&id).cloned().unwrap_or_default(),
+            Some(snapshot) => {
+                match match_guide_channel(
+                    channel,
+                    &snapshot.indexes,
+                    Some(&snapshot.indexes.known_ids),
+                ) {
+                    Some(id) => snapshot
+                        .guide
+                        .programmes
+                        .get(&id)
+                        .cloned()
+                        .unwrap_or_default(),
                     None => Vec::new(),
                 }
             }
@@ -14127,9 +14133,17 @@ fn request_suffix_refresh(wiring: &Wiring) {
     let generation = wiring.suffix_generation.get() + 1;
     wiring.suffix_generation.set(generation);
     wiring.suffix_pending.set(true);
+    let snapshot = wiring.epg.borrow().clone();
+    let guide_generation = snapshot
+        .as_ref()
+        .map_or(wiring.guide_generation.get(), |snapshot| {
+            snapshot.generation
+        });
+    let indexes = snapshot.map(|snapshot| Arc::clone(&snapshot.indexes));
     wiring.suffix_worker.build(SuffixJob {
         generation,
-        guide_generation: wiring.guide_generation.get(),
+        guide_generation,
+        indexes,
         model,
         store_path: epg_store_path(),
         at: now_epoch(),
@@ -14146,7 +14160,14 @@ fn request_suffix_refresh(wiring: &Wiring) {
 fn drain_suffix_results(wiring: &Wiring, list: ListCtrl) {
     while let Some(result) = wiring.suffix_worker.try_recv() {
         wiring.suffix_pending.set(false);
-        if result.generation != wiring.suffix_generation.get() {
+        if !suffix_result_matches(
+            result.generation,
+            wiring.suffix_generation.get(),
+            result.guide_generation,
+            wiring.guide_generation.get(),
+            result.playlist_ptr,
+            wiring.model.borrow().playlist_ptr(),
+        ) {
             continue;
         }
         let Some(suffixes) = result.suffixes else {
@@ -14155,9 +14176,6 @@ fn drain_suffix_results(wiring: &Wiring, list: ListCtrl) {
             wiring.epg_suffixes.borrow_mut().0 = now_epoch();
             continue;
         };
-        if result.playlist_ptr != wiring.model.borrow().playlist_ptr() {
-            continue;
-        }
         let changed = {
             let mut slot = wiring.epg_suffixes.borrow_mut();
             let changed = slot.2 != suffixes;
@@ -14173,6 +14191,19 @@ fn drain_suffix_results(wiring: &Wiring, list: ListCtrl) {
     }
 }
 
+fn suffix_result_matches(
+    result_generation: u64,
+    current_generation: u64,
+    result_guide_generation: u64,
+    current_guide_generation: u64,
+    result_playlist_ptr: usize,
+    current_playlist_ptr: usize,
+) -> bool {
+    result_generation == current_generation
+        && result_guide_generation == current_guide_generation
+        && result_playlist_ptr == current_playlist_ptr
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -14181,6 +14212,14 @@ mod tests {
 
     fn no_suffixes() -> (i64, usize, std::collections::HashMap<usize, String>) {
         (0, 0, std::collections::HashMap::new())
+    }
+
+    #[test]
+    fn stale_suffix_results_cannot_cross_guide_generations() {
+        assert!(suffix_result_matches(2, 2, 4, 4, 10, 10));
+        assert!(!suffix_result_matches(2, 2, 3, 4, 10, 10));
+        assert!(!suffix_result_matches(1, 2, 4, 4, 10, 10));
+        assert!(!suffix_result_matches(2, 2, 4, 4, 9, 10));
     }
 
     #[test]
