@@ -465,6 +465,9 @@ enum PendingEpgReadUi {
         channel: Channel,
         status: Status,
     },
+    AutoImportCheck {
+        sources: Vec<String>,
+    },
 }
 
 #[derive(Clone)]
@@ -493,6 +496,7 @@ struct Wiring {
     epg_read_worker: Rc<iptv_core::epg::EpgReadWorker>,
     epg_read_seq: Rc<std::cell::Cell<u64>>,
     pending_epg_reads: Rc<RefCell<std::collections::HashMap<u64, PendingEpgReadUi>>>,
+    epg_check_pending: Rc<std::cell::Cell<bool>>,
     epg_pending: Rc<std::cell::Cell<bool>>,
     epg_deferred: Rc<std::cell::Cell<bool>>,
     /// Programme rows appended below the channel rows by the
@@ -979,6 +983,7 @@ fn bind_browser(
         epg_read_worker: Rc::new(iptv_core::epg::EpgReadWorker::new()),
         epg_read_seq: Rc::new(std::cell::Cell::new(0)),
         pending_epg_reads: Rc::new(RefCell::new(std::collections::HashMap::new())),
+        epg_check_pending: Rc::new(std::cell::Cell::new(false)),
         epg_pending: Rc::new(std::cell::Cell::new(false)),
         epg_deferred: Rc::new(std::cell::Cell::new(false)),
         epg_rows,
@@ -1962,9 +1967,24 @@ fn drain_epg_reads(wiring: &Wiring) {
             continue;
         };
         if !epg_read_generation_matches(result.guide_generation, wiring.guide_generation.get()) {
+            if let PendingEpgReadUi::AutoImportCheck { sources } = ui {
+                wiring.epg_check_pending.set(false);
+                if !wiring.epg_pending.get() {
+                    dispatch_epg_load_mode(wiring, sources, false);
+                }
+            }
             continue;
         }
         match (ui, result.result) {
+            (
+                PendingEpgReadUi::AutoImportCheck { sources },
+                Ok(iptv_core::epg::EpgReadValue::UsableData(usable)),
+            ) => finish_epg_auto_import(wiring, sources, usable),
+            (PendingEpgReadUi::AutoImportCheck { sources }, Err(error)) => {
+                wiring.epg_check_pending.set(false);
+                iptv_core::applog::error("epg", &format!("Guide freshness check failed: {error}"));
+                finish_epg_auto_import(wiring, sources, false);
+            }
             (
                 PendingEpgReadUi::Highlight {
                     channel,
@@ -4066,6 +4086,7 @@ fn clone_wiring(wiring: &Wiring) -> Wiring {
         epg_read_worker: Rc::clone(&wiring.epg_read_worker),
         epg_read_seq: Rc::clone(&wiring.epg_read_seq),
         pending_epg_reads: Rc::clone(&wiring.pending_epg_reads),
+        epg_check_pending: Rc::clone(&wiring.epg_check_pending),
         epg_pending: Rc::clone(&wiring.epg_pending),
         epg_deferred: Rc::clone(&wiring.epg_deferred),
         epg_rows: Rc::clone(&wiring.epg_rows),
@@ -11010,32 +11031,50 @@ fn dispatch_epg_load_mode(wiring: &Wiring, sources: Vec<String>, force: bool) {
         wiring.epg_recheck.set(true);
         return;
     }
-    {
-        let config = wiring.persist.config.borrow();
-        if !config.bool_or("epg_enabled", true) {
-            return;
-        }
-        if !force {
-            let usable = wiring
-                .epg_store
-                .borrow()
-                .as_ref()
-                .and_then(|store| store.has_usable_data(now_epoch()).ok())
-                .unwrap_or(false);
-            #[allow(clippy::cast_possible_truncation)]
-            let last_import = config.f64_or("epg_last_import_epoch", 0.0) as i64;
-            if !should_auto_import_epg(
-                &sources,
-                &config.string_or("epg_last_sources_hash", ""),
-                last_import,
-                now_epoch(),
-                config.f64_or("epg_auto_import_interval_hours", 6.0),
-                usable,
-            ) {
-                return;
-            }
-        }
+    if wiring.epg_check_pending.get() {
+        wiring.epg_recheck.set(true);
+        return;
     }
+    if !wiring.persist.config.borrow().bool_or("epg_enabled", true) {
+        return;
+    }
+    if force {
+        start_epg_load(wiring, sources);
+        return;
+    }
+    wiring.epg_check_pending.set(true);
+    submit_epg_read(
+        wiring,
+        iptv_core::epg::EpgReadKind::UsableData { at: now_epoch() },
+        PendingEpgReadUi::AutoImportCheck { sources },
+    );
+}
+
+fn finish_epg_auto_import(wiring: &Wiring, sources: Vec<String>, usable: bool) {
+    wiring.epg_check_pending.set(false);
+    if wiring.epg_pending.get() {
+        wiring.epg_recheck.set(true);
+        return;
+    }
+    let should_import = {
+        let config = wiring.persist.config.borrow();
+        #[allow(clippy::cast_possible_truncation)]
+        let last_import = config.f64_or("epg_last_import_epoch", 0.0) as i64;
+        should_auto_import_epg(
+            &sources,
+            &config.string_or("epg_last_sources_hash", ""),
+            last_import,
+            now_epoch(),
+            config.f64_or("epg_auto_import_interval_hours", 6.0),
+            usable,
+        )
+    };
+    if should_import {
+        start_epg_load(wiring, sources);
+    }
+}
+
+fn start_epg_load(wiring: &Wiring, sources: Vec<String>) {
     wiring
         .epg_inflight_sources
         .borrow_mut()
