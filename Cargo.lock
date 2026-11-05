@@ -996,7 +996,7 @@ checksum = "791930b43c0d5973160d90a8f3894509f2b273430f5c5c73b668636d0287c5c0"
 
 [[package]]
 name = "iptv-app"
-version = "0.4.14"
+version = "0.4.15"
 dependencies = [
  "chrono",
  "iptv-core",
@@ -1012,7 +1012,7 @@ dependencies = [
 
 [[package]]
 name = "iptv-core"
-version = "0.4.14"
+version = "0.4.15"
 dependencies = [
  "aes",
  "base64",
@@ -1036,21 +1036,21 @@ dependencies = [
 
 [[package]]
 name = "iptv-sapi"
-version = "0.4.14"
+version = "0.4.15"
 dependencies = [
  "iptv-core",
 ]
 
 [[package]]
 name = "iptv-signer"
-version = "0.4.14"
+version = "0.4.15"
 dependencies = [
  "minisign",
 ]
 
 [[package]]
 name = "iptv-vlc"
-version = "0.4.14"
+version = "0.4.15"
 dependencies = [
  "iptv-core",
  "libloading 0.9.0",
@@ -1182,9 +1182,9 @@ dependencies = [
 
 [[package]]
 name = "mdns-sd"
-version = "0.20.3"
+version = "0.21.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "86dbb9f00c8c367f75ed3a775d3eb31d0375a72f58275ef64a1bc53c255a2ce2"
+checksum = "e6743ed743ff2bada2b8651ef298d3f98addb0b74844f19cdd57137d8bd0219e"
 dependencies = [
  "fastrand",
  "flume",
