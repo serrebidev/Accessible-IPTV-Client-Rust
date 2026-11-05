@@ -585,6 +585,11 @@ struct Wiring {
     /// A load was requested while one was already running; the
     /// completion re-checks whether the sources changed under it.
     epg_recheck: Rc<std::cell::Cell<bool>>,
+    /// The in-flight load was started by hand (Import EPG to DB
+    /// or the schema-repair offer) and owes the user a finished
+    /// message when it lands (N21; Python's `_epg_import_notify`).
+    /// Automatic loads never set it, so they stay quiet.
+    epg_import_notify: Rc<std::cell::Cell<bool>>,
     /// The independent 60-second guide-freshness timer (audit
     /// E11): row suffixes track programme boundaries even when
     /// every worker is idle.
@@ -1116,6 +1121,7 @@ fn bind_browser(
         epg_extra_sources: Rc::new(RefCell::new(Vec::new())),
         epg_inflight_sources: Rc::new(RefCell::new(Vec::new())),
         epg_recheck: Rc::new(std::cell::Cell::new(false)),
+        epg_import_notify: Rc::new(std::cell::Cell::new(false)),
         epg_timer: Rc::new(Timer::new(&frame)),
         reminders: Rc::new(RefCell::new(Vec::new())),
         provider_worker: Rc::new(ProviderWorker::new()),
@@ -1491,7 +1497,7 @@ fn bind_completion(frame: Frame, wiring: &Wiring, controls: Controls) {
             completed.epg_deferred.set(false);
             reload_epg(&completed);
         }
-        poll_epg(&completed, status);
+        poll_epg(&completed, frame, status);
         drain_epg_reads(&completed);
         drain_suffix_results(&completed, list);
         {
@@ -2232,9 +2238,41 @@ fn poll_providers(wiring: &Wiring, controls: Controls) {
 
 /// Drain a finished guide load and fire due reminders; runs on the main
 /// poll tick alongside browse completion.
-fn poll_epg(wiring: &Wiring, status: Status) {
+/// Report how a hand-started import turned out (N21;
+/// Python's `_report_epg_import_finished`). Both boxes go
+/// through the N18 notification queue, so a modal already
+/// open defers them instead of stacking.
+fn report_epg_import_finished(frame: Frame, success: bool) {
+    if success {
+        show_or_queue_notification(
+            frame,
+            "The EPG import has finished. The programme guide is up to date.",
+            "Import Complete",
+            MessageDialogStyle::OK | MessageDialogStyle::IconInformation,
+            None,
+        );
+    } else {
+        show_or_queue_notification(
+            frame,
+            "The EPG import did not finish. The programme guide may be incomplete or unchanged.\n\nCheck that the EPG sources in File > EPG Manager are reachable, then try again.",
+            "Import Failed",
+            MessageDialogStyle::OK | MessageDialogStyle::IconWarning,
+            None,
+        );
+    }
+}
+
+fn poll_epg(wiring: &Wiring, frame: Frame, status: Status) {
     if let Some(result) = wiring.epg_worker.try_recv() {
         wiring.epg_pending.set(false);
+        // A hand-started import reports how it turned out
+        // (N21; Python's `_report_epg_import_finished`, shown
+        // once the guide behind it is reloaded). The flag is
+        // consumed by whichever load finishes first — a manual
+        // start is refused while one is running, so that is
+        // always its own load.
+        let notify = wiring.epg_import_notify.get();
+        wiring.epg_import_notify.set(false);
         match result {
             Ok((snapshot, store_note)) => {
                 let counts = (
@@ -2266,6 +2304,9 @@ fn poll_epg(wiring: &Wiring, status: Status) {
                         ("note", &store_note),
                     ],
                 ));
+                if notify {
+                    report_epg_import_finished(frame, true);
+                }
                 // Sources changed while this load ran (a provider
                 // finished after it started): run the load the
                 // change asked for, as Python does.
@@ -2280,6 +2321,9 @@ fn poll_epg(wiring: &Wiring, status: Status) {
             Err(error) => {
                 iptv_core::applog::error("epg", &format!("Guide failed to load: {error}"));
                 status.set_label(&trf("Guide failed to load: {error}", &[("error", &error)]));
+                if notify {
+                    report_epg_import_finished(frame, false);
+                }
             }
         }
     }
@@ -5765,6 +5809,7 @@ fn clone_wiring(wiring: &Wiring) -> Wiring {
         epg_extra_sources: Rc::clone(&wiring.epg_extra_sources),
         epg_inflight_sources: Rc::clone(&wiring.epg_inflight_sources),
         epg_recheck: Rc::clone(&wiring.epg_recheck),
+        epg_import_notify: Rc::clone(&wiring.epg_import_notify),
         epg_timer: Rc::clone(&wiring.epg_timer),
         reminders: Rc::clone(&wiring.reminders),
         provider_worker: Rc::clone(&wiring.provider_worker),
@@ -7928,8 +7973,52 @@ fn menu_import_epg(wiring: &Wiring, frame: Frame, status: Status) {
             .persist
             .set_and_save("epg_urls", serde_json::json!(urls));
     }
-    dispatch_epg_load_mode(wiring, vec![path], true);
+    // Python's import guards and announcements (N21,
+    // `import_epg`): a disabled guide and an import already
+    // running are said out loud, and a started import promises
+    // the completion message that `poll_epg` then delivers.
+    if !wiring.persist.config.borrow().bool_or("epg_enabled", true) {
+        let dialog = MessageDialog::builder(&frame, "EPG is not enabled.", "EPG Not Available")
+            .with_style(MessageDialogStyle::OK | MessageDialogStyle::IconWarning)
+            .build();
+        dialog.show_modal_tracked();
+        return;
+    }
+    if wiring.epg_pending.get() {
+        // The load already running re-runs for the new source
+        // when it lands (the completion re-check); the user is
+        // told an import is in progress, as Python tells them.
+        dispatch_epg_load_mode(wiring, vec![path], true);
+        let dialog =
+            MessageDialog::builder(&frame, "EPG import is already in progress.", "In Progress")
+                .with_style(MessageDialogStyle::OK | MessageDialogStyle::IconInformation)
+                .build();
+        dialog.show_modal_tracked();
+        return;
+    }
+    if !start_manual_epg_import(wiring, vec![path]) {
+        let dialog = MessageDialog::builder(
+            &frame,
+            "The EPG import could not be started.",
+            "Import Failed",
+        )
+        .with_style(MessageDialogStyle::OK | MessageDialogStyle::IconWarning)
+        .build();
+        dialog.show_modal_tracked();
+        return;
+    }
     status.set_label("Importing EPG data...");
+    // Start first, announce second: the announcement promises
+    // a completion message, so it must not be shown for an
+    // import that never began (Python's ordering).
+    let dialog = MessageDialog::builder(
+        &frame,
+        "EPG import will start in the background. You can keep using the app; a message will tell you when the import has finished.",
+        "Import Started",
+    )
+    .with_style(MessageDialogStyle::OK | MessageDialogStyle::IconInformation)
+    .build();
+    dialog.show_modal_tracked();
 }
 
 /// View > Go to Channel Number...: select the row by its
@@ -8896,7 +8985,7 @@ fn bind_context_menu(frame: Frame, wiring: &Wiring, controls: Controls) {
                     Some(programme) => {
                         add_reminder(&wiring_menu, frame, &channel, &programme, status);
                     }
-                    None => open_channel_epg(&wiring_menu, &channel, status),
+                    None => open_channel_epg(&wiring_menu, frame, &channel, status),
                 }
             }
             CTX_SCHEDULE => {
@@ -8907,10 +8996,10 @@ fn bind_context_menu(frame: Frame, wiring: &Wiring, controls: Controls) {
                     Some(programme) => {
                         add_dvr_job(&wiring_menu, frame, &channel, &programme, status, "none");
                     }
-                    None => open_channel_epg(&wiring_menu, &channel, status),
+                    None => open_channel_epg(&wiring_menu, frame, &channel, status),
                 }
             }
-            CTX_EPG => open_channel_epg(&wiring_menu, &channel, status),
+            CTX_EPG => open_channel_epg(&wiring_menu, frame, &channel, status),
             CTX_CATCHUP => play_catchup(&wiring_menu, &channel, status),
             _ => {}
         }
@@ -9013,13 +9102,53 @@ fn bind_epg_description(
     });
 }
 
+/// The EPG database predates this build's schema; offer to
+/// rebuild it (N21; Python's `_offer_epg_schema_repair`). A
+/// store that cannot add the missing columns itself leaves
+/// every EPG view dying on them, so one clear dialog with a
+/// working fix beats that: Yes starts a forced import (which
+/// reports when it finishes), and a start that fails says so.
+fn offer_epg_schema_repair(wiring: &Wiring, frame: Frame) {
+    let dialog = MessageDialog::builder(
+        &frame,
+        "The EPG database was created by an older version and is missing newer fields. Import the guide again to update it?\n\n(Without this, the EPG views cannot show programme descriptions.)",
+        "EPG Database Update Needed",
+    )
+    .with_style(MessageDialogStyle::YesNo | MessageDialogStyle::IconQuestion)
+    .build();
+    if dialog.show_modal_tracked() != ID_YES {
+        return;
+    }
+    if !start_manual_epg_import(wiring, effective_epg_sources(wiring)) {
+        let dialog = MessageDialog::builder(
+            &frame,
+            "The EPG import could not be started.",
+            "Import Failed",
+        )
+        .with_style(MessageDialogStyle::OK | MessageDialogStyle::IconWarning)
+        .build();
+        dialog.show_modal_tracked();
+    }
+}
+
 #[allow(clippy::too_many_lines)] // grew with R16 repeat buttons
-fn open_channel_epg(wiring: &Wiring, channel: &Channel, _main_status: Status) {
+fn open_channel_epg(wiring: &Wiring, frame: Frame, channel: &Channel, _main_status: Status) {
     let now = now_epoch();
     // Python's Channel EPG query: from the programme on air now
     // through seven days of upcoming programmes, uncapped —
     // finished programmes belong to Catch-up, not this window.
-    let programmes: Vec<Programme> = guide_programmes(wiring, channel)
+    let stored = guide_programmes(wiring, channel);
+    if stored.is_empty()
+        && !iptv_core::epgstore::store_missing_columns(&epg_store_path()).is_empty()
+    {
+        // The view would fall back to the store, and the store
+        // predates the schema: offer the repair instead of a
+        // window that can only fail to load (Python's
+        // `_view_channel_epg` schema check, N21).
+        offer_epg_schema_repair(wiring, frame);
+        return;
+    }
+    let programmes: Vec<Programme> = stored
         .into_iter()
         .filter(|p| p.stop > now && p.start < now + 7 * 86_400)
         .collect();
@@ -13619,6 +13748,25 @@ fn finish_epg_auto_import(wiring: &Wiring, sources: Vec<String>, usable: bool) {
     if should_import {
         start_epg_load(wiring, sources);
     }
+}
+
+/// Start a guide import the user asked for by hand (N21;
+/// Python's `start_epg_import_background(force=True,
+/// notify=True)`): the load runs forced, and its completion
+/// reports back with the Import Complete / Import Failed box.
+/// Returns false when no import was started — no sources, the
+/// guide disabled, or one already running — so the caller can
+/// say so, as Python's callers do.
+fn start_manual_epg_import(wiring: &Wiring, sources: Vec<String>) -> bool {
+    if sources.is_empty() || wiring.epg_pending.get() {
+        return false;
+    }
+    if !wiring.persist.config.borrow().bool_or("epg_enabled", true) {
+        return false;
+    }
+    wiring.epg_import_notify.set(true);
+    start_epg_load(wiring, sources);
+    true
 }
 
 fn start_epg_load(wiring: &Wiring, sources: Vec<String>) {

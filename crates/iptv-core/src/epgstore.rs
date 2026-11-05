@@ -8,7 +8,7 @@
 //! that source's contribution, and a source that fails or is left
 //! out of a run keeps its previously stored guide (audit E04).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use rusqlite::{Connection, OptionalExtension as _};
@@ -890,6 +890,186 @@ fn collect_rows(
     Ok(programmes)
 }
 
+// ---------------------------------------------------------------------------
+// Cross-process import lock (port of playlist.py's file lock)
+// ---------------------------------------------------------------------------
+
+/// The lock and owner files for a store: `{stem}.import.lock`
+/// and `{stem}.import.pid` beside the database.
+fn import_lock_paths(db_path: &Path) -> (PathBuf, PathBuf) {
+    let base_dir = db_path
+        .parent()
+        .map_or_else(std::env::temp_dir, Path::to_path_buf);
+    let fname = db_path
+        .file_stem()
+        .map_or_else(String::new, |stem| stem.to_string_lossy().into_owned());
+    (
+        base_dir.join(format!("{fname}.import.lock")),
+        base_dir.join(format!("{fname}.import.pid")),
+    )
+}
+
+/// Whether a process exists, where the platform can say:
+/// `None` when it cannot be checked (Python's psutil-missing
+/// fallback, which falls back to the lock's age alone).
+#[cfg(windows)]
+fn pid_exists(pid: u32) -> Option<bool> {
+    // PROCESS_QUERY_LIMITED_INFORMATION: enough to learn the
+    // process is alive without any access to it.
+    extern "system" {
+        fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut std::ffi::c_void;
+        fn CloseHandle(handle: *mut std::ffi::c_void) -> i32;
+    }
+    let handle = unsafe { OpenProcess(0x1000, 0, pid) };
+    if handle.is_null() {
+        return Some(false);
+    }
+    unsafe {
+        CloseHandle(handle);
+    }
+    Some(true)
+}
+
+#[cfg(target_os = "linux")]
+#[allow(clippy::unnecessary_wraps)] // shared signature: other platforms may not know
+fn pid_exists(pid: u32) -> Option<bool> {
+    Some(std::path::Path::new(&format!("/proc/{pid}")).exists())
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+fn pid_exists(_pid: u32) -> Option<bool> {
+    None
+}
+
+/// Try to take the import lock, waiting up to `max_wait` for a
+/// live owner. A lock whose owner has exited (checked after it
+/// is a second old, as in Python) is reclaimed at once; a lock
+/// whose owner cannot be checked is reclaimed only after two
+/// hours — the age fallback must never take a live import's
+/// lock, because an import that runs for hours is still an
+/// import. An unexpected error acquiring means NOT acquired.
+fn try_acquire_import_lock(db_path: &Path, max_wait: Duration) -> Option<ImportLockGuard> {
+    let (lock_path, pid_path) = import_lock_paths(db_path);
+    let deadline = std::time::Instant::now() + max_wait;
+    loop {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+        {
+            Ok(mut file) => {
+                use std::io::Write as _;
+                let _ = file.write_all(b"locked");
+                let _ = std::fs::write(&pid_path, std::process::id().to_string());
+                return Some(ImportLockGuard {
+                    lock_path,
+                    pid_path,
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let age = std::fs::metadata(&lock_path)
+                    .and_then(|meta| meta.modified())
+                    .ok()
+                    .and_then(|modified| modified.elapsed().ok())
+                    .unwrap_or(Duration::ZERO);
+                let owner = std::fs::read_to_string(&pid_path)
+                    .ok()
+                    .and_then(|text| text.trim().parse::<u32>().ok());
+                let owner_known = owner.and_then(pid_exists);
+                let owner_exited =
+                    matches!(owner_known, Some(false)) && age > Duration::from_secs(1);
+                let stale =
+                    owner_exited || (owner_known.is_none() && age > Duration::from_hours(2));
+                if stale {
+                    let _ = std::fs::remove_file(&lock_path);
+                    let _ = std::fs::remove_file(&pid_path);
+                    continue;
+                }
+                if std::time::Instant::now() >= deadline {
+                    return None;
+                }
+                std::thread::sleep(Duration::from_secs(1));
+            }
+            Err(_) => return None,
+        }
+    }
+}
+
+/// The held import lock; dropping it releases the lock, but
+/// only while it is still ours — a lock that was reclaimed (or
+/// taken by another copy of the app) belongs to whoever holds
+/// it now.
+pub struct ImportLockGuard {
+    lock_path: PathBuf,
+    pid_path: PathBuf,
+}
+
+impl Drop for ImportLockGuard {
+    fn drop(&mut self) {
+        if let Ok(text) = std::fs::read_to_string(&self.pid_path) {
+            if let Ok(owner) = text.trim().parse::<u32>() {
+                if owner != std::process::id() {
+                    return;
+                }
+            }
+        }
+        let _ = std::fs::remove_file(&self.lock_path);
+        let _ = std::fs::remove_file(&self.pid_path);
+    }
+}
+
+/// Block until the cross-process import lock can be acquired
+/// (Python's `_wait_for_import_lock`): polls silently and
+/// gives up after 30 minutes so a wedged peer can never block
+/// imports forever.
+///
+/// # Errors
+/// Returns Python's timeout message when the lock is still
+/// held after 30 minutes.
+pub fn wait_for_import_lock(db_path: &Path) -> Result<ImportLockGuard, String> {
+    let mut waited = Duration::ZERO;
+    loop {
+        if let Some(guard) = try_acquire_import_lock(db_path, Duration::from_secs(10)) {
+            return Ok(guard);
+        }
+        waited += Duration::from_secs(10);
+        if waited >= Duration::from_mins(30) {
+            return Err("Timed out waiting for the EPG import lock".to_string());
+        }
+    }
+}
+
+/// Columns this build's queries require but the store at
+/// `path` lacks (Python's `EPGDatabase._check_schema`, checked
+/// against `programmes.description`): the database is opened
+/// read-only and never created or migrated here, so a database
+/// written before descriptions were stored reports them
+/// instead of dying with "no such column" in every EPG view.
+/// A missing or unreadable file reports nothing missing — the
+/// ordinary error paths own those cases.
+#[must_use]
+pub fn store_missing_columns(path: &Path) -> Vec<String> {
+    if !path.exists() {
+        return Vec::new();
+    }
+    let Ok(conn) = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+    else {
+        return Vec::new();
+    };
+    let Ok(mut statement) = conn.prepare("PRAGMA table_info(programmes)") else {
+        return Vec::new();
+    };
+    let Ok(rows) = statement.query_map([], |row| row.get::<_, String>(1)) else {
+        return Vec::new();
+    };
+    let columns: Vec<String> = rows.filter_map(Result::ok).collect();
+    ["description"]
+        .iter()
+        .filter(|required| !columns.iter().any(|column| column == *required))
+        .map(ToString::to_string)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::EpgStore;
@@ -1264,5 +1444,91 @@ mod tests {
         let bulk = store.all_now_next(1_150).unwrap();
         assert_eq!(bulk[0].1.current.as_ref().unwrap().start, 1_100);
         assert_eq!(bulk[0].1.next.as_ref().unwrap().title, "Later Show");
+    }
+
+    fn lock_test_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "iptv-epgstore-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn import_lock_excludes_and_releases() {
+        use std::time::Duration;
+        let dir = lock_test_dir("lock");
+        let db_path = dir.join("epg.db");
+        let guard = super::wait_for_import_lock(&db_path).unwrap();
+        let (lock_path, pid_path) = super::import_lock_paths(&db_path);
+        assert!(lock_path.exists());
+        assert_eq!(
+            std::fs::read_to_string(&pid_path).unwrap().trim(),
+            std::process::id().to_string()
+        );
+        // A second acquirer cannot take a live lock.
+        assert!(super::try_acquire_import_lock(&db_path, Duration::ZERO).is_none());
+        drop(guard);
+        assert!(!lock_path.exists());
+        assert!(!pid_path.exists());
+        // And the lock is free to take again.
+        let guard = super::wait_for_import_lock(&db_path).unwrap();
+        drop(guard);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn import_lock_reclaims_a_dead_owners_lock() {
+        use std::time::{Duration, SystemTime};
+        let dir = lock_test_dir("stale");
+        let db_path = dir.join("epg.db");
+        let (lock_path, pid_path) = super::import_lock_paths(&db_path);
+        // A lock left by a process that no longer exists, old
+        // enough that its owner can be checked (Python: age > 1 s
+        // plus a dead pid reclaims at once).
+        std::fs::write(&lock_path, b"locked").unwrap();
+        std::fs::write(&pid_path, "999999").unwrap();
+        let file = std::fs::File::open(&lock_path).unwrap();
+        file.set_modified(SystemTime::now() - Duration::from_secs(10))
+            .unwrap();
+        drop(file);
+        let guard = super::try_acquire_import_lock(&db_path, Duration::ZERO)
+            .expect("a dead owner's lock is reclaimed");
+        assert_eq!(
+            std::fs::read_to_string(&pid_path).unwrap().trim(),
+            std::process::id().to_string()
+        );
+        drop(guard);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn missing_columns_reports_only_a_real_gap() {
+        let dir = lock_test_dir("schema");
+        // A database written before descriptions were stored.
+        let old_path = dir.join("old.db");
+        let conn = rusqlite::Connection::open(&old_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE programmes (
+                 channel TEXT NOT NULL, start INTEGER NOT NULL,
+                 stop INTEGER NOT NULL, title TEXT NOT NULL
+             );",
+        )
+        .unwrap();
+        drop(conn);
+        assert_eq!(super::store_missing_columns(&old_path), ["description"]);
+        // A current store has nothing missing, and a file that
+        // does not exist is not a repair case.
+        let new_path = dir.join("epg.db");
+        let store = EpgStore::open(&new_path).unwrap();
+        drop(store);
+        assert!(super::store_missing_columns(&new_path).is_empty());
+        assert!(super::store_missing_columns(&dir.join("absent.db")).is_empty());
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
