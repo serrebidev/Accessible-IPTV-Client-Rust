@@ -8,6 +8,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::Read;
+use std::sync::Arc;
 
 use crate::Channel;
 
@@ -1986,9 +1987,16 @@ impl EpgReadWorker {
                                     .collect(),
                             ))
                         }
-                        EpgReadKind::Snapshot { at, model, snapshot } => {
+                        EpgReadKind::Snapshot {
+                            at,
+                            model,
+                            snapshot,
+                        } => {
                             let (indexes_for_rows, bulk) = if let Some(snapshot) = snapshot {
-                                (Arc::clone(&snapshot.indexes), snapshot.guide.bulk_now_next(at))
+                                (
+                                    Arc::clone(&snapshot.indexes),
+                                    snapshot.guide.bulk_now_next(at),
+                                )
                             } else {
                                 let db = &store.as_ref().expect("store opened for read").1;
                                 if !matches!(indexes.as_ref(), Some((generation, _)) if *generation == job.guide_generation)
@@ -1998,15 +2006,28 @@ impl EpgReadWorker {
                                         Arc::new(GuideIndexes::build(&db.channels()?)),
                                     ));
                                 }
-                                let bulk = db.all_now_next(at)?.into_iter().map(|(channel, entry)| (channel.id, entry)).collect();
-                                (Arc::clone(&indexes.as_ref().expect("indexes just built").1), bulk)
+                                let bulk = db
+                                    .all_now_next(at)?
+                                    .into_iter()
+                                    .map(|(channel, entry)| (channel.id, entry))
+                                    .collect();
+                                (
+                                    Arc::clone(&indexes.as_ref().expect("indexes just built").1),
+                                    bulk,
+                                )
                             };
                             let mut rows = Vec::new();
                             for (index, channel) in model.channels().iter().enumerate() {
-                                let Some(id) = match_guide_channel(channel, &indexes_for_rows, Some(&indexes_for_rows.known_ids)) else {
+                                let Some(id) = match_guide_channel(
+                                    channel,
+                                    &indexes_for_rows,
+                                    Some(&indexes_for_rows.known_ids),
+                                ) else {
                                     continue;
                                 };
-                                if let Some(current) = bulk.get(&id).and_then(|entry| entry.current.clone()) {
+                                if let Some(current) =
+                                    bulk.get(&id).and_then(|entry| entry.current.clone())
+                                {
                                     rows.push((index, current));
                                 }
                             }
@@ -2256,8 +2277,9 @@ mod tests {
             tvg_logo: String::new(),
             unknown_attributes: Default::default(),
         };
-        let model = std::sync::Arc::new(parse_m3u(
-            "#EXTM3U\n#EXTINF:-1 tvg-id=\"guide.one\",One News\nhttp://one",
+        let model = std::sync::Arc::new(crate::BrowseModel::from_parts(
+            parse_m3u("#EXTM3U\n#EXTINF:-1 tvg-id=\"guide.one\",One News\nhttp://one"),
+            0,
         ));
         let worker = EpgReadWorker::new();
         worker.submit(EpgReadJob {
@@ -2340,7 +2362,10 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].display_name, "One News");
         assert_eq!(hits[0].playlist_index, Some(0));
-        let snapshot = results.iter().find(|result| result.request_id == 4).unwrap();
+        let snapshot = results
+            .iter()
+            .find(|result| result.request_id == 4)
+            .unwrap();
         let EpgReadValue::Snapshot(rows) = snapshot.result.as_ref().unwrap() else {
             panic!("unexpected snapshot result: {snapshot:?}");
         };

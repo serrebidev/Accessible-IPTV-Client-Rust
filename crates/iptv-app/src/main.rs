@@ -12,8 +12,8 @@ use iptv_core::{
     epg::{
         airing_index, epg_info_message, epg_row_label, epg_time_range, hash_epg_sources,
         local_datetime, local_hhmm, match_guide_channel, merged_epg_sources,
-        should_auto_import_epg, should_run_epg_search, EpgSnapshot, EpgWorker,
-        NowNext, Programme, SuffixJob, SuffixWorker, SEARCH_EPG_RESULT_LIMIT,
+        should_auto_import_epg, should_run_epg_search, EpgSnapshot, EpgWorker, NowNext, Programme,
+        SuffixJob, SuffixWorker, SEARCH_EPG_RESULT_LIMIT,
     },
     favorites::{channel_key, remember_recent, FavoriteSet, Toggle},
     playback::{
@@ -480,7 +480,7 @@ enum PendingEpgReadUi {
         in_all_channels: bool,
     },
     WhatsOnSnapshot {
-        model: Arc<BrowseModel>,
+        model: Arc<iptv_core::BrowseModel>,
         rows: Rc<RefCell<Vec<(Channel, Programme)>>>,
         filtered: Rc<RefCell<Vec<usize>>>,
         filter: TextCtrl,
@@ -2164,7 +2164,11 @@ fn drain_epg_reads(wiring: &Wiring) {
                 let loaded_rows: Vec<(Channel, Programme)> = snapshot_rows
                     .into_iter()
                     .filter_map(|(index, programme)| {
-                        model.channels().get(index).cloned().map(|channel| (channel, programme))
+                        model
+                            .channels()
+                            .get(index)
+                            .cloned()
+                            .map(|channel| (channel, programme))
                     })
                     .collect();
                 *rows.borrow_mut() = loaded_rows;
