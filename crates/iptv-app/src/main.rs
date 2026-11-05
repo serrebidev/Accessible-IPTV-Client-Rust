@@ -469,7 +469,7 @@ enum PendingEpgReadUi {
         sources: Vec<String>,
     },
     SeriesProgrammes {
-        rule: iptv_core::dvr::DvrJob,
+        rule: Box<iptv_core::dvr::DvrJob>,
         now: f64,
     },
     SearchRows {
@@ -1963,6 +1963,7 @@ fn submit_epg_read(wiring: &Wiring, kind: iptv_core::epg::EpgReadKind, ui: Pendi
     ensure_polling(wiring);
 }
 
+#[allow(clippy::too_many_lines)] // One exhaustive dispatcher preserves request/result pairing.
 fn drain_epg_reads(wiring: &Wiring) {
     while let Some(result) = wiring.epg_read_worker.try_recv() {
         let Some(ui) = wiring
@@ -2180,8 +2181,11 @@ fn drain_epg_reads(wiring: &Wiring) {
                     status.set_silent("Select a programme to play or schedule.");
                 }
             }
-            (PendingEpgReadUi::ChannelProgrammes { status, .. }, Err(error))
-            | (PendingEpgReadUi::CatchupProgrammes { status, .. }, Err(error)) => {
+            (
+                PendingEpgReadUi::ChannelProgrammes { status, .. }
+                | PendingEpgReadUi::CatchupProgrammes { status, .. },
+                Err(error),
+            ) => {
                 iptv_core::applog::error("epg", &format!("Cold guide read failed: {error}"));
                 status.set_label("Could not load guide information.");
             }
@@ -2194,7 +2198,7 @@ fn drain_epg_reads(wiring: &Wiring) {
                 status.set_label("Could not load What's on Now.");
             }
             (_, Err(error)) => {
-                iptv_core::applog::error("epg", &format!("Cold guide read failed: {error}"))
+                iptv_core::applog::error("epg", &format!("Cold guide read failed: {error}"));
             }
             _ => {}
         }
@@ -3320,7 +3324,7 @@ fn run_series_scan(wiring: &Wiring) {
                 to: at + 7 * 86_400,
             },
             PendingEpgReadUi::SeriesProgrammes {
-                rule: rule.clone(),
+                rule: Box::new(rule.clone()),
                 now,
             },
         );

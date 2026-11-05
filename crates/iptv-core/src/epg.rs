@@ -1814,7 +1814,7 @@ pub struct SuffixWorker {
 }
 
 /// A cold persisted-guide read, tagged so the UI can reject stale
-/// completions without sharing SQLite connections across threads.
+/// completions without sharing `SQLite` connections across threads.
 #[derive(Clone, Debug)]
 pub enum EpgReadKind {
     UsableData {
@@ -1873,7 +1873,7 @@ pub struct EpgReadResult {
     pub result: Result<EpgReadValue, String>,
 }
 
-/// Worker-owned connection and indexes for cold SQLite guide reads.
+/// Worker-owned connection and indexes for cold `SQLite` guide reads.
 pub struct EpgReadWorker {
     jobs: std::sync::mpsc::Sender<EpgReadJob>,
     events: std::sync::Mutex<std::sync::mpsc::Receiver<EpgReadResult>>,
@@ -1886,7 +1886,11 @@ impl Default for EpgReadWorker {
 }
 
 impl EpgReadWorker {
+    /// Create a worker thread for cold guide reads.
+    /// # Panics
+    /// Panics if internal worker state violates its store or index initialization invariants.
     #[must_use]
+    #[allow(clippy::too_many_lines)] // Keep the worker's ordered request dispatch in one place.
     pub fn new() -> Self {
         let (jobs, receiver) = std::sync::mpsc::channel::<EpgReadJob>();
         let (sender, events) = std::sync::mpsc::channel::<EpgReadResult>();
@@ -2229,6 +2233,7 @@ fn fetch_epg_source_once(source: &str) -> Result<EpgGuide, String> {
 mod tests {
 
     #[test]
+    #[allow(clippy::too_many_lines)] // One end-to-end worker test covers all request variants.
     fn cold_read_worker_returns_channel_now_next_and_programmes_from_store() {
         use super::{EpgReadJob, EpgReadKind, EpgReadValue, EpgReadWorker};
         use crate::{
@@ -2275,7 +2280,7 @@ mod tests {
             tvg_id: "guide.one".into(),
             tvg_name: String::new(),
             tvg_logo: String::new(),
-            unknown_attributes: Default::default(),
+            unknown_attributes: std::collections::BTreeMap::default(),
         };
         let model = std::sync::Arc::new(crate::BrowseModel::from_parts(
             parse_m3u("#EXTM3U\n#EXTINF:-1 tvg-id=\"guide.one\",One News\nhttp://one"),
