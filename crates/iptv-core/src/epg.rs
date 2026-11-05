@@ -1812,6 +1812,143 @@ pub struct SuffixWorker {
     events: std::sync::Mutex<std::sync::mpsc::Receiver<SuffixResult>>,
 }
 
+/// A cold persisted-guide read, tagged so the UI can reject stale
+/// completions without sharing SQLite connections across threads.
+#[derive(Clone, Debug)]
+pub enum EpgReadKind {
+    UsableData {
+        at: i64,
+    },
+    NowNext {
+        channel: crate::Channel,
+        at: i64,
+    },
+    Programmes {
+        channel: crate::Channel,
+        from: i64,
+        to: i64,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub struct EpgReadJob {
+    pub request_id: u64,
+    pub guide_generation: u64,
+    pub store_path: std::path::PathBuf,
+    pub kind: EpgReadKind,
+}
+
+#[derive(Clone, Debug)]
+pub enum EpgReadValue {
+    UsableData(bool),
+    NowNext(Option<NowNext>),
+    Programmes(Vec<Programme>),
+}
+
+#[derive(Clone, Debug)]
+pub struct EpgReadResult {
+    pub request_id: u64,
+    pub guide_generation: u64,
+    pub result: Result<EpgReadValue, String>,
+}
+
+/// Worker-owned connection and indexes for cold SQLite guide reads.
+pub struct EpgReadWorker {
+    jobs: std::sync::mpsc::Sender<EpgReadJob>,
+    events: std::sync::Mutex<std::sync::mpsc::Receiver<EpgReadResult>>,
+}
+
+impl Default for EpgReadWorker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl EpgReadWorker {
+    #[must_use]
+    pub fn new() -> Self {
+        let (jobs, receiver) = std::sync::mpsc::channel::<EpgReadJob>();
+        let (sender, events) = std::sync::mpsc::channel::<EpgReadResult>();
+        std::thread::spawn(move || {
+            let mut store: Option<(std::path::PathBuf, crate::epgstore::EpgStore)> = None;
+            let mut indexes: Option<(u64, std::sync::Arc<GuideIndexes>)> = None;
+            while let Ok(job) = receiver.recv() {
+                let result = (|| {
+                    if !matches!(store.as_ref(), Some((path, _)) if *path == job.store_path) {
+                        store = Some((
+                            job.store_path.clone(),
+                            crate::epgstore::EpgStore::open(&job.store_path)?,
+                        ));
+                        indexes = None;
+                    }
+                    let db = &store.as_ref().expect("store just opened").1;
+                    match job.kind {
+                        EpgReadKind::UsableData { at } => {
+                            Ok(EpgReadValue::UsableData(db.has_usable_data(at)?))
+                        }
+                        EpgReadKind::NowNext { channel, at } => {
+                            if !matches!(indexes.as_ref(), Some((generation, _)) if *generation == job.guide_generation)
+                            {
+                                indexes = Some((
+                                    job.guide_generation,
+                                    std::sync::Arc::new(GuideIndexes::build(&db.channels()?)),
+                                ));
+                            }
+                            let indexes = &indexes.as_ref().expect("indexes just built").1;
+                            let value = match match_guide_channel(
+                                &channel,
+                                indexes,
+                                Some(&indexes.known_ids),
+                            ) {
+                                Some(id) => {
+                                    let (current, next) = db.now_next(&id, at)?;
+                                    Some(NowNext { current, next })
+                                }
+                                None => None,
+                            };
+                            Ok(EpgReadValue::NowNext(value))
+                        }
+                        EpgReadKind::Programmes { channel, from, to } => {
+                            let mut candidates = expand_tvg_id_candidates(channel.tvg_id.trim());
+                            candidates.push(channel.tvg_id.trim().to_string());
+                            for id in candidates {
+                                let programmes = db.programmes_between(&id, from, to)?;
+                                if !programmes.is_empty() {
+                                    return Ok(EpgReadValue::Programmes(programmes));
+                                }
+                            }
+                            Ok(EpgReadValue::Programmes(Vec::new()))
+                        }
+                    }
+                })();
+                if sender
+                    .send(EpgReadResult {
+                        request_id: job.request_id,
+                        guide_generation: job.guide_generation,
+                        result,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        Self {
+            jobs,
+            events: std::sync::Mutex::new(events),
+        }
+    }
+
+    pub fn submit(&self, job: EpgReadJob) {
+        let _ = self.jobs.send(job);
+    }
+
+    #[must_use]
+    pub fn try_recv(&self) -> Option<EpgReadResult> {
+        self.events.lock().ok()?.try_recv().ok()
+    }
+}
+
 impl Default for SuffixWorker {
     fn default() -> Self {
         Self::new()
@@ -1976,6 +2113,114 @@ fn fetch_epg_source_once(source: &str) -> Result<EpgGuide, String> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn cold_read_worker_returns_channel_now_next_and_programmes_from_store() {
+        use super::{EpgReadJob, EpgReadKind, EpgReadValue, EpgReadWorker};
+        use crate::{
+            epg::{EpgChannel, EpgGuide, Programme},
+            epgstore::EpgStore,
+            Channel,
+        };
+        use std::{
+            collections::HashMap,
+            time::{Duration, Instant},
+        };
+
+        let path = std::env::temp_dir().join(format!(
+            "iptv-epg-read-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut store = EpgStore::open(&path).unwrap();
+        let guide = EpgGuide {
+            channels: vec![EpgChannel {
+                id: "guide.one".into(),
+                display_name: "One News".into(),
+            }],
+            programmes: HashMap::from([(
+                "guide.one".into(),
+                vec![Programme {
+                    channel_id: "guide.one".into(),
+                    start: 100,
+                    stop: 200,
+                    title: "Evening News".into(),
+                    description: "A full description.".into(),
+                }],
+            )]),
+        };
+        store.import_guide(&guide).unwrap();
+        drop(store);
+        let channel = Channel {
+            name: "One News".into(),
+            group: String::new(),
+            url: String::new(),
+            tvg_id: "guide.one".into(),
+            tvg_name: String::new(),
+            tvg_logo: String::new(),
+            unknown_attributes: Default::default(),
+        };
+        let worker = EpgReadWorker::new();
+        worker.submit(EpgReadJob {
+            request_id: 1,
+            guide_generation: 0,
+            store_path: path.clone(),
+            kind: EpgReadKind::NowNext {
+                channel: channel.clone(),
+                at: 150,
+            },
+        });
+        worker.submit(EpgReadJob {
+            request_id: 2,
+            guide_generation: 0,
+            store_path: path.clone(),
+            kind: EpgReadKind::Programmes {
+                channel,
+                from: 0,
+                to: 300,
+            },
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut results = Vec::new();
+        while results.len() < 2 && Instant::now() < deadline {
+            if let Some(result) = worker.try_recv() {
+                results.push(result);
+            } else {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        let now_next = results
+            .iter()
+            .find(|result| result.request_id == 1)
+            .unwrap();
+        let EpgReadValue::NowNext(Some(entry)) = now_next.result.as_ref().unwrap() else {
+            panic!("unexpected now/next result: {now_next:?}");
+        };
+        assert_eq!(entry.current.as_ref().unwrap().title, "Evening News");
+        let programmes = results
+            .iter()
+            .find(|result| result.request_id == 2)
+            .unwrap();
+        let EpgReadValue::Programmes(rows) = programmes.result.as_ref().unwrap() else {
+            panic!("unexpected programme result: {programmes:?}");
+        };
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.title.as_str())
+                .collect::<Vec<_>>(),
+            ["Evening News"]
+        );
+        drop(worker);
+        for _ in 0..100 {
+            if std::fs::remove_file(&path).is_ok() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
 
     #[test]
     fn worker_mirrors_the_guide_to_the_store_on_its_own_thread() {
