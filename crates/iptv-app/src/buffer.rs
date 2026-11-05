@@ -34,6 +34,9 @@ pub struct BufferSession {
     seg_lock: Mutex<()>,
     activity: Mutex<(u32, Instant)>,
     closed: AtomicBool,
+    /// The provider URL this session ingests, set at
+    /// `start_ingest` (N13's one-stream provider checks).
+    source_url: Mutex<String>,
     process: Mutex<Option<Child>>,
     /// Configured retention (segment list sizing).
     seconds: i64,
@@ -107,6 +110,7 @@ impl BufferSession {
             seg_lock: Mutex::new(()),
             activity: Mutex::new((0, Instant::now())),
             closed: AtomicBool::new(false),
+            source_url: Mutex::new(String::new()),
             process: Mutex::new(None),
             seconds: settings.seconds,
             max_bytes: settings.max_bytes(),
@@ -234,6 +238,9 @@ impl BufferSession {
             merged.entries.push((k, v));
         }
         merged.extra.extend(modifiers.extra);
+        if let Ok(mut stored) = self.source_url.lock() {
+            stored.clone_from(&clean);
+        }
         let source = resolve_hls_input(&clean, &merged, cap_mbps)?;
         let dest = format!("{}/{}/", self.origin, self.write_token);
         let cmd = ingest_command(&source, &merged, &dest, self.seconds);
@@ -698,6 +705,35 @@ impl BufferRegistry {
     #[must_use]
     pub fn owns_view(&self, url: &str) -> bool {
         self.sessions.values().any(|s| s.owns_view(url))
+    }
+
+    /// Whether any live session ingests from this one-stream
+    /// provider (N13; Python's `has_provider`).
+    #[must_use]
+    pub fn has_provider(&self, provider_key: &str) -> bool {
+        if provider_key.is_empty() {
+            return false;
+        }
+        self.sessions.values().any(|session| {
+            !session.is_closed()
+                && session.source_url.lock().is_ok_and(|url| {
+                    iptv_core::catchup_direct::single_stream_provider_key(&url) == provider_key
+                })
+        })
+    }
+
+    /// Whether a live session ingests this exact source URL
+    /// (N13; Python's `owns_url`).
+    #[must_use]
+    pub fn owns_source(&self, url: &str) -> bool {
+        let (clean, _) = split_stream_modifiers(url);
+        self.sessions.values().any(|session| {
+            !session.is_closed()
+                && session
+                    .source_url
+                    .lock()
+                    .is_ok_and(|stored| *stored == clean)
+        })
     }
 
     /// Release the player's current lease (playback stop or
