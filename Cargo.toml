@@ -12,7 +12,18 @@ license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
 iptv-core = { path = "crates/iptv-core" }
-wxdragon = "0.9.24"
+# default-features = false for exactly one reason: wxdragon's
+# defaults include wx-asserts, which builds wxWidgets with
+# its internal consistency checks live — every failed check
+# becomes a modal "debugging check" dialog for the end user,
+# even in release builds (tree root expand, wxMenu::Delete,
+# EndRepositioningChildren — validation 0095). Release wx
+# builds compile those checks out, as wxPython ships. Every
+# other default is re-enabled in iptv-app's feature list, so
+# the ONLY build change is the assert dialogs. (Cargo only
+# honors default-features at this workspace definition; the
+# member crate's setting is ignored.)
+wxdragon = { version = "0.9.24", default-features = false }
 live-region = "0.3.3"
 serde_json = "1"
 sha2 = "0.11"
