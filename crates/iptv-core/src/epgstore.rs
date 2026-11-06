@@ -913,6 +913,7 @@ fn import_lock_paths(db_path: &Path) -> (PathBuf, PathBuf) {
 /// `None` when it cannot be checked (Python's psutil-missing
 /// fallback, which falls back to the lock's age alone).
 #[cfg(windows)]
+#[allow(unsafe_code)] // audited exception: see Cargo.toml lints note
 fn pid_exists(pid: u32) -> Option<bool> {
     // PROCESS_QUERY_LIMITED_INFORMATION: enough to learn the
     // process is alive without any access to it.
@@ -920,6 +921,9 @@ fn pid_exists(pid: u32) -> Option<bool> {
         fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut std::ffi::c_void;
         fn CloseHandle(handle: *mut std::ffi::c_void) -> i32;
     }
+    // SAFETY: OpenProcess either returns a live handle for the
+    // pid or null; the handle is closed exactly once below and
+    // nothing else is done with it.
     let handle = unsafe { OpenProcess(0x1000, 0, pid) };
     if handle.is_null() {
         return Some(false);
@@ -930,13 +934,28 @@ fn pid_exists(pid: u32) -> Option<bool> {
     Some(true)
 }
 
-#[cfg(target_os = "linux")]
-#[allow(clippy::unnecessary_wraps)] // shared signature: other platforms may not know
+#[cfg(unix)]
+#[allow(unsafe_code)] // audited exception: see Cargo.toml lints note
 fn pid_exists(pid: u32) -> Option<bool> {
-    Some(std::path::Path::new(&format!("/proc/{pid}")).exists())
+    // kill(pid, 0) sends no signal; it only probes whether the
+    // process exists and may be signalled — the check psutil's
+    // pid_exists makes on unix.
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return None;
+    };
+    // SAFETY: signal 0 performs error checking only; no signal
+    // is delivered and no memory is involved.
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return Some(true);
+    }
+    match std::io::Error::last_os_error().raw_os_error() {
+        Some(code) if code == libc::ESRCH => Some(false),
+        Some(code) if code == libc::EPERM => Some(true),
+        _ => None,
+    }
 }
 
-#[cfg(not(any(windows, target_os = "linux")))]
+#[cfg(not(any(windows, unix)))]
 fn pid_exists(_pid: u32) -> Option<bool> {
     None
 }

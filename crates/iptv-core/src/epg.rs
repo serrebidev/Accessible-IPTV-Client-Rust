@@ -1793,6 +1793,7 @@ impl EpgWorker {
 /// THREAD_PRIORITY_LOWEST as the fallback. A harmless no-op
 /// everywhere else or if the call fails.
 #[cfg(windows)]
+#[allow(unsafe_code)] // audited exception: see Cargo.toml lints note
 fn lower_current_thread_priority() {
     const THREAD_MODE_BACKGROUND_BEGIN: i32 = 0x0001_0000;
     const THREAD_PRIORITY_LOWEST: i32 = -2;
@@ -1802,6 +1803,8 @@ fn lower_current_thread_priority() {
     }
     // GetCurrentThread's pseudo-handle is exactly what
     // THREAD_MODE_BACKGROUND_BEGIN is valid on.
+    // SAFETY: the pseudo-handle needs no closing and the call
+    // only adjusts the calling thread's own priority.
     unsafe {
         if SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN) == 0 {
             let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
