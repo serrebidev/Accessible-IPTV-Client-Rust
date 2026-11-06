@@ -18,15 +18,22 @@ getrandom.workspace = true
 rust_cast.workspace = true
 mdns-sd.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
 [package]
 name = "iptv-core"
-version = "0.4.15"
+version = "0.4.16"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
 [lints.rust]
-unsafe_code = "forbid"
+# Deny, not forbid: the audited platform FFI exceptions
+# (epgstore's pid probe, epg's thread priority) carry
+# per-function #[allow(unsafe_code)] with SAFETY notes;
+# everything else in this crate stays unsafe-free.
+unsafe_code = "deny"
 
 [lints.clippy]
 all = "deny"
