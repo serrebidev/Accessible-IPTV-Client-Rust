@@ -1786,11 +1786,11 @@ impl EpgWorker {
 /// `_lower_current_thread_priority`, `main.py:746`), so a long
 /// guide import competes less aggressively with the UI thread
 /// and the screen reader, without touching the whole process's
-/// priority class. Windows uses THREAD_MODE_BACKGROUND_BEGIN —
+/// priority class. Windows uses `THREAD_MODE_BACKGROUND_BEGIN` —
 /// it lowers CPU, disk-I/O and memory priority together, which
 /// is what keeps the interface responsive while a
 /// multi-gigabyte import churns the page cache — with
-/// THREAD_PRIORITY_LOWEST as the fallback. A harmless no-op
+/// `THREAD_PRIORITY_LOWEST` as the fallback. A harmless no-op
 /// everywhere else or if the call fails.
 #[cfg(windows)]
 #[allow(unsafe_code)] // audited exception: see Cargo.toml lints note
