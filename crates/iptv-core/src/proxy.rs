@@ -64,6 +64,7 @@ pub fn firewall_rule_name(port: u16) -> String {
 /// every failure is ignored. Returns the rule name to remove
 /// on shutdown.
 #[cfg(windows)]
+#[allow(clippy::unnecessary_wraps)] // shared signature: non-Windows returns None
 fn ensure_firewall_rule(port: u16) -> Option<String> {
     use std::os::windows::process::CommandExt as _;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;

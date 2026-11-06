@@ -914,6 +914,7 @@ fn import_lock_paths(db_path: &Path) -> (PathBuf, PathBuf) {
 /// fallback, which falls back to the lock's age alone).
 #[cfg(windows)]
 #[allow(unsafe_code)] // audited exception: see Cargo.toml lints note
+#[allow(clippy::unnecessary_wraps)] // shared signature: other platforms may not know
 fn pid_exists(pid: u32) -> Option<bool> {
     // PROCESS_QUERY_LIMITED_INFORMATION: enough to learn the
     // process is alive without any access to it.
@@ -1512,7 +1513,12 @@ mod tests {
         // plus a dead pid reclaims at once).
         std::fs::write(&lock_path, b"locked").unwrap();
         std::fs::write(&pid_path, "999999").unwrap();
-        let file = std::fs::File::open(&lock_path).unwrap();
+        // Write access: Windows refuses SetFileTime on a
+        // read-only handle.
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
         file.set_modified(SystemTime::now() - Duration::from_secs(10))
             .unwrap();
         drop(file);
