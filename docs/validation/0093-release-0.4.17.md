@@ -1,7 +1,22 @@
-# 0093 — Release v0.4.16 (v0.4.15 recovery)
+# 0093 — Release v0.4.17 (v0.4.15 recovery)
 
-Date: 2026-11-05. Branch `agent/fix-release-0.4.16` from main
-a28e9c0 (the v0.4.15 release merge).
+Date: 2026-11-05. Fix branch `agent/fix-release-0.4.16` from main
+a28e9c0 (the v0.4.15 release merge), merged as PR #204; version
+bump branch `agent/release-0.4.17`.
+
+## Tag incident (why .17, not .16)
+
+The fixes were merged under version 0.4.16 (PR #204, main
+7453997), but the v0.4.16 tag was then placed from a stale local
+clone onto a28e9c0 — the v0.4.15 commit — because the clone's
+`origin/main` had not been re-fetched after the API merge. The
+Release run it triggered (42146701072) was cancelled within a
+minute, before any build finished; nothing published. Per the
+no-re-tag rule the misplaced tag stays as a tombstone alongside
+v0.4.15's, and the release ships as v0.4.17. Lesson recorded:
+always `git fetch` and read the merge SHA from the API before
+tagging — the local clone does not learn about API merges on
+its own.
 
 ## What happened
 

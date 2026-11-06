@@ -23,7 +23,7 @@ libc.workspace = true
 
 [package]
 name = "iptv-core"
-version = "0.4.16"
+version = "0.4.17"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
