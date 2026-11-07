@@ -211,10 +211,41 @@ jobs:
           EOF
           cat dist/update-manifest.json
 
+      # The release body is the tag's section of CHANGELOG.md
+      # (BlindRadio's rule, adopted at Brandon's direct OK
+      # 2026-11-07). A missing section fails the publish
+      # instead of shipping an empty release page.
+      - name: Extract release notes from CHANGELOG.md
+        shell: bash
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          python3 - "$TAG" <<'PY'
+          import sys
+          version = sys.argv[1].lstrip("v")
+          head = f"## {version}"
+          notes, inside = [], False
+          for line in open("CHANGELOG.md").read().splitlines():
+              if line.startswith("## "):
+                  inside = line.strip() == head
+                  if inside:
+                      continue
+                  if notes:
+                      break
+              if inside:
+                  notes.append(line)
+          body = "\n".join(notes).strip()
+          if not body:
+              sys.exit(f"CHANGELOG.md has no section for {version}; refusing to publish empty notes")
+          open("release-notes.md", "w").write(body + "\n")
+          print(body)
+          PY
+
       - name: Publish
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
           name: Accessible IPTV Client ${{ inputs.tag || github.ref_name }}
+          body_path: release-notes.md
           files: dist/*
           fail_on_unmatched_files: true
