@@ -5,6 +5,10 @@ adjacent releases were part of the same fix stream, they are combined with a
 version range such as `0.2.2-0.2.3`. Each release's section below is its
 GitHub release note, taken from this file by the release workflow.
 
+## 0.4.23
+
+- Translations now run on patois, the gettext library that translates Paperback: the catalogues for all 13 languages are compiled into the program itself instead of travelling as a folder of files beside it, and the standard dialogs’ own strings now follow the app’s language too. Same translations, same language menu, same best-fit choice for your system language.
+
 ## 0.4.22
 
 - Release notes are now written for people, in this file, and the GitHub release page shows them. Every past release's notes have been filled in the same way, back to the first one. The release process now refuses to publish a version whose changelog section is missing, so an empty release page cannot ship again.

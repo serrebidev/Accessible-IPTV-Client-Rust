@@ -5,6 +5,11 @@
 //! (`gst_player_*`), which lives in `gstreamer-player-1.0`. Until upstream
 //! probes the right pkg-config module, the app links it directly.
 fn main() {
+    // Compile the gettext catalogs in `po/` to the `locale/` tree
+    // `patois::embed_domain!` reads at compile time. Without the
+    // gettext tools on PATH the build still succeeds, with a Cargo
+    // warning and no translations (patois-build's contract).
+    patois_build::compile_translations("po", "locale");
     // The updater's minisign public key: line 2 of the committed
     // public key file (the secret half lives only in the release
     // pipeline's MINISIGN_KEY secret and the owner's vault).

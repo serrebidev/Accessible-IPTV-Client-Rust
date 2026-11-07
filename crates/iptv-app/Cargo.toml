@@ -1,11 +1,16 @@
 [package]
 name = "iptv-app"
-version = "0.4.22"
+version = "0.4.23"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+# patois collects this crate's marked strings into its catalog.
+[package.metadata.patois]
+translatable = true
+
 [dependencies]
+patois = { version = "0.3", features = ["wx"] }
 chrono.workspace = true
 serde_json.workspace = true
 iptv-core.workspace = true
@@ -28,6 +33,12 @@ wxdragon = { workspace = true, features = [
 live-region.workspace = true
 sha2.workspace = true
 ureq.workspace = true
+
+[build-dependencies]
+patois-build = "0.1"
+
+[dev-dependencies]
+patois-build = "0.1"
 
 [lints.rust]
 unsafe_code = "forbid"
