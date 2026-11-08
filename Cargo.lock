@@ -996,13 +996,15 @@ checksum = "791930b43c0d5973160d90a8f3894509f2b273430f5c5c73b668636d0287c5c0"
 
 [[package]]
 name = "iptv-app"
-version = "0.4.22"
+version = "0.4.23"
 dependencies = [
  "chrono",
  "iptv-core",
  "iptv-sapi",
  "iptv-vlc",
  "live-region",
+ "patois 0.3.0",
+ "patois-build",
  "serde_json",
  "sha2 0.11.1",
  "ship-shape",
@@ -1012,7 +1014,7 @@ dependencies = [
 
 [[package]]
 name = "iptv-core"
-version = "0.4.22"
+version = "0.4.23"
 dependencies = [
  "aes",
  "base64",
@@ -1026,6 +1028,7 @@ dependencies = [
  "hmac 0.13.0",
  "libc",
  "mdns-sd",
+ "patois 0.3.0",
  "pbkdf2 0.13.0",
  "quick-xml",
  "rusqlite",
@@ -1037,21 +1040,21 @@ dependencies = [
 
 [[package]]
 name = "iptv-sapi"
-version = "0.4.22"
+version = "0.4.23"
 dependencies = [
  "iptv-core",
 ]
 
 [[package]]
 name = "iptv-signer"
-version = "0.4.22"
+version = "0.4.23"
 dependencies = [
  "minisign",
 ]
 
 [[package]]
 name = "iptv-vlc"
-version = "0.4.22"
+version = "0.4.23"
 dependencies = [
  "iptv-core",
  "libloading 0.9.0",
@@ -1368,8 +1371,30 @@ checksum = "a04888353dc28fa9dc61f52c0f937b00c8c132c1df9c55001faa30f7ed56a779"
 dependencies = [
  "inventory",
  "miniz_oxide",
- "patois-macros",
+ "patois-macros 0.2.1",
  "sys-locale",
+]
+
+[[package]]
+name = "patois"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1a7b55abfc2fe4d2670c25cd9b6dc5186949c0d042c4e25c21f7e6666e452df2"
+dependencies = [
+ "inventory",
+ "miniz_oxide",
+ "patois-macros 0.3.0",
+ "sys-locale",
+ "wxdragon",
+]
+
+[[package]]
+name = "patois-build"
+version = "0.1.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ef4cd306ecd26c771cd5b83cc459ee1e29f916b1359fa0e26693030253e7ea91"
+dependencies = [
+ "serde_json",
 ]
 
 [[package]]
@@ -1382,6 +1407,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.9",
+]
+
+[[package]]
+name = "patois-macros"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "03fa50d507131487ed3864428a0b5f5b8724443c9b32a8502e6e4bbb49249b07"
+dependencies = [
+ "miniz_oxide",
+ "proc-macro2",
+ "quote",
 ]
 
 [[package]]
@@ -1925,7 +1961,7 @@ checksum = "6ce8fbe060ee50d27fa6ecbe67a266e79a547257c5452ac87dbb6382d5d98e51"
 dependencies = [
  "homeport",
  "minisign-verify",
- "patois",
+ "patois 0.2.4",
  "pulldown-cmark",
  "serde",
  "tempfile",
@@ -2680,7 +2716,7 @@ version = "0.4.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4ee31824ac70e91cf5de61fc01e82b850a8521158177c393204d877eb52349a7"
 dependencies = [
- "patois",
+ "patois 0.2.4",
  "wxdragon",
 ]
 

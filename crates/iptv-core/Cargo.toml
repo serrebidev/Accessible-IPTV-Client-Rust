@@ -15,6 +15,7 @@ hmac.workspace = true
 pbkdf2.workspace = true
 base64.workspace = true
 getrandom.workspace = true
+patois = "0.3"
 rust_cast.workspace = true
 mdns-sd.workspace = true
 
@@ -23,10 +24,14 @@ libc.workspace = true
 
 [package]
 name = "iptv-core"
-version = "0.4.22"
+version = "0.4.23"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+
+# patois collects this crate's marked strings into the app's catalog.
+[package.metadata.patois]
+translatable = true
 
 [lints.rust]
 # Deny, not forbid: the audited platform FFI exceptions

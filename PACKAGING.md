@@ -34,13 +34,14 @@ data files at runtime:
   same one-file-per-language layout the guide loader probes.
   Executable-relative discovery also has a gap when the working
   directory differs (audit S08);
-- `locale/<lang>/LC_MESSAGES/iptvclient.mo` and
-  `release_notes.mo` — the Python client's compiled catalogues,
-  bundled at the repo root and copied beside the executable by
-  release staging for all 14 languages (validation 0091). The
-  translations are synced to the English revision recorded in
-  the Python tree; untranslated strings fall back to English at
-  runtime, as they do in Python. See the
+- Translations are embedded in the binary (patois, since
+  v0.4.23): the catalogues in `crates/iptv-app/po/<lang>.po` —
+  the Python client's `iptvclient` and `release_notes` domains
+  merged per language by `tools/merge_catalogues.py` — are
+  compiled by the build script and embedded, so no locale
+  folder ships beside the executable. Untranslated strings
+  fall back to English at runtime, as they do in Python. See
+  the
   [feature parity audit](docs/feature-parity-audit.md#previously-documented-limits-still-relevant);
 - `update-manifest.json` — the updater manifest asset, uploaded as
   a separate release asset next to the archive, with fields:
