@@ -60,7 +60,28 @@ jobs:
       # gettext the build succeeds but ships no translations.
       - name: Install gettext (Windows)
         if: runner.os == 'Windows'
-        run: choco install gettext -y --no-progress
+        shell: pwsh
+        run: |
+          choco install gettext -y --no-progress
+          # The choco package does not put msgfmt on PATH for
+          # later steps; without it patois-build only warns and
+          # the build silently ships no translations. Find the
+          # binary, publish its folder, and prove it runs.
+          $candidates = @(
+            "C:\Program Files\gettext-iconv\bin",
+            "C:\Program Files (x86)\gettext-iconv\bin",
+            "C:\Program Files\gettext-utils\bin",
+            "C:\tools\gettext\bin"
+          )
+          $bin = $candidates | Where-Object { Test-Path "$_\msgfmt.exe" } | Select-Object -First 1
+          if (-not $bin) {
+            $found = Get-ChildItem "C:\Program Files", "C:\Program Files (x86)", "C:\ProgramData\chocolatey" -Filter msgfmt.exe -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($found) { $bin = $found.DirectoryName }
+          }
+          if (-not $bin) { throw "msgfmt.exe not found after choco install gettext" }
+          Add-Content -Path $env:GITHUB_PATH -Value $bin
+          $env:Path = "$bin;$env:Path"
+          msgfmt --version | Select-Object -First 1
 
       - name: Install gettext (macOS)
         if: runner.os == 'macOS'
