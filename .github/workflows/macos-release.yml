@@ -1,0 +1,82 @@
+# Generated from release.yml (build job): the macOS leg only, for the Forgejo Mac runner.
+# Dispatch with release_tag to attach the macOS build to an existing release.
+name: macOS release
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing release tag to build macOS for and attach to
+        required: true
+        type: string
+permissions:
+  contents: write
+jobs:
+  macos:
+    runs-on: macos-latest
+    timeout-minutes: 90
+    env:
+      TAG: ${{ inputs.release_tag }}
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        ref: ${{ inputs.release_tag }}
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        components: rustfmt, clippy
+    - name: Install gettext (macOS)
+      run: |
+        brew install gettext
+        echo "/opt/homebrew/opt/gettext/bin" >> "$GITHUB_PATH"
+    - name: Gates
+      run: |
+        cargo fmt --all --check
+        cargo clippy --workspace --all-targets -- -D warnings
+        cargo test --workspace
+    - name: Build
+      run: cargo build --release -p iptv-app
+    - name: Bundle libVLC (macOS)
+      run: |
+        # Newest 3.x only: the engine binds the libVLC 3 API (validation 0071).
+        ver="$(curl -s https://download.videolan.org/pub/videolan/vlc/ | sed -n 's/.*href="\(3\.[0-9.]*\)\/".*/\1/p' | sort -V | tail -1)"
+        echo "Bundling libVLC from VLC $ver"
+        mkdir -p vlc-src
+        curl -sL -o vlc-src/vlc.dmg "https://download.videolan.org/pub/videolan/vlc/$ver/macosx/vlc-$ver-arm64.dmg"
+        hdiutil attach vlc-src/vlc.dmg -nobrowse -mountpoint /tmp/vlcapp
+        mkdir -p bundle/plugins
+        cp -a /tmp/vlcapp/VLC.app/Contents/MacOS/lib/libvlc*.dylib /tmp/vlcapp/VLC.app/Contents/MacOS/lib/libvlccore*.dylib bundle/
+        cp -a /tmp/vlcapp/VLC.app/Contents/MacOS/plugins/. bundle/plugins/
+        hdiutil detach /tmp/vlcapp
+    - name: Package (macOS)
+      run: |
+        tag="${{ inputs.release_tag }}"
+        stage="accessible-iptv-client-${tag}-macos-arm64"
+        mkdir -p "$stage/docs"
+        cp "target/release/iptv-app" "$stage/"
+        cp -R docs/help "$stage/docs/help"
+        cp -a bundle/. "$stage/"
+        hdiutil create -volname "Accessible IPTV Client" -srcfolder "$stage" -ov -format UDZO accessible-iptv-client.dmg
+    - name: Sign the disk image (minisign)
+      env:
+        MINISIGN_KEY: ${{ secrets.MINISIGN_KEY }}
+        MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
+      run: |
+        cargo build --release -p iptv-signer
+        ./target/release/iptv-signer accessible-iptv-client.dmg
+        test -f accessible-iptv-client.dmg.minisig
+    - name: Attach to the Forgejo release
+      env:
+        FORGEJO_TOKEN: ${{ secrets.FORGEJO_TOKEN }}
+      run: |
+        set -euo pipefail
+        api="$GITHUB_SERVER_URL/api/v1/repos/$GITHUB_REPOSITORY"
+        h="Authorization: token $FORGEJO_TOKEN"
+        release="$(curl -sf -H "$h" "$api/releases/tags/$TAG")"
+        id="$(echo "$release" | jq -r .id)"
+        for file in accessible-iptv-client.dmg accessible-iptv-client.dmg.minisig; do
+          name="$(basename "$file")"
+          old="$(echo "$release" | jq -r --arg n "$name" '.assets[] | select(.name == $n) | .id')"
+          [ -z "$old" ] || curl -sf -X DELETE -H "$h" "$api/releases/$id/assets/$old"
+          curl -sf -o /dev/null -H "$h" -F "attachment=@$file" "$api/releases/$id/assets?name=$name"
+          echo "Attached $name to $TAG"
+        done
