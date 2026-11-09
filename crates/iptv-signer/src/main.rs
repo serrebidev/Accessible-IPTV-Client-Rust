@@ -1,8 +1,8 @@
 //! Sign release assets: `iptv-signer <file>...` writes
 //! `<file>.minisig` beside each file, using the minisign secret
 //! key from the MINISIGN_KEY environment variable. The key is
-//! the same one BlindRadio uses; it lives in the repo's Actions
-//! secrets and the owner's vault, never in git. Mirrors
+//! the product's own (key ID 32F554A2744755F4); it lives in
+//! the release pipeline and the owner's vault, never in git. Mirrors
 //! BlindRadio's xtask sign_file.
 
 use std::path::Path;

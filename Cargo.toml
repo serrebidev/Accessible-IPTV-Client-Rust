@@ -45,3 +45,7 @@ getrandom = "0.4"
 rust_cast = { package = "chromecast", version = "0.18" }
 mdns-sd = "0.21"
 libc = "0.2"
+
+[patch.crates-io]
+# ship-shape fork: configurable API base URL for Forgejo-hosted releases (upstream: trypsynth/ship-shape).
+ship-shape = { git = "https://git.serrebiradio.com/serrebi/ship-shape", rev = "cff6bdb5596676723b3a0890b1b030c8edac0d28" }

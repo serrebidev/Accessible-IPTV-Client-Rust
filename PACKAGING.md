@@ -53,7 +53,7 @@ data files at runtime:
 
 Since v0.4.0, updates run on ship-shape (the same signed
 updater as BlindRadio). Help → Check for Updates — and the
-optional launch check in Options — ask GitHub for the latest
+optional launch check in Options — ask Forgejo for the latest
 release; when its version is newer, ship-shape requires the
 platform asset below AND its `.minisig` sibling, downloads
 both, and verifies the minisign signature against the public

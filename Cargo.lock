@@ -996,7 +996,7 @@ checksum = "791930b43c0d5973160d90a8f3894509f2b273430f5c5c73b668636d0287c5c0"
 
 [[package]]
 name = "iptv-app"
-version = "0.4.24"
+version = "0.4.25"
 dependencies = [
  "chrono",
  "iptv-core",
@@ -1014,7 +1014,7 @@ dependencies = [
 
 [[package]]
 name = "iptv-core"
-version = "0.4.24"
+version = "0.4.25"
 dependencies = [
  "aes",
  "base64",
@@ -1040,21 +1040,21 @@ dependencies = [
 
 [[package]]
 name = "iptv-sapi"
-version = "0.4.24"
+version = "0.4.25"
 dependencies = [
  "iptv-core",
 ]
 
 [[package]]
 name = "iptv-signer"
-version = "0.4.24"
+version = "0.4.25"
 dependencies = [
  "minisign",
 ]
 
 [[package]]
 name = "iptv-vlc"
-version = "0.4.24"
+version = "0.4.25"
 dependencies = [
  "iptv-core",
  "libloading 0.9.0",
@@ -1956,8 +1956,7 @@ dependencies = [
 [[package]]
 name = "ship-shape"
 version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6ce8fbe060ee50d27fa6ecbe67a266e79a547257c5452ac87dbb6382d5d98e51"
+source = "git+https://git.serrebiradio.com/serrebi/ship-shape?rev=cff6bdb5596676723b3a0890b1b030c8edac0d28#cff6bdb5596676723b3a0890b1b030c8edac0d28"
 dependencies = [
  "homeport",
  "minisign-verify",

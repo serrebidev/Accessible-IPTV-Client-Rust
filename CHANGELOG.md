@@ -3,7 +3,11 @@
 Readable release history for Accessible IPTV Client, newest first. When
 adjacent releases were part of the same fix stream, they are combined with a
 version range such as `0.2.2-0.2.3`. Each release's section below is its
-GitHub release note, taken from this file by the release workflow.
+Forgejo release note, taken from this file by the release workflow.
+
+## 0.4.25
+
+- Updates now come from the project's Forgejo home instead of GitHub: Check for Updates, and the optional launch check in Options, ask the Forgejo release page for the newest version, and releases are published there from now on. The previous version still checked GitHub, so this one must be installed by hand; afterwards updates resume automatically from Forgejo. This release carries the Windows package.
 
 ## 0.4.24
 
