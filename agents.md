@@ -5,7 +5,7 @@ Read this first. All of it. Then work.
 ## What this is
 
 Rust port of Accessible-IPTV-Client.
-Python repo is the spec: https://github.com/serrebidev/Accessible-IPTV-Client
+Python repo is the spec: https://git.serrebiradio.com/serrebi/Accessible-IPTV-Client
 Python behavior wins every argument. If Rust differs, Rust is wrong.
 Python stays the shipping product until Brandon says swap. No swap without his word. No deleting Python features. Port them, all of them.
 
@@ -130,7 +130,7 @@ When unsure: read the Python code. It already answered.
 
 ### Issue tracker
 
-Issues and specs for this repository live in GitHub Issues. Use the `gh` CLI. See `docs/agents/issue-tracker.md`.
+Issues and specs for this repository live in Forgejo issues (git.serrebiradio.com). Use the `tea` CLI. See `docs/agents/issue-tracker.md`.
 
 ### Triage labels
 

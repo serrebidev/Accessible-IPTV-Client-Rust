@@ -1,2 +1,7 @@
 /target/
 /crates/iptv-app/locale/
+
+# Local release build leftovers
+/bundle/
+/accessible-iptv-client.*
+/SHA256SUMS
