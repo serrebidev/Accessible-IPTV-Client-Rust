@@ -29,8 +29,10 @@ jobs:
             os: windows-latest
             asset_suffix: windows-x64
             binary: iptv-app.exe
+          # Linux builds in WSL on the build PC (owner rule
+          # 2026-11-09), as BlindRadio's release does.
           - name: linux
-            os: ubuntu-latest
+            os: wsl-linux
             asset_suffix: linux-x64
             binary: iptv-app
           - name: macos
@@ -49,7 +51,8 @@ jobs:
           sudo apt-get install -y libgtk-3-dev libgstreamer1.0-dev \
             libgstreamer-plugins-base1.0-dev libgstreamer-plugins-bad1.0-dev \
             libwebkit2gtk-4.1-dev libsecret-1-dev libnotify-dev libsdl2-dev \
-            libjpeg-dev libtiff-dev clang libclang-dev pkg-config gettext
+            libjpeg-dev libtiff-dev clang libclang-dev pkg-config gettext \
+            cmake
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -96,7 +99,11 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          choco install gettext -y --no-progress
+          # The Forgejo Windows runner has gettext preinstalled and no
+          # admin rights for choco; install only where it is missing.
+          if (-not (Test-Path "C:\Program Files\gettext-iconv\bin\msgfmt.exe")) {
+            choco install gettext -y --no-progress
+          }
           # The choco package does not put msgfmt on PATH for
           # later steps; without it patois-build only warns and
           # the build silently ships no translations. Find the
@@ -214,7 +221,7 @@ jobs:
           hdiutil create -volname "Accessible IPTV Client" -srcfolder "$stage" -ov -format UDZO accessible-iptv-client.dmg
 
       - name: Upload package
-        uses: actions/upload-artifact@v4
+        uses: https://code.forgejo.org/forgejo/upload-artifact@v4
         with:
           name: package-${{ matrix.asset_suffix }}
           path: |
@@ -246,7 +253,7 @@ jobs:
           ref: ${{ inputs.tag || github.ref }}
 
       - name: Collect packages
-        uses: actions/download-artifact@v4
+        uses: https://code.forgejo.org/forgejo/download-artifact@v4
         with:
           pattern: package-*
           path: dist
@@ -263,6 +270,7 @@ jobs:
       - name: Sign release assets
         env:
           MINISIGN_KEY: ${{ secrets.MINISIGN_KEY }}
+          MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
         run: |
           cargo build --release -p iptv-signer
           ./target/release/iptv-signer dist/accessible-iptv-client.zip dist/accessible-iptv-client.tar.gz dist/accessible-iptv-client.dmg
@@ -281,7 +289,7 @@ jobs:
           {
             "version": "$version",
             "asset_filename": "$asset",
-            "download_url": "https://github.com/${{ github.repository }}/releases/download/${tag}/${asset}",
+            "download_url": "${{ github.server_url }}/${{ github.repository }}/releases/download/${tag}/${asset}",
             "sha256": "$sha",
             "published_date": "$published"
           }
@@ -318,11 +326,29 @@ jobs:
           print(body)
           PY
 
+      # Forgejo release API (the GitHub release action does not work
+      # here). Draft first, so the release never shows without its
+      # files; publish only once every asset is attached.
       - name: Publish
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ inputs.tag || github.ref_name }}
-          name: Accessible IPTV Client ${{ inputs.tag || github.ref_name }}
-          body_path: release-notes.md
-          files: dist/*
-          fail_on_unmatched_files: true
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+          FORGEJO_TOKEN: ${{ secrets.FORGEJO_TOKEN }}
+        run: |
+          set -euo pipefail
+          api="$GITHUB_SERVER_URL/api/v1/repos/$GITHUB_REPOSITORY"
+          h="Authorization: token $FORGEJO_TOKEN"
+          id="$(jq -n --arg tag "$TAG" --arg name "Accessible IPTV Client $TAG" --rawfile body release-notes.md \
+            '{tag_name: $tag, name: $name, body: $body, draft: true}' |
+            curl -sf -H "$h" -H 'Content-Type: application/json' -d @- "$api/releases" | jq -r .id)"
+          for file in dist/*; do
+            name="$(basename "$file")"
+            curl -sf -o /dev/null -H "$h" -F "attachment=@$file" "$api/releases/$id/assets?name=$name"
+            echo "Attached $name"
+          done
+          present="$(curl -sf -H "$h" "$api/releases/$id" | jq -r '.assets[].name')"
+          for file in dist/*; do
+            grep -qx "$(basename "$file")" <<<"$present" || { echo "missing: $file"; exit 1; }
+          done
+          curl -sf -o /dev/null -X PATCH -H "$h" -H 'Content-Type: application/json' \
+            -d '{"draft": false, "prerelease": false}' "$api/releases/$id"
+          test "$(curl -sf "$api/releases/latest" | jq -r .tag_name)" = "$TAG"
