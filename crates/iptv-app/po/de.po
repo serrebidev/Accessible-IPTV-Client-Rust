@@ -1297,8 +1297,8 @@ msgid "Find Next"
 msgstr "Weitersuchen"
 
 #: dialogs_misc.py:66
-msgid "Follow Serrebi on GitHub"
-msgstr "Serrebi auf GitHub folgen"
+msgid "Follow Serrebi on Forgejo"
+msgstr "Serrebi auf Forgejo folgen"
 
 #: main.py:9002
 msgid "Format"
@@ -1970,8 +1970,8 @@ msgid "Open Recordings Folder"
 msgstr "Aufnahmeordner öffnen"
 
 #: dialogs_misc.py:65
-msgid "Open the Accessible IPTV Client project on GitHub"
-msgstr "Das Projekt Accessible IPTV Client auf GitHub öffnen"
+msgid "Open the Accessible IPTV Client project on Forgejo"
+msgstr "Das Projekt Accessible IPTV Client auf Forgejo öffnen"
 
 #: main.py:8937
 msgid ""

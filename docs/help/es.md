@@ -439,6 +439,6 @@ Listas de fuentes en el Administrador de listas de reproducción y el Administra
 Preguntas, informes de errores y noticias de versiones:
 
 - El grupo de Telegram SerrebiProjects: https://t.me/SerrebiProjects
-- Informes de errores y sugerencias en GitHub: https://github.com/serrebidev/Accessible-IPTV-Client/issues
+- Informes de errores y sugerencias en Forgejo: https://git.serrebiradio.com/serrebi/Accessible-IPTV-Client/issues
 
 Ayuda > Acerca de… muestra la versión en uso y enlaza ambos. Al reportar un problema, Ayuda > Copiar registro e información de depuración da los detalles necesarios para rastrearlo.

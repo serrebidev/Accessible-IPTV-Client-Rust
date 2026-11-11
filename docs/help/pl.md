@@ -439,6 +439,6 @@ Listy źródeł w Menedżerze playlist i Menedżerze EPG:
 Pytania, zgłoszenia błędów i nowości o wydaniach:
 
 - Grupa Telegram SerrebiProjects: https://t.me/SerrebiProjects
-- Zgłoszenia błędów i sugestie na GitHubie: https://github.com/serrebidev/Accessible-IPTV-Client/issues
+- Zgłoszenia błędów i sugestie na Forgejo: https://git.serrebiradio.com/serrebi/Accessible-IPTV-Client/issues
 
 Pomoc > O programie... pokazuje używaną wersję i linkuje obie. Przy zgłaszaniu problemu Pomoc > Kopiuj dziennik i informacje diagnostyczne daje szczegóły potrzebne do namierzenia go.

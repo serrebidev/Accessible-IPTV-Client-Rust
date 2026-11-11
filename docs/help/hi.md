@@ -438,6 +438,6 @@ Windows पर प्रोग्राम खुद को अपडेट क�
 प्रश्न, बग रिपोर्ट और रिलीज़ समाचार:
 
 - SerrebiProjects टेलीग्राम समूह: https://t.me/SerrebiProjects
-- GitHub पर बग रिपोर्ट और सुझाव: https://github.com/serrebidev/Accessible-IPTV-Client/issues
+- Forgejo पर बग रिपोर्ट और सुझाव: https://git.serrebiradio.com/serrebi/Accessible-IPTV-Client/issues
 
 सहायता > के बारे में... उपयोग में संस्करण दिखाता है और दोनों को लिंक करता है। समस्या रिपोर्ट करते समय सहायता > लॉग और डिबग जानकारी कॉपी करें उसे ट्रैक करने के लिए आवश्यक विवरण देता है।

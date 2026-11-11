@@ -438,6 +438,6 @@ Oynatma listesi yöneticisi ve EPG Yöneticisi'ndeki kaynak listeleri:
 Sorular, hata raporları ve sürüm haberleri:
 
 - SerrebiProjects Telegram grubu: https://t.me/SerrebiProjects
-- GitHub'da hata raporları ve öneriler: https://github.com/serrebidev/Accessible-IPTV-Client/issues
+- Forgejo'da hata raporları ve öneriler: https://git.serrebiradio.com/serrebi/Accessible-IPTV-Client/issues
 
 Yardım > Hakkında..., kullandığınız sürümü gösterir ve ikisine de bağlantı verir. Sorun bildirirken Yardım > Günlüğü ve hata ayıklama bilgilerini kopyala, izlenmesi için gereken ayrıntıları verir.

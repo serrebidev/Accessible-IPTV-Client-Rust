@@ -438,6 +438,6 @@ F1 حساس للسياق. عند الضغط على عنصر قائمة، أو ف
 الأسئلة وتقارير الأخطاء وأخبار الإصدارات:
 
 - مجموعة SerrebiProjects على تيليغرام: https://t.me/SerrebiProjects
-- تقارير الأخطاء والاقتراحات على GitHub: https://github.com/serrebidev/Accessible-IPTV-Client/issues
+- تقارير الأخطاء والاقتراحات على Forgejo: https://git.serrebiradio.com/serrebi/Accessible-IPTV-Client/issues
 
 يعرض مساعدة > حول... الإصدار الذي تستخدمه ويربط بين الاثنين. وعند الإبلاغ عن مشكلة، تعطيك مساعدة > نسخ السجل ومعلومات التصحيح التفاصيل اللازمة لتتبعها.

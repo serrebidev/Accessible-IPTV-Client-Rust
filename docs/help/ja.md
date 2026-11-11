@@ -438,6 +438,6 @@ Linux では、代わりに新しいパッケージを古いものの上にイ�
 質問、バグ報告、リリースのニュース:
 
 - SerrebiProjects の Telegram グループ：https://t.me/SerrebiProjects
-- GitHub でのバグ報告と提案：https://github.com/serrebidev/Accessible-IPTV-Client/issues
+- Forgejo でのバグ報告と提案：https://git.serrebiradio.com/serrebi/Accessible-IPTV-Client/issues
 
 ヘルプ > バージョン情報...は、使っているバージョンを示し、両方にリンクします。問題を報告するときは、ヘルプ > ログとデバッグ情報をコピーが追跡に必要な詳細をくれます。

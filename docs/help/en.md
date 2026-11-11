@@ -460,6 +460,6 @@ Lists of sources in the Playlist Manager and EPG Manager:
 Questions, bug reports and release news:
 
 - The SerrebiProjects Telegram group: https://t.me/SerrebiProjects
-- Bug reports and suggestions on GitHub: https://github.com/serrebidev/Accessible-IPTV-Client/issues
+- Bug reports and suggestions on Forgejo: https://git.serrebiradio.com/serrebi/Accessible-IPTV-Client/issues
 
 Help > About shows the version you are running and links to both. When you report a problem, Help > Copy Log and Debug Information gives the details needed to track it down.

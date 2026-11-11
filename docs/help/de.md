@@ -439,6 +439,6 @@ Quellenlisten im Wiedergabelisten-Manager und EPG-Manager:
 Fragen, Fehlerberichte und Release-Neuigkeiten:
 
 - Die SerrebiProjects-Telegrammgruppe: https://t.me/SerrebiProjects
-- Fehlerberichte und Vorschläge auf GitHub: https://github.com/serrebidev/Accessible-IPTV-Client/issues
+- Fehlerberichte und Vorschläge auf Forgejo: https://git.serrebiradio.com/serrebi/Accessible-IPTV-Client/issues
 
 Hilfe > Über… zeigt die laufende Version und verlinkt beides. Bei einem Problem liefert Hilfe > Protokoll und Debug-Informationen kopieren die nötigen Einzelheiten.

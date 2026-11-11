@@ -439,6 +439,6 @@ Tab из списка каналов приводит к Описанию эпи
 Вопросы, отчёты об ошибках и новости выпусков:
 
 - Группа Telegram SerrebiProjects: https://t.me/SerrebiProjects
-- Отчёты об ошибках и предложения на GitHub: https://github.com/serrebidev/Accessible-IPTV-Client/issues
+- Отчёты об ошибках и предложения на Forgejo: https://git.serrebiradio.com/serrebi/Accessible-IPTV-Client/issues
 
 Справка > О программе... показывает используемую версию и ссылается на оба. При сообщении о проблеме Справка > Копировать журнал и отладочные сведения даёт подробности, нужные для её отслеживания.

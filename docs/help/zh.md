@@ -437,6 +437,6 @@ Stalker Portal 账户需要门户地址和提供商为你注册的 MAC 地址。
 问题、缺陷报告和版本消息：
 
 - SerrebiProjects Telegram 群组：https://t.me/SerrebiProjects
-- GitHub 上的缺陷报告和建议：https://github.com/serrebidev/Accessible-IPTV-Client/issues
+- Forgejo 上的缺陷报告和建议：https://git.serrebiradio.com/serrebi/Accessible-IPTV-Client/issues
 
 帮助 > 关于... 显示你运行的版本并链接两者。报告问题时，帮助 > 复制日志和调试信息 提供定位所需的详情。

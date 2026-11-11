@@ -508,6 +508,6 @@ A Lejátszási lista kezelése és a Műsorújság kezelése forráslistáiban:
 Kérdésekhez, hibajelentésekhez és a kiadásokkal kapcsolatos hírekhez az alábbi csatornákat használhatja:
 
 - SerrebiProjects Telegram-csoport: https://t.me/SerrebiProjects
-- Hibajelentések és javaslatok a GitHubon: https://github.com/serrebidev/Accessible-IPTV-Client/issues
+- Hibajelentések és javaslatok a Forgejo felületén: https://git.serrebiradio.com/serrebi/Accessible-IPTV-Client/issues
 
 A Súgó > Névjegy… megjeleníti az éppen használt verziót, és hivatkozásokat tartalmaz mind a Telegram-csoporthoz, mind a GitHub-oldalhoz. Hibajelentés készítésekor a Súgó > Napló- és hibakeresési adatok másolása paranccsal a kivizsgáláshoz szükséges technikai adatokat is a vágólapra helyezheti.
