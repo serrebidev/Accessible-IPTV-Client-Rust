@@ -12,6 +12,7 @@ Forgejo release note, taken from this file by the release workflow.
 - Scheduled Recordings gains Edit Times and Recording Conflicts. Overlaps are computed with schedule padding against the per-account recording connection limits; a new recording that would exceed a known account limit asks for confirmation with the overlapping recordings listed, and Recording Conflicts shows each overlap's channel, account and real recording window.
 - Continue Watching gains a Type choice between Video on Demand and Recordings. Recording positions live in their own store, are checked against the recording library by exact file signature, and saves run in the background: a failed save leaves the saved positions untouched and says so.
 - An Xtream account whose server rejects the saved credentials now reports an authentication failure instead of presenting an empty catalogue.
+- Copied text now survives closing the app: every copy (stream URLs, account details, diagnostic information, recording problem times, EPG source URLs) goes through one helper that flushes the clipboard before closing it, the pattern already shipped in BlindRadio and BlindRSS-Rust.
 
 ## 0.4.26
 

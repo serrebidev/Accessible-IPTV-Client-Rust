@@ -96,6 +96,19 @@ App (crates/iptv-app):
   Recording Conflicts) added to docs/help in all 14
   languages from the Python guides.
 
+## Also in this release: clipboard flush fix
+
+Brandon's standing clipboard bug (copied text vanishes when
+the app closes), folded into this release at his direction
+via the main chat. All five programmatic copy sites in the
+app (Recording Problem Times, diagnostic information, stream
+URL, EPG source URL, Account Info details) now go through
+one `copy_to_clipboard` helper — open, set, flush, close —
+the BlindRadio pattern as shipped in BlindRSS-Rust v0.1.110.
+A source-scan test, `clipboard_copies_flush_so_they_survive_exit`,
+guards that no bare `Clipboard::get().set_text` remains and
+that the helper opens and flushes.
+
 ## Deliberate divergences and named gaps
 
 - Conflicts analysis is synchronous: the Rust computation
