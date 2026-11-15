@@ -134,6 +134,10 @@ Xtream Codes-fióknál a program a szolgáltató film- vagy epizódazonosítój�
 
 A régi, kizárólag URL-alapú mentések megmaradnak. Xtream-tartalom ismételt megnyitásakor a pontos korábbi egyezés alapján átkerülhetnek az új azonosításhoz; már megváltozott cím alapján ez nem végezhető el biztonságosan. A korábban forráshoz nem kapcsolt M3U-mentést a program nem rendeli önkényesen valamelyik listához. Régi sorozatepizód esetén szükség lehet annak megnyitására az eredeti sorozatból: az alkalmazás nem tölti le minden sorozat összes epizódját pusztán a mentés megkereséséhez. A tárolt előzmények a címet, az időadatokat és a visszakereséshez szükséges korlátozott azonosítókat tartalmazzák; műsor-URL-címeket és bejelentkezési adatokat nem mentenek. A beállítások titkosított exportjába ezek az adatok is bekerülnek.
 
+A beépített lejátszó Lejátszás > Előző epizód (Ctrl+PageUp) és Következő epizód (Ctrl+PageDown) parancsával kézzel válthat az aktuális sorozat részei között. A billentyűkombinációk módosíthatók. A keresés közben a jelenlegi tartalom lejátszása folytatódik; ha a szomszédos rész nem érhető el vagy nem azonosítható egyértelműen, a program nem vált. Másik tartalom elindítása vagy a lejátszási lista megváltozása érvényteleníti a korábbi keresést.
+
+A Folytatásra váró tartalmak ablak Típus mezőjében az Igény szerinti videó és a Felvételek között választhat. A helyi felvételek pozícióit a program külön tárolja. Ellenőrzésükkor kizárólag a beállított felvételi mappákban keres, a háttérben; a fájlnak az elérési út és a tárolt fájljellemzők alapján is egyeznie kell. Hiányzó vagy lecserélt fájlt nem indít el. A pozíciók törlése és az összes bejegyzés eltávolítása mindig csak a kiválasztott típusra vonatkozik.
+
 ## Lejátszási lista kezelése {#playlist-manager}
 
 A Fájl > Lejátszási lista kezelése (Ctrl+M) ablakban a beállított források jelennek meg. Megnyitásakor a fókusz ezek listájára kerül.
@@ -297,6 +301,8 @@ Az MPV szöveges feliratai az alkalmazás által indított és felügyelt munkam
 
 Az egyes programok támogatottságát a Beállítások > Feliratfelolvasás > A feliratkezelés támogatottsága… ablakban ellenőrizheti. Az „elérhető”, „ez a lejátszó nem támogatja” és „még nincs ellenőrizve” állapotok eltérő jelentésűek; az utóbbi nem tekinthető a működés igazolásának.
 
+A Lejátszás > Felirat időzítése… (Ctrl+Shift+T) ablakban a felirat időzítését ezredmásodpercben, legfeljebb tíz perccel módosíthatja mindkét irányban. A léptetőmező 500 ezredmásodperces lépésekben változtatja az értéket; pozitív értéknél a felirat később jelenik meg, és a beépített lejátszó a fájlból betöltött feliratot is később olvassa fel. Az Időzítés alaphelyzetbe állítása gomb nullát állít be; a Mégse megőrzi a korábbi értéket. Új tartalom indításakor az igazítás alaphelyzetbe kerül. A beállítás a műsor és a képernyőolvasó sebességét nem módosítja.
+
 ### Hangkimeneti eszköz {#audio-output-device}
 
 A Lejátszás > Hangkimeneti eszköz (D) paranccsal kiválaszthatja, melyik hangszórón vagy fejhallgatón szóljon a beépített lejátszó hangja. Így például a műsor és a képernyőolvasó hangját eltérő kimenetre irányíthatja. Az „A rendszer alapértelmezett eszköze” beállítás a Windowsban kijelölt kimenetet követi. A program megjegyzi a választását.
@@ -351,6 +357,14 @@ A Felvételek > Minimális szabad hely… menüpontban 0–65536 MiB közötti �
 
 Az ellenőrzés a kézzel indított és az ütemezett felvételek, valamint a rögzítőmotort használó archív műsorletöltések indításakor is megtörténik. Nem az ütemezés felvételekor mért, esetleg már elavult adatokra támaszkodik. Hiba esetén az ütemezett felvétel sikertelen állapotba kerül; a hely felszabadítása után szükség lehet az ismételt ütemezésre. Más programok és a folyamatban lévő felvételek később is fogyaszthatják a tárhelyet. A vizsgálat ezért nem garantálja a teljes műsor rögzíthetőségét, nem foglal le előre lemezterületet, és a felvétel közben nem tart fenn állandó szabadhely-tartalékot. Elegendő kapacitásról továbbra is a felhasználónak kell gondoskodnia.
 
+A Felvételek > Felvételtár legfeljebb 20 mappa lezárt felvételeit jeleníti meg; ezek közé a mindenkori felvételi mappa is beletartozik. A Mappa hozzáadása… paranccsal egy meglévő mappát vehet fel a listába, az új felvételek mentési helyét azonban ez nem módosítja. A Mappa eltávolítása a felvételtárból parancs a fájlokat érintetlenül hagyja. A mindenkori felvételi mappa nem távolítható el a listából.
+
+Cím, csatorna vagy dátum alapján kereshet. A Lejátszás / Folytatás megnyitja a kijelölt fájlt, és – ha van mentett lejátszási pozíció – felajánlja a folytatást. Az időtartam és a felvétel állapota akkor jelenik meg, ha rendelkezésre áll; régebbi fájloknál az Ismeretlen jelzés szerepelhet. A folyamatban lévő felvételek és a beépített lejátszóban éppen megnyitott fájlok nem kerülnek a listába. A Cím átnevezése… csak a megjelenített címet módosítja: a fájlnév, a folytatási pozíció és a könyvjelzők megmaradnak. A Frissítés újra beolvassa a mappa tartalmát.
+
+Az Áthelyezés a felvételi lomtárba… parancs a fájlt az alkalmazás saját, az adott felvételi mappán belül tárolt lomtárába helyezi; ettől még nem szabadul fel tárhely. Ezeket a fájlokat a Törölt felvételek megjelenítése jelölőnégyzettel teheti láthatóvá. A Felvétel visszaállítása az eredeti mappába helyezi vissza a fájlt, és nem ír felül azonos nevű meglévő állományt. Ebben a nézetben a Felvételfájl törlése megerősítés után végleg törli a kijelölt fájlt. Az Ütemezett felvételek listájából eltávolított bejegyzéshez tartozó médiafájl megmarad.
+
+Az Összes felvételi mappa lehetőség a beállított mappák közös nézetét nyitja meg. Állapot szerint szűrhet, illetve dátum, cím, időtartam vagy fájlméret alapján rendezhet; a Csökkenő sorrend jelölőnégyzet megfordítja a rendezés irányát. A Ctrl+A valamennyi megjelenített sort kijelöli. Az állapotsor a kijelölt felvételek számát és összesített méretét is közli. A lomtárba helyezés, a végleges törlés és a visszaállítás több kijelölt fájlon is végrehajtható; lejátszáshoz és címváltoztatáshoz egyetlen felvételt jelöljön ki. A beolvasás és a szűrés a háttérben fut. Az ablak bezárása a már jóváhagyott fájlműveletet nem szakítja meg.
+
 ### Rögzítési formátumok {#recording-formats}
 
 A Felvételek > Rögzítési formátum menüponttal választhatja ki, milyen formátumban mentse a program a felvételeket:
@@ -379,6 +393,8 @@ Az ütemezett felvételek külön beavatkozás nélkül elindulnak, amennyiben a
 Ha egy új felvétel időtartama részben vagy egészben egybeesik valamely korábban ütemezett rögzítésével, a program a hozzáadása előtt figyelmezteti Önt. A szolgáltató korlátozhatja az egyidejűleg használható adatfolyamok számát.
 
 A program kilépés előtt megerősítést kér, ha van még indításra váró ütemezett felvétel, mert ezek csak az alkalmazás futása közben indulhatnak el. Ha ennek ellenére kilép, a várakozó felvételek nem indulnak el.
+
+Az Ütemezett felvételek ablak Felvételi ütközések… gombja a kijelölt bejegyzéssel időben átfedő felvételeket sorolja fel, az ütemezési ráhagyást is figyelembe véve. A részletek között a csatorna, a szolgáltatói fiók beállított elnevezése és a tényleges felvételi időszak is szerepel. Az Időpontok módosítása… gomb a meglévő szerkesztőt nyitja meg. Ütközés megerősítésekor szintén áttekintheti ezeket az adatokat, majd az Ütemezés ennek ellenére gombbal folytathatja a műveletet. Ismert felvételi kapcsolati keretnél az összehasonlítás az adott fiókra korlátozódik; ennek hiányában az időbeli átfedéseket mutatja, és nem állítja, hogy azok túllépnek egy szolgáltatói korlátot.
 
 ### Ütemezési ráhagyás {#schedule-padding}
 

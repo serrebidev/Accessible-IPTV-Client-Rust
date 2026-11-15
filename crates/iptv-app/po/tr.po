@@ -3752,3 +3752,179 @@ msgid ""
 msgstr ""
 "Arama taramaları geçit biletine uyar; sonuç grupları etkileşime yol verir "
 "(#108) (#114)"
+
+# PR #36 port (from the Python catalogues).
+
+msgid "A running recording's start time cannot be changed."
+msgstr "Devam eden bir kaydÄ±n baÅlangÄ±Ã§ saati deÄiÅtirilemez."
+
+msgid "Add Folder..."
+msgstr "KlasÃ¶r Ekle..."
+
+msgid "All Recording Folders"
+msgstr "TÃ¼m KayÄ±t KlasÃ¶rleri"
+
+msgid "All Recordings"
+msgstr "TÃ¼m KayÄ±tlar"
+
+msgid "Checking recording conflicts..."
+msgstr "KayÄ±t Ã§akÄ±ÅmalarÄ± denetleniyorâ¦"
+
+msgid "Choose a recording folder"
+msgstr "Bir kayÄ±t klasÃ¶rÃ¼ seÃ§in"
+
+msgid "Date"
+msgstr "Tarih"
+
+msgid "Delete Recording"
+msgstr "KaydÄ± sil"
+
+msgid "Delete Recording File..."
+msgstr "KayÄ±t dosyasÄ±nÄ± sil..."
+
+msgid "Descending"
+msgstr "Azalan"
+
+msgid "Details"
+msgstr "AyrÄ±ntÄ±lar"
+
+msgid "Duration"
+msgstr "SÃ¼re"
+
+msgid "Edit Times..."
+msgstr "Saatleri DÃ¼zenle..."
+
+msgid "End (local time, YYYY-MM-DD HH:MM)"
+msgstr "BitiÅ (yerel saat, YYYY-AA-GG SS:DD)"
+
+msgid "File Size"
+msgstr "Dosya Boyutu"
+
+msgid "Invalid recording time."
+msgstr "GeÃ§ersiz kayÄ±t saati."
+
+msgid "Invalid subtitle delay."
+msgstr "GeÃ§ersiz altyazÄ± gecikmesi."
+
+msgid "Loading recordings..."
+msgstr "KayÄ±tlar yÃ¼kleniyor..."
+
+msgid "Move to Recording Trash..."
+msgstr "KayÄ±t ÃÃ¶p Kutusuna TaÅÄ±..."
+
+msgid "Move {count} selected recordings to the recording trash?"
+msgstr "SeÃ§ilen {count} kayÄ±t, kayÄ±t Ã§Ã¶p kutusuna taÅÄ±nsÄ±n mÄ±?"
+
+msgid "Next Episode"
+msgstr "Sonraki BÃ¶lÃ¼m"
+
+msgid "No adjacent episode is available."
+msgstr "Ãnceki veya sonraki bÃ¶lÃ¼m kullanÄ±lamÄ±yor."
+
+msgid "Overlapping Recordings"
+msgstr "ÃakÄ±Åan KayÄ±tlar"
+
+msgid "Overlapping recordings, including schedule padding."
+msgstr "Zamanlama paylarÄ± dahil Ã§akÄ±Åan kayÄ±tlar."
+
+msgid "Overlapping recordings: {count}."
+msgstr "ÃakÄ±Åan kayÄ±t sayÄ±sÄ±: {count}."
+
+msgid "Partial"
+msgstr "KÄ±smi"
+
+msgid "Permanently delete {count} selected recording files? This cannot be undone."
+msgstr "SeÃ§ilen {count} kayÄ±t dosyasÄ± kalÄ±cÄ± olarak silinsin mi? Bu iÅlem geri alÄ±namaz."
+
+msgid "Play / Resume"
+msgstr "Oynat / Devam et"
+
+msgid "Previous Episode"
+msgstr "Ãnceki BÃ¶lÃ¼m"
+
+msgid "Processing recordings..."
+msgstr "KayÄ±tlar iÅleniyorâ¦"
+
+msgid "Recording Conflicts"
+msgstr "KayÄ±t ÃakÄ±ÅmalarÄ±"
+
+msgid "Recording Conflicts..."
+msgstr "KayÄ±t ÃakÄ±ÅmalarÄ±â¦"
+
+msgid "Recording Library"
+msgstr "KayÄ±t kitaplÄ±ÄÄ±"
+
+msgid "Recording folder:"
+msgstr "KayÄ±t klasÃ¶rÃ¼:"
+
+msgid "Recording metadata could not be read. The media files are still available."
+msgstr "KayÄ±t Ã¼st verileri okunamadÄ±. Medya dosyalarÄ± hÃ¢lÃ¢ kullanÄ±labilir."
+
+msgid "Recording schedule saved."
+msgstr "KayÄ±t planÄ± kaydedildi."
+
+msgid "Recording title:"
+msgstr "KayÄ±t baÅlÄ±ÄÄ±:"
+
+msgid "Remove Folder from Library"
+msgstr "KlasÃ¶rÃ¼ KitaplÄ±ktan KaldÄ±r"
+
+msgid "Rename Title..."
+msgstr "BaÅlÄ±ÄÄ± DeÄiÅtir..."
+
+msgid "Reset Timing"
+msgstr "ZamanlamayÄ± SÄ±fÄ±rla"
+
+msgid "Restore Recording"
+msgstr "KaydÄ± Geri YÃ¼kle"
+
+msgid "Schedule Anyway"
+msgstr "Yine de Zamanla"
+
+msgid "Schedule by Time"
+msgstr "Saate GÃ¶re Planla"
+
+msgid "Search recordings:"
+msgstr "KayÄ±tlarda ara:"
+
+msgid "Selected: {count}; total size: {size} MiB."
+msgstr "SeÃ§ilen: {count}; toplam boyut: {size} MiB."
+
+msgid "Show Deleted Recordings"
+msgstr "Silinen KayÄ±tlarÄ± GÃ¶ster"
+
+msgid "Sort by"
+msgstr "SÄ±ralama Ã¶lÃ§Ã¼tÃ¼"
+
+msgid "Start (local time, YYYY-MM-DD HH:MM)"
+msgstr "BaÅlangÄ±Ã§ (yerel saat, YYYY-AA-GG SS:DD)"
+
+msgid "Stopped by user"
+msgstr "KullanÄ±cÄ± tarafÄ±ndan durduruldu"
+
+msgid "Subtitle Timing..."
+msgstr "AltyazÄ± ZamanlamasÄ±â¦"
+
+msgid "Subtitle delay in milliseconds (-600000 to 600000). Positive values display and read subtitles later; 0 resets timing."
+msgstr "Milisaniye cinsinden altyazÄ± gecikmesi (-600000 ile 600000 arasÄ±). Pozitif deÄerler altyazÄ±larÄ±n daha geÃ§ gÃ¶sterilmesini ve okunmasÄ±nÄ± saÄlar; 0 zamanlamayÄ± sÄ±fÄ±rlar."
+
+msgid "Subtitle delay: {milliseconds} ms."
+msgstr "AltyazÄ± gecikmesi: {milliseconds} ms."
+
+msgid "Subtitle timing could not be changed."
+msgstr "AltyazÄ± zamanlamasÄ± deÄiÅtirilemedi."
+
+msgid "The end must be in the future and after the start, within seven days."
+msgstr "BitiÅ gelecekte, baÅlangÄ±Ã§tan sonra ve en fazla yedi gÃ¼n iÃ§inde olmalÄ±dÄ±r."
+
+msgid "The library can contain up to 20 folders."
+msgstr "KitaplÄ±k en fazla 20 klasÃ¶r iÃ§erebilir."
+
+msgid "The recording changed. Reopen its timing dialog."
+msgstr "KayÄ±t deÄiÅti. Saat penceresini yeniden aÃ§Ä±n."
+
+msgid "The recording start time has already passed."
+msgstr "KaydÄ±n baÅlangÄ±Ã§ saati geÃ§ti."
+
+msgid "{count} recording(s). Active recordings are not listed."
+msgstr "{count} kayÄ±t. Devam eden kayÄ±tlar listelenmez."

@@ -110,6 +110,10 @@ Visualizza > TV in diretta && Replay torna ai canali in diretta. Il campo di ric
 
 Il video on demand funziona meglio con gli account Xtream Codes, che descrivono bene il loro catalogo. Per le semplici playlist M3U il programma riconosce film e serie dai nomi dei gruppi e dalla numerazione degli episodi.
 
+Riproduzione > Episodio precedente (Ctrl+PagSu) ed Episodio successivo (Ctrl+PagGiù) cambiano episodio nella serie attuale. Le scorciatoie sono configurabili. La riproduzione continua durante la ricerca. Un episodio assente o ambiguo non provoca cambiamenti. Una nuova riproduzione o una modifica della playlist invalida la ricerca precedente.
+
+Continua a guardare permette di scegliere il tipo: video su richiesta o registrazioni. Le posizioni locali sono salvate separatamente. Il controllo cerca in background solo nelle cartelle configurate e richiede percorso e caratteristiche del file corrispondenti. I file mancanti o sostituiti non vengono riprodotti. Rimozione e cancellazione delle posizioni interessano solo il tipo selezionato.
+
 ## Gestione playlist {#playlist-manager}
 
 File > Gestione playlist (Ctrl+M) elenca le sorgenti delle playlist. Si apre con il focus sull'elenco.
@@ -238,6 +242,9 @@ Una traccia scelta è ricordata per quel canale e torna la volta successiva. Per
 Il testo dei sottotitoli appare nel video quando lo stream lo fornisce. Riproduzione > Carica file sottotitoli accetta un file di sottotitoli esterno. Attiva Riproduzione > Leggi i sottotitoli ad alta voce (Maiusc+S) e la voce selezionata leggerà ogni sottotitolo di un file SRT, ASS, SSA o WebVTT caricato non appena compare, anche con la finestra del lettore nascosta. Il sottotitolo corrente è mostrato anche come testo alla fine dei controlli del lettore. Il lettore integrato non può ancora leggere ad alta voce i sottotitoli inclusi nello stream.
 
 Riproduzione > Leggi il sottotitolo attuale (C) legge il sottotitolo sullo schermo, o l'ultimo mostrato se sullo schermo non ce n'è nessuno. Riproduzione > Sottotitolo precedente (Pag su) e Sottotitolo successivo (Pag giù) scorrono i sottotitoli già mostrati, così puoi riascoltare una riga che ti è sfuggita. Non leggono mai oltre la riproduzione e funzionano sia con Leggi i sottotitoli ad alta voce attivo sia disattivato. In Windows, Opzioni > Lettura dei sottotitoli > Velocità della voce dell’applicazione… consente di scegliere un valore da -10 a 10; 0 è normale. Non modifica la velocità del contenuto né le impostazioni dello screen reader.
+
+Riproduzione > Sincronizzazione sottotitoli (Ctrl+Maiusc+T) regola fino a dieci minuti in entrambe le direzioni, in millisecondi con incrementi di 500 ms. I valori positivi ritardano visualizzazione e lettura dei file di sottotitoli. Ripristina imposta zero; Annulla conserva il valore precedente. Un nuovo contenuto ripristina il valore iniziale. La velocità del contenuto e del lettore di schermo resta invariata.
+
 ### Dispositivo di uscita audio {#audio-output-device}
 
 Riproduzione > Dispositivo di uscita audio… (D) sceglie gli altoparlanti o le cuffie che il lettore usa, per esempio per tenere lontano il suono della TV dal proprio lettore di schermo. Predefinito di sistema segue il dispositivo predefinito di Windows. La scelta è ricordata.
@@ -284,6 +291,14 @@ Registrare ciò che si guarda nel lettore integrato usa la stessa connessione al
 
 Fermare una registrazione può richiedere un momento mentre il file viene finalizzato. Quando l'applicazione si chiude, anche le registrazioni ancora in corso vengono fermate; il programma concede prima un breve margine per finalizzare i file.
 
+Registrazioni > Raccolta registrazioni elenca i file completati in un massimo di 20 cartelle, compresa quella di registrazione attuale. Aggiungi cartella include una cartella esistente senza cambiare la destinazione delle nuove registrazioni. Rimuovi cartella dalla raccolta lascia intatti i file. La cartella di registrazione attuale non può essere rimossa.
+
+Cercare per titolo, canale o data. Riproduci / Riprendi apre il file e propone la posizione salvata, se disponibile. Durata e stato sono mostrati quando noti; i file meno recenti possono indicare Sconosciuto. Le registrazioni attive e i file aperti nel lettore integrato sono esclusi. Rinomina titolo cambia solo il titolo visualizzato, conservando nome del file, posizione e segnalibri. Aggiorna ricarica l’elenco.
+
+Sposta nel cestino delle registrazioni trasferisce il file nel cestino dell’applicazione dentro la sua cartella di registrazione, senza liberare spazio. Mostra registrazioni eliminate rende visibili questi file. Ripristina registrazione li riporta nella cartella originale senza sovrascrivere file esistenti. In questa vista, Elimina file di registrazione li elimina definitivamente dopo conferma. Rimuovere una voce da Registrazioni programmate non elimina il file multimediale.
+
+Tutte le cartelle delle registrazioni riunisce le cartelle configurate. Filtra per stato e ordina per data, titolo, durata o dimensione; Decrescente inverte l’ordine. Ctrl+A seleziona tutte le righe visibili; vengono mostrati conteggio e dimensione totale. Cestino, eliminazione definitiva e ripristino supportano più selezioni; riproduzione e rinomina richiedono un solo elemento. Analisi e filtri operano in background; la chiusura non annulla operazioni confermate.
+
 ### Formato di registrazione {#recording-formats}
 
 Registrazioni > Formato di registrazione sceglie come sono salvate le registrazioni:
@@ -310,6 +325,8 @@ Le registrazioni programmate partono da sole mentre il programma gira, anche min
 Quando una nuova registrazione si sovrappone ad un'altra registrazione programmata, il programma ti avvisa prima di aggiungerla. Il tuo provider potrebbe limitare il numero di stream che possono essere eseguiti contemporaneamente.
 
 Il programma chiede conferma prima di chiudersi se ci sono registrazioni programmate ancora in attesa di iniziare, perché possono iniziare solo mentre il programma è aperto. Se lo chiudi comunque, le registrazioni in attesa non partiranno.
+
+Conflitti di registrazione, in Registrazioni programmate, elenca le sovrapposizioni dell’elemento selezionato, inclusi i margini. I dettagli indicano canale, alias dell’account e intervallo effettivo. Modifica orari apre l’editor esistente. La conferma offre questi dettagli e Programma comunque. Un limite noto confronta solo lo stesso account; altrimenti mostra sovrapposizioni temporali senza presumere un limite del fornitore.
 
 ### Margine di programmazione {#schedule-padding}
 

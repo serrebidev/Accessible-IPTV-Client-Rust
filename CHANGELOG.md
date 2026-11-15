@@ -5,6 +5,14 @@ adjacent releases were part of the same fix stream, they are combined with a
 version range such as `0.2.2-0.2.3`. Each release's section below is its
 Forgejo release note, taken from this file by the release workflow.
 
+## 0.4.27
+
+- Recordings > Recording Library lists finished recordings from up to 20 folders: search, filter by completion status, sort by date, title, duration or file size, play or resume, rename titles, move recordings to the recording trash and restore them. Active recordings are never listed, and every finished recording is indexed as it completes.
+- The built-in player gains Playback > Previous Episode and Next Episode (Ctrl+PageUp and Ctrl+PageDown, configurable) and Playback > Subtitle Timing (Ctrl+Shift+T): the subtitle delay, up to ten minutes either way in milliseconds, applies to display and built-in subtitle speech for the current media and resets when new media starts.
+- Scheduled Recordings gains Edit Times and Recording Conflicts. Overlaps are computed with schedule padding against the per-account recording connection limits; a new recording that would exceed a known account limit asks for confirmation with the overlapping recordings listed, and Recording Conflicts shows each overlap's channel, account and real recording window.
+- Continue Watching gains a Type choice between Video on Demand and Recordings. Recording positions live in their own store, are checked against the recording library by exact file signature, and saves run in the background: a failed save leaves the saved positions untouched and says so.
+- An Xtream account whose server rejects the saved credentials now reports an authentication failure instead of presenting an empty catalogue.
+
 ## 0.4.26
 
 - The About box links and the user guide's bug-report address now point to the project's Forgejo home, as the Python client's do; the old GitHub addresses no longer open. All three packages (Windows, Linux and macOS) are now built and published by the Forgejo release workflow.

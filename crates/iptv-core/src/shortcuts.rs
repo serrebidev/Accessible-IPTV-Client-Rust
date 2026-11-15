@@ -62,6 +62,9 @@ pub fn player_defaults() -> Vec<(&'static str, &'static str)> {
         ("read_subtitle", "C"),
         ("previous_subtitle", "PageUp"),
         ("next_subtitle", "PageDown"),
+        ("previous_episode", "Ctrl+PageUp"),
+        ("next_episode", "Ctrl+PageDown"),
+        ("subtitle_timing", "Ctrl+Shift+T"),
         ("fullscreen", "F11"),
         ("hide", "Ctrl+W"),
         ("exit", "Ctrl+Q"),
@@ -108,6 +111,9 @@ pub fn label(context: &str, action: &str) -> Option<&'static str> {
             ("read_subtitle", "Read Current Subtitle"),
             ("previous_subtitle", "Previous Subtitle"),
             ("next_subtitle", "Next Subtitle"),
+            ("previous_episode", "Previous Episode"),
+            ("next_episode", "Next Episode"),
+            ("subtitle_timing", "Subtitle Timing..."),
             ("fullscreen", "Toggle Full Screen"),
             ("hide", "Hide Window"),
             ("exit", "Exit Player"),
@@ -260,6 +266,49 @@ pub fn effective(config: &serde_json::Value, context: &str) -> BTreeMap<String, 
             }
         }
         result.insert(action, value);
+    }
+    // Adding a new default must not steal an existing personal
+    // shortcut (Python `effective`, extended by PR #36 to the
+    // episode and subtitle-timing actions): keep an explicit
+    // binding as chosen; otherwise, when the default collides
+    // with another action's effective binding, pick the first
+    // free Ctrl+Alt+Shift+<letter>.
+    let additions: &[&str] = if context == "player" {
+        &[
+            "mute",
+            "previous_episode",
+            "next_episode",
+            "subtitle_timing",
+        ]
+    } else {
+        &["mute"]
+    };
+    for addition in additions {
+        if saved.is_some_and(|map| map.contains_key(&format!("{context}.{addition}"))) {
+            continue;
+        }
+        let Some(current) = result.get(*addition).cloned() else {
+            continue;
+        };
+        let Ok((flags, key, _)) = parse(&current) else {
+            continue;
+        };
+        let used: std::collections::HashSet<(u32, u32)> = result
+            .iter()
+            .filter(|(action, _)| action.as_str() != *addition)
+            .filter_map(|(_, value)| parse(value).ok().map(|(f, k, _)| (f, k)))
+            .collect();
+        if used.contains(&(flags, key)) {
+            for letter in "MABCDEFGHIJKLMNOPQRSTUVWXYZ".chars() {
+                let alternative = format!("Ctrl+Alt+Shift+{letter}");
+                if let Ok((alt_flags, alt_key, _)) = parse(&alternative) {
+                    if !used.contains(&(alt_flags, alt_key)) {
+                        result.insert((*addition).to_string(), alternative);
+                        break;
+                    }
+                }
+            }
+        }
     }
     result
 }
@@ -433,5 +482,28 @@ mod tests {
             set_shortcut(&mut config, "main", "nope", "Ctrl+X"),
             Err("Unknown command.".to_string())
         );
+    }
+
+    #[test]
+    fn new_player_defaults_do_not_steal_saved_bindings() {
+        // Python's PR #36 test: a saved Ctrl+PageUp on
+        // audio_track keeps it, and previous_episode's default
+        // must move out of the way.
+        let config = serde_json::json!({
+            "shortcuts": {"player.audio_track": "Ctrl+PageUp"}
+        });
+        let result = effective(&config, "player");
+        assert_eq!(result["audio_track"], "Ctrl+PageUp");
+        assert_ne!(result["previous_episode"], "Ctrl+PageUp");
+        let mut seen = std::collections::HashSet::new();
+        for value in result.values() {
+            let (flags, key, _) = parse(value).unwrap();
+            assert!(seen.insert((flags, key)), "duplicate binding {value}");
+        }
+        // Untouched defaults elsewhere.
+        let plain = effective(&serde_json::json!({}), "player");
+        assert_eq!(plain["previous_episode"], "Ctrl+PageUp");
+        assert_eq!(plain["next_episode"], "Ctrl+PageDown");
+        assert_eq!(plain["subtitle_timing"], "Ctrl+Shift+T");
     }
 }

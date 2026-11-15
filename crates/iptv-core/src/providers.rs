@@ -281,9 +281,7 @@ impl XtreamClient {
     ///
     /// Returns the provider error text when the server is unreachable, rejects the credentials, or answers invalid data.
     pub fn vod_categories(&self) -> ProviderResult<Value> {
-        Ok(list_or_empty(
-            self.player_api(Some("get_vod_categories"), &[])?,
-        ))
+        catalogue_list(self.player_api(Some("get_vod_categories"), &[])?)
     }
 
     ///
@@ -295,9 +293,7 @@ impl XtreamClient {
             .map(|id| ("category_id", id.to_string()))
             .into_iter()
             .collect();
-        Ok(list_or_empty(
-            self.player_api(Some("get_vod_streams"), &extra)?,
-        ))
+        catalogue_list(self.player_api(Some("get_vod_streams"), &extra)?)
     }
 
     ///
@@ -305,9 +301,7 @@ impl XtreamClient {
     ///
     /// Returns the provider error text when the server is unreachable, rejects the credentials, or answers invalid data.
     pub fn series_categories(&self) -> ProviderResult<Value> {
-        Ok(list_or_empty(
-            self.player_api(Some("get_series_categories"), &[])?,
-        ))
+        catalogue_list(self.player_api(Some("get_series_categories"), &[])?)
     }
 
     ///
@@ -319,7 +313,7 @@ impl XtreamClient {
             .map(|id| ("category_id", id.to_string()))
             .into_iter()
             .collect();
-        Ok(list_or_empty(self.player_api(Some("get_series"), &extra)?))
+        catalogue_list(self.player_api(Some("get_series"), &extra)?)
     }
 
     ///
@@ -390,12 +384,30 @@ impl XtreamClient {
     }
 }
 
-fn list_or_empty(value: Value) -> Value {
+/// Python `_catalogue_list` (PR #36): a list payload is a
+/// catalogue (an empty one is valid); an auth-0 payload is an
+/// authentication failure, never an empty catalogue; any other
+/// non-list payload is an invalid response.
+fn catalogue_list(value: Value) -> ProviderResult<Value> {
     if value.is_array() {
-        value
-    } else {
-        Value::Array(Vec::new())
+        return Ok(value);
     }
+    if let Some(user_info) = value.get("user_info").filter(|info| info.is_object()) {
+        let auth = user_info.get("auth");
+        let rejected = match auth {
+            Some(Value::String(text)) => text == "0",
+            Some(Value::Number(number)) => {
+                (number.is_i64() || number.is_u64()) && number.as_i64() == Some(0)
+            }
+            _ => false,
+        };
+        if rejected {
+            return Err(
+                "Authentication failed \u{2013} the server rejected these credentials".to_string(),
+            );
+        }
+    }
+    Err("Invalid response from Xtream player API".to_string())
 }
 
 fn strip_bom(bytes: &[u8]) -> Vec<u8> {
@@ -2243,5 +2255,31 @@ mod tests {
         assert_eq!(channel_account_key(&foreign, &accounts), None);
         let no_user = bare_channel("D", "http://panel.example.com:8080/bob/pass/123.ts");
         assert_eq!(channel_account_key(&no_user, &accounts), None);
+    }
+
+    #[test]
+    fn catalogue_list_rejects_non_list_payloads() {
+        // A genuinely empty catalogue is valid.
+        assert_eq!(
+            catalogue_list(serde_json::json!([])).unwrap(),
+            serde_json::json!([])
+        );
+        assert!(catalogue_list(serde_json::json!([{"a": 1}])).is_ok());
+        // Auth-0 is an authentication failure, not an empty list.
+        let error = catalogue_list(serde_json::json!({"user_info": {"auth": 0}})).unwrap_err();
+        assert!(error.contains("Authentication failed"), "{error}");
+        let error = catalogue_list(serde_json::json!({"user_info": {"auth": "0"}})).unwrap_err();
+        assert!(error.contains("Authentication failed"), "{error}");
+        // Anything else non-list is an invalid response.
+        for payload in [
+            serde_json::json!({"user_info": {"auth": 1}}),
+            serde_json::json!({"unexpected": true}),
+            serde_json::json!("garbage"),
+        ] {
+            assert_eq!(
+                catalogue_list(payload).unwrap_err(),
+                "Invalid response from Xtream player API"
+            );
+        }
     }
 }

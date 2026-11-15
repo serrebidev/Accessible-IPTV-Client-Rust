@@ -3791,3 +3791,179 @@ msgid ""
 msgstr ""
 "Le scansioni di ricerca rispondono al ticket del cancello; i lotti di "
 "risultati lasciano spazio all'interazione (#108) (#114)"
+
+# PR #36 port (from the Python catalogues).
+
+msgid "A running recording's start time cannot be changed."
+msgstr "Non Ã¨ possibile modificare l'ora di inizio di una registrazione in corso."
+
+msgid "Add Folder..."
+msgstr "Aggiungi cartella..."
+
+msgid "All Recording Folders"
+msgstr "Tutte le cartelle delle registrazioni"
+
+msgid "All Recordings"
+msgstr "Tutte le registrazioni"
+
+msgid "Checking recording conflicts..."
+msgstr "Verifica dei conflitti di registrazioneâ¦"
+
+msgid "Choose a recording folder"
+msgstr "Scegli una cartella di registrazioni"
+
+msgid "Date"
+msgstr "Data"
+
+msgid "Delete Recording"
+msgstr "Elimina registrazione"
+
+msgid "Delete Recording File..."
+msgstr "Elimina file della registrazione..."
+
+msgid "Descending"
+msgstr "Decrescente"
+
+msgid "Details"
+msgstr "Dettagli"
+
+msgid "Duration"
+msgstr "Durata"
+
+msgid "Edit Times..."
+msgstr "Modifica orari..."
+
+msgid "End (local time, YYYY-MM-DD HH:MM)"
+msgstr "Fine (ora locale, AAAA-MM-GG HH:MM)"
+
+msgid "File Size"
+msgstr "Dimensione del file"
+
+msgid "Invalid recording time."
+msgstr "Orario di registrazione non valido."
+
+msgid "Invalid subtitle delay."
+msgstr "Ritardo dei sottotitoli non valido."
+
+msgid "Loading recordings..."
+msgstr "Caricamento delle registrazioni..."
+
+msgid "Move to Recording Trash..."
+msgstr "Sposta nel cestino delle registrazioni..."
+
+msgid "Move {count} selected recordings to the recording trash?"
+msgstr "Spostare le {count} registrazioni selezionate nel cestino delle registrazioni?"
+
+msgid "Next Episode"
+msgstr "Episodio successivo"
+
+msgid "No adjacent episode is available."
+msgstr "Nessun episodio precedente o successivo disponibile."
+
+msgid "Overlapping Recordings"
+msgstr "Registrazioni sovrapposte"
+
+msgid "Overlapping recordings, including schedule padding."
+msgstr "Registrazioni sovrapposte, inclusi i margini di programmazione."
+
+msgid "Overlapping recordings: {count}."
+msgstr "Registrazioni sovrapposte: {count}."
+
+msgid "Partial"
+msgstr "Parziale"
+
+msgid "Permanently delete {count} selected recording files? This cannot be undone."
+msgstr "Eliminare definitivamente i {count} file di registrazione selezionati? Lâoperazione non puÃ² essere annullata."
+
+msgid "Play / Resume"
+msgstr "Riproduci / Riprendi"
+
+msgid "Previous Episode"
+msgstr "Episodio precedente"
+
+msgid "Processing recordings..."
+msgstr "Elaborazione delle registrazioniâ¦"
+
+msgid "Recording Conflicts"
+msgstr "Conflitti di registrazione"
+
+msgid "Recording Conflicts..."
+msgstr "Conflitti di registrazioneâ¦"
+
+msgid "Recording Library"
+msgstr "Raccolta registrazioni"
+
+msgid "Recording folder:"
+msgstr "Cartella delle registrazioni:"
+
+msgid "Recording metadata could not be read. The media files are still available."
+msgstr "Impossibile leggere i metadati delle registrazioni. I file multimediali sono ancora disponibili."
+
+msgid "Recording schedule saved."
+msgstr "Programmazione della registrazione salvata."
+
+msgid "Recording title:"
+msgstr "Titolo della registrazione:"
+
+msgid "Remove Folder from Library"
+msgstr "Rimuovi cartella dalla libreria"
+
+msgid "Rename Title..."
+msgstr "Rinomina titolo..."
+
+msgid "Reset Timing"
+msgstr "Ripristina sincronizzazione"
+
+msgid "Restore Recording"
+msgstr "Ripristina registrazione"
+
+msgid "Schedule Anyway"
+msgstr "Programma comunque"
+
+msgid "Schedule by Time"
+msgstr "Programma per orario"
+
+msgid "Search recordings:"
+msgstr "Cerca registrazioni:"
+
+msgid "Selected: {count}; total size: {size} MiB."
+msgstr "Selezionate: {count}; dimensione totale: {size} MiB."
+
+msgid "Show Deleted Recordings"
+msgstr "Mostra registrazioni eliminate"
+
+msgid "Sort by"
+msgstr "Ordina per"
+
+msgid "Start (local time, YYYY-MM-DD HH:MM)"
+msgstr "Inizio (ora locale, AAAA-MM-GG HH:MM)"
+
+msgid "Stopped by user"
+msgstr "Interrotta dallâutente"
+
+msgid "Subtitle Timing..."
+msgstr "Sincronizzazione sottotitoliâ¦"
+
+msgid "Subtitle delay in milliseconds (-600000 to 600000). Positive values display and read subtitles later; 0 resets timing."
+msgstr "Ritardo dei sottotitoli in millisecondi (da -600000 a 600000). I valori positivi ritardano la visualizzazione e la lettura; 0 ripristina la sincronizzazione originale."
+
+msgid "Subtitle delay: {milliseconds} ms."
+msgstr "Ritardo dei sottotitoli: {milliseconds} ms."
+
+msgid "Subtitle timing could not be changed."
+msgstr "Impossibile modificare la sincronizzazione dei sottotitoli."
+
+msgid "The end must be in the future and after the start, within seven days."
+msgstr "La fine deve essere futura e successiva all'inizio, entro sette giorni."
+
+msgid "The library can contain up to 20 folders."
+msgstr "La libreria puÃ² contenere fino a 20 cartelle."
+
+msgid "The recording changed. Reopen its timing dialog."
+msgstr "La registrazione Ã¨ cambiata. Riapri la finestra degli orari."
+
+msgid "The recording start time has already passed."
+msgstr "L'ora di inizio della registrazione Ã¨ giÃ  trascorsa."
+
+msgid "{count} recording(s). Active recordings are not listed."
+msgstr "{count} registrazioni. Quelle in corso non sono elencate."

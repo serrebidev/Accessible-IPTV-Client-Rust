@@ -3803,3 +3803,179 @@ msgid ""
 msgstr ""
 "Such-Scans folgen dem Gate-Ticket; Ergebnis-Batches weichen der Interaktion "
 "(#108) (#114)"
+
+# PR #36 port (from the Python catalogues).
+
+msgid "A running recording's start time cannot be changed."
+msgstr "Die Startzeit einer laufenden Aufnahme lÃ¤sst sich nicht Ã¤ndern."
+
+msgid "Add Folder..."
+msgstr "Ordner hinzufÃ¼gen..."
+
+msgid "All Recording Folders"
+msgstr "Alle Aufnahmeordner"
+
+msgid "All Recordings"
+msgstr "Alle Aufnahmen"
+
+msgid "Checking recording conflicts..."
+msgstr "Aufnahmekonflikte werden geprÃ¼ftâ¦"
+
+msgid "Choose a recording folder"
+msgstr "Aufnahmeordner auswÃ¤hlen"
+
+msgid "Date"
+msgstr "Datum"
+
+msgid "Delete Recording"
+msgstr "Aufnahme lÃ¶schen"
+
+msgid "Delete Recording File..."
+msgstr "Aufnahmedatei lÃ¶schen..."
+
+msgid "Descending"
+msgstr "Absteigend"
+
+msgid "Details"
+msgstr "Details"
+
+msgid "Duration"
+msgstr "Dauer"
+
+msgid "Edit Times..."
+msgstr "Zeiten bearbeiten..."
+
+msgid "End (local time, YYYY-MM-DD HH:MM)"
+msgstr "Ende (Ortszeit, JJJJ-MM-TT HH:MM)"
+
+msgid "File Size"
+msgstr "DateigrÃ¶Ãe"
+
+msgid "Invalid recording time."
+msgstr "UngÃ¼ltige Aufnahmezeit."
+
+msgid "Invalid subtitle delay."
+msgstr "UngÃ¼ltige UntertitelverzÃ¶gerung."
+
+msgid "Loading recordings..."
+msgstr "Aufnahmen werden geladen..."
+
+msgid "Move to Recording Trash..."
+msgstr "In den Aufnahme-Papierkorb verschieben..."
+
+msgid "Move {count} selected recordings to the recording trash?"
+msgstr "{count} ausgewÃ¤hlte Aufnahmen in den Aufnahme-Papierkorb verschieben?"
+
+msgid "Next Episode"
+msgstr "NÃ¤chste Folge"
+
+msgid "No adjacent episode is available."
+msgstr "Keine vorherige oder nÃ¤chste Episode verfÃ¼gbar."
+
+msgid "Overlapping Recordings"
+msgstr "Ãberlappende Aufnahmen"
+
+msgid "Overlapping recordings, including schedule padding."
+msgstr "Ãberlappende Aufnahmen einschlieÃlich Vor- und Nachlauf."
+
+msgid "Overlapping recordings: {count}."
+msgstr "Ãberlappende Aufnahmen: {count}."
+
+msgid "Partial"
+msgstr "UnvollstÃ¤ndig"
+
+msgid "Permanently delete {count} selected recording files? This cannot be undone."
+msgstr "{count} ausgewÃ¤hlte Aufnahmedateien endgÃ¼ltig lÃ¶schen? Dies kann nicht rÃ¼ckgÃ¤ngig gemacht werden."
+
+msgid "Play / Resume"
+msgstr "Wiedergabe / Fortsetzen"
+
+msgid "Previous Episode"
+msgstr "Vorherige Episode"
+
+msgid "Processing recordings..."
+msgstr "Aufnahmen werden verarbeitetâ¦"
+
+msgid "Recording Conflicts"
+msgstr "Aufnahmekonflikte"
+
+msgid "Recording Conflicts..."
+msgstr "Aufnahmekonflikteâ¦"
+
+msgid "Recording Library"
+msgstr "Aufnahmebibliothek"
+
+msgid "Recording folder:"
+msgstr "Aufnahmeordner:"
+
+msgid "Recording metadata could not be read. The media files are still available."
+msgstr "Die Aufnahmemetadaten konnten nicht gelesen werden. Die Mediendateien sind weiterhin verfÃ¼gbar."
+
+msgid "Recording schedule saved."
+msgstr "Aufnahmeplan gespeichert."
+
+msgid "Recording title:"
+msgstr "Aufnahmetitel:"
+
+msgid "Remove Folder from Library"
+msgstr "Ordner aus der Bibliothek entfernen"
+
+msgid "Rename Title..."
+msgstr "Titel umbenennen..."
+
+msgid "Reset Timing"
+msgstr "Zeitversatz zurÃ¼cksetzen"
+
+msgid "Restore Recording"
+msgstr "Aufnahme wiederherstellen"
+
+msgid "Schedule Anyway"
+msgstr "Trotzdem planen"
+
+msgid "Schedule by Time"
+msgstr "Aufnahme nach Uhrzeit planen"
+
+msgid "Search recordings:"
+msgstr "Aufnahmen suchen:"
+
+msgid "Selected: {count}; total size: {size} MiB."
+msgstr "AusgewÃ¤hlt: {count}; GesamtgrÃ¶Ãe: {size} MiB."
+
+msgid "Show Deleted Recordings"
+msgstr "GelÃ¶schte Aufnahmen anzeigen"
+
+msgid "Sort by"
+msgstr "Sortieren nach"
+
+msgid "Start (local time, YYYY-MM-DD HH:MM)"
+msgstr "Start (Ortszeit, JJJJ-MM-TT HH:MM)"
+
+msgid "Stopped by user"
+msgstr "Vom Benutzer beendet"
+
+msgid "Subtitle Timing..."
+msgstr "Untertitelzeitversatzâ¦"
+
+msgid "Subtitle delay in milliseconds (-600000 to 600000). Positive values display and read subtitles later; 0 resets timing."
+msgstr "UntertitelverzÃ¶gerung in Millisekunden (-600000 bis 600000). Positive Werte zeigen und lesen Untertitel spÃ¤ter; 0 setzt den Zeitversatz zurÃ¼ck."
+
+msgid "Subtitle delay: {milliseconds} ms."
+msgstr "UntertitelverzÃ¶gerung: {milliseconds} ms."
+
+msgid "Subtitle timing could not be changed."
+msgstr "Der Untertitelzeitversatz konnte nicht geÃ¤ndert werden."
+
+msgid "The end must be in the future and after the start, within seven days."
+msgstr "Das Ende muss in der Zukunft und nach dem Start liegen, hÃ¶chstens sieben Tage spÃ¤ter."
+
+msgid "The library can contain up to 20 folders."
+msgstr "Die Bibliothek kann bis zu 20 Ordner enthalten."
+
+msgid "The recording changed. Reopen its timing dialog."
+msgstr "Die Aufnahme wurde geÃ¤ndert. Ãffnen Sie ihren Zeitdialog erneut."
+
+msgid "The recording start time has already passed."
+msgstr "Die Startzeit der Aufnahme ist bereits vorbei."
+
+msgid "{count} recording(s). Active recordings are not listed."
+msgstr "{count} Aufnahme(n). Laufende Aufnahmen werden nicht angezeigt."

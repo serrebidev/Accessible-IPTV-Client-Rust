@@ -3707,3 +3707,179 @@ msgid ""
 msgstr ""
 "تستجيب عمليات فحص البحث لتذكرة البوابة؛ وتفسح دفعات النتائج المجال للتفاعل "
 "(#108) (#114)"
+
+# PR #36 port (from the Python catalogues).
+
+msgid "A running recording's start time cannot be changed."
+msgstr "ÙØ§ ÙÙÙÙ ØªØºÙÙØ± ÙÙØª Ø¨Ø¯Ø¡ ØªØ³Ø¬ÙÙ Ø¬Ø§Ø±Ù."
+
+msgid "Add Folder..."
+msgstr "Ø¥Ø¶Ø§ÙØ© ÙØ¬ÙØ¯..."
+
+msgid "All Recording Folders"
+msgstr "Ø¬ÙÙØ¹ ÙØ¬ÙØ¯Ø§Øª Ø§ÙØªØ³Ø¬ÙÙ"
+
+msgid "All Recordings"
+msgstr "Ø¬ÙÙØ¹ Ø§ÙØªØ³Ø¬ÙÙØ§Øª"
+
+msgid "Checking recording conflicts..."
+msgstr "Ø¬Ø§Ø±Ù Ø§ÙØªØ­ÙÙ ÙÙ ØªØ¹Ø§Ø±Ø¶Ø§Øª Ø§ÙØªØ³Ø¬ÙÙâ¦"
+
+msgid "Choose a recording folder"
+msgstr "Ø§Ø®ØªØ± ÙØ¬ÙØ¯ Ø§ÙØªØ³Ø¬ÙÙØ§Øª"
+
+msgid "Date"
+msgstr "Ø§ÙØªØ§Ø±ÙØ®"
+
+msgid "Delete Recording"
+msgstr "Ø­Ø°Ù Ø§ÙØªØ³Ø¬ÙÙ"
+
+msgid "Delete Recording File..."
+msgstr "Ø­Ø°Ù ÙÙÙ Ø§ÙØªØ³Ø¬ÙÙ..."
+
+msgid "Descending"
+msgstr "ØªÙØ§Ø²ÙÙ"
+
+msgid "Details"
+msgstr "Ø§ÙØªÙØ§ØµÙÙ"
+
+msgid "Duration"
+msgstr "Ø§ÙÙØ¯Ø©"
+
+msgid "Edit Times..."
+msgstr "ØªØ¹Ø¯ÙÙ Ø§ÙØ£ÙÙØ§Øª..."
+
+msgid "End (local time, YYYY-MM-DD HH:MM)"
+msgstr "Ø§ÙÙÙØ§ÙØ© (Ø§ÙØªÙÙÙØª Ø§ÙÙØ­ÙÙØ YYYY-MM-DD HH:MM)"
+
+msgid "File Size"
+msgstr "Ø­Ø¬Ù Ø§ÙÙÙÙ"
+
+msgid "Invalid recording time."
+msgstr "ÙÙØª Ø§ÙØªØ³Ø¬ÙÙ ØºÙØ± ØµØ§ÙØ­."
+
+msgid "Invalid subtitle delay."
+msgstr "ØªØ£Ø®ÙØ± Ø§ÙØªØ±Ø¬ÙØ© ØºÙØ± ØµØ§ÙØ­."
+
+msgid "Loading recordings..."
+msgstr "Ø¬Ø§Ø±Ù ØªØ­ÙÙÙ Ø§ÙØªØ³Ø¬ÙÙØ§Øª..."
+
+msgid "Move to Recording Trash..."
+msgstr "Ø§ÙÙÙÙ Ø¥ÙÙ Ø³ÙØ© ÙØ­Ø°ÙÙØ§Øª Ø§ÙØªØ³Ø¬ÙÙØ§Øª..."
+
+msgid "Move {count} selected recordings to the recording trash?"
+msgstr "ÙÙ ØªØ±ÙØ¯ ÙÙÙ Ø§ÙØªØ³Ø¬ÙÙØ§Øª Ø§ÙÙØ­Ø¯Ø¯Ø© ÙØ¹Ø¯Ø¯ÙØ§ {count} Ø¥ÙÙ Ø³ÙØ© Ø§ÙØªØ³Ø¬ÙÙØ§ØªØ"
+
+msgid "Next Episode"
+msgstr "Ø§ÙØ­ÙÙØ© Ø§ÙØªØ§ÙÙØ©"
+
+msgid "No adjacent episode is available."
+msgstr "ÙØ§ ØªØªÙÙØ± Ø­ÙÙØ© Ø³Ø§Ø¨ÙØ© Ø£Ù ØªØ§ÙÙØ©."
+
+msgid "Overlapping Recordings"
+msgstr "Ø§ÙØªØ³Ø¬ÙÙØ§Øª Ø§ÙÙØªØ¯Ø§Ø®ÙØ©"
+
+msgid "Overlapping recordings, including schedule padding."
+msgstr "Ø§ÙØªØ³Ø¬ÙÙØ§Øª Ø§ÙÙØªØ¯Ø§Ø®ÙØ©Ø Ø¨ÙØ§ ÙÙ Ø°ÙÙ ÙÙØ§ÙØ´ ÙÙØª Ø§ÙØ¬Ø¯ÙÙØ©."
+
+msgid "Overlapping recordings: {count}."
+msgstr "Ø¹Ø¯Ø¯ Ø§ÙØªØ³Ø¬ÙÙØ§Øª Ø§ÙÙØªØ¯Ø§Ø®ÙØ©: {count}."
+
+msgid "Partial"
+msgstr "Ø¬Ø²Ø¦Ù"
+
+msgid "Permanently delete {count} selected recording files? This cannot be undone."
+msgstr "ÙÙ ØªØ±ÙØ¯ Ø­Ø°Ù ÙÙÙØ§Øª Ø§ÙØªØ³Ø¬ÙÙ Ø§ÙÙØ­Ø¯Ø¯Ø© ÙØ¹Ø¯Ø¯ÙØ§ {count} ÙÙØ§Ø¦ÙÙØ§Ø ÙØ§ ÙÙÙÙ Ø§ÙØªØ±Ø§Ø¬Ø¹ Ø¹Ù ÙØ°Ø§ Ø§ÙØ¥Ø¬Ø±Ø§Ø¡."
+
+msgid "Play / Resume"
+msgstr "ØªØ´ØºÙÙ / Ø§Ø³ØªØ¦ÙØ§Ù"
+
+msgid "Previous Episode"
+msgstr "Ø§ÙØ­ÙÙØ© Ø§ÙØ³Ø§Ø¨ÙØ©"
+
+msgid "Processing recordings..."
+msgstr "Ø¬Ø§Ø±Ù ÙØ¹Ø§ÙØ¬Ø© Ø§ÙØªØ³Ø¬ÙÙØ§Øªâ¦"
+
+msgid "Recording Conflicts"
+msgstr "ØªØ¹Ø§Ø±Ø¶Ø§Øª Ø§ÙØªØ³Ø¬ÙÙ"
+
+msgid "Recording Conflicts..."
+msgstr "ØªØ¹Ø§Ø±Ø¶Ø§Øª Ø§ÙØªØ³Ø¬ÙÙâ¦"
+
+msgid "Recording Library"
+msgstr "ÙÙØªØ¨Ø© Ø§ÙØªØ³Ø¬ÙÙØ§Øª"
+
+msgid "Recording folder:"
+msgstr "ÙØ¬ÙØ¯ Ø§ÙØªØ³Ø¬ÙÙØ§Øª:"
+
+msgid "Recording metadata could not be read. The media files are still available."
+msgstr "ØªØ¹Ø°Ø±Øª ÙØ±Ø§Ø¡Ø© Ø¨ÙØ§ÙØ§Øª Ø§ÙØªØ³Ø¬ÙÙØ§Øª Ø§ÙÙØµÙÙØ©. ÙØ§ ØªØ²Ø§Ù ÙÙÙØ§Øª Ø§ÙÙØ³Ø§Ø¦Ø· ÙØªØ§Ø­Ø©."
+
+msgid "Recording schedule saved."
+msgstr "Ø­ÙÙØ¸ Ø¬Ø¯ÙÙ Ø§ÙØªØ³Ø¬ÙÙ."
+
+msgid "Recording title:"
+msgstr "Ø¹ÙÙØ§Ù Ø§ÙØªØ³Ø¬ÙÙ:"
+
+msgid "Remove Folder from Library"
+msgstr "Ø¥Ø²Ø§ÙØ© Ø§ÙÙØ¬ÙØ¯ ÙÙ Ø§ÙÙÙØªØ¨Ø©"
+
+msgid "Rename Title..."
+msgstr "ØªØºÙÙØ± Ø§ÙØ¹ÙÙØ§Ù..."
+
+msgid "Reset Timing"
+msgstr "Ø¥Ø¹Ø§Ø¯Ø© Ø¶Ø¨Ø· Ø§ÙØªÙÙÙØª"
+
+msgid "Restore Recording"
+msgstr "Ø§Ø³ØªØ¹Ø§Ø¯Ø© Ø§ÙØªØ³Ø¬ÙÙ"
+
+msgid "Schedule Anyway"
+msgstr "Ø§ÙØ¬Ø¯ÙÙØ© Ø¹ÙÙ Ø£Ù Ø­Ø§Ù"
+
+msgid "Schedule by Time"
+msgstr "Ø¬Ø¯ÙÙØ© Ø­Ø³Ø¨ Ø§ÙÙÙØª"
+
+msgid "Search recordings:"
+msgstr "Ø§ÙØ¨Ø­Ø« ÙÙ Ø§ÙØªØ³Ø¬ÙÙØ§Øª:"
+
+msgid "Selected: {count}; total size: {size} MiB."
+msgstr "Ø§ÙÙØ­Ø¯Ø¯: {count}Ø Ø§ÙØ­Ø¬Ù Ø§ÙØ¥Ø¬ÙØ§ÙÙ: {size} MiB."
+
+msgid "Show Deleted Recordings"
+msgstr "Ø¹Ø±Ø¶ Ø§ÙØªØ³Ø¬ÙÙØ§Øª Ø§ÙÙØ­Ø°ÙÙØ©"
+
+msgid "Sort by"
+msgstr "Ø§ÙØªØ±ØªÙØ¨ Ø­Ø³Ø¨"
+
+msgid "Start (local time, YYYY-MM-DD HH:MM)"
+msgstr "Ø§ÙØ¨Ø¯Ø§ÙØ© (Ø§ÙØªÙÙÙØª Ø§ÙÙØ­ÙÙØ YYYY-MM-DD HH:MM)"
+
+msgid "Stopped by user"
+msgstr "Ø£ÙÙÙÙ Ø§ÙÙØ³ØªØ®Ø¯Ù"
+
+msgid "Subtitle Timing..."
+msgstr "ØªÙÙÙØª Ø§ÙØªØ±Ø¬ÙØ©â¦"
+
+msgid "Subtitle delay in milliseconds (-600000 to 600000). Positive values display and read subtitles later; 0 resets timing."
+msgstr "ØªØ£Ø®ÙØ± Ø§ÙØªØ±Ø¬ÙØ© Ø¨Ø§ÙÙÙÙÙ Ø«Ø§ÙÙØ© (ÙÙ -600000 Ø¥ÙÙ 600000). ØªØ¤Ø®Ø± Ø§ÙÙÙÙ Ø§ÙÙÙØ¬Ø¨Ø© Ø¹Ø±Ø¶ Ø§ÙØªØ±Ø¬ÙØ© ÙÙØ±Ø§Ø¡ØªÙØ§Ø ÙØªØ¹ÙØ¯ Ø§ÙÙÙÙØ© 0 Ø§ÙØªÙÙÙØª Ø§ÙØ£ØµÙÙ."
+
+msgid "Subtitle delay: {milliseconds} ms."
+msgstr "ØªØ£Ø®ÙØ± Ø§ÙØªØ±Ø¬ÙØ©: {milliseconds} ÙÙÙÙ Ø«Ø§ÙÙØ©."
+
+msgid "Subtitle timing could not be changed."
+msgstr "ØªØ¹Ø°Ø± ØªØºÙÙØ± ØªÙÙÙØª Ø§ÙØªØ±Ø¬ÙØ©."
+
+msgid "The end must be in the future and after the start, within seven days."
+msgstr "ÙØ¬Ø¨ Ø£Ù ØªÙÙÙ Ø§ÙÙÙØ§ÙØ© ÙÙ Ø§ÙÙØ³ØªÙØ¨Ù ÙØ¨Ø¹Ø¯ Ø§ÙØ¨Ø¯Ø§ÙØ©Ø Ø®ÙØ§Ù Ø³Ø¨Ø¹Ø© Ø£ÙØ§Ù ÙÙÙØ§."
+
+msgid "The library can contain up to 20 folders."
+msgstr "ÙÙÙÙ Ø£Ù ØªØ­ØªÙÙ Ø§ÙÙÙØªØ¨Ø© Ø¹ÙÙ 20 ÙØ¬ÙØ¯ÙØ§ ÙØ­Ø¯ Ø£ÙØµÙ."
+
+msgid "The recording changed. Reopen its timing dialog."
+msgstr "ØªØºÙØ± Ø§ÙØªØ³Ø¬ÙÙ. Ø£Ø¹Ø¯ ÙØªØ­ ÙØ§ÙØ°Ø© Ø£ÙÙØ§ØªÙ."
+
+msgid "The recording start time has already passed."
+msgstr "Ø§ÙÙØ¶Ù ÙÙØª Ø¨Ø¯Ø¡ Ø§ÙØªØ³Ø¬ÙÙ Ø¨Ø§ÙÙØ¹Ù."
+
+msgid "{count} recording(s). Active recordings are not listed."
+msgstr "Ø¹Ø¯Ø¯ Ø§ÙØªØ³Ø¬ÙÙØ§Øª: {count}. ÙØ§ ØªÙØ¹Ø±Ø¶ Ø§ÙØªØ³Ø¬ÙÙØ§Øª Ø§ÙØ¬Ø§Ø±ÙØ©."

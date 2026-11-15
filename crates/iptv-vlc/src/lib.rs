@@ -48,6 +48,7 @@ type GetSpuFn = unsafe extern "C" fn(*mut c_void) -> c_int;
 type SetSpuFn = unsafe extern "C" fn(*mut c_void, c_int) -> c_int;
 type AddSlaveFn = unsafe extern "C" fn(*mut c_void, c_int, *const c_char, bool) -> c_int;
 type GetSpuDelayFn = unsafe extern "C" fn(*mut c_void) -> i64;
+type SetSpuDelayFn = unsafe extern "C" fn(*mut c_void, i64) -> c_int;
 
 /// `libvlc_media_stats_t` (field order per libvlc headers). libVLC
 /// writes the whole struct: a missing field overruns the stack.
@@ -225,6 +226,7 @@ struct Functions {
     set_spu: Option<SetSpuFn>,
     add_slave: Option<AddSlaveFn>,
     get_spu_delay: Option<GetSpuDelayFn>,
+    set_spu_delay: Option<SetSpuDelayFn>,
 }
 
 /// The per-load media options the core's cache plan decides
@@ -466,6 +468,9 @@ impl VlcEngine {
                 .ok()
                 .map(|s| *s),
             get_spu_delay: unsafe { lib.get::<GetSpuDelayFn>(b"libvlc_video_get_spu_delay") }
+                .ok()
+                .map(|s| *s),
+            set_spu_delay: unsafe { lib.get::<SetSpuDelayFn>(b"libvlc_video_set_spu_delay") }
                 .ok()
                 .map(|s| *s),
         };
@@ -736,6 +741,15 @@ impl VlcEngine {
             .fns
             .get_spu_delay
             .map_or(0, |get| unsafe { get(self.inner.player) / 1000 })
+    }
+
+    /// Set the subtitle delay in microseconds (Python's
+    /// `_apply_subtitle_timing` passes `milliseconds * 1000`).
+    /// Returns the libVLC result code (0 on success, negative
+    /// on failure), or None when the symbol is unavailable.
+    pub fn set_subtitle_delay_us(&self, delay_us: i64) -> Option<c_int> {
+        let set = self.inner.fns.set_spu_delay?;
+        Some(unsafe { set(self.inner.player, delay_us) })
     }
 
     /// Select a subtitle track by id (-1 disables rendering).

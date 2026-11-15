@@ -3762,3 +3762,179 @@ msgid ""
 msgstr ""
 "Сканирование поиска подчиняется билету механизма; пакеты результатов "
 "уступают взаимодействию (#108) (#114)"
+
+# PR #36 port (from the Python catalogues).
+
+msgid "A running recording's start time cannot be changed."
+msgstr "ÐÐµÐ»ÑÐ·Ñ Ð¸Ð·Ð¼ÐµÐ½Ð¸ÑÑ Ð²ÑÐµÐ¼Ñ Ð½Ð°ÑÐ°Ð»Ð° ÑÐµÐºÑÑÐµÐ¹ Ð·Ð°Ð¿Ð¸ÑÐ¸."
+
+msgid "Add Folder..."
+msgstr "ÐÐ¾Ð±Ð°Ð²Ð¸ÑÑ Ð¿Ð°Ð¿ÐºÑ..."
+
+msgid "All Recording Folders"
+msgstr "ÐÑÐµ Ð¿Ð°Ð¿ÐºÐ¸ Ð·Ð°Ð¿Ð¸ÑÐµÐ¹"
+
+msgid "All Recordings"
+msgstr "ÐÑÐµ Ð·Ð°Ð¿Ð¸ÑÐ¸"
+
+msgid "Checking recording conflicts..."
+msgstr "ÐÑÐ¾Ð²ÐµÑÐºÐ° ÐºÐ¾Ð½ÑÐ»Ð¸ÐºÑÐ¾Ð² Ð·Ð°Ð¿Ð¸ÑÐµÐ¹â¦"
+
+msgid "Choose a recording folder"
+msgstr "ÐÑÐ±ÐµÑÐ¸ÑÐµ Ð¿Ð°Ð¿ÐºÑ Ð·Ð°Ð¿Ð¸ÑÐµÐ¹"
+
+msgid "Date"
+msgstr "ÐÐ°ÑÐ°"
+
+msgid "Delete Recording"
+msgstr "Ð£Ð´Ð°Ð»Ð¸ÑÑ Ð·Ð°Ð¿Ð¸ÑÑ"
+
+msgid "Delete Recording File..."
+msgstr "Ð£Ð´Ð°Ð»Ð¸ÑÑ ÑÐ°Ð¹Ð» Ð·Ð°Ð¿Ð¸ÑÐ¸..."
+
+msgid "Descending"
+msgstr "ÐÐ¾ ÑÐ±ÑÐ²Ð°Ð½Ð¸Ñ"
+
+msgid "Details"
+msgstr "ÐÐ¾Ð´ÑÐ¾Ð±Ð½Ð¾ÑÑÐ¸"
+
+msgid "Duration"
+msgstr "ÐÐ»Ð¸ÑÐµÐ»ÑÐ½Ð¾ÑÑÑ"
+
+msgid "Edit Times..."
+msgstr "ÐÐ·Ð¼ÐµÐ½Ð¸ÑÑ Ð²ÑÐµÐ¼Ñ..."
+
+msgid "End (local time, YYYY-MM-DD HH:MM)"
+msgstr "ÐÐ¾Ð½ÐµÑ (Ð¼ÐµÑÑÐ½Ð¾Ðµ Ð²ÑÐµÐ¼Ñ, ÐÐÐÐ-ÐÐ-ÐÐ Ð§Ð§:ÐÐ)"
+
+msgid "File Size"
+msgstr "Ð Ð°Ð·Ð¼ÐµÑ ÑÐ°Ð¹Ð»Ð°"
+
+msgid "Invalid recording time."
+msgstr "ÐÐµÐ´Ð¾Ð¿ÑÑÑÐ¸Ð¼Ð¾Ðµ Ð²ÑÐµÐ¼Ñ Ð·Ð°Ð¿Ð¸ÑÐ¸."
+
+msgid "Invalid subtitle delay."
+msgstr "ÐÐµÐ´Ð¾Ð¿ÑÑÑÐ¸Ð¼Ð°Ñ Ð·Ð°Ð´ÐµÑÐ¶ÐºÐ° ÑÑÐ±ÑÐ¸ÑÑÐ¾Ð²."
+
+msgid "Loading recordings..."
+msgstr "ÐÐ°Ð³ÑÑÐ·ÐºÐ° Ð·Ð°Ð¿Ð¸ÑÐµÐ¹..."
+
+msgid "Move to Recording Trash..."
+msgstr "ÐÐµÑÐµÐ¼ÐµÑÑÐ¸ÑÑ Ð² ÐºÐ¾ÑÐ·Ð¸Ð½Ñ Ð·Ð°Ð¿Ð¸ÑÐµÐ¹..."
+
+msgid "Move {count} selected recordings to the recording trash?"
+msgstr "ÐÐµÑÐµÐ¼ÐµÑÑÐ¸ÑÑ Ð²ÑÐ±ÑÐ°Ð½Ð½ÑÐµ Ð·Ð°Ð¿Ð¸ÑÐ¸ ({count}) Ð² ÐºÐ¾ÑÐ·Ð¸Ð½Ñ Ð·Ð°Ð¿Ð¸ÑÐµÐ¹?"
+
+msgid "Next Episode"
+msgstr "Ð¡Ð»ÐµÐ´ÑÑÑÐ¸Ð¹ ÑÐ¿Ð¸Ð·Ð¾Ð´"
+
+msgid "No adjacent episode is available."
+msgstr "ÐÑÐµÐ´ÑÐ´ÑÑÐ¸Ð¹ Ð¸Ð»Ð¸ ÑÐ»ÐµÐ´ÑÑÑÐ¸Ð¹ ÑÐ¿Ð¸Ð·Ð¾Ð´ Ð½ÐµÐ´Ð¾ÑÑÑÐ¿ÐµÐ½."
+
+msgid "Overlapping Recordings"
+msgstr "ÐÐµÑÐµÑÐµÐºÐ°ÑÑÐ¸ÐµÑÑ Ð·Ð°Ð¿Ð¸ÑÐ¸"
+
+msgid "Overlapping recordings, including schedule padding."
+msgstr "ÐÐµÑÐµÑÐµÐºÐ°ÑÑÐ¸ÐµÑÑ Ð·Ð°Ð¿Ð¸ÑÐ¸ Ñ ÑÑÑÑÐ¾Ð¼ Ð·Ð°Ð¿Ð°ÑÐ° Ð²ÑÐµÐ¼ÐµÐ½Ð¸."
+
+msgid "Overlapping recordings: {count}."
+msgstr "ÐÐµÑÐµÑÐµÐºÐ°ÑÑÐ¸ÑÑÑ Ð·Ð°Ð¿Ð¸ÑÐµÐ¹: {count}."
+
+msgid "Partial"
+msgstr "Ð§Ð°ÑÑÐ¸ÑÐ½Ð°Ñ Ð·Ð°Ð¿Ð¸ÑÑ"
+
+msgid "Permanently delete {count} selected recording files? This cannot be undone."
+msgstr "ÐÐµÐ·Ð²Ð¾Ð·Ð²ÑÐ°ÑÐ½Ð¾ ÑÐ´Ð°Ð»Ð¸ÑÑ Ð²ÑÐ±ÑÐ°Ð½Ð½ÑÐµ ÑÐ°Ð¹Ð»Ñ Ð·Ð°Ð¿Ð¸ÑÐµÐ¹ ({count})? Ð­ÑÐ¾ Ð´ÐµÐ¹ÑÑÐ²Ð¸Ðµ Ð½ÐµÐ»ÑÐ·Ñ Ð¾ÑÐ¼ÐµÐ½Ð¸ÑÑ."
+
+msgid "Play / Resume"
+msgstr "ÐÐ¾ÑÐ¿ÑÐ¾Ð¸Ð·Ð²ÐµÑÑÐ¸ / ÐÑÐ¾Ð´Ð¾Ð»Ð¶Ð¸ÑÑ"
+
+msgid "Previous Episode"
+msgstr "ÐÑÐµÐ´ÑÐ´ÑÑÐ¸Ð¹ ÑÐ¿Ð¸Ð·Ð¾Ð´"
+
+msgid "Processing recordings..."
+msgstr "ÐÐ±ÑÐ°Ð±Ð¾ÑÐºÐ° Ð·Ð°Ð¿Ð¸ÑÐµÐ¹â¦"
+
+msgid "Recording Conflicts"
+msgstr "ÐÐ¾Ð½ÑÐ»Ð¸ÐºÑÑ Ð·Ð°Ð¿Ð¸ÑÐµÐ¹"
+
+msgid "Recording Conflicts..."
+msgstr "ÐÐ¾Ð½ÑÐ»Ð¸ÐºÑÑ Ð·Ð°Ð¿Ð¸ÑÐµÐ¹â¦"
+
+msgid "Recording Library"
+msgstr "ÐÐ¸Ð±Ð»Ð¸Ð¾ÑÐµÐºÐ° Ð·Ð°Ð¿Ð¸ÑÐµÐ¹"
+
+msgid "Recording folder:"
+msgstr "ÐÐ°Ð¿ÐºÐ° Ð·Ð°Ð¿Ð¸ÑÐµÐ¹:"
+
+msgid "Recording metadata could not be read. The media files are still available."
+msgstr "ÐÐµ ÑÐ´Ð°Ð»Ð¾ÑÑ Ð¿ÑÐ¾ÑÐ¸ÑÐ°ÑÑ Ð¼ÐµÑÐ°Ð´Ð°Ð½Ð½ÑÐµ Ð·Ð°Ð¿Ð¸ÑÐµÐ¹. ÐÐµÐ´Ð¸Ð°ÑÐ°Ð¹Ð»Ñ Ð¿Ð¾-Ð¿ÑÐµÐ¶Ð½ÐµÐ¼Ñ Ð´Ð¾ÑÑÑÐ¿Ð½Ñ."
+
+msgid "Recording schedule saved."
+msgstr "Ð Ð°ÑÐ¿Ð¸ÑÐ°Ð½Ð¸Ðµ Ð·Ð°Ð¿Ð¸ÑÐ¸ ÑÐ¾ÑÑÐ°Ð½ÐµÐ½Ð¾."
+
+msgid "Recording title:"
+msgstr "ÐÐ°Ð·Ð²Ð°Ð½Ð¸Ðµ Ð·Ð°Ð¿Ð¸ÑÐ¸:"
+
+msgid "Remove Folder from Library"
+msgstr "Ð£Ð±ÑÐ°ÑÑ Ð¿Ð°Ð¿ÐºÑ Ð¸Ð· Ð±Ð¸Ð±Ð»Ð¸Ð¾ÑÐµÐºÐ¸"
+
+msgid "Rename Title..."
+msgstr "ÐÐ·Ð¼ÐµÐ½Ð¸ÑÑ Ð½Ð°Ð·Ð²Ð°Ð½Ð¸Ðµ..."
+
+msgid "Reset Timing"
+msgstr "Ð¡Ð±ÑÐ¾ÑÐ¸ÑÑ ÑÐ¸Ð½ÑÑÐ¾Ð½Ð¸Ð·Ð°ÑÐ¸Ñ"
+
+msgid "Restore Recording"
+msgstr "ÐÐ¾ÑÑÑÐ°Ð½Ð¾Ð²Ð¸ÑÑ Ð·Ð°Ð¿Ð¸ÑÑ"
+
+msgid "Schedule Anyway"
+msgstr "ÐÑÑ ÑÐ°Ð²Ð½Ð¾ Ð·Ð°Ð¿Ð»Ð°Ð½Ð¸ÑÐ¾Ð²Ð°ÑÑ"
+
+msgid "Schedule by Time"
+msgstr "ÐÐ°Ð¿Ð»Ð°Ð½Ð¸ÑÐ¾Ð²Ð°ÑÑ Ð¿Ð¾ Ð²ÑÐµÐ¼ÐµÐ½Ð¸"
+
+msgid "Search recordings:"
+msgstr "ÐÐ¾Ð¸ÑÐº Ð·Ð°Ð¿Ð¸ÑÐµÐ¹:"
+
+msgid "Selected: {count}; total size: {size} MiB."
+msgstr "ÐÑÐ±ÑÐ°Ð½Ð¾: {count}; Ð¾Ð±ÑÐ¸Ð¹ ÑÐ°Ð·Ð¼ÐµÑ: {size} MiB."
+
+msgid "Show Deleted Recordings"
+msgstr "ÐÐ¾ÐºÐ°Ð·Ð°ÑÑ ÑÐ´Ð°Ð»ÑÐ½Ð½ÑÐµ Ð·Ð°Ð¿Ð¸ÑÐ¸"
+
+msgid "Sort by"
+msgstr "Ð¡Ð¾ÑÑÐ¸ÑÐ¾Ð²Ð°ÑÑ Ð¿Ð¾"
+
+msgid "Start (local time, YYYY-MM-DD HH:MM)"
+msgstr "ÐÐ°ÑÐ°Ð»Ð¾ (Ð¼ÐµÑÑÐ½Ð¾Ðµ Ð²ÑÐµÐ¼Ñ, ÐÐÐÐ-ÐÐ-ÐÐ Ð§Ð§:ÐÐ)"
+
+msgid "Stopped by user"
+msgstr "ÐÑÑÐ°Ð½Ð¾Ð²Ð»ÐµÐ½Ð¾ Ð¿Ð¾Ð»ÑÐ·Ð¾Ð²Ð°ÑÐµÐ»ÐµÐ¼"
+
+msgid "Subtitle Timing..."
+msgstr "Ð¡Ð¸Ð½ÑÑÐ¾Ð½Ð¸Ð·Ð°ÑÐ¸Ñ ÑÑÐ±ÑÐ¸ÑÑÐ¾Ð²â¦"
+
+msgid "Subtitle delay in milliseconds (-600000 to 600000). Positive values display and read subtitles later; 0 resets timing."
+msgstr "ÐÐ°Ð´ÐµÑÐ¶ÐºÐ° ÑÑÐ±ÑÐ¸ÑÑÐ¾Ð² Ð² Ð¼Ð¸Ð»Ð»Ð¸ÑÐµÐºÑÐ½Ð´Ð°Ñ (Ð¾Ñ -600000 Ð´Ð¾ 600000). ÐÐ¾Ð»Ð¾Ð¶Ð¸ÑÐµÐ»ÑÐ½ÑÐµ Ð·Ð½Ð°ÑÐµÐ½Ð¸Ñ Ð·Ð°Ð´ÐµÑÐ¶Ð¸Ð²Ð°ÑÑ Ð¿Ð¾ÐºÐ°Ð· Ð¸ ÑÑÐµÐ½Ð¸Ðµ ÑÑÐ±ÑÐ¸ÑÑÐ¾Ð²; 0 Ð²Ð¾ÑÑÑÐ°Ð½Ð°Ð²Ð»Ð¸Ð²Ð°ÐµÑ Ð¸ÑÑÐ¾Ð´Ð½ÑÑ ÑÐ¸Ð½ÑÑÐ¾Ð½Ð¸Ð·Ð°ÑÐ¸Ñ."
+
+msgid "Subtitle delay: {milliseconds} ms."
+msgstr "ÐÐ°Ð´ÐµÑÐ¶ÐºÐ° ÑÑÐ±ÑÐ¸ÑÑÐ¾Ð²: {milliseconds} Ð¼Ñ."
+
+msgid "Subtitle timing could not be changed."
+msgstr "ÐÐµ ÑÐ´Ð°Ð»Ð¾ÑÑ Ð¸Ð·Ð¼ÐµÐ½Ð¸ÑÑ ÑÐ¸Ð½ÑÑÐ¾Ð½Ð¸Ð·Ð°ÑÐ¸Ñ ÑÑÐ±ÑÐ¸ÑÑÐ¾Ð²."
+
+msgid "The end must be in the future and after the start, within seven days."
+msgstr "ÐÐ¾Ð½ÐµÑ Ð´Ð¾Ð»Ð¶ÐµÐ½ Ð±ÑÑÑ Ð² Ð±ÑÐ´ÑÑÐµÐ¼, Ð¿Ð¾ÑÐ»Ðµ Ð½Ð°ÑÐ°Ð»Ð° Ð¸ Ð½Ðµ Ð¿Ð¾Ð·Ð´Ð½ÐµÐµ ÑÐµÐ¼ ÑÐµÑÐµÐ· ÑÐµÐ¼Ñ Ð´Ð½ÐµÐ¹ Ð¿Ð¾ÑÐ»Ðµ Ð½ÐµÐ³Ð¾."
+
+msgid "The library can contain up to 20 folders."
+msgstr "ÐÐ¸Ð±Ð»Ð¸Ð¾ÑÐµÐºÐ° Ð¼Ð¾Ð¶ÐµÑ ÑÐ¾Ð´ÐµÑÐ¶Ð°ÑÑ Ð´Ð¾ 20 Ð¿Ð°Ð¿Ð¾Ðº."
+
+msgid "The recording changed. Reopen its timing dialog."
+msgstr "ÐÐ°Ð¿Ð¸ÑÑ Ð¸Ð·Ð¼ÐµÐ½Ð¸Ð»Ð°ÑÑ. ÐÑÐºÑÐ¾Ð¹ÑÐµ Ð¾ÐºÐ½Ð¾ ÐµÑ Ð²ÑÐµÐ¼ÐµÐ½Ð¸ Ð·Ð°Ð½Ð¾Ð²Ð¾."
+
+msgid "The recording start time has already passed."
+msgstr "ÐÑÐµÐ¼Ñ Ð½Ð°ÑÐ°Ð»Ð° Ð·Ð°Ð¿Ð¸ÑÐ¸ ÑÐ¶Ðµ Ð¿ÑÐ¾ÑÐ»Ð¾."
+
+msgid "{count} recording(s). Active recordings are not listed."
+msgstr "ÐÐ¾Ð»Ð¸ÑÐµÑÑÐ²Ð¾ Ð·Ð°Ð¿Ð¸ÑÐµÐ¹: {count}. Ð¢ÐµÐºÑÑÐ¸Ðµ Ð·Ð°Ð¿Ð¸ÑÐ¸ Ð½Ðµ Ð¾ÑÐ¾Ð±ÑÐ°Ð¶Ð°ÑÑÑÑ."
