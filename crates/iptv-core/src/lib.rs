@@ -12,6 +12,25 @@ pub(crate) fn hex_lower(bytes: &[u8]) -> String {
         })
 }
 
+/// Every child process the app starts goes through here. This is
+/// a GUI-subsystem app, so a console program (ffmpeg, reg, netsh,
+/// shutdown) started with a plain `Command::new` opens its own
+/// console window on Windows. `CREATE_NO_WINDOW` keeps every one
+/// of them invisible; GUI programs ignore the flag.
+/// clippy.toml disallows `Command::new` everywhere else.
+#[must_use]
+pub fn hidden_command(program: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
+    #[allow(clippy::disallowed_methods)]
+    #[allow(unused_mut)] // mut is only used by the Windows creation_flags call below
+    let mut command = std::process::Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    command
+}
+
 pub mod account_info;
 pub mod applog;
 pub mod audiotracks;

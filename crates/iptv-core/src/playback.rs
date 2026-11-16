@@ -84,7 +84,7 @@ fn parse_registry_proxy(query_output: &str) -> Option<String> {
 fn windows_registry_proxy() -> Option<String> {
     let key = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings";
     let query = |value: &str| {
-        std::process::Command::new("reg")
+        crate::hidden_command("reg")
             .args(["query", key, "/v", value])
             .output()
             .ok()

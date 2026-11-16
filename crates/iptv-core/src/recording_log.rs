@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -944,7 +944,7 @@ pub fn ffmpeg_supports_log_datetime(ffmpeg_path: &str) -> bool {
     {
         return *cached;
     }
-    let spawned = Command::new(ffmpeg_path)
+    let spawned = crate::hidden_command(ffmpeg_path)
         .args([
             "-hide_banner",
             "-loglevel",

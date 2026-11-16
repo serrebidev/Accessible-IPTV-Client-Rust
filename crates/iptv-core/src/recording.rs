@@ -6,7 +6,7 @@
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::{Arc, Mutex};
 
 use crate::playback::StreamHeaders;
@@ -505,7 +505,7 @@ impl RecordingEngine {
         // lines instead, and the recording carries no log.
         let log_file = open_recording_log(&out_path, command);
         let log_path = log_file.as_ref().map(|(_, path)| path.clone());
-        let mut cmd = Command::new(&command[0]);
+        let mut cmd = crate::hidden_command(&command[0]);
         cmd.args(&command[1..])
             .stdin(Stdio::piped())
             .stdout(if shared_stdout {
@@ -952,7 +952,7 @@ pub fn shutdown_commands(system: &str, windows_root: &str) -> Vec<Vec<String>> {
 pub fn shutdown_computer(system: &str, windows_root: &str) -> Result<Vec<String>, String> {
     let mut failures: Vec<String> = Vec::new();
     for cmd in shutdown_commands(system, windows_root) {
-        match Command::new(&cmd[0]).args(&cmd[1..]).status() {
+        match crate::hidden_command(&cmd[0]).args(&cmd[1..]).status() {
             Ok(status) if status.success() => return Ok(cmd),
             Ok(status) => failures.push(format!(
                 "{}: exit code {}",

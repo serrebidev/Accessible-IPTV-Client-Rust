@@ -1,0 +1,6 @@
+# Every child process goes through iptv_core::hidden_command, which
+# sets CREATE_NO_WINDOW. A plain Command::new from this GUI app opens
+# a console window per ffmpeg/reg/netsh run on Windows.
+disallowed-methods = [
+    { path = "std::process::Command::new", reason = "use iptv_core::hidden_command so no console window opens" },
+]

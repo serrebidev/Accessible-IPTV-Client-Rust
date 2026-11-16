@@ -66,8 +66,6 @@ pub fn firewall_rule_name(port: u16) -> String {
 #[cfg(windows)]
 #[allow(clippy::unnecessary_wraps)] // shared signature: non-Windows returns None
 fn ensure_firewall_rule(port: u16) -> Option<String> {
-    use std::os::windows::process::CommandExt as _;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let name = firewall_rule_name(port);
     let name_arg = format!("name={name}");
     let port_arg = format!("localport={port}");
@@ -85,10 +83,7 @@ fn ensure_firewall_rule(port: u16) -> Option<String> {
         "profile=private,domain",
     ];
     for args in [delete, add] {
-        let _ = std::process::Command::new("netsh")
-            .args(args)
-            .creation_flags(CREATE_NO_WINDOW)
-            .output();
+        let _ = crate::hidden_command("netsh").args(args).output();
     }
     Some(name)
 }
@@ -102,12 +97,9 @@ fn ensure_firewall_rule(_port: u16) -> Option<String> {
 /// `_remove_firewall_rule`); failures ignored.
 #[cfg(windows)]
 fn remove_firewall_rule(name: &str) {
-    use std::os::windows::process::CommandExt as _;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let name_arg = format!("name={name}");
-    let _ = std::process::Command::new("netsh")
+    let _ = crate::hidden_command("netsh")
         .args(["advfirewall", "firewall", "delete", "rule", &name_arg])
-        .creation_flags(CREATE_NO_WINDOW)
         .output();
 }
 

@@ -5,6 +5,12 @@ adjacent releases were part of the same fix stream, they are combined with a
 version range such as `0.2.2-0.2.3`. Each release's section below is its
 Forgejo release note, taken from this file by the release workflow.
 
+## 0.4.29
+
+- No more console windows. Every tool the app runs in the background (ffmpeg, the proxy lookup, the firewall rule, shutdown) now starts hidden. Before, a terminal window could open at startup and again every time you paused on a channel, taking the focus away from the app, which made moving around and switching back with Alt+Tab feel frozen.
+- Search now waits for you. Typing in Search channels no longer refilters the whole channel list on every key. Press Enter to search and move to the channel list, or just leave the field with Tab, Shift+Tab or a click. Clear the field and leave it to see every channel again.
+- Moving through the channel list does less work: the Episode description and Stream URL fields are only rewritten when their text actually changes, so your screen reader has fewer updates to process.
+
 ## 0.4.28
 
 - Recordings > Recording Library lists finished recordings from up to 20 folders: search, filter by completion status, sort by date, title, duration or file size, play or resume, rename titles, move recordings to the recording trash and restore them. Active recordings are never listed, and every finished recording is indexed as it completes.

@@ -13,7 +13,7 @@ use std::fmt::Write as _;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -244,17 +244,12 @@ impl BufferSession {
         let source = resolve_hls_input(&clean, &merged, cap_mbps)?;
         let dest = format!("{}/{}/", self.origin, self.write_token);
         let cmd = ingest_command(&source, &merged, &dest, self.seconds);
-        let mut command = Command::new(&cmd[0]);
+        let mut command = iptv_core::hidden_command(&cmd[0]);
         command
             .args(&cmd[1..])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-        }
         let mut child = command
             .spawn()
             .map_err(|e| format!("could not start ffmpeg: {e}"))?;
