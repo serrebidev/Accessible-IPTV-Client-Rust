@@ -1344,9 +1344,12 @@ mod tests {
         });
         let result = folders(&config, "/data/a");
         assert_eq!(result.len(), 3);
-        assert!(result[0].ends_with("data/a"));
-        assert!(result[1].ends_with("data/b"));
-        assert!(result[2].ends_with("data/c"));
+        // The absolutized paths use the platform separator
+        // (backslashes on Windows), so compare normalized.
+        let normalized: Vec<String> = result.iter().map(|path| path.replace('\\', "/")).collect();
+        assert!(normalized[0].ends_with("data/a"));
+        assert!(normalized[1].ends_with("data/b"));
+        assert!(normalized[2].ends_with("data/c"));
     }
 
     #[test]

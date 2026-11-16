@@ -1,4 +1,4 @@
-# 0101 — Python PR #36 ported: recording tools, playback navigation, data recovery (v0.4.27)
+# 0101 — Python PR #36 ported: recording tools, playback navigation, data recovery (v0.4.28)
 
 Brandon's order (2026-11-15, via the main chat): "put the pr's
 on both" — Tibor's (htibcsike) Python PR #36, "Improve
@@ -180,3 +180,14 @@ NVDA pass over the Recording Library dialog, the conflicts
 dialog and Edit Times, Subtitle Timing, episode navigation,
 and the Continue Watching Type switch, in English and one
 non-English language.
+
+## Release note: v0.4.27 tag burned, shipped as v0.4.28
+
+The v0.4.27 tag was pushed and its release run started, but
+the Windows build leg failed one test —
+`recording_library::tests::folders_dedupes_and_caps` asserted
+forward-slash path endings, and Windows absolutizes library
+folders with backslashes (the production behaviour matches
+Python; the assertion was platform-naive). No v0.4.27 release
+was published. Per this repo's tombstone rule the tag is
+never reused; the fix and the version bump ship as v0.4.28.
