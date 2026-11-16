@@ -80,6 +80,28 @@ fn iso_from_ts(ts: f64) -> String {
         .unwrap_or_default()
 }
 
+/// Python `manual_schedule.validate_window`: the window a
+/// by-time recording may occupy.
+///
+/// # Errors
+/// Returns Python's messages for non-finite times, an end not
+/// in the future or not after the start or beyond seven days,
+/// and a start already passed when the job has not started.
+pub fn validate_window(start: f64, end: f64, now: f64, allow_started: bool) -> Result<(), String> {
+    if !start.is_finite() || !end.is_finite() || !now.is_finite() {
+        return Err("Invalid recording time.".to_string());
+    }
+    if end <= start || end <= now || end - start > 7.0 * 86_400.0 {
+        return Err(
+            "The end must be in the future and after the start, within seven days.".to_string(),
+        );
+    }
+    if !allow_started && start < now {
+        return Err("The recording start time has already passed.".to_string());
+    }
+    Ok(())
+}
+
 /// The programme's own start: the padded record start plus the
 /// pre-padding that leads it.
 #[allow(clippy::cast_precision_loss)] // schedule times are whole seconds
@@ -371,6 +393,60 @@ impl DvrSchedule {
         self.jobs.push(job);
         self.save();
         id
+    }
+
+    /// Python `edit_timing`: retime one scheduled or recording
+    /// job, refusing a stale snapshot (the job's times or status
+    /// moved since the dialog opened) and any other status. The
+    /// edited window replaces the padded one, so padding zeroes.
+    ///
+    /// # Errors
+    /// Returns Python's messages for a stale or changed job, a
+    /// running job's start move, and an invalid window.
+    #[allow(clippy::float_cmp)] // the expected snapshot compares exactly, as Python's does
+    #[allow(clippy::cast_possible_truncation)] // programme times are whole seconds
+    pub fn edit_timing(
+        &mut self,
+        job_id: &str,
+        start: f64,
+        end: f64,
+        expected: (f64, f64, &str),
+        now: f64,
+    ) -> Result<DvrJob, String> {
+        let Some(job) = self.jobs.iter_mut().find(|j| j.id == job_id) else {
+            return Err("The recording changed. Reopen its timing dialog.".to_string());
+        };
+        if (job.status != STATUS_SCHEDULED && job.status != STATUS_RECORDING)
+            || job.start_ts != expected.0
+            || job.stop_ts != expected.1
+            || job.status != expected.2
+        {
+            return Err("The recording changed. Reopen its timing dialog.".to_string());
+        }
+        let running = job.status == STATUS_RECORDING;
+        if running && start != job.start_ts {
+            return Err("A running recording's start time cannot be changed.".to_string());
+        }
+        validate_window(start, end, now, running)?;
+        job.start_ts = start;
+        job.stop_ts = end;
+        job.start_at = iso_from_ts(start);
+        job.end_at = iso_from_ts(end);
+        job.pre_padding_minutes = 0;
+        job.post_padding_minutes = 0;
+        if let Some(program) = job.program.as_object_mut() {
+            program.insert(
+                "start".to_string(),
+                serde_json::json!(xmltv_from_ts(start as i64)),
+            );
+            program.insert(
+                "end".to_string(),
+                serde_json::json!(xmltv_from_ts(end as i64)),
+            );
+        }
+        let updated = job.clone();
+        self.save();
+        Ok(updated)
     }
 
     /// Delete a job outright (finished jobs only, like Python's

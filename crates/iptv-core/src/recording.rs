@@ -353,6 +353,9 @@ pub struct RecordingStartMeta {
     /// Seconds the capture was meant to run, when it had a
     /// planned length (a download's window, a DVR job's span).
     pub planned_seconds: Option<f64>,
+    /// The recorded channel's name, for the recording library
+    /// index (Python `Recording.channel_name`).
+    pub channel_name: String,
 }
 
 /// One running recording.
@@ -403,6 +406,11 @@ pub struct RecordingFinished {
     /// Media seconds ffmpeg reported writing (Python
     /// `media_written_seconds`), from the log's `time=` lines.
     pub media_written_seconds: Option<f64>,
+    /// Seconds the capture was meant to run, when it had a
+    /// planned length (from the start meta).
+    pub planned_seconds: Option<f64>,
+    /// The recorded channel's name (from the start meta).
+    pub channel_name: String,
 }
 
 /// The recording process manager: spawn ffmpeg, stop it gracefully,
@@ -784,6 +792,8 @@ fn build_finished(key: &str, active: Active, exit_code: i32, success: bool) -> R
         stderr_tail,
         problem_counts,
         media_written_seconds,
+        planned_seconds: meta.planned_seconds,
+        channel_name: meta.channel_name.clone(),
     }
 }
 
@@ -1369,6 +1379,7 @@ mod tests {
                     title: "Show".to_string(),
                     format: "provider_mkv".to_string(),
                     planned_seconds: Some(60.0),
+                    channel_name: "Test Channel".to_string(),
                 },
             )
             .expect("start");

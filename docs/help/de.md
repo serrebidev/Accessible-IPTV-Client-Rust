@@ -110,6 +110,10 @@ Ansicht > Live-TV && Nachholen schaltet auf Live-Sender zurück. Das Suchfeld le
 
 Video-on-Demand funktioniert am besten mit Xtream-Codes-Konten, die ihr Angebot korrekt beschreiben. Bei reinen M3U-Wiedergabelisten erkennt das Programm Filme und Serien an ihren Gruppennamen und Folgennummern.
 
+Wiedergabe > Vorherige Episode (Strg+BildAuf) und Nächste Episode (Strg+BildAb) wechseln innerhalb der aktuellen Serie. Die Tastenkürzel sind anpassbar. Während der Suche läuft die Wiedergabe weiter. Fehlende oder mehrdeutige Episoden bewirken keinen Wechsel. Eine neue Wiedergabe- oder Wiedergabelistenanforderung verwirft das Suchergebnis.
+
+Weitersehen bietet eine Typauswahl für Video auf Abruf oder Aufnahmen. Lokale Positionen werden getrennt gespeichert. Die Prüfung sucht im Hintergrund nur in eingerichteten Aufnahmeordnern und verlangt passenden Pfad und passende Dateimerkmale. Fehlende oder ersetzte Dateien werden nicht abgespielt. Entfernen und Leeren betrifft nur den gewählten Typ.
+
 ## Wiedergabelisten-Manager {#playlist-manager}
 
 Datei > Wiedergabelisten-Manager (Ctrl+M) listet Ihre Wiedergabelistenquellen auf. Er öffnet mit dem Fokus auf der Liste.
@@ -238,6 +242,9 @@ Eine gewählte Spur wird pro Sender gemerkt und kommt beim nächsten Mal wieder.
 Untertiteltext erscheint im Video, wenn der Stream ihn liefert. Wiedergabe > Untertiteldatei laden akzeptiert eine externe Untertiteldatei. Schalten Sie Wiedergabe > Untertitel vorlesen (Umschalt+S) ein, dann liest die ausgewählte Stimme jeden Untertitel einer geladenen SRT, ASS, SSA- oder WebVTT-Datei vor, sobald er erscheint, auch bei ausgeblendetem Player-Fenster. Der aktuelle Untertitel steht außerdem als Text am Ende der Player-Steuerelemente. Im integrierten Player können Untertitel aus dem Stream selbst noch nicht vorgelesen werden.
 
 Wiedergabe > Aktuellen Untertitel vorlesen (C) liest den Untertitel auf dem Bildschirm vor, oder den zuletzt angezeigten, wenn gerade keiner zu sehen ist. Wiedergabe > Vorheriger Untertitel (Bild auf) und Nächster Untertitel (Bild ab) bewegen sich durch die bereits angezeigten Untertitel, sodass Sie eine verpasste Zeile noch einmal hören. Sie lesen nie der Wiedergabe voraus und funktionieren, egal ob Untertitel vorlesen ein- oder ausgeschaltet ist. Unter Windows lässt sich die Anwendungsstimme unter Optionen > Untertitelsprache > Sprechgeschwindigkeit der Anwendungsstimme… von -10 bis 10 einstellen; 0 ist normal. Wiedergabegeschwindigkeit und Screenreader bleiben unverändert.
+
+Wiedergabe > Untertitelzeitversatz (Strg+Umschalt+T) verschiebt Untertitel um höchstens zehn Minuten in beide Richtungen. Die Eingabe erfolgt in Millisekunden mit 500-ms-Schritten; positive Werte verzögern Anzeige und Vorlesen von Untertiteldateien. Zurücksetzen stellt null ein, Abbrechen behält den bisherigen Wert. Neue Medien setzen die Anpassung zurück. Wiedergabe- und Screenreader-Geschwindigkeit bleiben unverändert.
+
 ### Audioausgabegerät {#audio-output-device}
 
 Wiedergabe > Audioausgabegerät… (D) wählt die Lautsprecher oder Kopfhörer, die der Player benutzt, etwa um TV-Ton von Ihrem Screenreader fernzuhalten. Systemstandard folgt dem Windows-Standardgerät. Die Wahl wird gemerkt.
@@ -284,6 +291,14 @@ Das Aufnehmen des laufenden Programms im integrierten Player benutzt dieselbe Ve
 
 Das Stoppen einer Aufnahme kann einen Moment dauern, bis ihre Datei fertiggestellt ist. Beim Beenden des Programms werden noch laufende Aufnahmen ebenfalls gestoppt; das Programm gibt ihnen vorher eine kurze Frist, um ihre Dateien fertigzustellen.
 
+Aufnahmen > Aufnahmebibliothek zeigt abgeschlossene Dateien aus bis zu 20 Ordnern einschließlich des aktuellen Aufnahmeordners. Ordner hinzufügen nimmt einen vorhandenen Ordner auf, ändert aber nicht das Speicherziel neuer Aufnahmen. Ordner aus Bibliothek entfernen lässt die Dateien unverändert. Der aktuelle Aufnahmeordner kann nicht entfernt werden.
+
+Suchen Sie nach Titel, Sender oder Datum. Wiedergeben / Fortsetzen öffnet die Datei und bietet gegebenenfalls die gespeicherte Position an. Dauer und Abschlussstatus erscheinen, soweit bekannt; ältere Dateien können Unbekannt anzeigen. Laufende Aufnahmen und im integrierten Player geöffnete Dateien werden ausgelassen. Titel umbenennen ändert nur den angezeigten Titel; Dateiname, Wiedergabeposition und Lesezeichen bleiben erhalten. Aktualisieren liest die Liste neu ein.
+
+In den Aufnahme-Papierkorb verschieben verschiebt die Datei in den Papierkorb der Anwendung innerhalb ihres Aufnahmeordners und gibt keinen Speicherplatz frei. Gelöschte Aufnahmen anzeigen zeigt diese Dateien. Aufnahme wiederherstellen bringt sie ohne Überschreiben vorhandener Dateien in den ursprünglichen Ordner zurück. Aufnahmedatei löschen entfernt sie in dieser Ansicht nach Bestätigung endgültig. Das Löschen eines Eintrags aus Geplante Aufnahmen löscht die Mediendatei nicht.
+
+Alle Aufnahmeordner zeigt die eingerichteten Ordner gemeinsam. Filtern Sie nach Status und sortieren Sie nach Datum, Titel, Dauer oder Dateigröße; Absteigend kehrt die Reihenfolge um. Strg+A markiert alle sichtbaren Zeilen; Anzahl und Gesamtgröße erscheinen. Papierkorb, endgültiges Löschen und Wiederherstellen unterstützen Mehrfachauswahl. Wiedergabe und Umbenennen benötigen eine Aufnahme. Scannen und Filtern laufen im Hintergrund; bestätigte Dateiaktionen werden beim Schließen fortgesetzt.
+
 ### Aufnahmeformat {#recording-formats}
 
 Aufnahmen > Aufnahmeformat wählt, wie Aufnahmen gespeichert werden:
@@ -310,6 +325,8 @@ Geplante Aufnahmen starten von selbst, während das Programm läuft, auch wenn e
 Wenn eine neue Aufnahme eine andere geplante Aufnahme überschneidet, warnt Sie das Programm vor dem Hinzufügen. Ihr Provider begrenzt möglicherweise die Anzahl der Streams, die gleichzeitig ausgeführt werden können.
 
 Das Programm fragt vor dem Schließen nach, solange geplante Aufnahmen noch auf ihren Start warten, denn sie können nur starten, während das Programm läuft. Schließen Sie es trotzdem, starten die wartenden Aufnahmen nicht.
+
+Aufnahmekonflikte in Geplante Aufnahmen zeigt Überschneidungen des ausgewählten Eintrags einschließlich Vor- und Nachlauf. Die Details nennen Kanal, Kontoname und Aufnahmezeitraum. Zeiten bearbeiten öffnet den vorhandenen Editor. Die Konfliktbestätigung bietet diese Details und Trotzdem planen. Bei bekanntem Aufnahmebudget wird nur dasselbe Konto verglichen; andernfalls werden zeitliche Überschneidungen ohne behauptetes Anbieterlimit gezeigt.
 
 ### Zeitpuffer für Aufnahmen {#schedule-padding}
 

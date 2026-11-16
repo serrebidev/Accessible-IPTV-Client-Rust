@@ -110,6 +110,10 @@ Affichage > TV en direct && Rattrapage revient aux chaînes en direct. Le champ 
 
 La vidéo à la demande fonctionne mieux avec les comptes Xtream Codes, qui décrivent correctement leur catalogue. Pour les simples listes M3U, le programme reconnaît les films et les séries d'après leurs noms de groupe et leur numérotation d'épisodes.
 
+Lecture > Épisode précédent (Ctrl+Page précédente) et Épisode suivant (Ctrl+Page suivante) permettent de changer d’épisode dans la série actuelle. Les raccourcis sont configurables. La lecture continue pendant la recherche. Un épisode indisponible ou ambigu ne provoque aucun changement. Une nouvelle lecture ou un changement de liste invalide la recherche précédente.
+
+Continuer à regarder propose un choix de type : vidéo à la demande ou enregistrements. Les positions locales restent séparées. Leur vérification recherche en arrière-plan dans les seuls dossiers configurés et exige un chemin et des caractéristiques de fichier identiques. Les fichiers absents ou remplacés ne sont pas lus. La suppression des positions concerne seulement le type sélectionné.
+
 ## Gestionnaire de listes de lecture {#playlist-manager}
 
 Fichier > Gestionnaire de listes de lecture (Ctrl+M) liste vos sources de listes de lecture. Il s'ouvre avec le focus sur la liste.
@@ -238,6 +242,9 @@ Une piste choisie est mémorisée pour cette chaîne et revient la prochaine foi
 Le texte des sous-titres apparaît dans la vidéo lorsque le flux le fournit. Lecture > Charger le fichier de sous-titres accepte un fichier de sous-titres externe. Activez Lecture > Lire les sous-titres à voix haute (Maj+S) et la voix sélectionnée lit chaque sous-titre d'un fichier SRT, ASS, SSA ou WebVTT chargé au moment où il apparaît, même lorsque la fenêtre du lecteur est masquée. Le sous-titre en cours s'affiche aussi sous forme de texte à la fin des commandes du lecteur. Le lecteur intégré ne peut pas encore lire à voix haute les sous-titres inclus dans le flux.
 
 Lecture > Lire le sous-titre actuel (C) lit le sous-titre à l'écran, ou le dernier affiché s'il n'y en a aucun à l'écran. Lecture > Sous-titre précédent (Page précédente) et Sous-titre suivant (Page suivante) parcourent les sous-titres déjà affichés, pour réentendre une ligne manquée. Ils ne lisent jamais en avance sur la lecture et fonctionnent que Lire les sous-titres à voix haute soit activé ou non. Sous Windows, Options > Lecture des sous-titres > Débit de la voix de l’application… règle le débit de -10 à 10 ; 0 correspond au débit normal. La vitesse de lecture du média et les réglages du lecteur d’écran restent inchangés.
+
+Lecture > Synchronisation des sous-titres (Ctrl+Maj+T) règle un décalage maximal de dix minutes dans chaque sens, en millisecondes par pas de 500 ms. Une valeur positive retarde l’affichage et la lecture vocale des fichiers de sous-titres. Réinitialiser règle zéro ; Annuler conserve la valeur précédente. Un nouveau média réinitialise le réglage. La vitesse du média et du lecteur d’écran reste inchangée.
+
 ### Périphérique de sortie audio {#audio-output-device}
 
 Lecture > Périphérique de sortie audio… (D) choisit les haut-parleurs ou le casque que le lecteur utilise, par exemple pour éloigner le son du téléviseur de votre lecteur d'écran. Par défaut du système suit le périphérique par défaut de Windows. Le choix est mémorisé.
@@ -284,6 +291,14 @@ Enregistrer ce que vous regardez dans le lecteur intégré utilise la même conn
 
 L'arrêt d'un enregistrement peut prendre un moment, le temps de finaliser son fichier. Quand l'application se ferme, les enregistrements encore en cours sont eux aussi arrêtés ; le programme leur laisse d'abord un court délai pour finaliser leurs fichiers.
 
+Enregistrements > Bibliothèque des enregistrements affiche les fichiers terminés de 20 dossiers au maximum, dont le dossier d’enregistrement actuel. Ajouter un dossier ajoute un dossier existant sans changer la destination des nouveaux enregistrements. Retirer le dossier de la bibliothèque conserve ses fichiers. Le dossier d’enregistrement actuel ne peut pas être retiré.
+
+Recherchez par titre, chaîne ou date. Lire / Reprendre ouvre le fichier et propose sa position mémorisée, si elle existe. La durée et l’état sont affichés lorsqu’ils sont connus ; les anciens fichiers peuvent indiquer Inconnu. Les enregistrements en cours et les fichiers ouverts dans le lecteur intégré sont exclus. Renommer le titre modifie uniquement le titre affiché, en conservant le nom du fichier, la position et les signets. Actualiser recharge la liste.
+
+Déplacer dans la corbeille des enregistrements place le fichier dans la corbeille de l’application à l’intérieur de son dossier d’enregistrement, sans libérer d’espace. Afficher les enregistrements supprimés les rend visibles. Restaurer l’enregistrement remet le fichier dans son dossier d’origine sans écraser un fichier existant. Dans cette vue, Supprimer le fichier d’enregistrement le supprime définitivement après confirmation. Retirer une entrée des Enregistrements programmés ne supprime pas le fichier multimédia.
+
+Tous les dossiers d’enregistrements réunit les dossiers configurés. Filtrez par état et triez par date, titre, durée ou taille ; Ordre décroissant inverse le tri. Ctrl+A sélectionne toutes les lignes visibles ; le nombre et la taille totale sont affichés. Corbeille, suppression définitive et restauration acceptent plusieurs fichiers ; lecture et renommage exigent une seule sélection. L’analyse et le filtrage s’effectuent en arrière-plan ; fermer ne suspend pas une action confirmée.
+
 ### Format d'enregistrement {#recording-formats}
 
 Enregistrements > Format d'enregistrement choisit comment les enregistrements sont sauvegardés :
@@ -310,6 +325,8 @@ Les enregistrements programmés démarrent tout seuls pendant que le programme t
 Lorsqu'un nouvel enregistrement chevauche un autre enregistrement programmé, le programme vous avertit avant de l'ajouter. Votre fournisseur peut limiter le nombre de flux pouvant être exécutés simultanément.
 
 Le programme demande confirmation avant de se fermer si des enregistrements programmés attendent encore de démarrer, car ils ne peuvent démarrer que pendant que le programme tourne. Si vous le fermez quand même, ces enregistrements ne démarreront pas.
+
+Conflits d’enregistrement, dans Enregistrements programmés, présente les chevauchements de l’entrée sélectionnée, marges comprises. Les détails indiquent la chaîne, l’alias du compte et la période réelle. Modifier les horaires ouvre l’éditeur existant. La confirmation propose ces détails et Programmer quand même. Un budget connu limite la comparaison au même compte ; sinon, les chevauchements ne prétendent pas représenter une limite du fournisseur.
 
 ### Marge de programmation {#schedule-padding}
 

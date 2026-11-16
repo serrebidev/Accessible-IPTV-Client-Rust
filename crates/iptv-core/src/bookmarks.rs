@@ -65,7 +65,11 @@ fn attr<'a>(channel: &'a Channel, key: &str) -> &'a str {
 /// entries too). The app's own URL classification decides, as
 /// it does for the resume gate in the player.
 fn is_movie(channel: &Channel) -> bool {
-    !crate::playback::PlaybackRequest::for_channel(channel, None).live
+    // Local recordings are movies by construction (Python's
+    // `playback_channel` sets `kind="movie"`); their file URLs
+    // match none of the VOD URL shapes the live heuristic knows.
+    attr(channel, "provider-id").starts_with("local-recording:")
+        || !crate::playback::PlaybackRequest::for_channel(channel, None).live
 }
 
 /// A Python `json.dumps` string literal with

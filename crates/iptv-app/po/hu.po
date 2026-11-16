@@ -3815,3 +3815,179 @@ msgid ""
 "Search scans answer to the gate ticket; result batches yield to interaction "
 "(#108) (#114)"
 msgstr ""
+
+# PR #36 port (from the Python catalogues).
+
+msgid "A running recording's start time cannot be changed."
+msgstr "A folyamatban lÃ©vÅ felvÃ©tel kezdÃ©si idÅpontja nem mÃ³dosÃ­thatÃ³."
+
+msgid "Add Folder..."
+msgstr "Mappa hozzÃ¡adÃ¡saâ¦"
+
+msgid "All Recording Folders"
+msgstr "Ãsszes felvÃ©teli mappa"
+
+msgid "All Recordings"
+msgstr "Ãsszes felvÃ©tel"
+
+msgid "Checking recording conflicts..."
+msgstr "FelvÃ©teli Ã¼tkÃ¶zÃ©sek ellenÅrzÃ©seâ¦"
+
+msgid "Choose a recording folder"
+msgstr "FelvÃ©teli mappa kivÃ¡lasztÃ¡sa"
+
+msgid "Date"
+msgstr "DÃ¡tum"
+
+msgid "Delete Recording"
+msgstr "FelvÃ©tel tÃ¶rlÃ©se"
+
+msgid "Delete Recording File..."
+msgstr "FelvÃ©telfÃ¡jl tÃ¶rlÃ©seâ¦"
+
+msgid "Descending"
+msgstr "CsÃ¶kkenÅ sorrend"
+
+msgid "Details"
+msgstr "RÃ©szletek"
+
+msgid "Duration"
+msgstr "IdÅtartam"
+
+msgid "Edit Times..."
+msgstr "IdÅpontok mÃ³dosÃ­tÃ¡saâ¦"
+
+msgid "End (local time, YYYY-MM-DD HH:MM)"
+msgstr "BefejezÃ©s (helyi idÅ, ÃÃÃÃ-HH-NN ÃÃ:PP)"
+
+msgid "File Size"
+msgstr "FÃ¡jlmÃ©ret"
+
+msgid "Invalid recording time."
+msgstr "ÃrvÃ©nytelen felvÃ©teli idÅpont."
+
+msgid "Invalid subtitle delay."
+msgstr "ÃrvÃ©nytelen feliratkÃ©sleltetÃ©s."
+
+msgid "Loading recordings..."
+msgstr "FelvÃ©telek betÃ¶ltÃ©seâ¦"
+
+msgid "Move to Recording Trash..."
+msgstr "ÃthelyezÃ©s a felvÃ©teli lomtÃ¡rbaâ¦"
+
+msgid "Move {count} selected recordings to the recording trash?"
+msgstr "Ãthelyezi a kijelÃ¶lt {count} felvÃ©telt a felvÃ©teli lomtÃ¡rba?"
+
+msgid "Next Episode"
+msgstr "KÃ¶vetkezÅ epizÃ³d"
+
+msgid "No adjacent episode is available."
+msgstr "A kÃ©rt irÃ¡nyban nem Ã©rhetÅ el epizÃ³d."
+
+msgid "Overlapping Recordings"
+msgstr "IdÅben Ã¡tfedÅ felvÃ©telek"
+
+msgid "Overlapping recordings, including schedule padding."
+msgstr "IdÅben Ã¡tfedÅ felvÃ©telek, az Ã¼temezÃ©si rÃ¡hagyÃ¡st is figyelembe vÃ©ve."
+
+msgid "Overlapping recordings: {count}."
+msgstr "IdÅben Ã¡tfedÅ felvÃ©telek szÃ¡ma: {count}."
+
+msgid "Partial"
+msgstr "RÃ©szleges"
+
+msgid "Permanently delete {count} selected recording files? This cannot be undone."
+msgstr "VÃ©gleg tÃ¶rli a kijelÃ¶lt {count} felvÃ©telfÃ¡jlt? A mÅ±velet nem vonhatÃ³ vissza."
+
+msgid "Play / Resume"
+msgstr "LejÃ¡tszÃ¡s / FolytatÃ¡s"
+
+msgid "Previous Episode"
+msgstr "ElÅzÅ epizÃ³d"
+
+msgid "Processing recordings..."
+msgstr "FelvÃ©telek feldolgozÃ¡saâ¦"
+
+msgid "Recording Conflicts"
+msgstr "FelvÃ©teli Ã¼tkÃ¶zÃ©sek"
+
+msgid "Recording Conflicts..."
+msgstr "FelvÃ©teli Ã¼tkÃ¶zÃ©sekâ¦"
+
+msgid "Recording Library"
+msgstr "FelvÃ©teltÃ¡r"
+
+msgid "Recording folder:"
+msgstr "FelvÃ©teli mappa:"
+
+msgid "Recording metadata could not be read. The media files are still available."
+msgstr "A felvÃ©telek kÃ­sÃ©rÅadatait nem sikerÃ¼lt beolvasni. A mÃ©diafÃ¡jlok tovÃ¡bbra is elÃ©rhetÅk."
+
+msgid "Recording schedule saved."
+msgstr "A felvÃ©tel Ã¼temezÃ©se megtÃ¶rtÃ©nt."
+
+msgid "Recording title:"
+msgstr "A felvÃ©tel cÃ­me:"
+
+msgid "Remove Folder from Library"
+msgstr "Mappa eltÃ¡volÃ­tÃ¡sa a felvÃ©teltÃ¡rbÃ³l"
+
+msgid "Rename Title..."
+msgstr "CÃ­m Ã¡tnevezÃ©seâ¦"
+
+msgid "Reset Timing"
+msgstr "IdÅzÃ­tÃ©s alaphelyzetbe Ã¡llÃ­tÃ¡sa"
+
+msgid "Restore Recording"
+msgstr "FelvÃ©tel visszaÃ¡llÃ­tÃ¡sa"
+
+msgid "Schedule Anyway"
+msgstr "ÃtemezÃ©s ennek ellenÃ©re"
+
+msgid "Schedule by Time"
+msgstr "FelvÃ©tel Ã¼temezÃ©se idÅpont alapjÃ¡n"
+
+msgid "Search recordings:"
+msgstr "KeresÃ©s a felvÃ©telek kÃ¶zÃ¶tt:"
+
+msgid "Selected: {count}; total size: {size} MiB."
+msgstr "KijelÃ¶lve: {count}; Ã¶sszesÃ­tett mÃ©ret: {size} MiB."
+
+msgid "Show Deleted Recordings"
+msgstr "TÃ¶rÃ¶lt felvÃ©telek megjelenÃ­tÃ©se"
+
+msgid "Sort by"
+msgstr "RendezÃ©s alapja"
+
+msgid "Start (local time, YYYY-MM-DD HH:MM)"
+msgstr "KezdÃ©s (helyi idÅ, ÃÃÃÃ-HH-NN ÃÃ:PP)"
+
+msgid "Stopped by user"
+msgstr "FelhasznÃ¡lÃ³ Ã¡ltal leÃ¡llÃ­tva"
+
+msgid "Subtitle Timing..."
+msgstr "Felirat idÅzÃ­tÃ©seâ¦"
+
+msgid "Subtitle delay in milliseconds (-600000 to 600000). Positive values display and read subtitles later; 0 resets timing."
+msgstr "FeliratkÃ©sleltetÃ©s ezredmÃ¡sodpercben (-600000 Ã©s 600000 kÃ¶zÃ¶tt). PozitÃ­v Ã©rtÃ©knÃ©l a felirat kÃ©sÅbb jelenik meg Ã©s hangzik el; a 0 visszaÃ¡llÃ­tja az eredeti idÅzÃ­tÃ©st."
+
+msgid "Subtitle delay: {milliseconds} ms."
+msgstr "FeliratkÃ©sleltetÃ©s: {milliseconds} ms."
+
+msgid "Subtitle timing could not be changed."
+msgstr "A felirat idÅzÃ­tÃ©sÃ©t nem sikerÃ¼lt mÃ³dosÃ­tani."
+
+msgid "The end must be in the future and after the start, within seven days."
+msgstr "A befejezÃ©snek a kezdÃ©snÃ©l Ã©s a jelenlegi idÅpontnÃ¡l is kÃ©sÅbbinek kell lennie. A felvÃ©tel idÅtartama legfeljebb hÃ©t nap lehet."
+
+msgid "The library can contain up to 20 folders."
+msgstr "A felvÃ©teltÃ¡rba legfeljebb 20 mappa vehetÅ fel."
+
+msgid "The recording changed. Reopen its timing dialog."
+msgstr "A felvÃ©tel adatai megvÃ¡ltoztak. Nyissa meg Ãºjra az idÅpontok mÃ³dosÃ­tÃ¡sÃ¡ra szolgÃ¡lÃ³ ablakot."
+
+msgid "The recording start time has already passed."
+msgstr "A felvÃ©tel kezdÃ©si idÅpontja mÃ¡r elmÃºlt."
+
+msgid "{count} recording(s). Active recordings are not listed."
+msgstr "FelvÃ©telek szÃ¡ma: {count}. A folyamatban lÃ©vÅ felvÃ©telek nem szerepelnek a listÃ¡ban."

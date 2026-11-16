@@ -48,7 +48,7 @@ jobs:
       - name: Check out pinned Python reference
         uses: actions/checkout@v4
         with:
-          repository: serrebidev/Accessible-IPTV-Client
+          repository: serrebi/Accessible-IPTV-Client
           ref: 9aa89e053225ef2c83c4f3659775a00723012ff7
           path: python-reference
           fetch-depth: 1
