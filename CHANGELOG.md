@@ -5,7 +5,7 @@ adjacent releases were part of the same fix stream, they are combined with a
 version range such as `0.2.2-0.2.3`. Each release's section below is its
 Forgejo release note, taken from this file by the release workflow.
 
-## 0.4.27
+## 0.4.28
 
 - Recordings > Recording Library lists finished recordings from up to 20 folders: search, filter by completion status, sort by date, title, duration or file size, play or resume, rename titles, move recordings to the recording trash and restore them. Active recordings are never listed, and every finished recording is indexed as it completes.
 - The built-in player gains Playback > Previous Episode and Next Episode (Ctrl+PageUp and Ctrl+PageDown, configurable) and Playback > Subtitle Timing (Ctrl+Shift+T): the subtitle delay, up to ten minutes either way in milliseconds, applies to display and built-in subtitle speech for the current media and resets when new media starts.
