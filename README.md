@@ -7,6 +7,12 @@ desktop interface and core implementations, but the
 records open behavior gaps against Python v1.150.58. The Rust port is
 not yet feature-complete against that reference.
 
+[![Join SerrebiProjects on Telegram](https://img.shields.io/badge/Telegram-SerrebiProjects-2CA5E0?style=for-the-badge&logo=telegram&logoColor=white)](https://t.me/SerrebiProjects)
+
+**Questions, bugs, or release news?** Join the [SerrebiProjects Telegram group](https://t.me/SerrebiProjects), the fastest place to get help.
+
+More serrebi projects: [projects.serrebiradio.com](https://projects.serrebiradio.com)
+
 ## What it does
 
 - Browse playlists from local files, remote URLs, Xtream Codes and
@@ -102,3 +108,7 @@ Design and parity records live under `docs/`:
   evidence. Note 0071 records the player tick and CPU fixes.
 - `tools/smoke-player-recovery.py` checks the running app's stream
   recovery, which unit tests cannot see.
+
+## Credits
+
+See [CREDITS.md](CREDITS.md) for where the ideas behind this project came from, and the third-party projects it builds on.
