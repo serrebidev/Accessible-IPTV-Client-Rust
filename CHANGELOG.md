@@ -5,6 +5,11 @@ adjacent releases were part of the same fix stream, they are combined with a
 version range such as `0.2.2-0.2.3`. Each release's section below is its
 Forgejo release note, taken from this file by the release workflow.
 
+## 0.4.30
+
+- Help > About now lists the author, the GitHub and Forgejo pages, the projects site and the Telegram channel, and points to CREDITS.md for full credits.
+- The README follows the shared layout and credits the libraries and upstream code the app uses.
+
 ## 0.4.29
 
 - No more console windows. Every tool the app runs in the background (ffmpeg, the proxy lookup, the firewall rule, shutdown) now starts hidden. Before, a terminal window could open at startup and again every time you paused on a channel, taking the focus away from the app, which made moving around and switching back with Alt+Tab feel frozen.
