@@ -2741,6 +2741,24 @@ mod tests {
         }
     }
 
+    /// An XMLTV timestamp `hours` from now. The store-mirror
+    /// tests build their programmes this way so they stay
+    /// inside the store's 14-day programme prune window
+    /// whatever the date is: the fixed 2026-11-01 fixtures
+    /// aged out of that window, and the mirrored programmes
+    /// were pruned again by the same import's maintenance.
+    fn xmltv_hours_from_now(hours: i64) -> String {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            .cast_signed();
+        chrono::DateTime::from_timestamp(now + hours * 3600, 0)
+            .unwrap()
+            .format("%Y%m%d%H%M%S +0000")
+            .to_string()
+    }
+
     #[test]
     fn worker_mirrors_the_guide_to_the_store_on_its_own_thread() {
         let dir = std::env::temp_dir().join(format!("iptv-epg-worker-{}", std::process::id()));
@@ -2748,7 +2766,11 @@ mod tests {
         let xml = dir.join("guide.xml");
         std::fs::write(
             &xml,
-            "<?xml version=\"1.0\"?><tv><channel id=\"c1\"><display-name>One</display-name></channel><programme channel=\"c1\" start=\"20261101180000 +0000\" stop=\"20261101190000 +0000\"><title>Show</title></programme></tv>",
+            format!(
+                "<?xml version=\"1.0\"?><tv><channel id=\"c1\"><display-name>One</display-name></channel><programme channel=\"c1\" start=\"{}\" stop=\"{}\"><title>Show</title></programme></tv>",
+                xmltv_hours_from_now(1),
+                xmltv_hours_from_now(2)
+            ),
         )
         .unwrap();
         let store_path = dir.join("epg.db");
@@ -3517,11 +3539,25 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("iptv-epg-partial-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let good = dir.join("good.xml");
-        std::fs::write(&good, GUIDE).unwrap();
+        std::fs::write(
+            &good,
+            format!(
+                "<?xml version=\"1.0\"?><tv><channel id=\"bbc2.uk\"><display-name>BBC Two</display-name></channel><channel id=\"bbc3.uk\"><display-name>BBC Three</display-name></channel><programme channel=\"bbc2.uk\" start=\"{}\" stop=\"{}\"><title>News Hour</title></programme><programme channel=\"bbc2.uk\" start=\"{}\" stop=\"{}\"><title>Quiz</title></programme></tv>",
+                xmltv_hours_from_now(1),
+                xmltv_hours_from_now(2),
+                xmltv_hours_from_now(2),
+                xmltv_hours_from_now(3)
+            ),
+        )
+        .unwrap();
         let other = dir.join("other.xml");
         std::fs::write(
             &other,
-            "<?xml version=\"1.0\"?><tv><channel id=\"x1\"><display-name>X One</display-name></channel><programme channel=\"x1\" start=\"20261101180000 +0000\" stop=\"20261101190000 +0000\"><title>X Show</title></programme></tv>",
+            format!(
+                "<?xml version=\"1.0\"?><tv><channel id=\"x1\"><display-name>X One</display-name></channel><programme channel=\"x1\" start=\"{}\" stop=\"{}\"><title>X Show</title></programme></tv>",
+                xmltv_hours_from_now(1),
+                xmltv_hours_from_now(2)
+            ),
         )
         .unwrap();
         let broken = dir.join("broken.xml");

@@ -156,14 +156,23 @@ that the helper opens and flushes.
 
 fmt clean; clippy `--workspace --all-targets -- -D warnings`
 clean; playlist parity PASS against the pinned Python tree;
-`git diff --check` clean. Tests: iptv-app 22 passed,
-iptv-vlc 9 passed, iptv-core 374 passed with 2 failures —
-`epg::tests::worker_mirrors_the_guide_to_the_store_on_its_own_thread`
-and `epg::tests::worker_partial_failure_keeps_loaded_sources_and_reports`
-fail identically on pristine Forgejo main 770e1ce6 in this
-environment (verified in a clean worktree before the port
-was applied), so they are pre-existing and not caused by
-this change.
+`git diff --check` clean. Tests: iptv-app 23 passed,
+iptv-vlc 9 passed, iptv-core 376 passed, 0 failed.
+
+Two epg store-mirror tests
+(`worker_mirrors_the_guide_to_the_store_on_its_own_thread`,
+`worker_partial_failure_keeps_loaded_sources_and_reports`)
+failed at first — identically on pristine main and on the
+Forgejo WSL runner, so not from this port. Root cause: their
+fixture programmes were fixed at 2026-11-01, and the store's
+post-import maintenance prunes programmes that ended over
+14 days ago; once the calendar passed 2026-11-15 the
+mirrored programmes were pruned by the same import that
+wrote them, and the store counts came back with zero
+programmes. The store behaviour is the designed Python
+parity; the tests were date-brittle. Both now build their
+programmes relative to now (one to three hours ahead), and
+the full core suite passes.
 
 ## Acceptance still Brandon's
 
