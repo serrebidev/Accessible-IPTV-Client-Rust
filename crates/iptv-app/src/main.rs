@@ -8070,7 +8070,7 @@ fn open_about(frame: Frame) {
     let _ = heading;
     let description = StaticText::builder(&panel)
         .with_label(&tr(
-            "A screen reader accessible IPTV client for Windows and Linux.\n\nSupports M3U/M3U Plus playlists, Stalker Portal, Xtream Codes, built-in VLC playback, casting, and XMLTV EPG.",
+            "A screen reader accessible IPTV client for Windows and Linux.\n\nSupports M3U/M3U Plus playlists, Stalker Portal, Xtream Codes, built-in VLC playback, casting, and XMLTV EPG.\n\nAuthor: serrebidev. GitHub: https://github.com/serrebidev/Accessible-IPTV-Client-Rust. Forgejo: https://git.serrebiradio.com/serrebi/Accessible-IPTV-Client-Rust. Projects: https://projects.serrebiradio.com. Telegram: https://t.me/SerrebiProjects. Full credits: CREDITS.md.",
         ))
         .build();
     let _ = description;
