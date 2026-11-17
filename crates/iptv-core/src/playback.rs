@@ -1227,9 +1227,9 @@ impl PlaybackSession {
     }
 
     /// Adjust volume by `delta` (Python: 2% arrow steps, 5% Ctrl steps),
-    /// clamped 0..=100. Returns the new volume.
+    /// clamped 0..=200 (boost past 100, as in Python). Returns the new volume.
     pub fn adjust_volume(&mut self, delta: i32) -> i32 {
-        self.volume = (self.volume + delta).clamp(0, 100);
+        self.volume = (self.volume + delta).clamp(0, 200);
         self.volume
     }
 
@@ -1552,7 +1552,8 @@ mod tests {
         let report = session.lost_report().expect("report");
         assert!(report.contains("Stream disconnected after 6 retries."));
         assert!(report.contains("Last error: stream stopped unexpectedly"));
-        assert_eq!(session.adjust_volume(5), 100);
+        assert_eq!(session.adjust_volume(5), 105);
+        assert_eq!(session.adjust_volume(500), 200);
         assert_eq!(session.adjust_volume(-250), 0);
 
         let mut vod = PlaybackSession::new();

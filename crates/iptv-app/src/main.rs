@@ -10754,7 +10754,7 @@ fn ensure_player_window(player: &Rc<RefCell<PlayerState>>, persist: &Persist, st
         .build();
     let _ = volume_caption;
     let volume = Slider::builder(&controls_panel).build();
-    volume.set_range(0, 100);
+    volume.set_range(0, 200);
     volume.set_value(100);
     volume.set_accessibility_label("Volume");
     let tracks_caption = StaticText::builder(&controls_panel)
@@ -11969,7 +11969,7 @@ fn wheel_volume(
             .map_or(0, |win| win.volume.get_value())
             + delta
     }
-    .clamp(0, 100);
+    .clamp(0, 200);
     player_set_volume(player, value);
     update_player_status(player, persist, status, None, 3);
 }
@@ -12764,7 +12764,9 @@ fn player_set_volume(player: &Rc<RefCell<PlayerState>>, percent: i32) {
             engine.set_volume(percent);
         }
     } else if let Some(win) = &state.window {
-        win.media.set_volume(f64::from(percent) / 100.0);
+        // The wx fallback player takes 0.0–1.0 and cannot boost; the libVLC
+        // engine above takes the full 0–200 percent.
+        win.media.set_volume((f64::from(percent) / 100.0).min(1.0));
     }
     if let Some(win) = &state.window {
         win.volume.set_value(percent);
@@ -13332,7 +13334,7 @@ fn dispatch_player_key(
             // (the event label carries the modifier).
             let step = if label.starts_with("Ctrl+") { 5 } else { 2 };
             let delta = if action == "volume_up" { step } else { -step };
-            let value = (win.volume.get_value() + delta).clamp(0, 100);
+            let value = (win.volume.get_value() + delta).clamp(0, 200);
             player_set_volume(player, value);
             // N23: Python's volume change only refreshes the
             // status line (its Vol segment) — no prefix, no
@@ -20076,7 +20078,7 @@ fn dispatch_main_hotkey(
                 .as_ref()
                 .map(|win| win.volume.get_value());
             if let Some(current) = current {
-                let value = (current + delta).clamp(0, 100);
+                let value = (current + delta).clamp(0, 200);
                 player_set_volume(&player, value);
                 status.set_label(&trf(
                     "Volume {value} percent.",

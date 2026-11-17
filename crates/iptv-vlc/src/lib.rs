@@ -577,9 +577,10 @@ impl VlcEngine {
         map_state(unsafe { (self.inner.fns.get_state)(self.inner.player) })
     }
 
-    /// Set the volume (0–100, libVLC's nominal scale).
+    /// Set the volume (0–200, libVLC's percent scale; above 100 amplifies,
+    /// so quiet streams can be boosted, VLC-style).
     pub fn set_volume(&self, percent: i32) {
-        unsafe { (self.inner.fns.set_volume)(self.inner.player, percent.clamp(0, 100)) };
+        unsafe { (self.inner.fns.set_volume)(self.inner.player, percent.clamp(0, 200)) };
     }
 
     /// The audio tracks as (id, name) pairs.
