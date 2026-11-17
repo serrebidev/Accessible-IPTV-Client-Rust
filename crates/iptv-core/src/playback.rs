@@ -1077,6 +1077,12 @@ impl PlaybackSession {
     }
 
     pub fn on_event(&mut self, event: EngineEvent, now_ms: i64) -> EngineAction {
+        // Giving up is final: settling a lost stream stops the
+        // engine, and its late stop/error callbacks must not give
+        // up again (one Stream Lost report per loss).
+        if self.state == SessionState::Lost {
+            return EngineAction::None;
+        }
         match event {
             EngineEvent::Started => {
                 if self.current.is_none() {
@@ -1106,7 +1112,7 @@ impl PlaybackSession {
     /// Periodic drive (the desktop tick): the startup deadline,
     /// the no-media timeout, and prolonged post-start buffering.
     pub fn on_tick(&mut self, now_ms: i64) -> EngineAction {
-        if self.current.is_none() {
+        if self.current.is_none() || self.state == SessionState::Lost {
             return EngineAction::None;
         }
         if !self.played && self.state == SessionState::Opening {
@@ -1134,9 +1140,13 @@ impl PlaybackSession {
     /// ordinary recovery — the adapter routes it there when
     /// this returns `None`). Exhausting the rollover budget
     /// loses the stream. The caller passes only endings it has
-    /// classified as expected TS rollovers.
+    /// classified as expected TS rollovers. A lost session
+    /// swallows the ending (`Some(None)`): giving up is final.
     pub fn note_rollover(&mut self, now_ms: i64) -> Option<EngineAction> {
         let request = self.current.clone()?;
+        if self.state == SessionState::Lost {
+            return Some(EngineAction::None);
+        }
         if !request.live || !self.played {
             return None;
         }
@@ -1566,6 +1576,43 @@ mod tests {
             EngineAction::None
         ));
         assert_eq!(vod.state(), &SessionState::Ended);
+    }
+
+    #[test]
+    fn lost_is_final_and_reports_once() {
+        // Regression: settling a lost stream stops the engine, and
+        // the engine's own stop/error callbacks fed back in gave up
+        // again — one more Stream Lost dialog per callback.
+        let mut session = PlaybackSession::new();
+        let request = PlaybackRequest::for_channel(&channel("http://live/1.ts"), None);
+        session.play(request, 0);
+        session.on_event(EngineEvent::Started, 100);
+        let mut now = 1_000;
+        for _ in 0..MAX_RECONNECTS {
+            now += 5_000;
+            session.on_event(EngineEvent::Stalled, now);
+        }
+        assert!(matches!(
+            session.on_event(EngineEvent::Stalled, now + 5_000),
+            EngineAction::Stop
+        ));
+        let generation = session.generation();
+        for event in [
+            EngineEvent::Stalled,
+            EngineEvent::Ended,
+            EngineEvent::Error("late".to_string()),
+            EngineEvent::Started,
+        ] {
+            assert_eq!(session.on_event(event, now + 6_000), EngineAction::None);
+        }
+        assert_eq!(session.on_tick(now + 60_000), EngineAction::None);
+        assert_eq!(session.note_rollover(now + 7_000), Some(EngineAction::None));
+        assert_eq!(session.state(), &SessionState::Lost);
+        assert_eq!(session.generation(), generation);
+        assert!(session
+            .lost_report()
+            .expect("report")
+            .contains("Last error: stream stopped unexpectedly"));
     }
 
     #[test]
