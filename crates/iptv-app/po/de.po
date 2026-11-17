@@ -3979,3 +3979,15 @@ msgstr "Die Startzeit der Aufnahme ist bereits vorbei."
 
 msgid "{count} recording(s). Active recordings are not listed."
 msgstr "{count} Aufnahme(n). Laufende Aufnahmen werden nicht angezeigt."
+
+msgid "Author: serrebidev."
+msgstr "Autor: serrebidev."
+
+msgid "Open the Accessible IPTV Client project on GitHub"
+msgstr "Das Projekt Accessible IPTV Client auf GitHub öffnen"
+
+msgid "Visit the projects site, projects.serrebiradio.com"
+msgstr "Die Projektseite projects.serrebiradio.com besuchen"
+
+msgid "Read the full credits"
+msgstr "Die vollständigen Danksagungen lesen"

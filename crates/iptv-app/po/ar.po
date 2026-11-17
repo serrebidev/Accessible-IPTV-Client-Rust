@@ -3883,3 +3883,15 @@ msgstr "Ø§ÙÙØ¶Ù ÙÙØª Ø¨Ø¯Ø¡ Ø§ÙØªØ³Ø¬Ù�
 
 msgid "{count} recording(s). Active recordings are not listed."
 msgstr "Ø¹Ø¯Ø¯ Ø§ÙØªØ³Ø¬ÙÙØ§Øª: {count}. ÙØ§ ØªÙØ¹Ø±Ø¶ Ø§ÙØªØ³Ø¬ÙÙØ§Øª Ø§ÙØ¬Ø§Ø±ÙØ©."
+
+msgid "Author: serrebidev."
+msgstr "المؤلف: serrebidev."
+
+msgid "Open the Accessible IPTV Client project on GitHub"
+msgstr "فتح مشروع Accessible IPTV Client على GitHub"
+
+msgid "Visit the projects site, projects.serrebiradio.com"
+msgstr "زيارة موقع المشاريع، projects.serrebiradio.com"
+
+msgid "Read the full credits"
+msgstr "قراءة قائمة الشكر الكاملة"

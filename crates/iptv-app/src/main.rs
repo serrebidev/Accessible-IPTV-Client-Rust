@@ -8070,10 +8070,13 @@ fn open_about(frame: Frame) {
     let _ = heading;
     let description = StaticText::builder(&panel)
         .with_label(&tr(
-            "A screen reader accessible IPTV client for Windows and Linux.\n\nSupports M3U/M3U Plus playlists, Stalker Portal, Xtream Codes, built-in VLC playback, casting, and XMLTV EPG.\n\nAuthor: serrebidev. GitHub: https://github.com/serrebidev/Accessible-IPTV-Client-Rust. Forgejo: https://git.serrebiradio.com/serrebi/Accessible-IPTV-Client-Rust. Projects: https://projects.serrebiradio.com. Telegram: https://t.me/SerrebiProjects. Full credits: CREDITS.md.",
+            "A screen reader accessible IPTV client for Windows and Linux.\n\nSupports M3U/M3U Plus playlists, Stalker Portal, Xtream Codes, built-in VLC playback, casting, and XMLTV EPG.",
         ))
         .build();
     let _ = description;
+    let author = StaticText::builder(&panel)
+        .with_label(&tr("Author: serrebidev."))
+        .build();
     let support = StaticText::builder(&panel)
         .with_label(&tr("Community and support"))
         .build();
@@ -8085,10 +8088,11 @@ fn open_about(frame: Frame) {
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     sizer.add(&heading, 0, SizerFlag::All, 12);
     sizer.add(&description, 0, SizerFlag::All, 12);
+    sizer.add(&author, 0, SizerFlag::All, 12);
     sizer.add(&support, 0, SizerFlag::All, 6);
-    // Python's three links, labels and URLs verbatim (its
-    // `app_links.py`): Telegram group, project page, author
-    // page.
+    // Python's links, labels verbatim (its `app_links.py`),
+    // each its own tab stop: Telegram group, project pages,
+    // projects site, author page and the full credits.
     for (label, url) in [
         (
             "Join the SerrebiProjects Telegram group",
@@ -8099,8 +8103,20 @@ fn open_about(frame: Frame) {
             "https://git.serrebiradio.com/serrebi/Accessible-IPTV-Client",
         ),
         (
+            "Open the Accessible IPTV Client project on GitHub",
+            "https://github.com/serrebidev/Accessible-IPTV-Client-Rust",
+        ),
+        (
+            "Visit the projects site, projects.serrebiradio.com",
+            "https://projects.serrebiradio.com",
+        ),
+        (
             "Follow Serrebi on Forgejo",
             "https://git.serrebiradio.com/serrebi",
+        ),
+        (
+            "Read the full credits",
+            "https://git.serrebiradio.com/serrebi/Accessible-IPTV-Client-Rust/src/branch/main/CREDITS.md",
         ),
     ] {
         let label_text = tr(label);

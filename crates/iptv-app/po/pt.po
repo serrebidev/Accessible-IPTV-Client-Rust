@@ -3957,3 +3957,15 @@ msgstr "A hora de inÃ­cio da gravaÃ§Ã£o jÃ¡ passou."
 
 msgid "{count} recording(s). Active recordings are not listed."
 msgstr "{count} gravaÃ§Ãµes. As gravaÃ§Ãµes em andamento nÃ£o sÃ£o exibidas."
+
+msgid "Author: serrebidev."
+msgstr "Autor: serrebidev."
+
+msgid "Open the Accessible IPTV Client project on GitHub"
+msgstr "Abrir o projeto Accessible IPTV Client no GitHub"
+
+msgid "Visit the projects site, projects.serrebiradio.com"
+msgstr "Visitar o site de projetos, projects.serrebiradio.com"
+
+msgid "Read the full credits"
+msgstr "Ler os créditos completos"

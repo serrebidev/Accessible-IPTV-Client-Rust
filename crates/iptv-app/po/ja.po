@@ -3927,3 +3927,15 @@ msgstr "é²ç»ã®éå§æå»ã¯æ¢ã«éã
 
 msgid "{count} recording(s). Active recordings are not listed."
 msgstr "é²ç»ã¯ {count} ä»¶ã§ããé²ç»ä¸­ã®é ç®ã¯è¡¨ç¤ºããã¾ããã"
+
+msgid "Author: serrebidev."
+msgstr "作者: serrebidev。"
+
+msgid "Open the Accessible IPTV Client project on GitHub"
+msgstr "GitHub で Accessible IPTV Client プロジェクトを開く"
+
+msgid "Visit the projects site, projects.serrebiradio.com"
+msgstr "プロジェクト サイト projects.serrebiradio.com を開く"
+
+msgid "Read the full credits"
+msgstr "全クレジットを読む"

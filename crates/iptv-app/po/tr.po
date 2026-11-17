@@ -3928,3 +3928,15 @@ msgstr "KaydÄ±n baÅlangÄ±Ã§ saati geÃ§ti."
 
 msgid "{count} recording(s). Active recordings are not listed."
 msgstr "{count} kayÄ±t. Devam eden kayÄ±tlar listelenmez."
+
+msgid "Author: serrebidev."
+msgstr "Yazar: serrebidev."
+
+msgid "Open the Accessible IPTV Client project on GitHub"
+msgstr "Accessible IPTV Client projesini GitHub'da aç"
+
+msgid "Visit the projects site, projects.serrebiradio.com"
+msgstr "Projeler sitesini ziyaret et, projects.serrebiradio.com"
+
+msgid "Read the full credits"
+msgstr "Tüm teşekkürleri oku"

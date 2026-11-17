@@ -3943,3 +3943,15 @@ msgstr "Czas rozpoczÄcia nagrania juÅ¼ minÄÅ."
 
 msgid "{count} recording(s). Active recordings are not listed."
 msgstr "Liczba nagraÅ: {count}. Nagrania w toku nie sÄ wyÅwietlane."
+
+msgid "Author: serrebidev."
+msgstr "Autor: serrebidev."
+
+msgid "Open the Accessible IPTV Client project on GitHub"
+msgstr "Otwórz projekt Accessible IPTV Client w serwisie GitHub"
+
+msgid "Visit the projects site, projects.serrebiradio.com"
+msgstr "Odwiedź stronę projektów, projects.serrebiradio.com"
+
+msgid "Read the full credits"
+msgstr "Przeczytaj pełną listę podziękowań"
