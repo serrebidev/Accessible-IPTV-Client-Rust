@@ -452,9 +452,14 @@ mod tests {
     }
 
     fn temp_dest(name: &str) -> PathBuf {
+        // Parallel tests can read the same clock tick; the counter
+        // keeps each test's folder its own, so one test's cleanup
+        // never deletes another's downloads (Windows CI flake).
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
-            "iptv-dl-{}-{}",
+            "iptv-dl-{}-{}-{}",
             std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.as_nanos())
