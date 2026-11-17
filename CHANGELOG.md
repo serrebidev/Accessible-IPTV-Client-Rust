@@ -5,6 +5,10 @@ adjacent releases were part of the same fix stream, they are combined with a
 version range such as `0.2.2-0.2.3`. Each release's section below is its
 Forgejo release note, taken from this file by the release workflow.
 
+## 0.4.31
+
+- Help > About now has a separate link for each of GitHub, Forgejo, the projects site, Telegram and the full credits: Tab reaches each one and Enter or Space opens it.
+
 ## 0.4.30
 
 - Help > About now lists the author, the GitHub and Forgejo pages, the projects site and the Telegram channel, and points to CREDITS.md for full credits.
