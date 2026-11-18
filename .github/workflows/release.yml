@@ -4,10 +4,11 @@ name: Release
 # Layout and manifest contract: PACKAGING.md. Approved by Brandon
 # 2026-11-01 (workflow changes need his direct OK in this repo).
 
+# Manual only: the Forgejo-to-GitHub sync disables GitHub workflows with
+# automatic triggers.
+# Push the tag, then run:
+#   gh workflow run release.yml --repo serrebidev/Accessible-IPTV-Client-Rust -f tag=vX.Y.Z
 on:
-  push:
-    tags:
-      - "v*"
   workflow_dispatch:
     inputs:
       tag:
