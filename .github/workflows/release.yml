@@ -14,6 +14,11 @@ on:
       tag:
         description: "Existing tag to build and publish"
         required: true
+      dry_run:
+        description: Build and sign only; publish nothing
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: write
@@ -285,6 +290,7 @@ jobs:
       # here). Draft first, so the release never shows without its
       # files; publish only once every asset is attached.
       - name: Publish
+        if: ${{ !inputs.dry_run }}
         env:
           TAG: ${{ inputs.tag || github.ref_name }}
           FORGEJO_TOKEN: ${{ secrets.FORGEJO_TOKEN }}
