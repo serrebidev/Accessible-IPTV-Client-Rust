@@ -40,7 +40,7 @@ jobs:
             asset_suffix: linux-x64
             binary: iptv-app
           - name: macos
-            os: macos-latest
+            os: xcode-27
             asset_suffix: macos-arm64
             binary: iptv-app
     steps:
