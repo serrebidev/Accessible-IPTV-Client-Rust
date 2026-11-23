@@ -67,6 +67,7 @@ pub mod recording_library;
 pub mod recording_limits;
 pub mod recording_log;
 pub mod reminders;
+pub mod saved_searches;
 pub mod search;
 pub mod settings_backup;
 pub mod shortcuts;

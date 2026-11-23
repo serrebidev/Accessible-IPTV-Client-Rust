@@ -216,9 +216,595 @@ fn fernet_decrypt(key: &[u8; 32], token: &str) -> Option<Vec<u8>> {
         .ok()
 }
 
+// ---------------------------------------------------------------------
+// Full backups (Python `full_backup.py`, format v2): settings plus the
+// recording schedule, reminders and saved-search history, restored
+// through a journal before any background service starts.
+
+/// Python `full_backup.FORMAT`.
+pub const FORMAT_V2: &str = "accessible-iptv-settings-v2";
+const BAD_BUNDLE: &str = "Backup settings are invalid.";
+
+fn valid_time(value: Option<&serde_json::Value>) -> bool {
+    value
+        .and_then(serde_json::Value::as_f64)
+        .is_some_and(|v| v.is_finite() && (0.0..=253_402_300_799.0).contains(&v))
+}
+
+fn valid_job_id(id: &str) -> bool {
+    (1..=128).contains(&id.len())
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+/// Python `full_backup.validate`: check a bundle and make it safe to
+/// restore. Running recordings and scheduled ones already due come
+/// back as missed (a time repeat marked to queue its next future
+/// occurrence); recording ids clear; reminders normalize and past
+/// ones expire; the search history keeps only upcoming entries.
+///
+/// # Errors
+/// Returns Python's "Backup settings are invalid." for any shape or
+/// value it rejects.
+#[allow(clippy::too_many_lines)] // one validation, in Python's order
+pub fn validate_bundle(bundle: &serde_json::Value, now: f64) -> Result<serde_json::Value, String> {
+    use serde_json::Value;
+    let bad = || BAD_BUNDLE.to_string();
+    let object = bundle.as_object().ok_or_else(bad)?;
+    let keys: std::collections::BTreeSet<&str> = object.keys().map(String::as_str).collect();
+    let full: std::collections::BTreeSet<&str> = ["config", "jobs", "reminders", "search_seen"]
+        .into_iter()
+        .collect();
+    if !keys.is_subset(&full) {
+        return Err(bad());
+    }
+    let config = object
+        .get("config")
+        .and_then(Value::as_object)
+        .ok_or_else(bad)?;
+    if !config.get("playlists").is_some_and(Value::is_array)
+        || !config.get("epgs").is_some_and(Value::is_array)
+    {
+        return Err(bad());
+    }
+    let only_config: std::collections::BTreeSet<&str> = std::iter::once("config").collect();
+    if keys != only_config && keys != full {
+        return Err(bad());
+    }
+    let mut data = bundle.clone();
+    if keys == only_config {
+        return Ok(data);
+    }
+    let jobs = data["jobs"]
+        .as_array_mut()
+        .filter(|j| j.len() <= 10_000)
+        .ok_or_else(bad)?;
+    let mut ids = std::collections::BTreeSet::new();
+    for job in jobs.iter_mut() {
+        let map = job.as_object().ok_or_else(bad)?;
+        let id = map.get("id").and_then(Value::as_str).ok_or_else(bad)?;
+        let status = map.get("status").and_then(Value::as_str).ok_or_else(bad)?;
+        let known = matches!(
+            status,
+            crate::dvr::STATUS_SCHEDULED
+                | crate::dvr::STATUS_RECORDING
+                | crate::dvr::STATUS_STOPPING
+        ) || crate::dvr::DONE_STATUSES.contains(&status);
+        let text_or_none = |key: &str| map.get(key).is_none_or(|v| v.is_null() || v.is_string());
+        if !valid_job_id(id)
+            || ids.contains(id)
+            || !known
+            || !valid_time(map.get("start_ts"))
+            || !valid_time(map.get("stop_ts"))
+            || map["stop_ts"].as_f64() <= map["start_ts"].as_f64()
+            || !map.get("channel").is_some_and(Value::is_object)
+            || !map.get("program").is_some_and(Value::is_object)
+            || !text_or_none("title")
+            || !text_or_none("repeat")
+            || !map.get("format").is_some_and(Value::is_string)
+        {
+            return Err(bad());
+        }
+        let checked: DvrJobCheck = serde_json::from_value(job.clone()).map_err(|_| bad())?;
+        if !checked.valid() {
+            return Err(bad());
+        }
+        ids.insert(id.to_string());
+        let start = map["start_ts"].as_f64().unwrap_or(0.0);
+        let repeat = map
+            .get("repeat")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let live = matches!(
+            status,
+            crate::dvr::STATUS_RECORDING | crate::dvr::STATUS_STOPPING
+        ) || (status == crate::dvr::STATUS_SCHEDULED && start <= now);
+        if live {
+            if crate::dvr::TIME_REPEATS.contains(&repeat.as_str()) {
+                job["restore_next_occurrence"] = Value::Bool(true);
+            }
+            job["status"] = crate::dvr::STATUS_MISSED.into();
+            job["message"] = "".into();
+        }
+        job["recording_id"] = Value::Null;
+    }
+    let rows = data["reminders"].as_array().ok_or_else(bad)?;
+    if rows.len() > crate::reminders::MAX_REMINDERS {
+        return Err(bad());
+    }
+    let parsed: Vec<crate::reminders::Reminder> = rows
+        .iter()
+        .map(|row| serde_json::from_value(row.clone()))
+        .collect::<Result<_, _>>()
+        .map_err(|_| bad())?;
+    let count = parsed.len();
+    let mut normalized = crate::reminders::normalize_reminders(parsed);
+    if normalized.len() != count {
+        return Err(bad());
+    }
+    #[allow(clippy::cast_possible_truncation)] // whole seconds
+    let now_secs = now as i64;
+    for row in &mut normalized {
+        if row.end <= now_secs
+            && matches!(
+                row.status,
+                crate::reminders::ReminderStatus::Scheduled
+                    | crate::reminders::ReminderStatus::Ready
+            )
+        {
+            row.status = crate::reminders::ReminderStatus::Expired;
+        }
+    }
+    data["reminders"] = serde_json::to_value(normalized).map_err(|_| bad())?;
+    data["search_seen"] = crate::saved_searches::normalize_seen(&data["search_seen"], now)?;
+    Ok(data)
+}
+
+/// The job checks Python makes through `dvr.valid_padding_pair`,
+/// `valid_series_padding` and `checked_weekdays`.
+#[derive(serde::Deserialize)]
+struct DvrJobCheck {
+    #[serde(default)]
+    repeat: Option<String>,
+    #[serde(default)]
+    weekdays: Option<serde_json::Value>,
+    #[serde(default)]
+    future_padding: Option<serde_json::Value>,
+    #[serde(default)]
+    series_padding_changes: Option<serde_json::Value>,
+}
+
+impl DvrJobCheck {
+    fn valid(&self) -> bool {
+        if self
+            .future_padding
+            .as_ref()
+            .is_some_and(|v| !crate::dvr::valid_padding_pair(v))
+            || self
+                .series_padding_changes
+                .as_ref()
+                .is_some_and(|v| !crate::dvr::valid_series_padding(v))
+        {
+            return false;
+        }
+        if self.repeat.as_deref() == Some("weekdays") {
+            return self.weekdays.as_ref().is_some_and(|days| {
+                crate::dvr::checked_weekdays(days).is_ok_and(|d| !d.is_empty())
+            });
+        }
+        true
+    }
+}
+
+/// Python `full_backup.export_bundle`: validate (without changing the
+/// snapshot) and encrypt the bundle into the v2 envelope.
+///
+/// # Errors
+/// Validation errors, an empty password, randomness failures, and
+/// Python's size message.
+pub fn export_bundle(
+    bundle: &serde_json::Value,
+    password: &str,
+    now: f64,
+) -> Result<Vec<u8>, String> {
+    validate_bundle(bundle, now)?;
+    if password.is_empty() {
+        return Err(ERR_PASSWORD_REQUIRED.to_string());
+    }
+    let payload = serde_json::to_vec(bundle).map_err(|e| e.to_string())?;
+    let mut salt = [0u8; SALT_LEN];
+    getrandom::fill(&mut salt).map_err(|_| "Could not generate random salt.".to_string())?;
+    let key = derive_key(password, &salt);
+    let token =
+        fernet_encrypt(&key, &payload).map_err(|()| "Could not generate random IV.".to_string())?;
+    let envelope = format!(
+        "{{\"format\": \"{FORMAT_V2}\", \"salt\": \"{}\", \"data\": \"{token}\"}}",
+        STANDARD.encode(salt)
+    );
+    if envelope.len() > MAX_BACKUP_BYTES {
+        return Err("Settings are too large to back up.".to_string());
+    }
+    Ok(envelope.into_bytes())
+}
+
+/// Python `full_backup.import_bundle`: a v2 backup decrypted and
+/// validated, or a v1 backup as settings only.
+///
+/// # Errors
+/// Python's messages for a foreign file, a wrong password or damaged
+/// backup, and an invalid bundle.
+pub fn import_bundle(bytes: &[u8], password: &str, now: f64) -> Result<serde_json::Value, String> {
+    if bytes.len() > MAX_BACKUP_BYTES {
+        return Err("Backup file is too large.".to_string());
+    }
+    let envelope: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|_| ERR_NOT_A_BACKUP.to_string())?;
+    match envelope.get("format").and_then(serde_json::Value::as_str) {
+        Some(FORMAT) => {
+            let config: serde_json::Value =
+                serde_json::from_slice(&import_settings(bytes, password)?)
+                    .map_err(|_| ERR_WRONG_OR_DAMAGED.to_string())?;
+            return validate_bundle(&serde_json::json!({ "config": config }), now);
+        }
+        Some(FORMAT_V2) => {}
+        _ => return Err(ERR_NOT_A_BACKUP.to_string()),
+    }
+    let damaged = || ERR_WRONG_OR_DAMAGED.to_string();
+    let salt = envelope
+        .get("salt")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|text| STANDARD.decode(text).ok())
+        .filter(|salt| salt.len() == SALT_LEN)
+        .ok_or_else(damaged)?;
+    let token = envelope
+        .get("data")
+        .and_then(serde_json::Value::as_str)
+        .filter(|token| token.is_ascii())
+        .ok_or_else(damaged)?;
+    let key = derive_key(password, &salt);
+    let contents = fernet_decrypt(&key, token).ok_or_else(damaged)?;
+    let bundle: serde_json::Value = serde_json::from_slice(&contents).map_err(|_| damaged())?;
+    validate_bundle(&bundle, now)
+}
+
+/// Where a restore writes (Python `full_backup.paths`).
+#[derive(Clone, Debug)]
+pub struct RestoreTargets {
+    pub config: std::path::PathBuf,
+    pub jobs: std::path::PathBuf,
+    pub reminders: std::path::PathBuf,
+    pub search_seen: std::path::PathBuf,
+}
+
+impl RestoreTargets {
+    /// The config write target and the files beside the schedule.
+    #[must_use]
+    pub fn new(config: std::path::PathBuf, jobs: std::path::PathBuf) -> Self {
+        Self {
+            reminders: crate::reminders::reminders_path(&jobs),
+            search_seen: jobs.with_file_name("programme-search-state.json"),
+            config,
+            jobs,
+        }
+    }
+
+    /// Python `pending_path`: the restore journal.
+    #[must_use]
+    pub fn pending(&self) -> std::path::PathBuf {
+        self.jobs.with_file_name("pending-restore.json")
+    }
+}
+
+/// Python `atomic_json`: a synced temp file renamed over `path`.
+fn atomic_json(path: &std::path::Path, value: &serde_json::Value) -> Result<(), String> {
+    let text = serde_json::to_vec(value).map_err(|e| e.to_string())?;
+    let directory = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    std::fs::create_dir_all(directory).map_err(|e| e.to_string())?;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let temporary = directory.join(format!("restore-{}-{nanos}.tmp", std::process::id()));
+    let written = (|| -> std::io::Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        std::io::Write::write_all(&mut file, &text)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&temporary, path)
+    })();
+    if let Err(error) = written {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error.to_string());
+    }
+    Ok(())
+}
+
+/// Python `stage_restore`: write the checked bundle as the journal the
+/// next start finishes.
+///
+/// # Errors
+/// Validation errors, Python's size message, and write errors.
+pub fn stage_restore(
+    bundle: &serde_json::Value,
+    targets: &RestoreTargets,
+    now: f64,
+) -> Result<(), String> {
+    let checked = validate_bundle(bundle, now)?;
+    if serde_json::to_vec(&checked).map_or(usize::MAX, |b| b.len()) > MAX_BACKUP_BYTES {
+        return Err("Backup file is too large.".to_string());
+    }
+    atomic_json(&targets.pending(), &checked)
+}
+
+/// Python `apply_pending`: finish a staged restore before anything
+/// else reads these files. Returns whether one was applied; the
+/// journal is removed only after every file is written, so a crash
+/// finishes the same restore on the next start.
+///
+/// # Errors
+/// Returns read, validation and write errors; the journal then stays.
+pub fn apply_pending(targets: &RestoreTargets, now: f64) -> Result<bool, String> {
+    let pending = targets.pending();
+    let bytes = match std::fs::read(&pending) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.to_string()),
+    };
+    if bytes.len() > MAX_BACKUP_BYTES {
+        return Err("Backup file is too large.".to_string());
+    }
+    let staged: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+    let bundle = validate_bundle(&staged, now)?;
+    let object = bundle.as_object().ok_or_else(|| BAD_BUNDLE.to_string())?;
+    for (key, value) in object {
+        match key.as_str() {
+            "config" => atomic_json(&targets.config, value)?,
+            "jobs" => atomic_json(
+                &targets.jobs,
+                &serde_json::json!({"version": 1, "jobs": restored_jobs(value, now)?}),
+            )?,
+            "reminders" => atomic_json(
+                &targets.reminders,
+                &serde_json::json!({"version": 1, "reminders": value}),
+            )?,
+            "search_seen" => atomic_json(&targets.search_seen, value)?,
+            _ => {}
+        }
+    }
+    std::fs::remove_file(&pending).map_err(|e| e.to_string())?;
+    Ok(true)
+}
+
+/// Python's job step in `apply_pending`: a repeat that was live in
+/// the backup queues its next future occurrence, unless one for the
+/// same channel, title, days and programme window already exists.
+fn restored_jobs(value: &serde_json::Value, now: f64) -> Result<Vec<serde_json::Value>, String> {
+    let jobs: Vec<serde_json::Value> = value.as_array().cloned().unwrap_or_default();
+    let slot = |job: &crate::dvr::DvrJob| {
+        #[allow(clippy::cast_precision_loss)] // padding minutes
+        let start = job.start_ts + job.pre_padding_minutes as f64 * 60.0;
+        #[allow(clippy::cast_precision_loss)]
+        let end = job.stop_ts - job.post_padding_minutes as f64 * 60.0;
+        let days = if job.repeat == "weekdays" {
+            let mut days = job.weekdays.clone().unwrap_or_default();
+            days.sort_unstable();
+            days.dedup();
+            days
+        } else {
+            Vec::new()
+        };
+        format!(
+            "{}|{}|{}|{days:?}|{start}|{end}",
+            crate::reminders::reminder_channel_key(&crate::dvr::channel_from_snapshot(
+                &job.channel
+            )),
+            job.title,
+            job.repeat
+        )
+    };
+    let typed: Vec<crate::dvr::DvrJob> = jobs
+        .iter()
+        .map(|job| serde_json::from_value(job.clone()).map_err(|_| BAD_BUNDLE.to_string()))
+        .collect::<Result<_, _>>()?;
+    let mut existing: std::collections::BTreeSet<String> = typed
+        .iter()
+        .filter(|job| crate::dvr::TIME_REPEATS.contains(&job.repeat.as_str()))
+        .map(slot)
+        .collect();
+    let mut out = Vec::with_capacity(jobs.len());
+    let mut ids: std::collections::BTreeSet<String> =
+        typed.iter().map(|job| job.id.clone()).collect();
+    let mut successors = Vec::new();
+    for mut job in typed {
+        let flagged =
+            job.extra.remove("restore_next_occurrence") == Some(serde_json::Value::Bool(true));
+        if flagged
+            && job.status == crate::dvr::STATUS_MISSED
+            && crate::dvr::TIME_REPEATS.contains(&job.repeat.as_str())
+        {
+            let next = crate::dvr::next_time_occurrence_after(&job, now, &chrono::Local, true)?;
+            let key = slot(&next);
+            if !existing.contains(&key) && ids.insert(next.id.clone()) {
+                existing.insert(key);
+                successors.push(next);
+            }
+        }
+        out.push(serde_json::to_value(&job).map_err(|e| e.to_string())?);
+    }
+    for next in successors {
+        out.push(serde_json::to_value(&next).map_err(|e| e.to_string())?);
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{export_settings, import_settings};
+    use super::*;
+
+    fn sample_bundle(now: f64) -> serde_json::Value {
+        let channel = crate::Channel {
+            name: "News".to_string(),
+            url: "http://example.com/s".to_string(),
+            ..crate::Channel::default()
+        };
+        let spec = |start: i64, repeat: &'static str| crate::dvr::NewJob {
+            channel: &channel,
+            programme_title: "Show",
+            programme_start: start,
+            programme_stop: start + 3600,
+            format: "provider_mkv",
+            pre_padding_minutes: 0,
+            post_padding_minutes: 0,
+            repeat,
+            episode: "",
+            subtitle: "",
+            description: "",
+        };
+        #[allow(clippy::cast_possible_truncation)]
+        let at = now as i64;
+        let mut live = crate::dvr::build_job(&spec(at - 600, "daily"), now).unwrap();
+        live.id = "live".to_string();
+        live.status = crate::dvr::STATUS_RECORDING.to_string();
+        live.recording_id = Some("7".to_string());
+        let mut later = crate::dvr::build_job(&spec(at + 7200, ""), now).unwrap();
+        later.id = "later".to_string();
+        let mut reminder_channel = channel.clone();
+        reminder_channel
+            .unknown_attributes
+            .insert("playlist-id".to_string(), "m3u:abc".to_string());
+        let programme = crate::epg::Programme {
+            start: at + 3600,
+            stop: at + 7200,
+            title: "Film".to_string(),
+            ..crate::epg::Programme::default()
+        };
+        let reminder =
+            crate::reminders::build_reminder(&reminder_channel, &programme, 5, at).unwrap();
+        serde_json::json!({
+            "config": {"playlists": [], "epgs": [], "volume": 80},
+            "jobs": [live, later],
+            "reminders": [reminder],
+            "search_seen": {"a".repeat(64): now + 600.0},
+        })
+    }
+
+    #[test]
+    fn full_backup_round_trip_restores_running_work_as_missed() {
+        let now = 1_795_000_000.0;
+        let bundle = sample_bundle(now);
+        let bytes = export_bundle(&bundle, "pw", now).unwrap();
+        let envelope: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(envelope["format"], FORMAT_V2);
+        assert_eq!(
+            import_bundle(&bytes, "wrong", now),
+            Err(ERR_WRONG_OR_DAMAGED.to_string())
+        );
+        let restored = import_bundle(&bytes, "pw", now).unwrap();
+        assert_eq!(restored["config"], bundle["config"]);
+        let live = &restored["jobs"][0];
+        assert_eq!(live["status"], crate::dvr::STATUS_MISSED);
+        assert_eq!(live["restore_next_occurrence"], true);
+        assert!(live["recording_id"].is_null());
+        assert_eq!(restored["jobs"][1]["status"], crate::dvr::STATUS_SCHEDULED);
+        assert_eq!(restored["reminders"], bundle["reminders"]);
+        assert_eq!(restored["search_seen"], bundle["search_seen"]);
+    }
+
+    #[test]
+    fn invalid_bundles_are_refused() {
+        let now = 1_795_000_000.0;
+        let bad = Err(BAD_BUNDLE.to_string());
+        let mut extra = sample_bundle(now);
+        extra["other"] = serde_json::json!(1);
+        assert_eq!(validate_bundle(&extra, now), bad);
+        let mut partial = sample_bundle(now);
+        partial.as_object_mut().unwrap().remove("reminders");
+        assert_eq!(validate_bundle(&partial, now), bad);
+        let mut bad_id = sample_bundle(now);
+        bad_id["jobs"][1]["id"] = serde_json::json!("has space");
+        assert_eq!(validate_bundle(&bad_id, now), bad);
+        let mut bad_days = sample_bundle(now);
+        bad_days["jobs"][1]["repeat"] = serde_json::json!("weekdays");
+        assert_eq!(validate_bundle(&bad_days, now), bad);
+        let only = serde_json::json!({"config": {"playlists": [], "epgs": []}});
+        assert_eq!(validate_bundle(&only, now), Ok(only.clone()));
+        // A settings-only (v1) backup imports as settings only.
+        let v1 = export_settings(br#"{"playlists": [], "epgs": []}"#, "pw").unwrap();
+        assert_eq!(import_bundle(&v1, "pw", now).unwrap(), only);
+    }
+
+    #[test]
+    fn staged_restore_finishes_on_the_next_start() {
+        let now = 1_795_000_000.0;
+        let dir = std::env::temp_dir().join(format!(
+            "iptv-restore-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let targets = RestoreTargets::new(
+            dir.join("iptvclient.conf"),
+            dir.join("scheduled_recordings.json"),
+        );
+        stage_restore(&sample_bundle(now), &targets, now).unwrap();
+        assert!(targets.pending().exists());
+        assert_eq!(apply_pending(&targets, now), Ok(true));
+        assert!(!targets.pending().exists());
+        let config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&targets.config).unwrap()).unwrap();
+        assert_eq!(config["volume"], 80);
+        let schedule = crate::dvr::DvrSchedule::load(targets.jobs.clone(), now);
+        assert!(
+            schedule.load_warning.is_empty(),
+            "{}",
+            schedule.load_warning
+        );
+        let live = schedule.get("live").unwrap();
+        assert_eq!(live.status, crate::dvr::STATUS_MISSED);
+        assert!(!live.extra.contains_key("restore_next_occurrence"));
+        // The daily repeat that was recording queues its next future occurrence.
+        assert_eq!(schedule.jobs().len(), 3);
+        assert!(schedule
+            .jobs()
+            .iter()
+            .any(|j| j.status == crate::dvr::STATUS_SCHEDULED
+                && j.start_ts > now
+                && j.repeat == "daily"));
+        let reminders = crate::reminders::load_reminder_file(&targets.reminders);
+        assert_eq!(reminders.rows.len(), 1);
+        assert!(targets.search_seen.exists());
+        assert_eq!(apply_pending(&targets, now), Ok(false));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Cross-check with the Python client: set `IPTV_BACKUP_ORACLE` to a
+    /// folder holding `python.aiptv` (exported by Python with password
+    /// `pw`); this test imports it and writes `rust.aiptv` for Python to
+    /// import (`tools/backup-oracle.py`). Skipped when unset.
+    #[test]
+    fn python_full_backup_oracle() {
+        let Some(dir) = std::env::var_os("IPTV_BACKUP_ORACLE").map(std::path::PathBuf::from) else {
+            return;
+        };
+        let now = 1_795_000_000.0;
+        let python = std::fs::read(dir.join("python.aiptv")).unwrap();
+        let bundle = import_bundle(&python, "pw", now).unwrap();
+        assert!(bundle["jobs"].as_array().is_some_and(|j| !j.is_empty()));
+        std::fs::write(
+            dir.join("rust.aiptv"),
+            export_bundle(&sample_bundle(now), "pw", now).unwrap(),
+        )
+        .unwrap();
+    }
 
     /// A real backup written by the pinned Python client's
     /// `export_settings` (cryptography 50.0.1) for the config in

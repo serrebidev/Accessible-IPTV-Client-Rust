@@ -579,13 +579,17 @@ fn is_int_in(value: &serde_json::Value, max: i64) -> bool {
     value.as_i64().is_some_and(|n| (0..=max).contains(&n)) && !value.is_f64()
 }
 
-fn valid_padding_pair(value: &serde_json::Value) -> bool {
+/// Python `dvr.valid_padding_pair`: two whole minutes, 0 to 180.
+#[must_use]
+pub fn valid_padding_pair(value: &serde_json::Value) -> bool {
     value
         .as_array()
         .is_some_and(|pair| pair.len() == 2 && pair.iter().all(|n| is_int_in(n, 180)))
 }
 
-fn valid_series_padding(value: &serde_json::Value) -> bool {
+/// Python `dvr.valid_series_padding`: ascending (XMLTV start, before, after) rows.
+#[must_use]
+pub fn valid_series_padding(value: &serde_json::Value) -> bool {
     let Some(changes) = value.as_array() else {
         return false;
     };
@@ -1749,6 +1753,22 @@ pub fn next_time_occurrence<Tz: chrono::TimeZone>(
     now: f64,
     tz: &Tz,
 ) -> Result<DvrJob, String> {
+    next_time_occurrence_after(job, now, tz, false)
+}
+
+/// [`next_time_occurrence`] with Python's `future_only`: the
+/// occurrence must also start after `now` (a restored backup never
+/// queues one already under way).
+///
+/// # Errors
+/// As [`next_time_occurrence`].
+#[allow(clippy::cast_possible_truncation)] // padding minutes are whole numbers
+pub fn next_time_occurrence_after<Tz: chrono::TimeZone>(
+    job: &DvrJob,
+    now: f64,
+    tz: &Tz,
+    future_only: bool,
+) -> Result<DvrJob, String> {
     use chrono::Datelike as _;
     let invalid = || "The recording times are invalid. Check the recording schedule.".to_string();
     let days: Vec<u8> = match job.repeat.as_str() {
@@ -1761,7 +1781,7 @@ pub fn next_time_occurrence<Tz: chrono::TimeZone>(
         "weekdays" => job.weekdays.clone().unwrap_or_default(),
         _ => return Err(invalid()),
     };
-    let mut successor = next_weekday_job(job, now, &days, false, tz)?.ok_or_else(invalid)?;
+    let mut successor = next_weekday_job(job, now, &days, future_only, tz)?.ok_or_else(invalid)?;
     successor.id = uuid::Uuid::new_v5(
         &uuid::Uuid::NAMESPACE_URL,
         format!("iptv-dvr:{}", job.id).as_bytes(),
