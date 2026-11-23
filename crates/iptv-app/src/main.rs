@@ -18546,7 +18546,7 @@ fn edit_job_times(wiring: &Wiring, parent: &dyn WxWidget, job_id: &str, dstatus:
     match wiring
         .dvr
         .borrow_mut()
-        .edit_timing(&job.id, start, end, expected, now_seconds())
+        .edit_timing(&job.id, start, end, expected, now_seconds(), None)
     {
         Ok(_) => dstatus.set_label(&tr("Recording schedule saved.")),
         Err(error) => {

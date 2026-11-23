@@ -518,6 +518,7 @@ impl DvrSchedule {
         if invalid {
             schedule.preserve_unreadable();
         }
+        let mut interrupted = Vec::new();
         for job in &mut jobs {
             if job.status == STATUS_WAITING {
                 // A wait is not replayed after a restart: the job
@@ -528,6 +529,9 @@ impl DvrSchedule {
                 job.recording_id = None;
                 if job.stop_ts > 0.0 && now >= job.stop_ts {
                     job.status = STATUS_FAILED.to_string();
+                    if TIME_REPEATS.contains(&job.repeat.as_str()) {
+                        interrupted.push(job.clone());
+                    }
                     if job.message.is_empty() {
                         job.message = "Interrupted by application restart.".to_string();
                     }
@@ -538,6 +542,12 @@ impl DvrSchedule {
             }
         }
         schedule.jobs = jobs;
+        for job in &interrupted {
+            schedule.schedule_next_occurrence(job, now);
+        }
+        if !interrupted.is_empty() {
+            schedule.save_logged();
+        }
         schedule
     }
 
@@ -690,7 +700,11 @@ impl DvrSchedule {
         end: f64,
         expected: (f64, f64, &str),
         now: f64,
+        weekdays: Option<&[u8]>,
     ) -> Result<DvrJob, String> {
+        let weekdays = weekdays
+            .map(|days| checked_weekdays(&serde_json::json!(days)))
+            .transpose()?;
         self.transaction(|jobs| {
             let Some(job) = jobs.iter_mut().find(|j| j.id == job_id) else {
                 return Err("The recording changed. Reopen its timing dialog.".to_string());
@@ -722,6 +736,19 @@ impl DvrSchedule {
                     "end".to_string(),
                     serde_json::json!(xmltv_from_ts(end as i64)),
                 );
+            }
+            if let Some(days) = weekdays {
+                if running || job.repeat == "series" {
+                    return Err(
+                        "Select one pending recording that is not a series rule.".to_string()
+                    );
+                }
+                job.repeat = if days.is_empty() {
+                    String::new()
+                } else {
+                    "weekdays".to_string()
+                };
+                job.weekdays = Some(days);
             }
             Ok(job.clone())
         })
@@ -916,6 +943,9 @@ impl DvrSchedule {
                 STATUS_FAILED,
                 "Could not resolve the scheduled recording before its window ended.",
             );
+            if let Some(job) = self.get(job_id).cloned() {
+                self.schedule_next_occurrence(&job, now);
+            }
         } else {
             self.set_status(job_id, STATUS_SCHEDULED, "");
         }
@@ -970,6 +1000,7 @@ impl DvrSchedule {
                                 STATUS_FAILED,
                                 "Could not resolve the scheduled recording before its window ended.",
                             );
+                            self.schedule_next_occurrence(&job, now);
                             changed = true;
                         }
                         continue;
@@ -987,6 +1018,7 @@ impl DvrSchedule {
                         } else {
                             self.set_status(&id, STATUS_MISSED, "Scheduled recording was missed.");
                         }
+                        self.schedule_next_occurrence(&job, now);
                         changed = true;
                     } else if now >= job.start_ts {
                         if let Some(reason) = gate(&job) {
@@ -1108,48 +1140,247 @@ impl DvrSchedule {
         self.save_logged();
     }
 
+    /// Queue a time repeat's next occurrence once (Python
+    /// `_schedule_next_occurrence`: `setdefault` on the stable
+    /// successor id, so a second call adds nothing).
     fn schedule_next_occurrence(&mut self, job: &DvrJob, now: f64) {
-        let days: i64 = match job.repeat.as_str() {
-            "daily" => 1,
-            "weekly" => 7,
-            _ => return,
-        };
-        let mut next = job.clone();
-        next.id = hex_id(&format!("{}:{}:{}", now, job.id, job.start_ts));
-        #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
-        let shift_local_days = |ts: f64, days: i64| -> f64 {
-            let local = chrono::Utc
-                .timestamp_opt(ts as i64, 0)
-                .single()
-                .map(|dt| dt.with_timezone(&chrono::Local));
-            match local {
-                Some(dt) => (dt + chrono::TimeDelta::days(days)).timestamp() as f64,
-                None => ts + f64::from(i32::try_from(days * 86_400).unwrap_or(0)),
+        if !TIME_REPEATS.contains(&job.repeat.as_str()) {
+            return;
+        }
+        match next_time_occurrence(job, now, &chrono::Local) {
+            Ok(next) => {
+                if !self.jobs.iter().any(|j| j.id == next.id) {
+                    self.jobs.push(next);
+                }
             }
-        };
-        while next.stop_ts <= now {
-            next.start_ts = shift_local_days(next.start_ts, days);
-            next.stop_ts = shift_local_days(next.stop_ts, days);
+            Err(error) => crate::applog::error(
+                "dvr",
+                &format!("Invalid recurring recording {}: {error}", job.id),
+            ),
         }
-        if next.start_ts <= job.start_ts {
-            next.start_ts = shift_local_days(next.start_ts, days);
-            next.stop_ts = shift_local_days(next.stop_ts, days);
-        }
-        next.start_at = iso_from_ts(
-            next.start_ts + f64::from(i32::try_from(next.pre_padding_minutes).unwrap_or(0)) * 60.0,
-        );
-        next.end_at = iso_from_ts(
-            next.stop_ts - f64::from(i32::try_from(next.post_padding_minutes).unwrap_or(0)) * 60.0,
-        );
-        next.status = STATUS_SCHEDULED.to_string();
-        next.started_late = false;
-        next.wait_reason = String::new();
-        next.recording_id = None;
-        next.output_path = String::new();
-        next.message = String::new();
-        next.created_at = iso_from_ts(now);
-        self.jobs.push(next);
     }
+
+    /// Python `skip_occurrence`: mark one pending time-based
+    /// occurrence skipped and queue the next, in one durable edit.
+    /// Returns the next occurrence.
+    ///
+    /// # Errors
+    /// Returns Python's message for anything but a pending time
+    /// repeat still starting at `expected_start`, and write errors.
+    #[allow(clippy::float_cmp)] // the expected start compares exactly, as Python's does
+    pub fn skip_occurrence(
+        &mut self,
+        job_id: &str,
+        expected_start: f64,
+        now: f64,
+    ) -> Result<DvrJob, String> {
+        self.transaction(|jobs| {
+            let Some(index) = jobs.iter().position(|j| {
+                j.id == job_id
+                    && j.status == STATUS_SCHEDULED
+                    && TIME_REPEATS.contains(&j.repeat.as_str())
+                    && j.start_ts == expected_start
+            }) else {
+                return Err("Select one pending recurring recording.".to_string());
+            };
+            let successor = next_time_occurrence(&jobs[index], now, &chrono::Local)?;
+            jobs[index].status = STATUS_SKIPPED.to_string();
+            jobs[index].message = String::new();
+            if let Some(existing) = jobs.iter().find(|j| j.id == successor.id) {
+                return Ok(existing.clone());
+            }
+            jobs.push(successor.clone());
+            Ok(successor)
+        })
+    }
+
+    /// Python `set_weekdays`: repeat one pending recording that is
+    /// not a series rule on the given weekdays; no days makes it a
+    /// single recording again.
+    ///
+    /// # Errors
+    /// Returns Python's messages for invalid days or the wrong job,
+    /// and write errors.
+    pub fn set_weekdays(&mut self, job_id: &str, weekdays: &[u8]) -> Result<(), String> {
+        let days = checked_weekdays(&serde_json::json!(weekdays))?;
+        self.transaction(|jobs| {
+            let Some(job) = jobs
+                .iter_mut()
+                .find(|j| j.id == job_id && j.status == STATUS_SCHEDULED && j.repeat != "series")
+            else {
+                return Err("Select one pending recording that is not a series rule.".to_string());
+            };
+            job.repeat = if days.is_empty() {
+                String::new()
+            } else {
+                "weekdays".to_string()
+            };
+            job.weekdays = Some(days);
+            Ok(())
+        })
+    }
+}
+
+/// Python `manual_schedule.local_candidates` for one wall-clock
+/// minute: the UTC seconds it maps to in `tz` (two during the
+/// autumn repeat, none in the spring gap), ascending.
+fn local_candidates<Tz: chrono::TimeZone>(tz: &Tz, wall: chrono::NaiveDateTime) -> Vec<i64> {
+    let mut stamps: Vec<i64> = match tz.from_local_datetime(&wall) {
+        chrono::LocalResult::Single(dt) => vec![dt.timestamp()],
+        chrono::LocalResult::Ambiguous(a, b) => vec![a.timestamp(), b.timestamp()],
+        chrono::LocalResult::None => Vec::new(),
+    };
+    stamps.retain(|s| *s >= 0);
+    stamps.sort_unstable();
+    stamps.dedup();
+    stamps
+}
+
+/// The local wall time of a UTC instant, with Python's `fold`
+/// (1 when it is the second of two identical wall times).
+#[allow(clippy::cast_possible_truncation)] // schedule times are whole seconds
+fn local_wall<Tz: chrono::TimeZone>(tz: &Tz, ts: f64) -> Option<(chrono::NaiveDateTime, usize)> {
+    let secs = ts.floor() as i64;
+    let wall = tz.timestamp_opt(secs, 0).single()?.naive_local();
+    let fold = match tz.from_local_datetime(&wall) {
+        chrono::LocalResult::Ambiguous(_, later) if later.timestamp() == secs => 1,
+        _ => 0,
+    };
+    Some((wall, fold))
+}
+
+#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)] // whole seconds
+fn ts_f64(secs: i64) -> f64 {
+    secs as f64
+}
+
+/// Python `planning_tools.next_weekday_job`: the next occurrence of
+/// a recurring job on one of `weekdays` (Monday 0), keeping the
+/// programme's wall-clock times and padding, skipping a window the
+/// clock change makes nonexistent, taking `future_padding` when set.
+/// `None` when no weekday is chosen.
+///
+/// # Errors
+/// Returns Python's messages for invalid days, an unreadable job
+/// time, and no valid window within 370 days.
+#[allow(clippy::cast_possible_truncation)] // padding minutes and schedule times are whole numbers
+pub fn next_weekday_job<Tz: chrono::TimeZone>(
+    job: &DvrJob,
+    now: f64,
+    weekdays: &[u8],
+    future_only: bool,
+    tz: &Tz,
+) -> Result<Option<DvrJob>, String> {
+    use chrono::{Datelike as _, Timelike as _};
+    let days = checked_weekdays(&serde_json::json!(weekdays))?;
+    if days.is_empty() {
+        return Ok(None);
+    }
+    let invalid = || "The recording times are invalid. Check the recording schedule.".to_string();
+    let pre = job.pre_padding_minutes * 60;
+    let post = job.post_padding_minutes * 60;
+    let previous_start = job.start_ts;
+    let (original, original_fold) =
+        local_wall(tz, job.start_ts + ts_f64(pre)).ok_or_else(invalid)?;
+    let (end, end_fold) = local_wall(tz, job.stop_ts - ts_f64(post)).ok_or_else(invalid)?;
+    let [pre_minutes, post_minutes] = job.future_padding.unwrap_or([pre / 60, post / 60]);
+    let (pre, post) = (pre_minutes * 60, post_minutes * 60);
+    let offset = (end.date() - original.date()).num_days();
+    let (today, _) = local_wall(tz, now).ok_or_else(invalid)?;
+    let first = std::cmp::max(
+        original.date() + chrono::TimeDelta::days(1),
+        today.date() - chrono::TimeDelta::days(offset.max(1)),
+    );
+    let minute = |date: chrono::NaiveDate, time: chrono::NaiveDateTime| {
+        date.and_hms_opt(time.hour(), time.minute(), 0)
+    };
+    for step in 0..370 {
+        let date = first + chrono::TimeDelta::days(step);
+        let weekday = u8::try_from(date.weekday().num_days_from_monday()).unwrap_or(7);
+        if !days.contains(&weekday) {
+            continue;
+        }
+        let (Some(starts), Some(ends)) = (
+            minute(date, original),
+            minute(date + chrono::TimeDelta::days(offset), end),
+        ) else {
+            continue;
+        };
+        let (a, b) = (local_candidates(tz, starts), local_candidates(tz, ends));
+        if a.is_empty() || b.is_empty() {
+            continue;
+        }
+        let start = a[original_fold.min(a.len() - 1)] + i64::from(original.second()) - pre;
+        let stop = b[end_fold.min(b.len() - 1)] + i64::from(end.second()) + post;
+        let (start_f, stop_f) = (ts_f64(start), ts_f64(stop));
+        if start_f <= previous_start
+            || stop_f <= now
+            || stop <= start
+            || (future_only && start_f <= now)
+        {
+            continue;
+        }
+        let mut result = job.clone();
+        result.future_padding = None;
+        result.id = unique_suffix(&job.id);
+        result.start_ts = start_f;
+        result.stop_ts = stop_f;
+        result.pre_padding_minutes = pre / 60;
+        result.post_padding_minutes = post / 60;
+        result.start_at = iso_from_ts(ts_f64(start + pre));
+        result.end_at = iso_from_ts(ts_f64(stop - post));
+        result.status = STATUS_SCHEDULED.to_string();
+        result.recording_id = None;
+        result.output_path = String::new();
+        result.message = String::new();
+        result.started_late = false;
+        result.wait_reason = String::new();
+        result.created_at = iso_from_ts(now);
+        if !result.program.is_object() {
+            result.program = serde_json::json!({});
+        }
+        if let Some(program) = result.program.as_object_mut() {
+            program.insert("start".into(), xmltv_from_ts(start + pre).into());
+            program.insert("end".into(), xmltv_from_ts(stop - post).into());
+        }
+        return Ok(Some(result));
+    }
+    Err("No valid recording window was found for the selected weekdays.".to_string())
+}
+
+/// Python `dvr.next_time_occurrence`: the next daily, weekly or
+/// weekday occurrence, with the id every caller derives the same
+/// way (`uuid5(NAMESPACE_URL, "iptv-dvr:" + id)`), so a restart or a
+/// second caller cannot queue a second copy.
+///
+/// # Errors
+/// As [`next_weekday_job`]; also when the job is not a time repeat.
+#[allow(clippy::cast_possible_truncation)] // padding minutes are whole numbers
+pub fn next_time_occurrence<Tz: chrono::TimeZone>(
+    job: &DvrJob,
+    now: f64,
+    tz: &Tz,
+) -> Result<DvrJob, String> {
+    use chrono::Datelike as _;
+    let invalid = || "The recording times are invalid. Check the recording schedule.".to_string();
+    let days: Vec<u8> = match job.repeat.as_str() {
+        "daily" => (0..7).collect(),
+        "weekly" => {
+            let (start, _) = local_wall(tz, job.start_ts + ts_f64(job.pre_padding_minutes * 60))
+                .ok_or_else(invalid)?;
+            vec![u8::try_from(start.weekday().num_days_from_monday()).unwrap_or(0)]
+        }
+        "weekdays" => job.weekdays.clone().unwrap_or_default(),
+        _ => return Err(invalid()),
+    };
+    let mut successor = next_weekday_job(job, now, &days, false, tz)?.ok_or_else(invalid)?;
+    successor.id = uuid::Uuid::new_v5(
+        &uuid::Uuid::NAMESPACE_URL,
+        format!("iptv-dvr:{}", job.id).as_bytes(),
+    )
+    .simple()
+    .to_string();
+    Ok(successor)
 }
 
 fn stalker_resolution_request(
@@ -1411,6 +1642,202 @@ mod tests {
             "manual": true,
             "a_future_python_field": {"kept": [1, 2]}
         })
+    }
+
+    fn utc(text: &str) -> f64 {
+        #[allow(clippy::cast_precision_loss)] // whole-second test times
+        let secs = chrono::DateTime::parse_from_rfc3339(text)
+            .unwrap()
+            .timestamp() as f64;
+        secs
+    }
+
+    /// A recurring job whose padded window is `start`..`stop` (UTC
+    /// RFC 3339) with the given padding minutes.
+    fn recurring(repeat: &str, start: &str, stop: &str, pre: i64, post: i64) -> DvrJob {
+        let chan = channel();
+        let mut job = build_job(&spec(&chan, "Show", 0, 1, 0, 0), 0.0).unwrap();
+        job.id = "abc".to_string();
+        job.repeat = repeat.to_string();
+        job.start_ts = utc(start) - 60.0 * f64::from(i32::try_from(pre).unwrap());
+        job.stop_ts = utc(stop) + 60.0 * f64::from(i32::try_from(post).unwrap());
+        job.pre_padding_minutes = pre;
+        job.post_padding_minutes = post;
+        job
+    }
+
+    const BUDAPEST: chrono_tz::Tz = chrono_tz::Europe::Budapest;
+
+    #[test]
+    #[allow(clippy::float_cmp)] // whole-second schedule values are exact in f64
+    fn weekday_recurrence_keeps_wall_clock_times() {
+        // Monday 21:00 to 22:00 Budapest (UTC+1), Mondays and Wednesdays.
+        let mut job = recurring(
+            "weekdays",
+            "2026-11-23T20:00:00Z",
+            "2026-11-23T21:00:00Z",
+            0,
+            0,
+        );
+        job.weekdays = Some(vec![0, 2]);
+        let next = next_weekday_job(&job, job.stop_ts, &[0, 2], false, &BUDAPEST)
+            .unwrap()
+            .unwrap();
+        assert_eq!(next.start_ts, utc("2026-11-25T20:00:00Z"));
+        assert_eq!(next.stop_ts, utc("2026-11-25T21:00:00Z"));
+        assert_eq!(next.program["start"], "20261125200000");
+        assert_eq!(next.status, STATUS_SCHEDULED);
+
+        // Overnight 23:30 to 00:30 keeps its one-day offset.
+        let job = recurring(
+            "weekdays",
+            "2026-11-23T22:30:00Z",
+            "2026-11-23T23:30:00Z",
+            0,
+            0,
+        );
+        let next = next_weekday_job(&job, job.stop_ts, &[0], false, &BUDAPEST)
+            .unwrap()
+            .unwrap();
+        assert_eq!(next.start_ts, utc("2026-11-30T22:30:00Z"));
+        assert_eq!(next.stop_ts, utc("2026-11-30T23:30:00Z"));
+
+        assert!(next_weekday_job(&job, 0.0, &[], false, &BUDAPEST)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)] // whole-second schedule values are exact in f64
+    fn recurrence_skips_spring_gap_and_keeps_autumn_fold() {
+        // Daily 02:30 to 03:30 local: 2026-03-29 02:30 does not exist
+        // in Budapest, so the next recording is on 2026-03-30 (CEST).
+        let job = recurring(
+            "daily",
+            "2026-03-28T01:30:00Z",
+            "2026-03-28T02:30:00Z",
+            0,
+            0,
+        );
+        let next = next_time_occurrence(&job, job.stop_ts, &BUDAPEST).unwrap();
+        assert_eq!(next.start_ts, utc("2026-03-30T00:30:00Z"));
+        assert_eq!(next.stop_ts, utc("2026-03-30T01:30:00Z"));
+
+        // Daily 02:30 to 03:00 CEST: on 2026-10-25 02:30 happens
+        // twice; the first occurrence (fold 0) is kept, and 03:00
+        // is the single CET time after the change.
+        let job = recurring(
+            "daily",
+            "2026-10-24T00:30:00Z",
+            "2026-10-24T01:00:00Z",
+            0,
+            0,
+        );
+        let next = next_time_occurrence(&job, job.stop_ts, &BUDAPEST).unwrap();
+        assert_eq!(next.start_ts, utc("2026-10-25T00:30:00Z"));
+        assert_eq!(next.stop_ts, utc("2026-10-25T02:00:00Z"));
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)] // whole-second schedule values are exact in f64
+    fn successor_takes_future_padding_and_a_stable_id() {
+        let mut job = recurring(
+            "weekly",
+            "2026-11-23T20:00:00Z",
+            "2026-11-23T21:00:00Z",
+            5,
+            10,
+        );
+        job.future_padding = Some([1, 3]);
+        let next = next_time_occurrence(&job, job.stop_ts, &BUDAPEST).unwrap();
+        // Python: uuid.uuid5(uuid.NAMESPACE_URL, "iptv-dvr:abc").hex
+        assert_eq!(next.id, "00caabfe6acd508e88d744d59ffb82ff");
+        assert_eq!(next.start_ts, utc("2026-11-30T20:00:00Z") - 60.0);
+        assert_eq!(next.stop_ts, utc("2026-11-30T21:00:00Z") + 180.0);
+        assert_eq!(
+            (next.pre_padding_minutes, next.post_padding_minutes),
+            (1, 3)
+        );
+        assert_eq!(next.future_padding, None);
+        assert_eq!(next.start_at, "2026-11-30T20:00:00+00:00");
+    }
+
+    #[test]
+    fn skip_occurrence_and_failed_repeats_queue_one_successor() {
+        let dir = temp_dir("skip");
+        let mut schedule = DvrSchedule::load(dir.join("scheduled_recordings.json"), 0.0);
+        let job = recurring(
+            "daily",
+            "2026-11-23T20:00:00Z",
+            "2026-11-23T21:00:00Z",
+            0,
+            0,
+        );
+        let start = job.start_ts;
+        schedule.add_job(job).unwrap();
+        assert_eq!(
+            schedule.skip_occurrence("abc", start + 1.0, start - 60.0),
+            Err("Select one pending recurring recording.".to_string())
+        );
+        let next = schedule
+            .skip_occurrence("abc", start, start - 60.0)
+            .unwrap();
+        assert_eq!(schedule.get("abc").unwrap().status, STATUS_SKIPPED);
+        assert_eq!(schedule.jobs().len(), 2);
+        assert_eq!(schedule.get(&next.id).unwrap().status, STATUS_SCHEDULED);
+
+        // A missed time repeat queues its successor too (Python
+        // `_set_status`), and only once.
+        let missed_at = next.stop_ts + 1.0;
+        schedule.tick(missed_at);
+        assert_eq!(schedule.get(&next.id).unwrap().status, STATUS_MISSED);
+        assert_eq!(schedule.jobs().len(), 3);
+        schedule.tick(missed_at);
+        assert_eq!(schedule.jobs().len(), 3);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn set_weekdays_refuses_series_rules() {
+        let dir = temp_dir("weekdays");
+        let mut schedule = DvrSchedule::load(dir.join("scheduled_recordings.json"), 0.0);
+        schedule
+            .add_job(recurring(
+                "series",
+                "2026-11-23T20:00:00Z",
+                "2026-11-23T21:00:00Z",
+                0,
+                0,
+            ))
+            .unwrap();
+        assert_eq!(
+            schedule.set_weekdays("abc", &[1]),
+            Err("Select one pending recording that is not a series rule.".to_string())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut schedule = DvrSchedule::load(dir.join("scheduled_recordings.json"), 0.0);
+        schedule
+            .add_job(recurring(
+                "",
+                "2026-11-23T20:00:00Z",
+                "2026-11-23T21:00:00Z",
+                0,
+                0,
+            ))
+            .unwrap();
+        schedule.set_weekdays("abc", &[4, 1, 4]).unwrap();
+        let job = schedule.get("abc").unwrap();
+        assert_eq!(
+            (job.repeat.as_str(), job.weekdays.clone()),
+            ("weekdays", Some(vec![1, 4]))
+        );
+        schedule.set_weekdays("abc", &[]).unwrap();
+        let job = schedule.get("abc").unwrap();
+        assert_eq!(
+            (job.repeat.as_str(), job.weekdays.clone()),
+            ("", Some(vec![]))
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
