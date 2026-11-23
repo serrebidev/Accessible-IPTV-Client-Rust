@@ -18136,20 +18136,7 @@ fn job_views(wiring: &Wiring) -> Vec<iptv_core::recording_limits::JobView> {
         .jobs()
         .iter()
         .filter(|job| !iptv_core::dvr::DONE_STATUSES.contains(&job.status.as_str()))
-        .map(|job| iptv_core::recording_limits::JobView {
-            id: job.id.clone(),
-            title: job.title.clone(),
-            status: if job.status == iptv_core::dvr::STATUS_WAITING {
-                "scheduled".to_string()
-            } else {
-                job.status.clone()
-            },
-            start_ts: job.start_ts,
-            stop_ts: job.stop_ts,
-            pre_padding_minutes: job.pre_padding_minutes,
-            post_padding_minutes: job.post_padding_minutes,
-            channel: iptv_core::dvr::channel_from_snapshot(&job.channel),
-        })
+        .map(iptv_core::recording_limits::JobView::from_job)
         .collect()
 }
 

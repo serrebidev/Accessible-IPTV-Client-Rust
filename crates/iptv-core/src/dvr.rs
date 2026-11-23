@@ -105,7 +105,9 @@ pub struct DvrJob {
 }
 
 #[allow(clippy::cast_possible_truncation)] // schedule times are whole seconds
-fn iso_from_ts(ts: f64) -> String {
+/// ISO 8601 UTC (`+00:00`) for an epoch second, as Python writes it.
+#[must_use]
+pub fn iso_from_ts(ts: f64) -> String {
     let secs = ts as i64;
     chrono::Utc
         .timestamp_opt(secs, 0)
@@ -952,7 +954,9 @@ impl DvrSchedule {
         Ok(true)
     }
 
-    /// Cancel a job that has not finished.
+    /// Cancel a job that has not finished, or a series rule at any
+    /// time: its own airing may be over while it keeps booking
+    /// episodes, and cancelling it stops them (Python cancels any job).
     ///
     /// # Errors
     /// Returns the write error; the job then keeps its status.
@@ -961,7 +965,9 @@ impl DvrSchedule {
             let Some(job) = jobs.iter_mut().find(|j| j.id == job_id) else {
                 return Ok(false);
             };
-            if DONE_STATUSES.contains(&job.status.as_str()) {
+            if job.status == STATUS_CANCELED
+                || (DONE_STATUSES.contains(&job.status.as_str()) && job.repeat != "series")
+            {
                 return Ok(false);
             }
             job.status = STATUS_CANCELED.to_string();
@@ -1002,6 +1008,44 @@ impl DvrSchedule {
             };
             job.repeat = repeat.to_string();
             Ok(true)
+        })
+    }
+
+    /// The jobs an edit is computed against (Python `edit_snapshot`).
+    #[must_use]
+    pub fn edit_snapshot(&self) -> Vec<DvrJob> {
+        self.jobs.clone()
+    }
+
+    /// Python `apply_reviewed_edit`: publish an edit's changed jobs
+    /// in one transaction, only when the schedule is still exactly
+    /// the snapshot the edit was computed from (and, for a moved
+    /// airing, `future_start` has not passed).
+    ///
+    /// # Errors
+    /// Returns Python's message when the schedule changed, and write
+    /// errors (the schedule is then unchanged).
+    pub fn apply_reviewed_edit(
+        &mut self,
+        snapshot: &[DvrJob],
+        changes: std::collections::BTreeMap<String, DvrJob>,
+        future_start: Option<f64>,
+        now: f64,
+    ) -> Result<(), String> {
+        if self.jobs != snapshot || future_start.is_some_and(|start| start <= now) {
+            return Err(
+                "The recording schedule changed. Check the times and try again.".to_string(),
+            );
+        }
+        self.transaction(|jobs| {
+            for (id, job) in changes {
+                if let Some(slot) = jobs.iter_mut().find(|j| j.id == id) {
+                    *slot = job;
+                } else {
+                    jobs.push(job);
+                }
+            }
+            Ok(())
         })
     }
 

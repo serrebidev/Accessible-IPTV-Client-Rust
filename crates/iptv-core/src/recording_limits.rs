@@ -141,6 +141,28 @@ pub struct JobView {
     pub channel: Channel,
 }
 
+impl JobView {
+    /// A schedule job as the limits see it: Rust's `waiting` counts
+    /// as scheduled.
+    #[must_use]
+    pub fn from_job(job: &crate::dvr::DvrJob) -> Self {
+        Self {
+            id: job.id.clone(),
+            title: job.title.clone(),
+            status: if job.status == crate::dvr::STATUS_WAITING {
+                crate::dvr::STATUS_SCHEDULED.to_string()
+            } else {
+                job.status.clone()
+            },
+            start_ts: job.start_ts,
+            stop_ts: job.stop_ts,
+            pre_padding_minutes: job.pre_padding_minutes,
+            post_padding_minutes: job.post_padding_minutes,
+            channel: crate::dvr::channel_from_snapshot(&job.channel),
+        }
+    }
+}
+
 fn job_active(job: &JobView) -> bool {
     matches!(job.status.as_str(), "scheduled" | "recording" | "stopping")
         && job.start_ts.is_finite()

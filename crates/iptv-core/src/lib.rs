@@ -62,6 +62,7 @@ pub mod playback;
 pub mod providers;
 pub mod proxy;
 pub mod recording;
+pub mod recording_edits;
 pub mod recording_library;
 pub mod recording_limits;
 pub mod recording_log;
@@ -79,7 +80,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 /// A channel as it appears in a playlist.
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Channel {
     pub name: String,
     pub group: String,
