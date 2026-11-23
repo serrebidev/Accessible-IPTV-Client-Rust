@@ -996,7 +996,7 @@ checksum = "791930b43c0d5973160d90a8f3894509f2b273430f5c5c73b668636d0287c5c0"
 
 [[package]]
 name = "iptv-app"
-version = "0.4.34"
+version = "0.4.35"
 dependencies = [
  "chrono",
  "iptv-core",
@@ -1014,7 +1014,7 @@ dependencies = [
 
 [[package]]
 name = "iptv-core"
-version = "0.4.34"
+version = "0.4.35"
 dependencies = [
  "aes",
  "base64",
@@ -1040,21 +1040,21 @@ dependencies = [
 
 [[package]]
 name = "iptv-sapi"
-version = "0.4.34"
+version = "0.4.35"
 dependencies = [
  "iptv-core",
 ]
 
 [[package]]
 name = "iptv-signer"
-version = "0.4.34"
+version = "0.4.35"
 dependencies = [
  "minisign",
 ]
 
 [[package]]
 name = "iptv-vlc"
-version = "0.4.34"
+version = "0.4.35"
 dependencies = [
  "iptv-core",
  "libloading 0.9.1",
@@ -1930,7 +1930,7 @@ dependencies = [
 [[package]]
 name = "ship-shape"
 version = "0.6.0"
-source = "git+https://git.serrebiradio.com/serrebi/ship-shape?rev=82034b7eb3c68af0256f1102d005bc7e57483150#82034b7eb3c68af0256f1102d005bc7e57483150"
+source = "git+https://git.serrebiradio.com/serrebi/ship-shape?rev=a02488d9df6a824675d77855bfe193703872c2ee#a02488d9df6a824675d77855bfe193703872c2ee"
 dependencies = [
  "homeport",
  "minisign-verify",
