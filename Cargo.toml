@@ -23,7 +23,7 @@ iptv-core = { path = "crates/iptv-core" }
 # the ONLY build change is the assert dialogs. (Cargo only
 # honors default-features at this workspace definition; the
 # member crate's setting is ignored.)
-wxdragon = { version = "0.9.24", default-features = false }
+wxdragon = { version = "0.9.25", default-features = false }
 live-region = "0.3.3"
 serde_json = "1"
 sha2 = "0.11"
@@ -35,7 +35,7 @@ chrono = "0.4"
 chrono-tz = "0.10"
 serde = { version = "1", features = ["derive"] }
 libloading = "0.9"
-rusqlite = { version = "0.41", features = ["bundled"] }
+rusqlite = { version = "0.43", features = ["bundled"] }
 aes = "0.9"
 cbc = { version = "0.2", features = ["alloc"] }
 hmac = "0.13"
@@ -43,9 +43,9 @@ pbkdf2 = "0.13"
 base64 = "0.23"
 getrandom = "0.4"
 rust_cast = { package = "chromecast", version = "0.18" }
-mdns-sd = "0.21"
+mdns-sd = "0.22"
 libc = "0.2"
 
 [patch.crates-io]
 # ship-shape fork: configurable API base URL for Forgejo-hosted releases (upstream: trypsynth/ship-shape).
-ship-shape = { git = "https://git.serrebiradio.com/serrebi/ship-shape", rev = "cff6bdb5596676723b3a0890b1b030c8edac0d28" }
+ship-shape = { git = "https://git.serrebiradio.com/serrebi/ship-shape", rev = "82034b7eb3c68af0256f1102d005bc7e57483150" }

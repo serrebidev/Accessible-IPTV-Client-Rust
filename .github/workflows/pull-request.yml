@@ -12,7 +12,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out Rust port
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -25,12 +25,12 @@ jobs:
             libjpeg-dev libtiff-dev clang libclang-dev pkg-config gettext
 
       - name: Install Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: '3.x'
 
       - name: Check out pinned Python reference
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: serrebi/Accessible-IPTV-Client
           ref: 9aa89e053225ef2c83c4f3659775a00723012ff7

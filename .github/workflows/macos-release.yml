@@ -32,10 +32,10 @@ jobs:
     - name: Gates
       run: |
         cargo fmt --all --check
-        cargo clippy --workspace --all-targets -- -D warnings
-        cargo test --workspace
+        cargo clippy --locked --workspace --all-targets -- -D warnings
+        cargo test --locked --workspace
     - name: Build
-      run: cargo build --release -p iptv-app
+      run: cargo build --release --locked -p iptv-app
     - name: Bundle libVLC (macOS)
       run: |
         # Newest 3.x only: the engine binds the libVLC 3 API (validation 0071).
@@ -43,11 +43,11 @@ jobs:
         echo "Bundling libVLC from VLC $ver"
         mkdir -p vlc-src
         curl -sL -o vlc-src/vlc.dmg "https://download.videolan.org/pub/videolan/vlc/$ver/macosx/vlc-$ver-arm64.dmg"
-        hdiutil attach vlc-src/vlc.dmg -nobrowse -mountpoint /tmp/vlcapp
+        diskutil image attach --readOnly --nobrowse --mountPoint /tmp/vlcapp vlc-src/vlc.dmg
         mkdir -p bundle/plugins
         cp -a /tmp/vlcapp/VLC.app/Contents/MacOS/lib/libvlc*.dylib /tmp/vlcapp/VLC.app/Contents/MacOS/lib/libvlccore*.dylib bundle/
         cp -a /tmp/vlcapp/VLC.app/Contents/MacOS/plugins/. bundle/plugins/
-        hdiutil detach /tmp/vlcapp
+        diskutil eject /tmp/vlcapp
     - name: Package (macOS)
       run: |
         tag="${{ inputs.release_tag }}"
@@ -56,13 +56,13 @@ jobs:
         cp "target/release/iptv-app" "$stage/"
         cp -R docs/help "$stage/docs/help"
         cp -a bundle/. "$stage/"
-        hdiutil create -volname "Accessible IPTV Client" -srcfolder "$stage" -ov -format UDZO accessible-iptv-client.dmg
+        diskutil image create from --volumeName "Accessible IPTV Client" --format UDZO "$stage" accessible-iptv-client.dmg
     - name: Sign the disk image (minisign)
       env:
         MINISIGN_KEY: ${{ secrets.MINISIGN_KEY }}
         MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
       run: |
-        cargo build --release -p iptv-signer
+        cargo build --release --locked -p iptv-signer
         ./target/release/iptv-signer accessible-iptv-client.dmg
         test -f accessible-iptv-client.dmg.minisig
     - name: Attach to the Forgejo release
