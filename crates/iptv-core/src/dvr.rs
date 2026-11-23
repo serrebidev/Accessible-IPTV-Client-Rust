@@ -1395,6 +1395,30 @@ impl DvrSchedule {
         self.save_logged();
     }
 
+    /// [`DvrSchedule::mark_finished`] with the capture's classified
+    /// outcome: `partial` and `stopped` become the job's status
+    /// (Python `mark_finished(outcome=)`); any other outcome falls
+    /// back to `success`.
+    pub fn mark_finished_with_outcome(
+        &mut self,
+        job_id: &str,
+        success: bool,
+        outcome: &str,
+        output_path: &str,
+        message: &str,
+        now: f64,
+    ) {
+        self.mark_finished_inner(job_id, success, output_path, message, now);
+        if matches!(outcome, STATUS_PARTIAL | STATUS_STOPPED) {
+            if let Some(job) = self.jobs.iter_mut().find(|j| {
+                j.id == job_id && matches!(j.status.as_str(), STATUS_COMPLETED | STATUS_FAILED)
+            }) {
+                job.status = outcome.to_string();
+            }
+        }
+        self.save_logged();
+    }
+
     /// Queue a time repeat's next occurrence once (Python
     /// `_schedule_next_occurrence`: `setdefault` on the stable
     /// successor id, so a second call adds nothing).
@@ -1755,6 +1779,26 @@ pub fn series_title_matches(rule_title: &str, programme_title: &str) -> bool {
     !rule.is_empty() && !programme.is_empty() && rule.to_lowercase() == programme.to_lowercase()
 }
 
+/// Python `_status_label`: the English label a job status shows
+/// as (the app translates it); an unknown status shows as itself.
+#[must_use]
+pub fn status_label(status: &str) -> &str {
+    match status {
+        STATUS_SCHEDULED => "Scheduled",
+        STATUS_WAITING => "Waiting",
+        STATUS_RECORDING => "Recording",
+        STATUS_STOPPING => "Stopping",
+        STATUS_COMPLETED => "Completed",
+        STATUS_PARTIAL => "Partial",
+        STATUS_STOPPED => "Stopped by user",
+        STATUS_FAILED => "Failed",
+        STATUS_MISSED => "Missed",
+        STATUS_CANCELED => "Canceled",
+        STATUS_SKIPPED => "Skipped",
+        other => other,
+    }
+}
+
 /// Format a padded-window timestamp in local time for a row label.
 #[allow(clippy::cast_possible_truncation)] // schedule times are whole seconds
 fn local_row_time(ts: f64) -> String {
@@ -1781,7 +1825,7 @@ pub fn job_row_label(job: &DvrJob) -> String {
         local_row_time(job.stop_ts),
         job.title,
         job.channel_name,
-        job.status,
+        status_label(&job.status),
         format_label
     )
 }
@@ -2238,6 +2282,26 @@ mod tests {
             .iter()
             .filter(|j| j.series_source.as_deref() == Some(rule.id.as_str()))
             .all(|j| j.status == STATUS_CANCELED && j.message == "Series recording canceled."));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn finish_outcome_sets_partial_and_stopped() {
+        let dir = temp_dir("outcome");
+        let mut schedule = DvrSchedule::load(dir.join("scheduled_recordings.json"), 0.0);
+        let chan = channel();
+        for (start, outcome, success, expected) in [
+            (1000, "partial", true, STATUS_PARTIAL),
+            (2000, "stopped", true, STATUS_STOPPED),
+            (3000, "completed", true, STATUS_COMPLETED),
+            (4000, "failed", false, STATUS_FAILED),
+        ] {
+            let job = build_job(&spec(&chan, "Show", start, start + 600, 0, 0), 0.0).unwrap();
+            let id = schedule.add_job(job).unwrap();
+            schedule.mark_recording(&id, ts_f64(start));
+            schedule.mark_finished_with_outcome(&id, success, outcome, "", "", ts_f64(start + 600));
+            assert_eq!(schedule.get(&id).unwrap().status, expected, "{outcome}");
+        }
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -2893,7 +2957,7 @@ mod tests {
                 .unwrap_or_default()
         };
         let expected = format!(
-            "{} - {} | Show | News | scheduled | Provider quality (copy, MKV)",
+            "{} - {} | Show | News | Scheduled | Provider quality (copy, MKV)",
             fmt_local(880.0),
             fmt_local(4900.0)
         );

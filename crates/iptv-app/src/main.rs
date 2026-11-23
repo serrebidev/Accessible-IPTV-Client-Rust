@@ -1556,10 +1556,17 @@ fn bind_main_close(frame: Frame, wiring: &Wiring) {
             for report in &finished {
                 if let Some(job_id) = report.key.strip_prefix("dvr:") {
                     // Python's exit path: the job outcome is
-                    // persisted as interrupted, never a success.
-                    dvr.mark_finished(
+                    // persisted as interrupted, never a success:
+                    // partial when a file was written.
+                    let outcome = if recording::output_has_media(&report.out_path) {
+                        iptv_core::dvr::STATUS_PARTIAL
+                    } else {
+                        iptv_core::dvr::STATUS_FAILED
+                    };
+                    dvr.mark_finished_with_outcome(
                         job_id,
                         false,
+                        outcome,
                         &report.out_path.to_string_lossy(),
                         "Stopped because the app exited.",
                         now,
@@ -4786,10 +4793,12 @@ fn run_dvr_actions(wiring: &Wiring, status: Status, now: f64, actions: Vec<DvrAc
                 status.set_label("Resolving scheduled recording stream...");
             }
             DvrAction::Stop(job_id) => {
+                // The scheduler's own stop, not the user's: the
+                // capture classifies as completed, not stopped.
                 wiring
                     .recordings
                     .borrow_mut()
-                    .stop(&format!("dvr:{job_id}"));
+                    .stop_for(&format!("dvr:{job_id}"), "scheduled");
             }
             DvrAction::Start(job_id) => {
                 wiring.conflict_override.borrow_mut().remove(&job_id);
@@ -4885,6 +4894,19 @@ fn poll_recordings(wiring: &Wiring, frame: Frame, status: Status) {
         // never a saved success, for manual and DVR alike.
         let produced = recording::output_has_media(&finished.out_path);
         let success = finished.success && produced;
+        // Python `recording_outcome.classify`, shared by the library
+        // index and the scheduled job's status.
+        let outcome = iptv_core::recording_library::classify_outcome(
+            &iptv_core::recording_library::Outcome {
+                produced,
+                interrupted: finished.killed,
+                stop_reason: &finished.stop_reason,
+                stopped_by_user: finished.stopped_by_user,
+                exit_code: finished.exit_code,
+                written_seconds: finished.media_written_seconds,
+                planned_seconds: finished.planned_seconds,
+            },
+        );
         // PR #36: every finished recording joins the recording
         // library index (Python's recorder calls
         // `recording_library.remember` on its single finish
@@ -4895,9 +4917,11 @@ fn poll_recordings(wiring: &Wiring, frame: Frame, status: Status) {
                 title: finished.title.clone(),
                 channel_name: finished.channel_name.clone(),
                 media_seconds: finished.media_written_seconds,
-                outcome: None,
+                outcome: Some(outcome.to_string()),
                 produced,
                 stopped_by_user: finished.stopped_by_user,
+                stop_reason: finished.stop_reason.clone(),
+                interrupted: finished.killed,
                 exit_code: finished.exit_code,
                 planned_seconds: finished.planned_seconds,
             })
@@ -4948,9 +4972,10 @@ fn poll_recordings(wiring: &Wiring, frame: Frame, status: Status) {
             } else {
                 String::new()
             };
-            wiring.dvr.borrow_mut().mark_finished(
+            wiring.dvr.borrow_mut().mark_finished_with_outcome(
                 job_id,
                 success,
+                outcome,
                 &finished.out_path.to_string_lossy(),
                 &message,
                 now,
@@ -18018,9 +18043,13 @@ fn render_scheduled_jobs(wiring: &Wiring, list: ListCtrl, dstatus: Status) {
         list.set_item_text_by_column(row, 2, &job.channel_name);
         let status = if job.status == iptv_core::dvr::STATUS_WAITING && !job.wait_reason.is_empty()
         {
-            format!("{}: {}", job.status, job.wait_reason)
+            format!(
+                "{}: {}",
+                tr(iptv_core::dvr::status_label(&job.status)),
+                job.wait_reason
+            )
         } else {
-            job.status.clone()
+            tr(iptv_core::dvr::status_label(&job.status))
         };
         list.set_item_text_by_column(row, 3, &status);
         let format_label = iptv_core::recording::RECORDING_FORMATS

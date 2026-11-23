@@ -963,28 +963,42 @@ pub fn query_rows(
 // ---------------------------------------------------------------------
 // Remembering finished recordings.
 
-/// Python `recording_outcome.classify`, reduced to the inputs
-/// the Rust engine reports: nothing produced is `failed`, a user
-/// stop is `stopped`, a nonzero exit or a large shortfall against
-/// the planned length is `partial`, otherwise `completed`.
+/// What [`classify_outcome`] reads about a finished capture.
+pub struct Outcome<'a> {
+    /// The output file exists and is not empty.
+    pub produced: bool,
+    /// The app was exiting, or ffmpeg had to be killed before it
+    /// finished the file (Python `exiting`, `finalize_timed_out`).
+    pub interrupted: bool,
+    /// Why the engine stopped it: `user`, `scheduled`, `storage`,
+    /// or empty when ffmpeg ended by itself.
+    pub stop_reason: &'a str,
+    pub stopped_by_user: bool,
+    pub exit_code: i32,
+    pub written_seconds: Option<f64>,
+    pub planned_seconds: Option<f64>,
+}
+
+/// Python `recording_outcome.classify`: nothing produced is
+/// `failed`; an interrupted capture or a low-space stop is
+/// `partial`; a user stop (not the scheduler's end-of-window stop)
+/// is `stopped`; a nonzero exit or a shortfall against the planned
+/// length beyond max(5, min(30, 2 %)) is `partial`; else `completed`.
 #[must_use]
-pub fn classify_outcome(
-    produced: bool,
-    stopped_by_user: bool,
-    exit_code: i32,
-    written_seconds: Option<f64>,
-    planned_seconds: Option<f64>,
-) -> &'static str {
-    if !produced {
+pub fn classify_outcome(outcome: &Outcome<'_>) -> &'static str {
+    if !outcome.produced {
         return "failed";
     }
-    if stopped_by_user {
-        return "stopped";
-    }
-    if exit_code != 0 {
+    if outcome.interrupted || outcome.stop_reason == "storage" {
         return "partial";
     }
-    if let (Some(expected), Some(written)) = (planned_seconds, written_seconds) {
+    if outcome.stopped_by_user && outcome.stop_reason != "scheduled" {
+        return "stopped";
+    }
+    if outcome.exit_code != 0 {
+        return "partial";
+    }
+    if let (Some(expected), Some(written)) = (outcome.planned_seconds, outcome.written_seconds) {
         if expected.is_finite() && written.is_finite() && expected > 0.0 {
             let slack = (expected * 0.02).clamp(5.0, 30.0);
             if written + slack < expected {
@@ -1005,6 +1019,8 @@ pub struct RememberInput {
     pub outcome: Option<String>,
     pub produced: bool,
     pub stopped_by_user: bool,
+    pub stop_reason: String,
+    pub interrupted: bool,
     pub exit_code: i32,
     pub planned_seconds: Option<f64>,
 }
@@ -1030,13 +1046,15 @@ pub fn remember(input: &RememberInput) -> Result<(), String> {
         .media_seconds
         .filter(|value| value.is_finite() && *value >= 0.0);
     let status = input.outcome.clone().unwrap_or_else(|| {
-        classify_outcome(
-            input.produced,
-            input.stopped_by_user,
-            input.exit_code,
-            seconds,
-            input.planned_seconds,
-        )
+        classify_outcome(&Outcome {
+            produced: input.produced,
+            interrupted: input.interrupted,
+            stop_reason: &input.stop_reason,
+            stopped_by_user: input.stopped_by_user,
+            exit_code: input.exit_code,
+            written_seconds: seconds,
+            planned_seconds: input.planned_seconds,
+        })
         .to_string()
     });
     let stem = path
@@ -1299,6 +1317,63 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
+    /// Every branch of Python `recording_outcome.classify`, in its
+    /// order.
+    #[test]
+    fn classify_outcome_follows_python() {
+        let c = |produced, interrupted, reason, user, rc, written: Option<f64>, planned| {
+            classify_outcome(&Outcome {
+                produced,
+                interrupted,
+                stop_reason: reason,
+                stopped_by_user: user,
+                exit_code: rc,
+                written_seconds: written,
+                planned_seconds: planned,
+            })
+        };
+        assert_eq!(c(false, true, "user", true, 0, None, None), "failed");
+        assert_eq!(c(true, true, "", false, 0, None, None), "partial");
+        assert_eq!(c(true, false, "storage", true, 0, None, None), "partial");
+        assert_eq!(c(true, false, "user", true, 1, None, None), "stopped");
+        // The scheduler's own end-of-window stop is not a user stop.
+        assert_eq!(
+            c(
+                true,
+                false,
+                "scheduled",
+                true,
+                0,
+                Some(3600.0),
+                Some(3600.0)
+            ),
+            "completed"
+        );
+        assert_eq!(
+            c(true, false, "scheduled", true, 255, None, None),
+            "partial"
+        );
+        assert_eq!(c(true, false, "", false, 1, None, None), "partial");
+        // Shortfall tolerance max(5, min(30, 2 %)).
+        assert_eq!(
+            c(true, false, "", false, 0, Some(3575.0), Some(3600.0)),
+            "completed"
+        );
+        assert_eq!(
+            c(true, false, "", false, 0, Some(3520.0), Some(3600.0)),
+            "partial"
+        );
+        assert_eq!(
+            c(true, false, "", false, 0, Some(95.0), Some(100.0)),
+            "completed"
+        );
+        assert_eq!(
+            c(true, false, "", false, 0, Some(94.0), Some(100.0)),
+            "partial"
+        );
+        assert_eq!(c(true, false, "", false, 0, None, Some(100.0)), "completed");
+    }
+
     #[test]
     fn remember_indexes_a_finished_recording() {
         let dir = temp_dir("remember");
@@ -1311,6 +1386,8 @@ mod tests {
             outcome: None,
             produced: true,
             stopped_by_user: false,
+            stop_reason: String::new(),
+            interrupted: false,
             exit_code: 0,
             planned_seconds: Some(120.0),
         })
@@ -1329,6 +1406,8 @@ mod tests {
             outcome: None,
             produced: true,
             stopped_by_user: true,
+            stop_reason: "user".to_string(),
+            interrupted: false,
             exit_code: 1,
             planned_seconds: Some(120.0),
         })

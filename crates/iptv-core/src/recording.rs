@@ -377,6 +377,9 @@ struct Active {
     fallback_tail: Option<Arc<Mutex<Vec<String>>>>,
     /// The user asked for this stop (Python `stopped_by_user`).
     stopped_by_user: bool,
+    /// Why it was stopped (Python `stop_reason`): `user`,
+    /// `scheduled` or `storage`.
+    stop_reason: String,
     /// The stop had to kill ffmpeg before it finished writing.
     killed: bool,
 }
@@ -391,6 +394,11 @@ pub struct RecordingFinished {
     pub exit_code: i32,
     /// The user asked for the stop (Python `stopped_by_user`).
     pub stopped_by_user: bool,
+    /// Why the engine stopped it (`user`, `scheduled`, `storage`),
+    /// empty when ffmpeg ended on its own.
+    pub stop_reason: String,
+    /// ffmpeg had to be killed before it finished the file.
+    pub killed: bool,
     /// The recording's display title.
     pub title: String,
     /// The recording format key.
@@ -570,6 +578,7 @@ impl RecordingEngine {
                 log_path,
                 fallback_tail,
                 stopped_by_user: false,
+                stop_reason: String::new(),
                 killed: false,
             },
         );
@@ -599,8 +608,16 @@ impl RecordingEngine {
     /// Ask ffmpeg to finish: `q` on stdin, like the reference; the
     /// process is collected by [`RecordingEngine::poll_finished`].
     pub fn stop(&mut self, key: &str) {
+        self.stop_for(key, "user");
+    }
+
+    /// [`RecordingEngine::stop`] with Python's `stop_reason`, so the
+    /// scheduler's end-of-window stop is not classified as a user
+    /// stop and a low-space stop is partial.
+    pub fn stop_for(&mut self, key: &str, reason: &str) {
         if let Some(active) = self.active.get_mut(key) {
             active.stopped_by_user = true;
+            reason.clone_into(&mut active.stop_reason);
             if let Some(stdin) = active.child.stdin.as_mut() {
                 let _ = stdin.write_all(b"q\n");
                 let _ = stdin.flush();
@@ -737,6 +754,7 @@ fn build_finished(key: &str, active: Active, exit_code: i32, success: bool) -> R
         log_path,
         fallback_tail,
         stopped_by_user,
+        stop_reason,
         killed,
         started_epoch,
         ..
@@ -786,6 +804,8 @@ fn build_finished(key: &str, active: Active, exit_code: i32, success: bool) -> R
         success,
         exit_code,
         stopped_by_user,
+        stop_reason,
+        killed,
         title: meta.title.clone(),
         format: meta.format.clone(),
         log_path,
