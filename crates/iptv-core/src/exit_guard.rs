@@ -146,6 +146,7 @@ mod tests {
             end,
             lead: 300,
             status,
+            notify_at: None,
         }
     }
 

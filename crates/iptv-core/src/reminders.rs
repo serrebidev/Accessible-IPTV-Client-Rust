@@ -21,6 +21,51 @@ pub enum ReminderStatus {
     Expired,
 }
 
+/// Whole epoch seconds written as Python writes them: a JSON float
+/// (`1795000000.0`), since Python's ids hash `json.dumps([key, start])`
+/// over that float; read from an integer or a float.
+mod float_secs {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    #[allow(clippy::cast_precision_loss, clippy::trivially_copy_pass_by_ref)] // epoch seconds fit an f64; serde's `with` signature
+    pub fn serialize<S: Serializer>(value: &i64, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_f64(*value as f64)
+    }
+
+    #[allow(clippy::cast_possible_truncation)] // whole seconds; Python's are too
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<i64, D::Error> {
+        let value = f64::deserialize(deserializer)?;
+        if value.is_finite() {
+            Ok(value.floor() as i64)
+        } else {
+            Err(serde::de::Error::custom("time is not finite"))
+        }
+    }
+
+    pub mod option {
+        use serde::{Deserialize, Deserializer, Serializer};
+
+        #[allow(clippy::ref_option, clippy::cast_precision_loss)] // serde's `with` signature
+        pub fn serialize<S: Serializer>(
+            value: &Option<i64>,
+            serializer: S,
+        ) -> Result<S::Ok, S::Error> {
+            match value {
+                Some(value) => serializer.serialize_f64(*value as f64),
+                None => serializer.serialize_none(),
+            }
+        }
+
+        #[allow(clippy::cast_possible_truncation)] // whole seconds
+        pub fn deserialize<'de, D: Deserializer<'de>>(
+            deserializer: D,
+        ) -> Result<Option<i64>, D::Error> {
+            let value = Option::<f64>::deserialize(deserializer)?;
+            Ok(value.filter(|v| v.is_finite()).map(|v| v.floor() as i64))
+        }
+    }
+}
+
 /// One stored reminder row (Python's dict shape).
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Reminder {
@@ -28,10 +73,151 @@ pub struct Reminder {
     pub channel_key: String,
     pub title: String,
     pub channel: String,
+    #[serde(with = "float_secs")]
     pub start: i64,
+    #[serde(with = "float_secs")]
     pub end: i64,
     pub lead: i64,
     pub status: ReminderStatus,
+    /// A postponed reminder's next alert time (Python `notify_at`,
+    /// Remind Again / Remind at Programme Start).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "float_secs::option"
+    )]
+    pub notify_at: Option<i64>,
+}
+
+/// Python's reminder file beside the schedule.
+#[must_use]
+pub fn reminders_path(schedule_path: &std::path::Path) -> std::path::PathBuf {
+    schedule_path.with_file_name("programme-reminders.json")
+}
+
+/// What reading the reminder file gave.
+#[derive(Debug, Default)]
+pub struct ReminderLoad {
+    pub rows: Vec<Reminder>,
+    /// Python's warning when rows were skipped or the file could not
+    /// be read; empty otherwise.
+    pub warning: String,
+    /// The original file could not be preserved: writes are refused.
+    pub blocked: bool,
+    /// The file did not exist.
+    pub missing: bool,
+}
+
+/// Python `ReminderStore.__init__`: read `{"version": 1, "reminders":
+/// [...]}`; when any row is invalid (or the file cannot be read), the
+/// original bytes are copied to `<path>.corrupt-<hex>` first, and if
+/// that fails every later write is refused.
+#[must_use]
+pub fn load_reminder_file(path: &std::path::Path) -> ReminderLoad {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return ReminderLoad {
+                missing: true,
+                ..ReminderLoad::default()
+            };
+        }
+        Err(_) => return preserve_reminder_file(path, Vec::new()),
+    };
+    let parsed = (bytes.len() <= 2 * 1024 * 1024)
+        .then(|| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .flatten()
+        .filter(|data| data.get("version") == Some(&serde_json::json!(1)));
+    let Some(serde_json::Value::Array(raw)) =
+        parsed.and_then(|mut data| data.get_mut("reminders").map(serde_json::Value::take))
+    else {
+        return preserve_reminder_file(path, Vec::new());
+    };
+    let total = raw.len();
+    let rows: Vec<Reminder> = raw
+        .into_iter()
+        .filter_map(|row| serde_json::from_value(row).ok())
+        .collect();
+    let rows = normalize_reminders(rows);
+    if rows.len() == total {
+        return ReminderLoad {
+            rows,
+            ..ReminderLoad::default()
+        };
+    }
+    preserve_reminder_file(path, rows)
+}
+
+fn preserve_reminder_file(path: &std::path::Path, rows: Vec<Reminder>) -> ReminderLoad {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let suffix = &sha256_hex(format!("{}:{nanos}", std::process::id()).as_bytes())[..32];
+    let mut name = path.as_os_str().to_owned();
+    name.push(format!(".corrupt-{suffix}"));
+    let backup = std::path::PathBuf::from(name);
+    let copied = (|| -> std::io::Result<()> {
+        let bytes = std::fs::read(path)?;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&backup)?;
+        std::io::Write::write_all(&mut file, &bytes)?;
+        file.sync_all()
+    })();
+    if copied.is_ok() {
+        ReminderLoad {
+            rows,
+            warning: format!(
+                "Invalid reminders were skipped. The original file was preserved at {}.",
+                backup.display()
+            ),
+            ..ReminderLoad::default()
+        }
+    } else {
+        let _ = std::fs::remove_file(&backup);
+        ReminderLoad {
+            rows,
+            warning: "Invalid reminders could not be backed up. Changes are disabled to protect the original file.".to_string(),
+            blocked: true,
+            missing: false,
+        }
+    }
+}
+
+/// Python `ReminderStore._commit`: the normalized rows, written to a
+/// synced temp file renamed over the old one.
+///
+/// # Errors
+/// Returns the I/O error; the previous file is then untouched.
+pub fn save_reminder_file(path: &std::path::Path, rows: &[Reminder]) -> Result<(), String> {
+    let normalized = normalize_reminders(rows.to_vec());
+    let text = serde_json::to_string(&serde_json::json!({"version": 1, "reminders": normalized}))
+        .map_err(|e| e.to_string())?;
+    let directory = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    std::fs::create_dir_all(directory).map_err(|e| e.to_string())?;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let temporary = directory.join(format!("reminders-{}-{nanos}.tmp", std::process::id()));
+    let written = (|| -> std::io::Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        std::io::Write::write_all(&mut file, text.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&temporary, path)
+    })();
+    if let Err(error) = written {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error.to_string());
+    }
+    Ok(())
 }
 
 /// The reminder-scope key for a channel: sha256 of the Python
@@ -139,6 +325,7 @@ pub fn build_reminder(
         end: programme.stop,
         lead,
         status: ReminderStatus::Scheduled,
+        notify_at: None,
     })
 }
 
@@ -166,11 +353,16 @@ pub fn normalize_reminders(rows: Vec<Reminder>) -> Vec<Reminder> {
         {
             continue;
         }
+        // Python keeps a postponement only inside the alert window.
+        let notify_at = row
+            .notify_at
+            .filter(|at| valid_time(*at) && row.start - row.lead * 60 <= *at && *at < row.end);
         by_id.insert(
             row.id.clone(),
             Reminder {
                 title: safe_title(&row.title),
                 channel: safe_title(&row.channel),
+                notify_at,
                 ..row
             },
         );
@@ -195,10 +387,17 @@ pub fn normalize_reminders(rows: Vec<Reminder>) -> Vec<Reminder> {
 }
 
 impl Reminder {
+    /// When the alert falls due: a postponement's time, else the lead
+    /// before the start (Python `row.get('notify_at', start - lead*60)`).
+    #[must_use]
+    pub fn alert_at(&self) -> i64 {
+        self.notify_at.unwrap_or(self.start - self.lead * 60)
+    }
+
     /// True when the lead window has opened and the reminder still waits.
     #[must_use]
     pub fn is_due(&self, now: i64) -> bool {
-        self.status == ReminderStatus::Scheduled && now >= self.start - self.lead * 60
+        self.status == ReminderStatus::Scheduled && now >= self.alert_at()
     }
 
     /// True when the programme has ended without firing.
@@ -234,7 +433,7 @@ pub fn next_pending_delivery<S: std::hash::BuildHasher>(
                     row.status,
                     ReminderStatus::Scheduled | ReminderStatus::Ready
                 )
-                && now >= row.start - row.lead * 60
+                && now >= row.alert_at()
                 && now < row.end
         })
         .cloned()
@@ -279,6 +478,7 @@ pub fn set_lead(rows: &mut [Reminder], id: &str, lead: i64, now: i64) -> Result<
     }
     row.lead = lead;
     row.status = ReminderStatus::Scheduled;
+    row.notify_at = None;
     Ok(())
 }
 
@@ -299,7 +499,7 @@ pub fn display_status(reminder: &Reminder, now: i64) -> &'static str {
     }
     match reminder.status {
         ReminderStatus::Ready => "Pending",
-        ReminderStatus::Scheduled if now >= reminder.start - reminder.lead * 60 => "Pending",
+        ReminderStatus::Scheduled if now >= reminder.alert_at() => "Pending",
         ReminderStatus::Notified => "Notified",
         ReminderStatus::Expired => "Expired",
         ReminderStatus::Scheduled => "Scheduled",
@@ -339,6 +539,56 @@ pub fn find_channel_for_reminder<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A reminder file as Python v1.151.6 writes it (float times, a
+    /// postponement) loads and saves back unchanged.
+    #[test]
+    fn python_reminder_file_round_trips() {
+        let dir = std::env::temp_dir().join(format!(
+            "iptv-reminders-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("programme-reminders.json");
+        let built = build_reminder(&channel(), &programme(1_795_000_000), 5, 0).unwrap();
+        let mut row = serde_json::to_value(&built).unwrap();
+        row["notify_at"] = serde_json::json!(1_794_999_900.0);
+        assert_eq!(row["start"], serde_json::json!(1_795_000_000.0));
+        let file = serde_json::json!({"version": 1, "reminders": [row.clone()]});
+        std::fs::write(&path, file.to_string()).unwrap();
+        let loaded = load_reminder_file(&path);
+        assert!(loaded.warning.is_empty(), "{}", loaded.warning);
+        assert_eq!(loaded.rows.len(), 1);
+        assert_eq!(loaded.rows[0].notify_at, Some(1_794_999_900));
+        assert_eq!(loaded.rows[0].alert_at(), 1_794_999_900);
+        save_reminder_file(&path, &loaded.rows).unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved, file);
+
+        // An invalid row is skipped and the original kept aside.
+        let mut bad = row;
+        bad["id"] = serde_json::json!("0".repeat(64));
+        let text = serde_json::json!({"version": 1, "reminders": [bad]}).to_string();
+        std::fs::write(&path, &text).unwrap();
+        let loaded = load_reminder_file(&path);
+        assert!(loaded.rows.is_empty() && !loaded.blocked);
+        assert!(loaded
+            .warning
+            .starts_with("Invalid reminders were skipped."));
+        let copies = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains(".corrupt-"))
+            .count();
+        assert_eq!(copies, 1);
+        assert!(load_reminder_file(&dir.join("absent.json")).missing);
+        let _ = std::fs::remove_dir_all(dir);
+    }
     use std::collections::BTreeMap;
 
     fn channel() -> Channel {

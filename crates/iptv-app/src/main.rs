@@ -999,6 +999,18 @@ impl Default for PlayerState {
 struct Persist {
     config: Rc<RefCell<Config>>,
     path: PathBuf,
+    reminders: Rc<ReminderFile>,
+}
+
+/// Python's reminder file (`programme-reminders.json` beside the
+/// schedule) and what its load said.
+#[derive(Default)]
+struct ReminderFile {
+    path: PathBuf,
+    /// The unreadable file could not be preserved: no writes.
+    blocked: std::cell::Cell<bool>,
+    /// Python's load warning, shown once at startup.
+    warning: RefCell<String>,
 }
 
 impl Persist {
@@ -1058,23 +1070,47 @@ impl Persist {
         );
     }
 
+    /// Load the reminder file once (startup). Earlier Rust builds kept
+    /// reminders in the config key `programme_reminders`, which Python
+    /// never read: with no file yet, those rows move into the file and
+    /// the key is cleared.
     fn reminders(&self) -> Vec<Reminder> {
-        let rows: Vec<Reminder> = self
+        let loaded = iptv_core::reminders::load_reminder_file(&self.reminders.path);
+        self.reminders.blocked.set(loaded.blocked);
+        *self.reminders.warning.borrow_mut() = loaded.warning;
+        if !loaded.missing {
+            return loaded.rows;
+        }
+        let legacy: Vec<Reminder> = self
             .config
             .borrow()
             .value("programme_reminders")
             .and_then(|value| serde_json::from_value(value.clone()).ok())
             .unwrap_or_default();
-        normalize_reminders(rows)
+        let legacy = normalize_reminders(legacy);
+        if legacy.is_empty() {
+            return legacy;
+        }
+        match iptv_core::reminders::save_reminder_file(&self.reminders.path, &legacy) {
+            Ok(()) => self.set_and_save("programme_reminders", serde_json::Value::Null),
+            Err(error) => iptv_core::applog::error(
+                "reminders",
+                &format!("Could not move reminders into their file: {error}"),
+            ),
+        }
+        legacy
     }
 
+    /// Python `ReminderStore._commit`: a failed write keeps the
+    /// previous file; a blocked store writes nothing.
     fn save_reminders(&self, rows: &[Reminder]) {
-        let mut config = self.config.borrow_mut();
-        config.set_value(
-            "programme_reminders",
-            serde_json::to_value(rows).unwrap_or(serde_json::Value::Null),
-        );
-        let _ = config.save(&self.path);
+        if self.reminders.blocked.get() {
+            iptv_core::applog::error("reminders", &self.reminders.warning.borrow());
+            return;
+        }
+        if let Err(error) = iptv_core::reminders::save_reminder_file(&self.reminders.path, rows) {
+            iptv_core::applog::error("reminders", &format!("Could not save reminders: {error}"));
+        }
     }
 
     /// The per-channel audio-track memory (P06): remembered
@@ -1248,6 +1284,10 @@ fn bind_browser(
         persist: Persist {
             config: Rc::new(RefCell::new(loaded.config)),
             path: loaded.path,
+            reminders: Rc::new(ReminderFile {
+                path: iptv_core::reminders::reminders_path(&dvr_path),
+                ..ReminderFile::default()
+            }),
         },
         player: Rc::new(RefCell::new(PlayerState::default())),
         epg: Rc::new(RefCell::new(None)),
@@ -1428,6 +1468,16 @@ fn bind_housekeeping(frame: Frame, wiring: &Wiring) {
                     frame,
                     &warning,
                     &tr("Scheduled Recordings"),
+                    MessageDialogStyle::OK | MessageDialogStyle::IconWarning,
+                    None,
+                );
+            }
+            let reminder_warning = tick_wiring.persist.reminders.warning.borrow().clone();
+            if !reminder_warning.is_empty() {
+                show_or_queue_notification(
+                    frame,
+                    &tr(&reminder_warning),
+                    &tr("Programme Reminders"),
                     MessageDialogStyle::OK | MessageDialogStyle::IconWarning,
                     None,
                 );
@@ -6074,10 +6124,7 @@ struct GuideUi {
 /// is an Rc handle).
 fn clone_wiring(wiring: &Wiring) -> Wiring {
     Wiring {
-        persist: Persist {
-            config: Rc::clone(&wiring.persist.config),
-            path: wiring.persist.path.clone(),
-        },
+        persist: wiring.persist.clone(),
         browser: Rc::clone(&wiring.browser),
         categories: Rc::clone(&wiring.categories),
         category_fav_count: Rc::clone(&wiring.category_fav_count),
