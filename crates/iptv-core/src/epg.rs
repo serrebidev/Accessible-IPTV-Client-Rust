@@ -2107,6 +2107,26 @@ impl EpgReadWorker {
                         }
                         EpgReadKind::Programmes { channel, from, to } => {
                             let db = &store.as_ref().expect("store opened for read").1;
+                            // The channel's guide is the one now/next
+                            // uses (Python resolves both through
+                            // `resolve_best_channel_id`): a channel
+                            // matched by name, not tvg-id, has one too.
+                            if !matches!(indexes.as_ref(), Some((generation, _)) if *generation == job.guide_generation)
+                            {
+                                indexes = Some((
+                                    job.guide_generation,
+                                    std::sync::Arc::new(GuideIndexes::build(&db.channels()?)),
+                                ));
+                            }
+                            let indexes = &indexes.as_ref().expect("indexes just built").1;
+                            if let Some(id) =
+                                match_guide_channel(&channel, indexes, Some(&indexes.known_ids))
+                            {
+                                let programmes = db.programmes_between(&id, from, to)?;
+                                if !programmes.is_empty() {
+                                    return Ok(EpgReadValue::Programmes(programmes));
+                                }
+                            }
                             let mut candidates = expand_tvg_id_candidates(channel.tvg_id.trim());
                             candidates.push(channel.tvg_id.trim().to_string());
                             for id in candidates {
@@ -2653,6 +2673,72 @@ mod tests {
         assert_eq!(rows[0].subtitle, "The Pilot");
         assert_eq!(rows[1].episode, "S02E01");
         assert_eq!(rows[1].subtitle, "");
+    }
+
+    /// A channel the guide matches by name (no tvg-id) gets its
+    /// programmes, not only its now/next.
+    #[test]
+    fn channel_programmes_use_the_name_matcher() {
+        use super::{EpgReadJob, EpgReadKind, EpgReadValue, EpgReadWorker};
+        use crate::{
+            epg::{EpgChannel, EpgGuide, Programme},
+            epgstore::EpgStore,
+            Channel,
+        };
+        let path = std::env::temp_dir().join(format!(
+            "iptv-epg-byname-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut store = EpgStore::open(&path).unwrap();
+        let programme = Programme {
+            channel_id: "news.hu".into(),
+            start: 100,
+            stop: 200,
+            title: "Híradó".into(),
+            ..Programme::default()
+        };
+        let guide = EpgGuide {
+            channels: vec![EpgChannel {
+                id: "news.hu".into(),
+                display_name: "Hír TV".into(),
+            }],
+            programmes: std::collections::HashMap::from([("news.hu".into(), vec![programme])]),
+        };
+        store.import_guide(&guide).unwrap();
+        drop(store);
+        let worker = EpgReadWorker::new();
+        worker.submit(EpgReadJob {
+            request_id: 1,
+            guide_generation: 0,
+            store_path: path.clone(),
+            kind: EpgReadKind::Programmes {
+                channel: Channel {
+                    name: "Hír TV".into(),
+                    ..Channel::default()
+                },
+                from: 0,
+                to: 300,
+            },
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let result = loop {
+            if let Some(result) = worker.try_recv() {
+                break result;
+            }
+            assert!(std::time::Instant::now() < deadline, "no read result");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        let Ok(EpgReadValue::Programmes(rows)) = result.result else {
+            panic!("unexpected result: {result:?}");
+        };
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].title, "Híradó");
+        drop(worker);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
