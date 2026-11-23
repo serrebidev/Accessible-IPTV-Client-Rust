@@ -43,6 +43,7 @@ pub fn main_defaults() -> Vec<(&'static str, &'static str, i32)> {
         ("recent_channels", "Ctrl+H", 4024),
         ("whats_on_now", "Ctrl+W", 4025),
         ("what_is_playing", "Ctrl+Shift+I", 4026),
+        ("mute", "Ctrl+Shift+M", 4027),
     ]
 }
 
@@ -65,6 +66,7 @@ pub fn player_defaults() -> Vec<(&'static str, &'static str)> {
         ("previous_episode", "Ctrl+PageUp"),
         ("next_episode", "Ctrl+PageDown"),
         ("subtitle_timing", "Ctrl+Shift+T"),
+        ("mute", "M"),
         ("fullscreen", "F11"),
         ("hide", "Ctrl+W"),
         ("exit", "Ctrl+Q"),
@@ -97,6 +99,7 @@ pub fn label(context: &str, action: &str) -> Option<&'static str> {
             ("recent_channels", "Recently Watched..."),
             ("whats_on_now", "What's on Now"),
             ("what_is_playing", "What Is Playing"),
+            ("mute", "Mute / Unmute"),
         ],
         _ => &[
             ("play_pause", "Play/Pause"),
@@ -114,6 +117,7 @@ pub fn label(context: &str, action: &str) -> Option<&'static str> {
             ("previous_episode", "Previous Episode"),
             ("next_episode", "Next Episode"),
             ("subtitle_timing", "Subtitle Timing..."),
+            ("mute", "Mute / Unmute"),
             ("fullscreen", "Toggle Full Screen"),
             ("hide", "Hide Window"),
             ("exit", "Exit Player"),
@@ -445,7 +449,7 @@ mod tests {
         assert_eq!(eff["record"], "Ctrl+Alt+R");
         assert_eq!(eff["cast"], "Ctrl+Shift+C", "invalid override ignored");
         let entries = main_entries(&config);
-        assert_eq!(entries.len(), 19);
+        assert_eq!(entries.len(), 20);
         let rows = searchable_commands(&config, "recording");
         assert_eq!(rows.len(), 1, "only Start Recording matches");
         assert_eq!(rows[0].0, "main");
@@ -502,6 +506,11 @@ mod tests {
         }
         // Untouched defaults elsewhere.
         let plain = effective(&serde_json::json!({}), "player");
+        assert_eq!(plain["mute"], "M");
+        assert_eq!(
+            effective(&serde_json::json!({}), "main")["mute"],
+            "Ctrl+Shift+M"
+        );
         assert_eq!(plain["previous_episode"], "Ctrl+PageUp");
         assert_eq!(plain["next_episode"], "Ctrl+PageDown");
         assert_eq!(plain["subtitle_timing"], "Ctrl+Shift+T");

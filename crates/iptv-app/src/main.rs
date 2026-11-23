@@ -497,6 +497,7 @@ fn update_player_status(
             state.status_bitrate_mbps,
             volume,
             &state.audio_track_label,
+            state.muted,
         )
     };
     let line = &tr(&line);
@@ -911,6 +912,18 @@ struct PlayerState {
     resume_store: String,
     resume_key: String,
     resume_write_pending: bool,
+    /// Mute state (M1): survives channel changes and reconnects,
+    /// re-applied to each new load at Playing, and a volume change
+    /// never undoes it (Python's `_muted`).
+    muted: bool,
+    /// Per-channel volume context (M1): the current channel's
+    /// volume key (empty when Remember Volume is off), the
+    /// unscoped volume to return to, and the debounced pending
+    /// save `(key, value, due_ms)` (Python's `_volume_context`,
+    /// `_unscoped_volume`, `_volume_pending`).
+    volume_key: String,
+    unscoped_volume: i32,
+    volume_pending: Option<(String, i32, i64)>,
 }
 
 impl Default for PlayerState {
@@ -990,6 +1003,10 @@ impl Default for PlayerState {
             resume_store: "playback_bookmarks".to_string(),
             resume_key: String::new(),
             resume_write_pending: false,
+            muted: false,
+            volume_key: String::new(),
+            unscoped_volume: 100,
+            volume_pending: None,
         }
     }
 }
@@ -1097,6 +1114,23 @@ impl Persist {
             .filter_map(|(k, v)| v.as_i64().map(|n| (k, n)))
             .collect();
         (names, indices)
+    }
+
+    /// The per-channel volume map (M1): the config's
+    /// `channel_volumes` object, empty when absent or malformed.
+    fn channel_volumes(&self) -> serde_json::Map<String, serde_json::Value> {
+        match self.config.borrow().value("channel_volumes") {
+            Some(serde_json::Value::Object(map)) => map.clone(),
+            _ => serde_json::Map::new(),
+        }
+    }
+
+    /// Persist one remembered channel volume (M1, Python's
+    /// `_remember_channel_volume` through `_save_tool_setting`).
+    fn save_channel_volume(&self, key: &str, value: i32) {
+        let mut values = self.channel_volumes();
+        iptv_core::channel_preferences::remember_volume(&mut values, key, i64::from(value));
+        self.set_and_save("channel_volumes", serde_json::Value::Object(values));
     }
 
     /// Persist one manual audio choice (P06): the channel's
@@ -6268,6 +6302,8 @@ pub const SHOW_PLAYER: i32 = 5111;
 pub const PLAY_PAUSE: i32 = 5112;
 pub const STOP: i32 = 5113;
 pub const CAST_CONNECT: i32 = 5114;
+pub const MUTE: i32 = 5115;
+pub const REMEMBER_CHANNEL_VOLUME: i32 = 5116;
 pub const VIEW_LIVE: i32 = 5121;
 pub const VIEW_VOD: i32 = 5122;
 pub const CONTINUE_WATCHING: i32 = 5123;
@@ -6496,7 +6532,7 @@ fn build_menu(frame: Frame, wiring: &Wiring, controls: Controls) {
     let raw = serde_json::Value::Object(config.raw().clone());
     let keys = iptv_core::shortcuts::effective(&raw, "main");
     let file_menu = build_file_menu(&keys);
-    let player_menu = build_player_menu(&keys);
+    let player_menu = build_player_menu(&keys, config.bool_or("remember_channel_volume", false));
     let view_menu = build_view_menu(&keys);
     let options_menu = build_options_menu(&config);
     let recordings_menu = build_recordings_menu(&config);
@@ -6587,7 +6623,10 @@ fn build_file_menu(keys: &std::collections::BTreeMap<String, String>) -> Menu {
     file_menu
 }
 
-fn build_player_menu(keys: &std::collections::BTreeMap<String, String>) -> Menu {
+fn build_player_menu(
+    keys: &std::collections::BTreeMap<String, String>,
+    remember_channel_volume: bool,
+) -> Menu {
     let player_menu = Menu::builder().build();
     menu_add(
         &player_menu,
@@ -6617,6 +6656,25 @@ fn build_player_menu(keys: &std::collections::BTreeMap<String, String>) -> Menu 
         "",
         ItemKind::Normal,
     );
+    // M1: Python's Player menu continues with the sound tools
+    // (`_add_sound_tools_menu`): Mute / Unmute, then the
+    // per-channel volume memory switch. (Automatically Play the
+    // Next Episode, which Python puts first, is C8's port.)
+    menu_add(
+        &player_menu,
+        MUTE,
+        &menu_label(keys, "&Mute / Unmute", "mute"),
+        "",
+        ItemKind::Normal,
+    );
+    menu_add(
+        &player_menu,
+        REMEMBER_CHANNEL_VOLUME,
+        "Remember &Volume for Each Channel",
+        "",
+        ItemKind::Check,
+    );
+    player_menu.check_item(REMEMBER_CHANNEL_VOLUME, remember_channel_volume);
 
     player_menu
 }
@@ -7749,6 +7807,35 @@ fn bind_menu_actions(frame: Frame, wiring: &Wiring, controls: Controls) {
                 }
             }
             PLAY_PAUSE | STOP => menu_player_transport(&wiring, id == PLAY_PAUSE),
+            MUTE => {
+                // Python's `_toggle_player_mute`: without a player
+                // window the command reports its line instead.
+                if wiring.player.borrow().window.is_some() {
+                    player_toggle_mute(&wiring.player, persist, status);
+                } else {
+                    status.set_label("Start playback in the built-in player first.");
+                }
+            }
+            REMEMBER_CHANNEL_VOLUME => {
+                // Python's toggle: save the switch, then re-prepare
+                // the playing channel's volume under the new rule
+                // (turning off first banks the scoped volume as the
+                // unscoped one).
+                let next = !persist
+                    .config
+                    .borrow()
+                    .bool_or("remember_channel_volume", false);
+                persist.set_and_save("remember_channel_volume", serde_json::json!(next));
+                if !next {
+                    let mut state = wiring.player.borrow_mut();
+                    state.unscoped_volume = state
+                        .window
+                        .as_ref()
+                        .map_or(state.unscoped_volume, |win| win.volume.get_value());
+                }
+                let channel = wiring.player.borrow().current_channel.clone();
+                prepare_channel_volume(&wiring.player, persist, channel.as_ref());
+            }
             VIEW_LIVE => status.set_label("Live TV and catch-up view."),
             VIEW_VOD => open_vod_window(&wiring, status),
             FAVORITE => toggle_selected_favorite(&wiring, list, status),
@@ -10352,6 +10439,10 @@ fn play_builtin(
         }
     }
     ensure_player_window(player, persist, status);
+    // M1: a fresh channel choice prepares its volume context
+    // (Python's main window calls `_prepare_channel_volume` when
+    // it hands a channel to the player frame).
+    prepare_channel_volume(player, persist, Some(channel));
     let mut state = player.borrow_mut();
     state.current_channel = Some(channel.clone());
     // PR #36 prepare(): the episode snapshot for Previous/Next
@@ -10937,6 +11028,7 @@ const PM_EXIT: i32 = 5334;
 const PM_PREV_EPISODE: i32 = 5335;
 const PM_NEXT_EPISODE: i32 = 5336;
 const PM_SUBTITLE_TIMING: i32 = 5337;
+const PM_MUTE: i32 = 5338;
 const PM_TRACK_BASE: i32 = 5340;
 const PM_SUB_BASE: i32 = 5400;
 
@@ -10959,6 +11051,15 @@ fn playback_transport_items(menu: &Menu, keys: &std::collections::BTreeMap<Strin
         ItemKind::Normal,
     );
     menu_add(menu, PM_SLEEP, "Sleep &Timer...", "", ItemKind::Normal);
+    // M1: Python's Playback menu puts the Mute check item right
+    // after Sleep Timer.
+    menu_add(
+        menu,
+        PM_MUTE,
+        &menu_label(keys, "&Mute / Unmute", "mute"),
+        "",
+        ItemKind::Check,
+    );
     menu_add(
         menu,
         PM_LIVE_BUFFER,
@@ -11000,6 +11101,7 @@ fn build_playback_menu(
         .collect::<std::collections::BTreeMap<_, _>>();
     let menu = Menu::builder().build();
     playback_transport_items(&menu, &keys);
+    menu.check_item(PM_MUTE, player.borrow().muted);
     menu.append_separator();
     let audio_menu = Menu::builder().build();
     menu_add(
@@ -11172,6 +11274,7 @@ fn dispatch_player_menu(
     };
     match id {
         PM_PLAY_PAUSE => toggle_pause_state(player, persist, status),
+        PM_MUTE => player_toggle_mute(player, persist, status),
         PM_STOP | PM_EXIT => player_stop(player, persist, status),
         PM_SLEEP => prompt_sleep_timer(player, win.frame, persist, status),
         PM_LIVE_BUFFER => prompt_live_buffer_config(player, win.frame, persist, status),
@@ -11259,18 +11362,19 @@ fn playback_menu(player: &Rc<RefCell<PlayerState>>) -> Option<Menu> {
     win.frame.get_menu_bar()?.get_menu(0)
 }
 
-/// The Audio Track submenu (Playback menu position 5, after
-/// Play/Pause, Stop, Sleep Timer, Record and a separator).
+/// The Audio Track submenu (Playback menu position 9, after
+/// Play/Pause, Stop, Sleep Timer, Mute, the live-buffer items,
+/// Record and a separator).
 fn audio_track_menu(player: &Rc<RefCell<PlayerState>>) -> Option<Menu> {
     playback_menu(player)?
-        .find_item_by_position(8)?
+        .find_item_by_position(9)?
         .get_sub_menu()
 }
 
-/// The Subtitles submenu (position 9, after Audio Track).
+/// The Subtitles submenu (position 10, after Audio Track).
 fn subtitle_menu(player: &Rc<RefCell<PlayerState>>) -> Option<Menu> {
     playback_menu(player)?
-        .find_item_by_position(9)?
+        .find_item_by_position(10)?
         .get_sub_menu()
 }
 
@@ -11798,6 +11902,7 @@ struct PlayerButtons {
 /// resume checkpointing, subtitle speech, engine state,
 /// the sleep timer and the window chrome.
 fn player_tick(player: &Rc<RefCell<PlayerState>>, persist: &Persist, status: Status) {
+    flush_channel_volume(player, persist, false);
     drain_fullscreen_layout(player);
     deliver_vlc_load(player, persist, status);
     deliver_buffer_pending(player, persist, status);
@@ -11935,6 +12040,9 @@ fn wire_player_events(
     let close_persist = persist.clone();
     frame.on_close(move |event| {
         checkpoint_resume(&close_player, &close_persist, status, true);
+        // M1: a pending channel-volume save flushes on close,
+        // as Python's player flushes on destroy.
+        flush_channel_volume(&close_player, &close_persist, true);
         // Closing the player stops the actual engine, not just
         // the session (P02): VLC stops (sound and upstream
         // connection end), the live-buffer lease is released
@@ -11999,7 +12107,7 @@ fn wheel_volume(
             + delta
     }
     .clamp(0, 200);
-    player_set_volume(player, value);
+    player_apply_user_volume(player, value);
     update_player_status(player, persist, status, None, 3);
 }
 
@@ -12045,7 +12153,7 @@ fn bind_player_controls(
     let volume_handle = win.volume;
     let volume_player = Rc::clone(player);
     volume_handle.bind_internal(EventType::SLIDER, move |_| {
-        player_set_volume(&volume_player, volume_handle.get_value());
+        player_apply_user_volume(&volume_player, volume_handle.get_value());
     });
     let tracks_handle = win.tracks;
     let tracks_player = Rc::clone(player);
@@ -12786,20 +12894,169 @@ fn player_seek_to(player: &Rc<RefCell<PlayerState>>, target_ms: i64) {
 }
 
 /// Set the active engine's volume and mirror it on the slider.
+/// An explicit mute survives a volume change (Python's
+/// `_apply_volume` re-applies the mute after setting the volume):
+/// the libVLC engine keeps its mute flag, and the fallback player,
+/// which has no mute control, is held at zero while muted.
 fn player_set_volume(player: &Rc<RefCell<PlayerState>>, percent: i32) {
     let mut state = player.borrow_mut();
     if state.vlc_active {
         if let Some(engine) = &mut state.vlc {
             engine.set_volume(percent);
+            if state.muted {
+                engine.set_mute(true);
+            }
         }
     } else if let Some(win) = &state.window {
         // The wx fallback player takes 0.0–1.0 and cannot boost; the libVLC
         // engine above takes the full 0–200 percent.
-        win.media.set_volume((f64::from(percent) / 100.0).min(1.0));
+        let level = if state.muted {
+            0.0
+        } else {
+            (f64::from(percent) / 100.0).min(1.0)
+        };
+        win.media.set_volume(level);
     }
     if let Some(win) = &state.window {
         win.volume.set_value(percent);
     }
+}
+
+/// A user-driven volume change (M1): set it, and when the current
+/// channel has a volume context, queue its remembered value for
+/// the debounced save (Python's `_apply_volume` with
+/// `remember=True`; the sleep fade calls `player_set_volume`
+/// directly and is never remembered).
+fn player_apply_user_volume(player: &Rc<RefCell<PlayerState>>, percent: i32) {
+    player_set_volume(player, percent);
+    let mut state = player.borrow_mut();
+    if !state.volume_key.is_empty() {
+        let key = state.volume_key.clone();
+        state.volume_pending = Some((key, percent, now_ms() + 400));
+    }
+}
+
+/// Flush the debounced channel-volume save when it is due, or at
+/// once when `force` (a context switch or a settings toggle, as
+/// Python's `_flush_channel_volume` runs from
+/// `set_volume_context`).
+fn flush_channel_volume(player: &Rc<RefCell<PlayerState>>, persist: &Persist, force: bool) {
+    let due = {
+        let mut state = player.borrow_mut();
+        match &state.volume_pending {
+            Some((_, _, due_ms)) if force || now_ms() >= *due_ms => state.volume_pending.take(),
+            _ => None,
+        }
+    };
+    if let Some((key, value, _)) = due {
+        persist.save_channel_volume(&key, value);
+    }
+}
+
+/// Apply the mute state to the active engine. Returns whether the
+/// engine accepted it (the fallback player always can: mute is a
+/// zero volume there).
+fn player_set_mute(player: &Rc<RefCell<PlayerState>>, muted: bool) -> bool {
+    let mut state = player.borrow_mut();
+    if state.vlc_active {
+        if let Some(engine) = &mut state.vlc {
+            return engine.set_mute(muted);
+        }
+        return false;
+    }
+    if let Some(win) = &state.window {
+        let level = if muted {
+            0.0
+        } else {
+            (f64::from(win.volume.get_value()) / 100.0).min(1.0)
+        };
+        win.media.set_volume(level);
+        return true;
+    }
+    false
+}
+
+/// Toggle the mute (M1, Python's `toggle_mute`): flip the state,
+/// sync both menus' check marks, and announce through the player
+/// status line at priority 1. A failed engine call keeps the old
+/// state and reports Python's failure line instead.
+fn player_toggle_mute(player: &Rc<RefCell<PlayerState>>, persist: &Persist, status: Status) {
+    let muted = !player.borrow().muted;
+    if !player_set_mute(player, muted) {
+        update_player_status(
+            player,
+            persist,
+            status,
+            Some("The player could not change its mute state."),
+            1,
+        );
+        return;
+    }
+    player.borrow_mut().muted = muted;
+    if let Some(menu) = playback_menu(player) {
+        menu.check_item(PM_MUTE, muted);
+    }
+    update_player_status(
+        player,
+        persist,
+        status,
+        Some(if muted { "Muted" } else { "Sound restored" }),
+        1,
+    );
+}
+
+/// Set the volume context for a new channel (M1, Python's
+/// `_prepare_channel_volume` plus the player's
+/// `set_volume_context`): flush the outgoing channel's pending
+/// save, keep the unscoped volume, then apply the incoming
+/// channel's remembered value (or the unscoped volume when
+/// Remember Volume is off or the channel has no saved value).
+/// The context application itself is never remembered.
+fn prepare_channel_volume(
+    player: &Rc<RefCell<PlayerState>>,
+    persist: &Persist,
+    channel: Option<&Channel>,
+) {
+    flush_channel_volume(player, persist, true);
+    let (current, old_key) = {
+        let state = player.borrow();
+        (
+            state
+                .window
+                .as_ref()
+                .map_or(100, |win| win.volume.get_value()),
+            state.volume_key.clone(),
+        )
+    };
+    {
+        let mut state = player.borrow_mut();
+        if old_key.is_empty() {
+            state.unscoped_volume = current;
+        }
+    }
+    let default = player.borrow().unscoped_volume;
+    let key = if persist
+        .config
+        .borrow()
+        .bool_or("remember_channel_volume", false)
+    {
+        channel.map_or(String::new(), iptv_core::reminders::reminder_channel_key)
+    } else {
+        String::new()
+    };
+    let value = if key.is_empty() {
+        default
+    } else {
+        let config = serde_json::Value::Object(persist.config.borrow().raw().clone());
+        i32::try_from(iptv_core::channel_preferences::channel_volume(
+            &config,
+            &key,
+            i64::from(default),
+        ))
+        .unwrap_or(default)
+    };
+    player.borrow_mut().volume_key = key;
+    player_set_volume(player, value);
 }
 
 /// The P04 interception: when the current request is an
@@ -12845,6 +13102,21 @@ fn poll_vlc_state(player: &Rc<RefCell<PlayerState>>, persist: &Persist, status: 
                 }
                 if let Some(ms) = state.pending_resume_ms.take() {
                     engine.set_time(ms);
+                }
+                // M1: a new load starts from the engine's own
+                // defaults, so the user's volume and mute are
+                // re-applied at the first Playing of each load —
+                // that is what makes mute survive channel changes
+                // and reconnects (Python's `_schedule_volume_apply`).
+                if confirm_history {
+                    let volume = state
+                        .window
+                        .as_ref()
+                        .map_or(100, |win| win.volume.get_value());
+                    engine.set_volume(volume);
+                    if state.muted {
+                        engine.set_mute(true);
+                    }
                 }
                 // PR #36: restore the per-media subtitle delay
                 // once this load reaches Playing; a failure is
@@ -13010,6 +13282,14 @@ fn poll_fallback_state(player: &Rc<RefCell<PlayerState>>, persist: &Persist, sta
     };
     if matches!(act, Act::Started) {
         record_history_once(player, persist);
+        // M1: the fallback engine also restarts at its own
+        // defaults on a new load; re-apply volume and mute.
+        let volume = player
+            .borrow()
+            .window
+            .as_ref()
+            .map_or(100, |win| win.volume.get_value());
+        player_set_volume(player, volume);
     }
     if matches!(act, Act::Started | Act::Settled) {
         let state = player.borrow();
@@ -13364,12 +13644,13 @@ fn dispatch_player_key(
             let step = if label.starts_with("Ctrl+") { 5 } else { 2 };
             let delta = if action == "volume_up" { step } else { -step };
             let value = (win.volume.get_value() + delta).clamp(0, 200);
-            player_set_volume(player, value);
+            player_apply_user_volume(player, value);
             // N23: Python's volume change only refreshes the
             // status line (its Vol segment) — no prefix, no
             // speech.
             update_player_status(player, persist, status, None, 3);
         }
+        "mute" => player_toggle_mute(player, persist, status),
         "audio_track" => cycle_audio_track(player, persist, status),
         "subtitles" => cycle_subtitle_track(player, persist, status),
         "speak_subtitles" => {
@@ -20072,7 +20353,9 @@ where
 
 /// Main-window keys that have no menu item (Python dispatches them
 /// as accelerators): volume up/down drive the built-in player in
-/// steps of 2, and Record toggles recording of the selected channel.
+/// steps of 2, Record toggles recording of the selected channel,
+/// and Mute toggles the player's mute (its menu item exists, but
+/// wxdragon installs no accelerator for it).
 /// wxdragon exposes no accelerator table, so the binding rides the
 /// focusable controls' `KEY_DOWN` events, next to the F1 bindings.
 fn bind_main_hotkeys<T>(control: &T, wiring: &Wiring, controls: Controls, status: Status)
@@ -20102,7 +20385,7 @@ fn dispatch_main_hotkey(
     };
     let config = serde_json::Value::Object(wiring.persist.config.borrow().raw().clone());
     let keys = iptv_core::shortcuts::effective(&config, "main");
-    let action = ["volume_up", "volume_down", "record"]
+    let action = ["volume_up", "volume_down", "record", "mute"]
         .into_iter()
         .find(|name| keys.get(*name) == Some(&label));
     match action {
@@ -20116,11 +20399,21 @@ fn dispatch_main_hotkey(
                 .map(|win| win.volume.get_value());
             if let Some(current) = current {
                 let value = (current + delta).clamp(0, 200);
-                player_set_volume(&player, value);
+                player_apply_user_volume(&player, value);
                 status.set_label(&trf(
                     "Volume {value} percent.",
                     &[("value", &value.to_string())],
                 ));
+            }
+            true
+        }
+        Some("mute") => {
+            // The main-window mute shortcut (M1) fires the same
+            // `_toggle_player_mute` as the Player menu item.
+            if wiring.player.borrow().window.is_some() {
+                player_toggle_mute(&wiring.player, &wiring.persist, status);
+            } else {
+                status.set_label("Start playback in the built-in player first.");
             }
             true
         }

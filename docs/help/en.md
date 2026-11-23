@@ -250,6 +250,8 @@ Keys in the player:
 
 The same commands are on the player's Playback menu. The player reconnects on its own when a live stream drops, and keeps the audio track you chose.
 
+Mute / Unmute silences the built-in player without pausing playback or recording. The default shortcut is Ctrl+Shift+M in the main window and M in the player; both can be changed in Keyboard Shortcuts. Muting survives channel changes and reconnects. Player > Remember Volume for Each Channel is optional and off by default: it recalls your chosen volume separately for each playlist or provider. Channels without a saved value use the ordinary player volume. Neither feature changes screen-reader volume.
+
 ### Audio tracks {#audio-tracks}
 
 Channels can carry several audio tracks, such as other languages or audio description. Press A to move to the next track, use Playback > Audio Track, or Tab to Choose Audio Track, which always names the track that is playing.
