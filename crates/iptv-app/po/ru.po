@@ -3950,3 +3950,51 @@ msgstr "Открыть сайт проектов, projects.serrebiradio.com"
 
 msgid "Read the full credits"
 msgstr "Прочитать полный список благодарностей"
+
+msgid "Back 10 Seconds"
+msgstr "Назад на 10 секунд"
+
+msgid "Forward 10 Seconds"
+msgstr "Вперёд на 10 секунд"
+
+msgid "Back 60 Seconds"
+msgstr "Назад на 60 секунд"
+
+msgid "Forward 60 Seconds"
+msgstr "Вперёд на 60 секунд"
+
+msgid "Go to Time..."
+msgstr "Перейти к времени..."
+
+msgid "Playback Time"
+msgstr "Время воспроизведения"
+
+msgid "Enter seconds, MM:SS or HH:MM:SS."
+msgstr "Введите секунды, ММ:СС или ЧЧ:ММ:СС."
+
+msgid "Minutes and seconds after a colon must be below 60."
+msgstr "Минуты и секунды после двоеточия должны быть меньше 60."
+
+msgid "The requested position is too large."
+msgstr "Запрошенная позиция слишком велика."
+
+msgid "The playback position is not available yet."
+msgstr "Позиция воспроизведения пока недоступна."
+
+msgid "The media duration is not available yet."
+msgstr "Длительность материала пока недоступна."
+
+msgid "This command is available during on-demand playback."
+msgstr "Эта команда доступна при воспроизведении по запросу."
+
+msgid "This stream does not support seeking."
+msgstr "Этот поток не поддерживает переход по времени."
+
+msgid "The player could not seek to the requested position."
+msgstr "Проигрыватель не смог перейти к указанной позиции."
+
+msgid "Choose a position before the end of the media."
+msgstr "Выберите позицию до конца материала."
+
+msgid "Elapsed: {elapsed}. Total: {total}. Remaining: {remaining}."
+msgstr "Прошло: {elapsed}. Всего: {total}. Осталось: {remaining}."

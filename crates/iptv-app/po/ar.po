@@ -3895,3 +3895,51 @@ msgstr "زيارة موقع المشاريع، projects.serrebiradio.com"
 
 msgid "Read the full credits"
 msgstr "قراءة قائمة الشكر الكاملة"
+
+msgid "Back 10 Seconds"
+msgstr "رجوع 10 ثوانٍ"
+
+msgid "Forward 10 Seconds"
+msgstr "تقديم 10 ثوانٍ"
+
+msgid "Back 60 Seconds"
+msgstr "رجوع 60 ثانية"
+
+msgid "Forward 60 Seconds"
+msgstr "تقديم 60 ثانية"
+
+msgid "Go to Time..."
+msgstr "الانتقال إلى وقت..."
+
+msgid "Playback Time"
+msgstr "وقت التشغيل"
+
+msgid "Enter seconds, MM:SS or HH:MM:SS."
+msgstr "أدخل الثواني أو MM:SS أو HH:MM:SS."
+
+msgid "Minutes and seconds after a colon must be below 60."
+msgstr "يجب أن تقل الدقائق والثواني بعد النقطتين عن 60."
+
+msgid "The requested position is too large."
+msgstr "الموضع المطلوب كبير جدًا."
+
+msgid "The playback position is not available yet."
+msgstr "موضع التشغيل غير متاح بعد."
+
+msgid "The media duration is not available yet."
+msgstr "مدة الوسائط غير متاحة بعد."
+
+msgid "This command is available during on-demand playback."
+msgstr "يتاح هذا الأمر أثناء التشغيل حسب الطلب."
+
+msgid "This stream does not support seeking."
+msgstr "هذا البث لا يدعم الانتقال إلى موضع زمني."
+
+msgid "The player could not seek to the requested position."
+msgstr "تعذر على المشغّل الانتقال إلى الموضع المطلوب."
+
+msgid "Choose a position before the end of the media."
+msgstr "اختر موضعًا قبل نهاية الوسائط."
+
+msgid "Elapsed: {elapsed}. Total: {total}. Remaining: {remaining}."
+msgstr "المنقضي: {elapsed}. الإجمالي: {total}. المتبقي: {remaining}."

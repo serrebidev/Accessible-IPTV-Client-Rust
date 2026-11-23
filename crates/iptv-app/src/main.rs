@@ -911,6 +911,9 @@ struct PlayerState {
     resume_store: String,
     resume_key: String,
     resume_write_pending: bool,
+    /// M2: a seek whose landing the player tick still judges
+    /// (Python's `_pending_media_seek`).
+    pending_seek: Option<iptv_core::media_navigation::PendingSeek>,
 }
 
 impl Default for PlayerState {
@@ -990,6 +993,7 @@ impl Default for PlayerState {
             resume_store: "playback_bookmarks".to_string(),
             resume_key: String::new(),
             resume_write_pending: false,
+            pending_seek: None,
         }
     }
 }
@@ -10908,6 +10912,12 @@ const PM_EXIT: i32 = 5334;
 const PM_PREV_EPISODE: i32 = 5335;
 const PM_NEXT_EPISODE: i32 = 5336;
 const PM_SUBTITLE_TIMING: i32 = 5337;
+const PM_SEEK_BACK_10: i32 = 5460;
+const PM_SEEK_FORWARD_10: i32 = 5461;
+const PM_SEEK_BACK_60: i32 = 5462;
+const PM_SEEK_FORWARD_60: i32 = 5463;
+const PM_GO_TO_TIME: i32 = 5464;
+const PM_MEDIA_TIME: i32 = 5465;
 const PM_TRACK_BASE: i32 = 5340;
 const PM_SUB_BASE: i32 = 5400;
 
@@ -10971,6 +10981,53 @@ fn build_playback_menu(
         .collect::<std::collections::BTreeMap<_, _>>();
     let menu = Menu::builder().build();
     playback_transport_items(&menu, &keys);
+    // M2: Python's navigation block follows the transport
+    // items (in Python it follows the Mute item, which is
+    // M1's branch): the four seeks, Go to Time and Playback
+    // Time. Previous/Next Episode and Subtitle Timing already
+    // sit at the menu's end in this port.
+    menu_add(
+        &menu,
+        PM_SEEK_BACK_10,
+        &menu_label(&keys, "&Back 10 Seconds", "seek_back_10"),
+        "",
+        ItemKind::Normal,
+    );
+    menu_add(
+        &menu,
+        PM_SEEK_FORWARD_10,
+        &menu_label(&keys, "&Forward 10 Seconds", "seek_forward_10"),
+        "",
+        ItemKind::Normal,
+    );
+    menu_add(
+        &menu,
+        PM_SEEK_BACK_60,
+        &menu_label(&keys, "Bac&k 60 Seconds", "seek_back_60"),
+        "",
+        ItemKind::Normal,
+    );
+    menu_add(
+        &menu,
+        PM_SEEK_FORWARD_60,
+        &menu_label(&keys, "For&ward 60 Seconds", "seek_forward_60"),
+        "",
+        ItemKind::Normal,
+    );
+    menu_add(
+        &menu,
+        PM_GO_TO_TIME,
+        &menu_label(&keys, "&Go to Time...", "go_to_time"),
+        "",
+        ItemKind::Normal,
+    );
+    menu_add(
+        &menu,
+        PM_MEDIA_TIME,
+        &menu_label(&keys, "Playback &Time", "media_time"),
+        "",
+        ItemKind::Normal,
+    );
     menu.append_separator();
     let audio_menu = Menu::builder().build();
     menu_add(
@@ -11193,6 +11250,12 @@ fn dispatch_player_menu(
         PM_PREV_EPISODE => episode_navigate(player, persist, status, -1),
         PM_NEXT_EPISODE => episode_navigate(player, persist, status, 1),
         PM_SUBTITLE_TIMING => prompt_subtitle_timing(player, win.frame, persist, status),
+        PM_SEEK_BACK_10 => player_seek_media(player, status, Some(-10_000), None),
+        PM_SEEK_FORWARD_10 => player_seek_media(player, status, Some(10_000), None),
+        PM_SEEK_BACK_60 => player_seek_media(player, status, Some(-60_000), None),
+        PM_SEEK_FORWARD_60 => player_seek_media(player, status, Some(60_000), None),
+        PM_GO_TO_TIME => prompt_go_to_time(player, win.frame, status),
+        PM_MEDIA_TIME => player_announce_media_time(player, status),
         PM_CAST => {
             let state = player.borrow();
             if let Some(shared) = &state.shared {
@@ -11774,6 +11837,7 @@ fn player_tick(player: &Rc<RefCell<PlayerState>>, persist: &Persist, status: Sta
     deliver_buffer_pending(player, persist, status);
     poll_buffer(player, persist, status);
     checkpoint_resume(player, persist, status, false);
+    poll_pending_seek(player, persist, status);
     speak_subtitle_cue(player, persist, status);
     drive_speech_watchdog(player, persist, status);
     poll_vlc_state(player, persist, status);
@@ -12742,17 +12806,236 @@ fn player_stop(player: &Rc<RefCell<PlayerState>>, persist: &Persist, status: Sta
 
 /// Seek the active engine (libVLC when it drives playback, else
 /// the `MediaCtrl`).
+/// Forget subtitle speech and display history after a seek or
+/// a timing change (Python's sink clear plus
+/// `subtitle_pipeline.seeked()`): the spoken cue is discarded,
+/// the cue indexes reset, the parse generation bumps so an
+/// in-flight sample cannot re-anchor to the old position, and
+/// the caller clears the visible label.
+fn reset_subtitle_history(state: &mut PlayerState) {
+    state.app_voice.stop();
+    state.last_spoken_cue = None;
+    state.last_label_cue = None;
+    state.active_cue_index = None;
+    state.last_shown_cue = None;
+    state.review.reset();
+    state.subtitle_generation += 1;
+}
+
 fn player_seek_to(player: &Rc<RefCell<PlayerState>>, target_ms: i64) {
     let mut state = player.borrow_mut();
     // A seek discards the cue being spoken: stale words from the
-    // old position never finish (issue #131).
-    state.app_voice.stop();
+    // old position never finish (issue #131). M2: the whole
+    // subtitle history resets, as Python's `_seek_media` does.
+    reset_subtitle_history(&mut state);
     if state.vlc_active {
         if let Some(engine) = &mut state.vlc {
             engine.set_time(target_ms);
         }
     } else if let Some(win) = &state.window {
         win.media.seek(target_ms, SeekMode::FromStart);
+    }
+    let window = state.window.clone();
+    drop(state);
+    if let Some(win) = window {
+        win.subtitle_label.set_label("");
+    }
+}
+
+/// The media clock for on-demand commands (Python
+/// `_media_clock`): only on-demand playback has one — a
+/// non-live request, or a local recording — and the position
+/// and duration must both be readable.
+fn media_clock(player: &Rc<RefCell<PlayerState>>) -> Result<(i64, i64), String> {
+    let state = player.borrow();
+    let on_demand = match state.session.current() {
+        Some(request) => {
+            !request.live
+                || state.current_channel.as_ref().is_some_and(|channel| {
+                    channel.unknown_attributes.contains_key("local-recording")
+                })
+        }
+        None => false,
+    };
+    if !on_demand {
+        return Err(tr("This command is available during on-demand playback."));
+    }
+    let (position, length) = position_length(&state);
+    iptv_core::media_navigation::target_position(position, length, None, Some(position))
+        .map(|_| (position, length))
+        .map_err(|error| tr(&error))
+}
+
+/// Seek the on-demand media (Python `_seek_media`): rapid
+/// seeks accumulate from the pending target, the landing is
+/// judged by the player tick, and the subtitle history resets
+/// with the jump.
+fn player_seek_media(
+    player: &Rc<RefCell<PlayerState>>,
+    status: Status,
+    delta: Option<i64>,
+    target: Option<i64>,
+) {
+    if let Err(error) = seek_media_inner(player, delta, target) {
+        status.set_label(&error);
+    }
+}
+
+fn seek_media_inner(
+    player: &Rc<RefCell<PlayerState>>,
+    delta: Option<i64>,
+    target: Option<i64>,
+) -> Result<(), String> {
+    use iptv_core::media_navigation::{target_position, PendingSeek};
+    let (position, length) = media_clock(player)?;
+    let mut state = player.borrow_mut();
+    let generation = state.session.generation();
+    let origin = match &state.pending_seek {
+        Some(pending) if pending.generation == generation => pending.target,
+        _ => position,
+    };
+    let destination = target_position(origin, length, delta, target).map_err(|error| tr(&error))?;
+    if state.vlc_active {
+        if !state
+            .vlc
+            .as_ref()
+            .is_some_and(|engine| engine.is_seekable())
+        {
+            return Err(tr("This stream does not support seeking."));
+        }
+        let code = state
+            .vlc
+            .as_mut()
+            .map_or(0, |engine| engine.set_time(destination));
+        if code < 0 {
+            return Err(tr("The player could not seek to the requested position."));
+        }
+        reset_subtitle_history(&mut state);
+        state.pending_seek = Some(PendingSeek::new(generation, destination, position));
+        let window = state.window.clone();
+        drop(state);
+        if let Some(win) = window {
+            win.subtitle_label.set_label("");
+        }
+    } else {
+        state.pending_seek = Some(PendingSeek::new(generation, destination, position));
+        drop(state);
+        player_seek_to(player, destination);
+    }
+    Ok(())
+}
+
+/// Judge a pending seek on the player tick (Python
+/// `_poll_media_seek`): a landed seek forces a resume
+/// checkpoint and announces the new time; a seek that never
+/// lands within eight seconds is reported once.
+fn poll_pending_seek(player: &Rc<RefCell<PlayerState>>, persist: &Persist, status: Status) {
+    use iptv_core::media_navigation::SeekOutcome;
+    let outcome = {
+        let state = player.borrow();
+        let Some(pending) = &state.pending_seek else {
+            return;
+        };
+        if state.session.current().is_none() {
+            SeekOutcome::Stale
+        } else {
+            let (position, _) = position_length(&state);
+            pending.outcome(
+                state.session.generation(),
+                position,
+                std::time::Instant::now(),
+            )
+        }
+    };
+    match outcome {
+        SeekOutcome::Pending => {}
+        SeekOutcome::Stale => {
+            player.borrow_mut().pending_seek = None;
+        }
+        SeekOutcome::Done => {
+            player.borrow_mut().pending_seek = None;
+            checkpoint_resume(player, persist, status, true);
+            player_announce_media_time(player, status);
+        }
+        SeekOutcome::Failed => {
+            player.borrow_mut().pending_seek = None;
+            status.set_label("The player could not seek to the requested position.");
+        }
+    }
+}
+
+/// Announce elapsed / total / remaining (Python
+/// `_announce_media_time`); an unavailable clock announces its
+/// own error, as Python does.
+fn player_announce_media_time(player: &Rc<RefCell<PlayerState>>, status: Status) {
+    use iptv_core::media_navigation::clock_text;
+    let text = match media_clock(player) {
+        Ok((position, length)) => trf(
+            "Elapsed: {elapsed}. Total: {total}. Remaining: {remaining}.",
+            &[
+                ("elapsed", &clock_text(position)),
+                ("total", &clock_text(length)),
+                ("remaining", &clock_text(length - position)),
+            ],
+        ),
+        Err(error) => error,
+    };
+    status.set_label(&text);
+}
+
+/// Go to Time (Python `_go_to_media_time`): the entry starts
+/// at the current position, an invalid entry warns and the
+/// dialog reopens with what was typed, and a position at or
+/// past the end is refused the same way.
+fn prompt_go_to_time(player: &Rc<RefCell<PlayerState>>, frame: Frame, status: Status) {
+    let (position, length) = match media_clock(player) {
+        Ok(clock) => clock,
+        Err(error) => {
+            status.set_label(&error);
+            return;
+        }
+    };
+    let generation = player.borrow().session.generation();
+    let mut entry = iptv_core::media_navigation::clock_text(position);
+    loop {
+        let dialog = TextEntryDialog::builder(
+            &frame,
+            &tr("Enter seconds, MM:SS or HH:MM:SS."),
+            &tr("Go to Time..."),
+        )
+        .with_default_value(&entry)
+        .build();
+        if dialog.show_modal_tracked() != ID_OK {
+            return;
+        }
+        if player.borrow().session.generation() != generation {
+            return;
+        }
+        let Some(value) = dialog.get_value() else {
+            return;
+        };
+        entry = value.clone();
+        let parsed = iptv_core::media_navigation::parse_position(&value)
+            .map_err(|error| tr(&error))
+            .and_then(|target| {
+                if target >= length {
+                    Err(tr("Choose a position before the end of the media."))
+                } else {
+                    Ok(target)
+                }
+            });
+        match parsed {
+            Ok(target) => {
+                player_seek_media(player, status, None, Some(target));
+                return;
+            }
+            Err(error) => {
+                let warning = MessageDialog::builder(&frame, &error, &tr("Go to Time..."))
+                    .with_style(MessageDialogStyle::OK | MessageDialogStyle::IconWarning)
+                    .build();
+                warning.show_modal_tracked();
+            }
+        }
     }
 }
 
@@ -13363,6 +13646,12 @@ fn dispatch_player_key(
         "previous_episode" => episode_navigate(player, persist, status, -1),
         "next_episode" => episode_navigate(player, persist, status, 1),
         "subtitle_timing" => prompt_subtitle_timing(player, win.frame, persist, status),
+        "seek_back_10" => player_seek_media(player, status, Some(-10_000), None),
+        "seek_forward_10" => player_seek_media(player, status, Some(10_000), None),
+        "seek_back_60" => player_seek_media(player, status, Some(-60_000), None),
+        "seek_forward_60" => player_seek_media(player, status, Some(60_000), None),
+        "go_to_time" => prompt_go_to_time(player, win.frame, status),
+        "media_time" => player_announce_media_time(player, status),
         "fullscreen" => set_fullscreen(player, !win.frame.is_full_screen()),
         "hide" => win.frame.hide(),
         "what_is_playing" => {
@@ -13589,12 +13878,7 @@ fn apply_subtitle_timing(
     }
     state.subtitle_timing_ms = milliseconds;
     state.subtitle_timing_pending = false;
-    state.app_voice.stop();
-    state.last_spoken_cue = None;
-    state.active_cue_index = None;
-    state.last_shown_cue = None;
-    state.last_label_cue = None;
-    state.review.reset();
+    reset_subtitle_history(&mut state);
     let window = state.window.clone();
     drop(state);
     if let Some(window) = window {

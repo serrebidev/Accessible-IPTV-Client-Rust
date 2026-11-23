@@ -4003,3 +4003,51 @@ msgstr "Visiter le site des projets, projects.serrebiradio.com"
 
 msgid "Read the full credits"
 msgstr "Lire les crédits complets"
+
+msgid "Back 10 Seconds"
+msgstr "Reculer de 10 secondes"
+
+msgid "Forward 10 Seconds"
+msgstr "Avancer de 10 secondes"
+
+msgid "Back 60 Seconds"
+msgstr "Reculer de 60 secondes"
+
+msgid "Forward 60 Seconds"
+msgstr "Avancer de 60 secondes"
+
+msgid "Go to Time..."
+msgstr "Aller à un instant..."
+
+msgid "Playback Time"
+msgstr "Temps de lecture"
+
+msgid "Enter seconds, MM:SS or HH:MM:SS."
+msgstr "Saisissez des secondes, MM:SS ou HH:MM:SS."
+
+msgid "Minutes and seconds after a colon must be below 60."
+msgstr "Les minutes et secondes après un deux-points doivent être inférieures à 60."
+
+msgid "The requested position is too large."
+msgstr "La position demandée est trop grande."
+
+msgid "The playback position is not available yet."
+msgstr "La position de lecture n'est pas encore disponible."
+
+msgid "The media duration is not available yet."
+msgstr "La durée du média n'est pas encore disponible."
+
+msgid "This command is available during on-demand playback."
+msgstr "Cette commande est disponible pendant la lecture à la demande."
+
+msgid "This stream does not support seeking."
+msgstr "Ce flux ne permet pas de changer de position."
+
+msgid "The player could not seek to the requested position."
+msgstr "Le lecteur n'a pas pu atteindre la position demandée."
+
+msgid "Choose a position before the end of the media."
+msgstr "Choisissez une position avant la fin du média."
+
+msgid "Elapsed: {elapsed}. Total: {total}. Remaining: {remaining}."
+msgstr "Écoulé : {elapsed}. Durée totale : {total}. Restant : {remaining}."

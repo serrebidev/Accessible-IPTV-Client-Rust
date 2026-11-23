@@ -3897,3 +3897,51 @@ msgstr "प्रोजेक्ट साइट projects.serrebiradio.com प�
 
 msgid "Read the full credits"
 msgstr "पूरा श्रेय पढ़ें"
+
+msgid "Back 10 Seconds"
+msgstr "10 सेकंड पीछे"
+
+msgid "Forward 10 Seconds"
+msgstr "10 सेकंड आगे"
+
+msgid "Back 60 Seconds"
+msgstr "60 सेकंड पीछे"
+
+msgid "Forward 60 Seconds"
+msgstr "60 सेकंड आगे"
+
+msgid "Go to Time..."
+msgstr "निर्दिष्ट समय पर जाएँ..."
+
+msgid "Playback Time"
+msgstr "प्लेबैक समय"
+
+msgid "Enter seconds, MM:SS or HH:MM:SS."
+msgstr "सेकंड, MM:SS या HH:MM:SS दर्ज करें।"
+
+msgid "Minutes and seconds after a colon must be below 60."
+msgstr "कोलन के बाद मिनट और सेकंड का मान 60 से कम होना चाहिए।"
+
+msgid "The requested position is too large."
+msgstr "अनुरोधित स्थान बहुत बड़ा है।"
+
+msgid "The playback position is not available yet."
+msgstr "प्लेबैक का स्थान अभी उपलब्ध नहीं है।"
+
+msgid "The media duration is not available yet."
+msgstr "मीडिया की अवधि अभी उपलब्ध नहीं है।"
+
+msgid "This command is available during on-demand playback."
+msgstr "यह आदेश ऑन-डिमांड प्लेबैक के दौरान उपलब्ध है।"
+
+msgid "This stream does not support seeking."
+msgstr "इस स्ट्रीम में समय बदलकर आगे-पीछे जाना समर्थित नहीं है।"
+
+msgid "The player could not seek to the requested position."
+msgstr "प्लेयर अनुरोधित स्थान पर नहीं जा सका।"
+
+msgid "Choose a position before the end of the media."
+msgstr "मीडिया के अंत से पहले का स्थान चुनें।"
+
+msgid "Elapsed: {elapsed}. Total: {total}. Remaining: {remaining}."
+msgstr "बीता: {elapsed}। कुल: {total}। शेष: {remaining}।"

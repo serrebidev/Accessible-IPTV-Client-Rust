@@ -4003,3 +4003,51 @@ msgstr "A projektek oldalának megnyitása: projects.serrebiradio.com"
 
 msgid "Read the full credits"
 msgstr "A teljes köszönetnyilvánítás elolvasása"
+
+msgid "Back 10 Seconds"
+msgstr "Vissza 10 másodperccel"
+
+msgid "Forward 10 Seconds"
+msgstr "Előre 10 másodperccel"
+
+msgid "Back 60 Seconds"
+msgstr "Vissza 60 másodperccel"
+
+msgid "Forward 60 Seconds"
+msgstr "Előre 60 másodperccel"
+
+msgid "Go to Time..."
+msgstr "Ugrás időpontra…"
+
+msgid "Playback Time"
+msgstr "Lejátszási idő"
+
+msgid "Enter seconds, MM:SS or HH:MM:SS."
+msgstr "Adja meg az időpontot másodpercben, PP:MM vagy ÓÓ:PP:MM formátumban."
+
+msgid "Minutes and seconds after a colon must be below 60."
+msgstr "A kettőspont utáni perc- és másodpercértéknek 60-nál kisebbnek kell lennie."
+
+msgid "The requested position is too large."
+msgstr "A megadott időpont meghaladja a megengedett értéket."
+
+msgid "The playback position is not available yet."
+msgstr "A lejátszási pozíció még nem érhető el."
+
+msgid "The media duration is not available yet."
+msgstr "A műsor teljes időtartama még nem érhető el."
+
+msgid "This command is available during on-demand playback."
+msgstr "Ez a parancs igény szerinti tartalom vagy helyi felvétel lejátszásakor használható."
+
+msgid "This stream does not support seeking."
+msgstr "Ennél a műsornál nem lehet másik időpontra ugrani."
+
+msgid "The player could not seek to the requested position."
+msgstr "A lejátszó nem tudott a megadott időpontra ugrani."
+
+msgid "Choose a position before the end of the media."
+msgstr "A műsor vége előtti időpontot adjon meg."
+
+msgid "Elapsed: {elapsed}. Total: {total}. Remaining: {remaining}."
+msgstr "Eltelt idő: {elapsed}. Teljes időtartam: {total}. Hátralévő idő: {remaining}."

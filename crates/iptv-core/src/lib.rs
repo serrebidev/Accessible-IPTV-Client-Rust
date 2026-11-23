@@ -56,6 +56,7 @@ mod guide_match_data;
 pub mod i18n;
 pub mod instance;
 pub mod loading;
+pub mod media_navigation;
 pub mod media_type;
 pub mod navindex;
 pub mod playback;

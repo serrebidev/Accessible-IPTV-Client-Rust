@@ -3939,3 +3939,51 @@ msgstr "プロジェクト サイト projects.serrebiradio.com を開く"
 
 msgid "Read the full credits"
 msgstr "全クレジットを読む"
+
+msgid "Back 10 Seconds"
+msgstr "10秒戻る"
+
+msgid "Forward 10 Seconds"
+msgstr "10秒進む"
+
+msgid "Back 60 Seconds"
+msgstr "60秒戻る"
+
+msgid "Forward 60 Seconds"
+msgstr "60秒進む"
+
+msgid "Go to Time..."
+msgstr "指定時刻へ移動..."
+
+msgid "Playback Time"
+msgstr "再生時間"
+
+msgid "Enter seconds, MM:SS or HH:MM:SS."
+msgstr "秒数、MM:SS、またはHH:MM:SSを入力してください。"
+
+msgid "Minutes and seconds after a colon must be below 60."
+msgstr "コロンの後の分と秒は60未満にしてください。"
+
+msgid "The requested position is too large."
+msgstr "指定された位置が大きすぎます。"
+
+msgid "The playback position is not available yet."
+msgstr "再生位置はまだ取得できません。"
+
+msgid "The media duration is not available yet."
+msgstr "メディアの長さはまだ取得できません。"
+
+msgid "This command is available during on-demand playback."
+msgstr "このコマンドはオンデマンド再生中に使用できます。"
+
+msgid "This stream does not support seeking."
+msgstr "このストリームはシークに対応していません。"
+
+msgid "The player could not seek to the requested position."
+msgstr "プレーヤーは指定した位置に移動できませんでした。"
+
+msgid "Choose a position before the end of the media."
+msgstr "メディアの終了前の位置を選んでください。"
+
+msgid "Elapsed: {elapsed}. Total: {total}. Remaining: {remaining}."
+msgstr "経過：{elapsed}。全体：{total}。残り：{remaining}。"

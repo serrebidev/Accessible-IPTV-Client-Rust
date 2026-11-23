@@ -3940,3 +3940,51 @@ msgstr "Projeler sitesini ziyaret et, projects.serrebiradio.com"
 
 msgid "Read the full credits"
 msgstr "Tüm teşekkürleri oku"
+
+msgid "Back 10 Seconds"
+msgstr "10 Saniye Geri"
+
+msgid "Forward 10 Seconds"
+msgstr "10 Saniye İleri"
+
+msgid "Back 60 Seconds"
+msgstr "60 Saniye Geri"
+
+msgid "Forward 60 Seconds"
+msgstr "60 Saniye İleri"
+
+msgid "Go to Time..."
+msgstr "Zamana Git..."
+
+msgid "Playback Time"
+msgstr "Oynatma Süresi"
+
+msgid "Enter seconds, MM:SS or HH:MM:SS."
+msgstr "Saniye, DD:SS veya SS:DD:SS biçiminde girin."
+
+msgid "Minutes and seconds after a colon must be below 60."
+msgstr "İki noktadan sonraki dakika ve saniye değerleri 60'tan küçük olmalıdır."
+
+msgid "The requested position is too large."
+msgstr "İstenen konum çok büyük."
+
+msgid "The playback position is not available yet."
+msgstr "Oynatma konumu henüz kullanılamıyor."
+
+msgid "The media duration is not available yet."
+msgstr "Medya süresi henüz kullanılamıyor."
+
+msgid "This command is available during on-demand playback."
+msgstr "Bu komut isteğe bağlı içerik oynatılırken kullanılabilir."
+
+msgid "This stream does not support seeking."
+msgstr "Bu akış konum değiştirmeyi desteklemiyor."
+
+msgid "The player could not seek to the requested position."
+msgstr "Oynatıcı istenen konuma gidemedi."
+
+msgid "Choose a position before the end of the media."
+msgstr "Medyanın bitişinden önce bir konum seçin."
+
+msgid "Elapsed: {elapsed}. Total: {total}. Remaining: {remaining}."
+msgstr "Geçen: {elapsed}. Toplam: {total}. Kalan: {remaining}."

@@ -3847,3 +3847,51 @@ msgstr "访问项目网站 projects.serrebiradio.com"
 
 msgid "Read the full credits"
 msgstr "阅读完整致谢"
+
+msgid "Back 10 Seconds"
+msgstr "后退10秒"
+
+msgid "Forward 10 Seconds"
+msgstr "前进10秒"
+
+msgid "Back 60 Seconds"
+msgstr "后退60秒"
+
+msgid "Forward 60 Seconds"
+msgstr "前进60秒"
+
+msgid "Go to Time..."
+msgstr "跳转到时间..."
+
+msgid "Playback Time"
+msgstr "播放时间"
+
+msgid "Enter seconds, MM:SS or HH:MM:SS."
+msgstr "请输入秒数、MM:SS或HH:MM:SS。"
+
+msgid "Minutes and seconds after a colon must be below 60."
+msgstr "冒号后的分钟和秒数必须小于60。"
+
+msgid "The requested position is too large."
+msgstr "请求的位置过大。"
+
+msgid "The playback position is not available yet."
+msgstr "播放位置暂不可用。"
+
+msgid "The media duration is not available yet."
+msgstr "媒体时长暂不可用。"
+
+msgid "This command is available during on-demand playback."
+msgstr "此命令可在点播播放期间使用。"
+
+msgid "This stream does not support seeking."
+msgstr "此流不支持时间跳转。"
+
+msgid "The player could not seek to the requested position."
+msgstr "播放器无法跳转到所请求的位置。"
+
+msgid "Choose a position before the end of the media."
+msgstr "请选择媒体结束之前的位置。"
+
+msgid "Elapsed: {elapsed}. Total: {total}. Remaining: {remaining}."
+msgstr "已播放：{elapsed}。总时长：{total}。剩余：{remaining}。"
