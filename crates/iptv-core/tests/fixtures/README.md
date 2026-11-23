@@ -19,7 +19,7 @@ This fixture is focused browse evidence, not the full parity gate of ticket 04.
 
 Every fixture in `python-channels.tsv`, `python-search.tsv`, and
 `python-outcomes.tsv` represents Python revision
-`9aa89e053225ef2c83c4f3659775a00723012ff7` (also recorded in each golden header).
+`a29ad9a3a48a41a09d8276e226e719e6d12bb07b` (v1.151.6, also recorded in each golden header).
 `recovery.m3u` adds CR-only lines, duplicate keys, overwritten/dangling metadata,
 unbalanced quotes, duplicate names, a bare URL and Unicode search ranking.
 `empty.m3u` has only a header/comments. `invalid-utf8.m3u` exercises the Python

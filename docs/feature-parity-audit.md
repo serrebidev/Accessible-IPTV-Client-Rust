@@ -1314,3 +1314,37 @@ These were already documented and remain true:
 3. N10 and N13, since they stop streams or downloads from working at all.
 4. N09 and N12, then the rest by severity.
 
+
+## Third-round audit (2026-11-23)
+
+References: Python v1.151.6 (`a29ad9a3`) against Rust v0.4.33 (`6bdb07e`). Python moved from v1.150.58 by 52 commits; Rust had ported Python PR #36 (validation 0101), the 200 percent volume boost and the About links from that range.
+
+Method: every feature paragraph added to Python's `docs/help/en.md` since v1.150.58 was turned into its menu label, and each label plus the internals behind it was searched for in `crates/`. Every entry below had no Rust match. Design and split: `docs/superpowers/specs/2026-11-23-python-parity-round3-design.md`. C entries are ported by Claude, M entries by muse.ai through Forgejo pull requests.
+
+Checked and not gaps: Python's start-at-100-percent volume fix (Rust never reads libVLC's starting volume) and the help text saying main search skips the guide (Python `main.py:6241` still adds guide rows; the change was wording only).
+
+### Open
+
+- **C1, high: recording planning engine.** Review Guide Changes and its notice option, Find Another Airing, Skip This Occurrence, Repeat on Weekdays, Padding for This Recording, episode-aware rerun suppression, Partial and Stopped-by-user outcomes with later-airing rescheduling, unreadable-schedule backup. Python `dvr.py`, `recording_edits.py`, `planning_tools.py`, `recording_outcome.py`.
+- **C2, medium: Recover from Channel Archive.** Python `main.py`.
+- **C3, medium: Prevent Automatic Sleep While Recording and Wake for Scheduled Recordings.** Python `recording_power.py`.
+- **C4, medium: Recording Space Monitor.** Python `storage_monitor.py`.
+- **C5, medium: Save Recent Broadcast.** Python `buffer_clip.py`.
+- **C6, medium: Read Embedded Subtitle Track and Recording Chapters.** Python `recording_media.py`, `media_navigation_ui.py`.
+- **C7, medium: Recording Playback Queue and play from Problem Times.** Python `recording_queue.py`, `recording_library_ui.py`.
+- **C8, medium: Automatically Play the Next Episode.** Python `episode_continuation_ui.py`.
+- **C9, high: full backup (`accessible-iptv-settings-v2`).** Python `full_backup.py`.
+- **C10, medium: Assign Programme Guide.** Python `accessible_tools_ui.py`.
+- **C11, medium: Saved Programme Searches.** Python `saved_searches.py`.
+- **M1, medium: Mute / Unmute and Remember Volume for Each Channel.** Python `channel_preferences.py`.
+- **M2, medium: on-demand seek keys, Go to Time, time announcement.** Python `media_navigation.py`.
+- **M3, low: Named Bookmarks.** Python `named_bookmarks.py`.
+- **M4, low: reminder snooze and Export to Calendar.** Python `programme_reminders.py`, `planning_tools.py`.
+- **M5, low: Notification History.** Python `session_tools_ui.py`.
+- **M6, low: per-event announcement switches.** Python `main.py` (PR #118).
+- **M7, low: Recording Connection Limits dialog.** Python `recording_limits_ui.py`.
+- **M8, low: Recording Library CSV export.** Python `recording_library_ui.py`.
+- **M9, medium: Favourite Lists with export, import and relink.** Python `favorite_collections.py`, `favourite_transfer.py`.
+- **M10, low: Programme Guide by Time and Programme Details.** Python `personal_tools_ui.py`.
+
+The CI pin and the playlist goldens moved to `a29ad9a3` with this section; the goldens changed only in their revision headers.

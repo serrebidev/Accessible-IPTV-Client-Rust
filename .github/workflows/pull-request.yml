@@ -33,7 +33,7 @@ jobs:
         uses: actions/checkout@v7
         with:
           repository: serrebi/Accessible-IPTV-Client
-          ref: 9aa89e053225ef2c83c4f3659775a00723012ff7
+          ref: a29ad9a3a48a41a09d8276e226e719e6d12bb07b
           path: python-reference
           fetch-depth: 1
 

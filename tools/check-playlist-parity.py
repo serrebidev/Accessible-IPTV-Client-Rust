@@ -9,7 +9,7 @@ import subprocess
 import sys
 from typing import Dict, List
 
-REVISION = "9aa89e053225ef2c83c4f3659775a00723012ff7"
+REVISION = "a29ad9a3a48a41a09d8276e226e719e6d12bb07b"
 FIXTURES = Path(__file__).resolve().parents[1] / "crates/iptv-core/tests/fixtures"
 SOURCES = ("local.m3u", "recovery.m3u", "empty.m3u", "invalid-utf8.m3u")
 QUERIES = ("", "c", " CAT ", "news", "missing", "映画")
