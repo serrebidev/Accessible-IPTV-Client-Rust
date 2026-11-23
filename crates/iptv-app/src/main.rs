@@ -2504,6 +2504,16 @@ fn poll_epg(wiring: &Wiring, frame: Frame, status: Status) {
                     "epg_last_sources_hash",
                     serde_json::json!(hash_epg_sources(&imported)),
                 );
+                let notify = wiring
+                    .persist
+                    .config
+                    .borrow()
+                    .value("notify_recording_guide_changes")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true);
+                if notify {
+                    review_guide_changes(wiring, frame, None, true);
+                }
                 status.set_label(&trf(
                     "Guide loaded: {channels} channels, {programmes} programmes.{note}",
                     &[
@@ -3293,6 +3303,12 @@ impl ModalRun for TextEntryDialog {
 }
 
 impl ModalRun for SingleChoiceDialog {
+    fn show_modal_tracked(&self) -> i32 {
+        run_modal(|| self.show_modal())
+    }
+}
+
+impl ModalRun for MultiChoiceDialog {
     fn show_modal_tracked(&self) -> i32 {
         run_modal(|| self.show_modal())
     }
@@ -6355,6 +6371,7 @@ pub const REC_SET_FOLDER: i32 = 5222;
 pub const REC_SHUTDOWN_AFTER: i32 = 5223;
 pub const REC_PROBLEM_TIMES: i32 = 5224;
 pub const REC_FORMAT_CHECKING: i32 = 5225;
+pub const REC_BY_TIME: i32 = 5226;
 
 /// The Recording Format submenu inside the Recordings menu
 /// (found by its label, the same fetch-by-parent pattern the
@@ -6804,6 +6821,13 @@ fn build_recordings_menu(config: &Config) -> Menu {
         &menu,
         REC_MIN_FREE,
         "&Minimum Free Space...",
+        "",
+        ItemKind::Normal,
+    );
+    menu_add(
+        &menu,
+        REC_BY_TIME,
+        "Schedule by &Time...",
         "",
         ItemKind::Normal,
     );
@@ -7895,6 +7919,7 @@ fn menu_recordings_action(
         }
         REC_REMINDERS => open_reminders_dialog(wiring, status),
         REC_SCHEDULED => open_scheduled_dialog(wiring, status),
+        REC_BY_TIME => schedule_by_time(wiring, &frame, list, status),
         REC_STORAGE => show_recording_storage(wiring, frame, status),
         REC_LIBRARY => open_recording_library(wiring, status),
         REC_MIN_FREE => prompt_min_free_space(wiring, frame, status),
@@ -18418,119 +18443,204 @@ fn show_conflicts(
     );
 }
 
-/// Parse Python's `local_timestamp` shape ("YYYY-MM-DD HH:MM"
-/// in local time); a repeated clock-change time resolves to
-/// its first occurrence.
+/// Python `manual_schedule.local_candidates`: the instants a local
+/// "YYYY-MM-DD HH:MM" names, ascending (two in the autumn repeat).
 #[allow(clippy::cast_precision_loss)] // epoch seconds in an f64, as everywhere in the app
-fn local_timestamp(text: &str) -> Result<f64, String> {
+fn local_candidates(text: &str) -> Result<Vec<f64>, String> {
     let naive = chrono::NaiveDateTime::parse_from_str(text.trim(), "%Y-%m-%d %H:%M")
-        .map_err(|_| "Invalid recording time.".to_string())?;
+        .map_err(|_| "Enter a local date and time as YYYY-MM-DD HH:MM.".to_string())?;
     match chrono::TimeZone::from_local_datetime(&chrono::Local, &naive) {
-        chrono::LocalResult::Single(moment) => Ok(moment.timestamp() as f64),
-        chrono::LocalResult::Ambiguous(first, _) => Ok(first.timestamp() as f64),
-        chrono::LocalResult::None => Err("Invalid recording time.".to_string()),
+        chrono::LocalResult::Single(moment) => Ok(vec![moment.timestamp() as f64]),
+        chrono::LocalResult::Ambiguous(first, second) => {
+            Ok(vec![first.timestamp() as f64, second.timestamp() as f64])
+        }
+        chrono::LocalResult::None => {
+            Err("This local time does not exist. Check the clock-change date.".to_string())
+        }
     }
 }
 
-/// The Recording Times dialog for editing one job (Python's
-/// `RecordingTimesDialog` in its edit form): the channel
-/// name, the title (fixed for an existing job), and start/end
-/// fields in local "YYYY-MM-DD HH:MM" form. A running
-/// recording's start cannot move. Validation errors are
-/// shown and the dialog stays open, as Python's does.
-#[allow(clippy::cast_possible_truncation)] // programme times are whole seconds
+/// Python `field_timestamp`: a field's local time; a time the clock
+/// change repeats asks which one is meant. `Ok(None)` is a cancelled
+/// choice.
+#[allow(clippy::cast_possible_truncation)] // whole-second instants
+fn field_timestamp(parent: &dyn WxWidget, text: &str, name: &str) -> Result<Option<f64>, String> {
+    let candidates = local_candidates(text)?;
+    if candidates.len() == 1 {
+        return Ok(Some(candidates[0]));
+    }
+    let choices: Vec<String> = candidates
+        .iter()
+        .map(|stamp| {
+            chrono::TimeZone::timestamp_opt(&chrono::Local, *stamp as i64, 0)
+                .single()
+                .map(|dt| dt.format("%Y-%m-%d %H:%M %z").to_string())
+                .unwrap_or_default()
+        })
+        .collect();
+    let dialog = SingleChoiceDialog::builder(
+        parent,
+        &tr("This local time occurs twice when the clocks change."),
+        name,
+        &choices.iter().map(String::as_str).collect::<Vec<_>>(),
+    )
+    .build();
+    if dialog.show_modal_tracked() != ID_OK {
+        return Ok(None);
+    }
+    Ok(usize::try_from(dialog.get_selection())
+        .ok()
+        .and_then(|i| candidates.get(i).copied()))
+}
+
+/// What the Schedule by Time dialog returns.
+struct RecordingTimes {
+    title: String,
+    start: f64,
+    end: f64,
+    weekdays: Vec<u8>,
+}
+
+/// Python `RecordingTimesDialog`: Schedule by Time for a channel, or
+/// Edit Times for one job. Title (fixed for an existing job), local
+/// start and end, and the repeat weekdays; a running recording's
+/// start cannot move. Errors are shown and the dialog stays open.
+#[allow(clippy::too_many_lines, clippy::cast_possible_truncation)] // one dialog; whole-second times
 fn prompt_recording_times(
     parent: &dyn WxWidget,
-    job: &iptv_core::dvr::DvrJob,
-) -> Option<(f64, f64)> {
-    let running = job.status == iptv_core::dvr::STATUS_RECORDING;
+    channel_name: &str,
+    job: Option<&iptv_core::dvr::DvrJob>,
+) -> Option<RecordingTimes> {
+    let running = job.is_some_and(|j| j.status == iptv_core::dvr::STATUS_RECORDING);
+    let series = job.is_some_and(|j| j.repeat == "series");
+    // Python: a new recording starts five minutes from now, for an hour.
+    let (start, end) = job.map_or_else(
+        || {
+            let start = (now_seconds() as i64 / 60 + 5) * 60;
+            (start, start + 3600)
+        },
+        |job| (job.start_ts as i64, job.stop_ts as i64),
+    );
     let dialog = Dialog::builder(parent, &tr("Schedule by Time"))
         .with_size(650, 450)
         .build();
     dialog.set_accessibility_label(&tr("Schedule by Time"));
     bind_escape_cancel(dialog);
     let panel = Panel::builder(&dialog).build();
-    let channel_label = StaticText::builder(&panel)
-        .with_label(&job.channel_name)
-        .build();
+    let channel_label = StaticText::builder(&panel).with_label(channel_name).build();
     let title_label = StaticText::builder(&panel).with_label(&tr("Title")).build();
-    let title_field = TextCtrl::builder(&panel).with_value(&job.title).build();
+    let title_field = TextCtrl::builder(&panel)
+        .with_value(job.map_or(channel_name, |j| j.title.as_str()))
+        .build();
     title_field.set_accessibility_label(&tr("Title"));
-    title_field.enable(false);
-    let start_label = StaticText::builder(&panel)
-        .with_label(&tr("Start (local time, YYYY-MM-DD HH:MM)"))
-        .build();
+    title_field.enable(job.is_none());
+    let start_name = tr("Start (local time, YYYY-MM-DD HH:MM)");
+    let start_label = StaticText::builder(&panel).with_label(&start_name).build();
     let start_field = TextCtrl::builder(&panel)
-        .with_value(&iptv_core::epg::local_datetime(job.start_ts as i64))
+        .with_value(&iptv_core::epg::local_datetime(start))
         .build();
-    start_field.set_accessibility_label(&tr("Start (local time, YYYY-MM-DD HH:MM)"));
-    if running {
-        start_field.enable(false);
-    }
-    let end_label = StaticText::builder(&panel)
-        .with_label(&tr("End (local time, YYYY-MM-DD HH:MM)"))
-        .build();
+    start_field.set_accessibility_label(&start_name);
+    start_field.enable(!running);
+    let end_name = tr("End (local time, YYYY-MM-DD HH:MM)");
+    let end_label = StaticText::builder(&panel).with_label(&end_name).build();
     let end_field = TextCtrl::builder(&panel)
-        .with_value(&iptv_core::epg::local_datetime(job.stop_ts as i64))
+        .with_value(&iptv_core::epg::local_datetime(end))
         .build();
-    end_field.set_accessibility_label(&tr("End (local time, YYYY-MM-DD HH:MM)"));
+    end_field.set_accessibility_label(&end_name);
+    let days_name = tr("Repeat on selected weekdays (none: once):");
+    let days_label = StaticText::builder(&panel).with_label(&days_name).build();
+    let days = CheckListBox::builder(&panel).build();
+    days.set_accessibility_label(&days_name);
+    for day in [
+        "Monday",
+        "Tuesday",
+        "Wednesday",
+        "Thursday",
+        "Friday",
+        "Saturday",
+        "Sunday",
+    ] {
+        days.append(&tr(day));
+    }
+    if let Some(job) = job.filter(|j| j.repeat == "weekdays") {
+        for day in job.weekdays.clone().unwrap_or_default() {
+            days.check(u32::from(day), true);
+        }
+    }
+    days.enable(!running && !series);
     let ok = Button::builder(&panel).with_label("&OK").build();
     ok.set_accessibility_label("OK");
     let cancel = Button::builder(&panel).with_label("&Cancel").build();
     cancel.set_accessibility_label("Cancel");
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     sizer.add(&channel_label, 0, SizerFlag::Expand | SizerFlag::All, 6);
-    sizer.add(&title_label, 0, SizerFlag::Expand | SizerFlag::All, 6);
-    sizer.add(&title_field, 0, SizerFlag::Expand | SizerFlag::All, 6);
-    sizer.add(&start_label, 0, SizerFlag::Expand | SizerFlag::All, 6);
-    sizer.add(&start_field, 0, SizerFlag::Expand | SizerFlag::All, 6);
-    sizer.add(&end_label, 0, SizerFlag::Expand | SizerFlag::All, 6);
-    sizer.add(&end_field, 0, SizerFlag::Expand | SizerFlag::All, 6);
+    for (label, field) in [
+        (&title_label, &title_field),
+        (&start_label, &start_field),
+        (&end_label, &end_field),
+    ] {
+        sizer.add(label, 0, SizerFlag::Expand | SizerFlag::All, 6);
+        sizer.add(field, 0, SizerFlag::Expand | SizerFlag::All, 6);
+    }
+    sizer.add(&days_label, 0, SizerFlag::Expand | SizerFlag::All, 6);
+    sizer.add(&days, 1, SizerFlag::Expand | SizerFlag::All, 6);
     let buttons = BoxSizer::builder(Orientation::Horizontal).build();
     buttons.add(&ok, 0, SizerFlag::All, 4);
     buttons.add(&cancel, 0, SizerFlag::All, 4);
     sizer.add_sizer(&buttons, 0, SizerFlag::Expand, 0);
     panel.set_sizer(sizer, true);
-    let values = Rc::new(RefCell::new(None::<(f64, f64)>));
+    let values = Rc::new(RefCell::new(None::<RecordingTimes>));
     let values_ok = Rc::clone(&values);
-    let dialog_ok = dialog;
-    let job_start = job.start_ts;
+    let job_start = job.map(|j| j.start_ts);
     ok.on_click(move |_| {
-        let parsed = (|| -> Result<(f64, f64), String> {
-            let start = if running {
-                job_start
-            } else {
-                local_timestamp(&start_field.get_value())?
+        let parsed = (|| -> Result<Option<RecordingTimes>, String> {
+            let start = match (running, job_start) {
+                (true, Some(start)) => start,
+                _ => match field_timestamp(&dialog, &start_field.get_value(), &start_name)? {
+                    Some(start) => start,
+                    None => return Ok(None),
+                },
             };
-            let end = local_timestamp(&end_field.get_value())?;
+            let Some(end) = field_timestamp(&dialog, &end_field.get_value(), &end_name)? else {
+                return Ok(None);
+            };
             iptv_core::dvr::validate_window(start, end, now_seconds(), running)?;
-            Ok((start, end))
+            let weekdays: Vec<u8> = (0..7u8)
+                .filter(|d| days.is_checked(u32::from(*d)))
+                .collect();
+            let first_day = chrono::TimeZone::timestamp_opt(&chrono::Local, start as i64, 0)
+                .single()
+                .map(|dt| {
+                    u8::try_from(chrono::Datelike::weekday(&dt).num_days_from_monday()).unwrap_or(0)
+                });
+            if !weekdays.is_empty() && !running && first_day.is_some_and(|d| !weekdays.contains(&d))
+            {
+                return Err("The first recording must start on a selected weekday.".to_string());
+            }
+            Ok(Some(RecordingTimes {
+                title: title_field.get_value(),
+                start,
+                end,
+                weekdays,
+            }))
         })();
         match parsed {
-            Ok(pair) => {
-                *values_ok.borrow_mut() = Some(pair);
-                dialog_ok.end_modal(ID_OK);
+            Ok(Some(times)) => {
+                *values_ok.borrow_mut() = Some(times);
+                dialog.end_modal(ID_OK);
             }
-            Err(error) => {
-                let message =
-                    MessageDialog::builder(&dialog_ok, &tr(&error), &tr("Schedule by Time"))
-                        .with_style(MessageDialogStyle::OK | MessageDialogStyle::IconError)
-                        .build();
-                message.show_modal_tracked();
-            }
+            Ok(None) => {}
+            Err(error) => operation_failed_box(&dialog, &error),
         }
     });
-    let dialog_cancel = dialog;
-    cancel.on_click(move |_| {
-        dialog_cancel.end_modal(ID_CANCEL);
-    });
+    cancel.on_click(move |_| dialog.end_modal(ID_CANCEL));
     if running {
         end_field.set_focus();
     } else {
         start_field.set_focus();
     }
     if dialog.show_modal_tracked() == ID_OK {
-        *values.borrow()
+        values.borrow_mut().take()
     } else {
         None
     }
@@ -18549,9 +18659,10 @@ fn edit_job_times(wiring: &Wiring, parent: &dyn WxWidget, job_id: &str, dstatus:
     {
         return;
     }
-    let Some((start, end)) = prompt_recording_times(parent, &job) else {
+    let Some(times) = prompt_recording_times(parent, &job.channel_name, Some(&job)) else {
         return;
     };
+    let (start, end) = (times.start, times.end);
     let channel = iptv_core::dvr::channel_from_snapshot(&job.channel);
     let config = config_value(wiring);
     let jobs = job_views(wiring);
@@ -18571,20 +18682,897 @@ fn edit_job_times(wiring: &Wiring, parent: &dyn WxWidget, job_id: &str, dstatus:
     {
         return;
     }
+    // Python: the days change only for a pending non-series job, and
+    // only when some are chosen or the job already repeats on days.
+    let edit_days = job.status != iptv_core::dvr::STATUS_RECORDING && job.repeat != "series";
+    let weekdays = (edit_days && (!times.weekdays.is_empty() || job.repeat == "weekdays"))
+        .then_some(times.weekdays.as_slice());
     let expected = (job.start_ts, job.stop_ts, job.status.as_str());
-    match wiring
-        .dvr
-        .borrow_mut()
-        .edit_timing(&job.id, start, end, expected, now_seconds(), None)
-    {
+    match wiring.dvr.borrow_mut().edit_timing(
+        &job.id,
+        start,
+        end,
+        expected,
+        now_seconds(),
+        weekdays,
+    ) {
         Ok(_) => dstatus.set_label(&tr("Recording schedule saved.")),
-        Err(error) => {
-            let message = MessageDialog::builder(parent, &tr(&error), &tr("Schedule by Time"))
-                .with_style(MessageDialogStyle::OK | MessageDialogStyle::IconError)
-                .build();
-            message.show_modal_tracked();
+        Err(error) => operation_failed_box(parent, &error),
+    }
+}
+
+/// Recordings > Schedule by Time... (Python `_schedule_by_time` for a
+/// new job): record the selected channel between two local times,
+/// optionally on chosen weekdays, without a guide programme.
+fn schedule_by_time(wiring: &Wiring, frame: &Frame, list: ListCtrl, status: Status) {
+    let Some(channel) = selected_channel(wiring, list) else {
+        operation_failed_box(frame, "No channel selected.");
+        return;
+    };
+    let name = iptv_core::favorites::display_name(&channel).to_string();
+    let Some(times) = prompt_recording_times(frame, &name, None) else {
+        return;
+    };
+    let config = config_value(wiring);
+    let warning = iptv_core::recording_limits::warning(
+        &config,
+        &channel,
+        times.start,
+        times.end,
+        &job_views(wiring),
+        None,
+    );
+    if !warning.is_empty()
+        && !confirm_conflicts(
+            wiring,
+            frame,
+            status,
+            &channel,
+            times.start,
+            times.end,
+            &warning,
+            None,
+        )
+    {
+        return;
+    }
+    let format = recording_format_for_channel(&wiring.persist, &wiring.media_probe.cache, &channel);
+    let now = now_seconds();
+    let result = iptv_core::dvr::build_manual_job(
+        &channel,
+        &times.title,
+        times.start,
+        times.end,
+        &format,
+        now,
+    )
+    .and_then(|mut job| {
+        if !times.weekdays.is_empty() {
+            job.repeat = "weekdays".to_string();
+            job.weekdays = Some(times.weekdays.clone());
+        }
+        wiring.dvr.borrow_mut().add_manual_job(job, now)
+    });
+    match result {
+        Ok(()) => {
+            ensure_polling(wiring);
+            status.set_label(&tr("Recording schedule saved."));
+        }
+        Err(error) => operation_failed_box(frame, &error),
+    }
+}
+
+const DVR_CTX_PADDING: i32 = 6054;
+const DVR_CTX_FIND_AIRING: i32 = 6055;
+const DVR_CTX_SKIP: i32 = 6056;
+
+/// Python `start_operation`: run `work` off the UI thread and hand
+/// its result to `done` on the UI thread.
+fn run_in_background<R: Send + 'static>(
+    owner: &Frame,
+    work: impl FnOnce() -> R + Send + 'static,
+    done: impl FnOnce(R) + 'static,
+) {
+    let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let filler = std::sync::Arc::clone(&slot);
+    std::thread::spawn(move || {
+        let result = work();
+        if let Ok(mut guard) = filler.lock() {
+            *guard = Some(result);
+        }
+    });
+    // ponytail: the timer keeps itself alive through its own closure
+    // (wxDragon destroys a dropped timer) and is only stopped once
+    // the result is in: one small timer per operation, never freed.
+    let timer = Rc::new(Timer::new(owner));
+    let keep = Rc::clone(&timer);
+    let done = RefCell::new(Some(done));
+    timer.on_tick(move |_| {
+        let ready = slot.lock().ok().and_then(|mut guard| guard.take());
+        if let Some(result) = ready {
+            keep.stop();
+            if let Some(done) = done.borrow_mut().take() {
+                done(result);
+            }
+        }
+    });
+    let _ = timer.start(100, false);
+}
+
+/// Python `personal_tools_ui.error_box`.
+fn operation_failed_box(parent: &dyn WxWidget, error: &str) {
+    let message = MessageDialog::builder(
+        parent,
+        &trf("The operation failed:\n{error}", &[("error", &tr(error))]),
+        &tr("Error"),
+    )
+    .with_style(MessageDialogStyle::OK | MessageDialogStyle::IconError)
+    .build();
+    message.show_modal_tracked();
+}
+
+/// Python `personal_tools_ui.confirm`: Yes/No, No by default.
+fn confirm_box(parent: &dyn WxWidget, text: &str) -> bool {
+    let message = MessageDialog::builder(parent, text, &tr("Confirm"))
+        .with_style(
+            MessageDialogStyle::YesNo
+                | MessageDialogStyle::NoDefault
+                | MessageDialogStyle::IconQuestion,
+        )
+        .build();
+    message.show_modal_tracked() == ID_YES
+}
+
+/// Python `_schedule_window_label`: the padded window, local time.
+fn schedule_window_label(job: &iptv_core::dvr::DvrJob) -> String {
+    #[allow(clippy::cast_possible_truncation)] // whole-second schedule times
+    let local = |ts: f64| {
+        chrono::TimeZone::timestamp_opt(&chrono::Local, ts as i64, 0)
+            .single()
+            .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+            .unwrap_or_default()
+    };
+    format!("{} - {}", local(job.start_ts), local(job.stop_ts))
+}
+
+/// A guide programme's window, local time (Python's review labels).
+fn programme_window_label(start: i64, stop: i64) -> String {
+    let local = |ts: i64| {
+        chrono::TimeZone::timestamp_opt(&chrono::Local, ts, 0)
+            .single()
+            .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+            .unwrap_or_default()
+    };
+    format!("{} – {}", local(start), local(stop))
+}
+
+fn selected_single_job(wiring: &Wiring, list: ListCtrl) -> Option<iptv_core::dvr::DvrJob> {
+    let ids = selected_job_ids(wiring, list);
+    (ids.len() == 1)
+        .then(|| wiring.dvr.borrow().get(&ids[0]).cloned())
+        .flatten()
+}
+
+fn edit_snapshot_map(snapshot: &[iptv_core::dvr::DvrJob]) -> iptv_core::recording_edits::Changes {
+    snapshot
+        .iter()
+        .map(|job| (job.id.clone(), job.clone()))
+        .collect()
+}
+
+/// Python `recording_edits_ui._review`: show the edit's limit
+/// warnings with its question, ask once, run `validate`, and publish
+/// against the snapshot it was computed from.
+fn publish_reviewed_edit(
+    wiring: &Wiring,
+    parent: &dyn WxWidget,
+    snapshot: &[iptv_core::dvr::DvrJob],
+    changes: iptv_core::recording_edits::Changes,
+    question: &str,
+    future_start: Option<f64>,
+    validate: Option<&dyn Fn() -> Result<(), String>>,
+) -> bool {
+    let warnings = iptv_core::recording_edits::warnings(
+        &config_value(wiring),
+        &changes,
+        &edit_snapshot_map(snapshot),
+    );
+    let text = std::iter::once(question.to_string())
+        .chain(warnings.iter().map(|w| tr(w)))
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    if !text.is_empty() && !confirm_box(parent, &text) {
+        return false;
+    }
+    if let Some(validate) = validate {
+        if let Err(error) = validate() {
+            operation_failed_box(parent, &error);
+            return false;
         }
     }
+    let result =
+        wiring
+            .dvr
+            .borrow_mut()
+            .apply_reviewed_edit(snapshot, changes, future_start, now_seconds());
+    match result {
+        Ok(()) => {
+            ensure_polling(wiring);
+            true
+        }
+        Err(error) => {
+            operation_failed_box(parent, &error);
+            false
+        }
+    }
+}
+
+/// Scheduled Recordings > Skip This Occurrence (Python `_skip_occurrence`).
+fn skip_selected_occurrence(wiring: &Wiring, frame: Frame, list: ListCtrl, dstatus: Status) {
+    let Some(job) = selected_single_job(wiring, list) else {
+        return;
+    };
+    let title = if job.display_title.is_empty() {
+        &job.title
+    } else {
+        &job.display_title
+    };
+    if !confirm_box_titled(
+        &frame,
+        &trf("Skip this occurrence of {title}?", &[("title", title)]),
+        &tr("Skip This Occurrence"),
+    ) {
+        return;
+    }
+    let result = wiring
+        .dvr
+        .borrow_mut()
+        .skip_occurrence(&job.id, job.start_ts, now_seconds());
+    render_scheduled_jobs(wiring, list, dstatus);
+    let (text, style) = match result {
+        Ok(next) => (
+            trf(
+                "Next recording: {time}",
+                &[("time", &schedule_window_label(&next))],
+            ),
+            MessageDialogStyle::OK | MessageDialogStyle::IconInformation,
+        ),
+        Err(error) => (
+            tr(&error),
+            MessageDialogStyle::OK | MessageDialogStyle::IconError,
+        ),
+    };
+    let message = MessageDialog::builder(&frame, &text, &tr("Scheduled Recordings"))
+        .with_style(style)
+        .build();
+    message.show_modal_tracked();
+}
+
+fn confirm_box_titled(parent: &dyn WxWidget, text: &str, title: &str) -> bool {
+    let message = MessageDialog::builder(parent, text, title)
+        .with_style(
+            MessageDialogStyle::YesNo
+                | MessageDialogStyle::NoDefault
+                | MessageDialogStyle::IconQuestion,
+        )
+        .build();
+    message.show_modal_tracked() == ID_YES
+}
+
+/// Scheduled Recordings > Repeat on Weekdays... (Python
+/// `planning_tools_ui.weekdays` + `_edit_weekdays`).
+fn edit_selected_weekdays(wiring: &Wiring, frame: Frame, list: ListCtrl, dstatus: Status) {
+    let Some(job) = selected_single_job(wiring, list) else {
+        dstatus.set_label(&tr(
+            "Select one pending recording that is not a series rule.",
+        ));
+        return;
+    };
+    let labels: Vec<String> = [
+        "Monday",
+        "Tuesday",
+        "Wednesday",
+        "Thursday",
+        "Friday",
+        "Saturday",
+        "Sunday",
+    ]
+    .iter()
+    .map(|day| tr(day))
+    .collect();
+    let dialog = MultiChoiceDialog::builder(
+        &frame,
+        &tr("Choose repeat days. Clear all days to record only once."),
+        &tr("Repeat on Weekdays..."),
+        &labels.iter().map(String::as_str).collect::<Vec<_>>(),
+    )
+    .build();
+    let current: Vec<i32> = if job.repeat == "weekdays" {
+        job.weekdays
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .map(i32::from)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    dialog.set_selections(&current);
+    if dialog.show_modal_tracked() != ID_OK {
+        return;
+    }
+    let days: Vec<u8> = dialog
+        .get_selections()
+        .into_iter()
+        .filter_map(|day| u8::try_from(day).ok())
+        .collect();
+    let result = wiring.dvr.borrow_mut().set_weekdays(&job.id, &days);
+    render_scheduled_jobs(wiring, list, dstatus);
+    if let Err(error) = result {
+        operation_failed_box(&frame, &error);
+    }
+}
+
+/// Scheduled Recordings > Padding for This Recording... (Python
+/// `RecordingPaddingDialog(job=)` + `padding_dialog`).
+fn padding_for_selected(wiring: &Wiring, frame: Frame, list: ListCtrl, dstatus: Status) {
+    let Some(job) = selected_single_job(wiring, list) else {
+        return;
+    };
+    let caption = tr("Padding for This Recording...");
+    let dialog = Dialog::builder(&frame, &caption)
+        .with_size(460, 240)
+        .build();
+    dialog.set_accessibility_label(&caption);
+    bind_escape_cancel(dialog);
+    let panel = Panel::builder(&dialog).build();
+    let intro = StaticText::builder(&panel).with_label(&job.title).build();
+    let before_label = tr("Minutes before programme:");
+    let after_label = tr("Minutes after programme:");
+    let spin = |label: &str, value: i64| {
+        let text = StaticText::builder(&panel).with_label(label).build();
+        let control = SpinCtrl::builder(&panel).with_range(0, 180).build();
+        control.set_value(i32::try_from(value.clamp(0, 180)).unwrap_or(0));
+        control.set_accessibility_label(label);
+        (text, control)
+    };
+    let (before_text, before) = spin(&before_label, job.pre_padding_minutes);
+    let (after_text, after) = spin(&after_label, job.post_padding_minutes);
+    let recurring = iptv_core::dvr::TIME_REPEATS.contains(&job.repeat.as_str())
+        || job.repeat == "series"
+        || job.series_source.is_some();
+    let future = recurring.then(|| {
+        CheckBox::builder(&panel)
+            .with_label(&tr("Apply to future occurrences too"))
+            .build()
+    });
+    let ok = Button::builder(&panel).with_label(&tr("OK")).build();
+    let cancel = Button::builder(&panel).with_label(&tr("Cancel")).build();
+    let sizer = BoxSizer::builder(Orientation::Vertical).build();
+    sizer.add(&intro, 0, SizerFlag::All, 8);
+    for (text, control) in [(&before_text, &before), (&after_text, &after)] {
+        sizer.add(text, 0, SizerFlag::Left | SizerFlag::Right, 8);
+        sizer.add(control, 0, SizerFlag::Expand | SizerFlag::All, 8);
+    }
+    if let Some(future) = &future {
+        sizer.add(future, 0, SizerFlag::All, 8);
+    }
+    let buttons = BoxSizer::builder(Orientation::Horizontal).build();
+    buttons.add(&ok, 0, SizerFlag::All, 4);
+    buttons.add(&cancel, 0, SizerFlag::All, 4);
+    sizer.add_sizer(&buttons, 0, SizerFlag::Expand, 0);
+    panel.set_sizer(sizer, true);
+    ok.on_click(move |_| dialog.end_modal(ID_OK));
+    cancel.on_click(move |_| dialog.end_modal(ID_CANCEL));
+    before.set_focus();
+    if dialog.show_modal_tracked() != ID_OK {
+        return;
+    }
+    let (before, after) = (i64::from(before.value()), i64::from(after.value()));
+    let future = future.is_some_and(|f| f.is_checked());
+    let snapshot = wiring.dvr.borrow().edit_snapshot();
+    if snapshot.iter().find(|j| j.id == job.id) != Some(&job) {
+        operation_failed_box(
+            &frame,
+            "The recording schedule changed. Check the times and try again.",
+        );
+        return;
+    }
+    match iptv_core::recording_edits::edit_padding(
+        &job,
+        before,
+        after,
+        future,
+        &edit_snapshot_map(&snapshot),
+        now_seconds(),
+    ) {
+        Ok(changes) => {
+            publish_reviewed_edit(wiring, &frame, &snapshot, changes, "", None, None);
+        }
+        Err(error) => operation_failed_box(&frame, &error),
+    }
+    render_scheduled_jobs(wiring, list, dstatus);
+}
+
+/// The automatic guide matcher over a store; C10's guide assignment
+/// joins it there.
+fn open_guide_matcher(
+) -> Result<(iptv_core::epgstore::EpgStore, iptv_core::epg::GuideIndexes), String> {
+    let store = iptv_core::epgstore::EpgStore::open(&epg_store_path())?;
+    let indexes = iptv_core::epg::GuideIndexes::build(&store.channels()?);
+    Ok((store, indexes))
+}
+
+fn guide_for_channel(
+    indexes: &iptv_core::epg::GuideIndexes,
+    channel: &Channel,
+) -> Option<(String, bool)> {
+    iptv_core::epg::match_guide_channel(channel, indexes, Some(&indexes.known_ids))
+        .map(|id| (id, false))
+}
+
+fn pending_jobs(wiring: &Wiring) -> Vec<iptv_core::dvr::DvrJob> {
+    wiring
+        .dvr
+        .borrow()
+        .jobs()
+        .iter()
+        .filter(|job| !iptv_core::dvr::DONE_STATUSES.contains(&job.status.as_str()))
+        .cloned()
+        .collect()
+}
+
+/// Scheduled Recordings > Review Guide Changes... (Python
+/// `review_guide_changes`); with `notify_only`, the after-import
+/// notice instead.
+#[allow(clippy::too_many_lines)] // one dialog flow, as in Python
+fn review_guide_changes(
+    wiring: &Wiring,
+    frame: Frame,
+    refresh: Option<(ListCtrl, Status)>,
+    notify_only: bool,
+) {
+    let jobs = pending_jobs(wiring);
+    let wiring_done = clone_wiring(wiring);
+    run_in_background(
+        &frame,
+        move || -> Result<Vec<iptv_core::recording_edits::GuideChange>, String> {
+            if jobs.is_empty() {
+                return Ok(Vec::new());
+            }
+            let (store, indexes) = open_guide_matcher()?;
+            iptv_core::recording_edits::changed_guide_times(
+                &store,
+                &jobs,
+                now_seconds(),
+                &|channel| guide_for_channel(&indexes, channel),
+                &|| false,
+            )
+        },
+        move |result| {
+            let wiring = &wiring_done;
+            if notify_only {
+                if let Ok(rows) = result {
+                    let count = rows
+                        .iter()
+                        .map(|(job, _, _)| job.id.as_str())
+                        .collect::<std::collections::BTreeSet<_>>()
+                        .len();
+                    if count > 0 {
+                        show_or_queue_notification(
+                            frame,
+                            &trf(
+                                "The guide times changed for {count} scheduled recording(s). Open Scheduled Recordings and choose Review Guide Changes.",
+                                &[("count", &count.to_string())],
+                            ),
+                            &tr("Scheduled Recordings"),
+                            MessageDialogStyle::OK | MessageDialogStyle::IconInformation,
+                            None,
+                        );
+                    }
+                }
+                return;
+            }
+            let rows = match result {
+                Ok(rows) => rows,
+                Err(error) => {
+                    operation_failed_box(&frame, &error);
+                    return;
+                }
+            };
+            if rows.is_empty() {
+                let message = MessageDialog::builder(
+                    &frame,
+                    &tr("No changes were found to upcoming recording times."),
+                    &tr("Review Guide Changes..."),
+                )
+                .with_style(MessageDialogStyle::OK)
+                .build();
+                message.show_modal_tracked();
+                return;
+            }
+            let labels: Vec<String> = rows
+                .iter()
+                .map(|(job, programme, exact)| {
+                    let old = (
+                        job.program.get("start").and_then(serde_json::Value::as_str).and_then(iptv_core::epg::parse_xmltv_time),
+                        job.program.get("end").and_then(serde_json::Value::as_str).and_then(iptv_core::epg::parse_xmltv_time),
+                    );
+                    let old = match old {
+                        (Some(start), Some(end)) => programme_window_label(start, end),
+                        _ => String::new(),
+                    };
+                    let (before, after) = iptv_core::recording_edits::padding(job);
+                    format!(
+                        "{} {}",
+                        trf(
+                            "{title} — {channel}. Previous time: {old}. New time: {new}. Padding in minutes: {before} before, {after} after.",
+                            &[
+                                ("title", &job.title),
+                                ("channel", &job.channel_name),
+                                ("old", &old),
+                                ("new", &programme_window_label(programme.start, programme.stop)),
+                                ("before", &before.to_string()),
+                                ("after", &after.to_string()),
+                            ],
+                        ),
+                        if *exact {
+                            tr("Matching programme details.")
+                        } else {
+                            tr("Possible time change. Check the programme.")
+                        }
+                    )
+                })
+                .collect();
+            let dialog = SingleChoiceDialog::builder(
+                &frame,
+                &tr("Choose a time change to review:"),
+                &tr("Review Guide Changes..."),
+                &labels.iter().map(String::as_str).collect::<Vec<_>>(),
+            )
+            .build();
+            if dialog.show_modal_tracked() != ID_OK {
+                return;
+            }
+            let Some(index) = usize::try_from(dialog.get_selection())
+                .ok()
+                .filter(|i| *i < rows.len())
+            else {
+                return;
+            };
+            let (job, programme, exact) = rows[index].clone();
+            let snapshot = wiring.dvr.borrow().edit_snapshot();
+            let changes = iptv_core::recording_edits::retime_booking(
+                &job,
+                &programme,
+                &edit_snapshot_map(&snapshot),
+                now_seconds(),
+            );
+            let changes = match changes {
+                Ok(changes) => changes,
+                Err(error) => {
+                    operation_failed_box(&frame, &error);
+                    return;
+                }
+            };
+            let still_current = || -> Result<(), String> {
+                let (store, indexes) = open_guide_matcher()?;
+                let rows = iptv_core::recording_edits::changed_guide_times(
+                    &store,
+                    std::slice::from_ref(&job),
+                    now_seconds(),
+                    &|channel| guide_for_channel(&indexes, channel),
+                    &|| false,
+                )?;
+                if rows
+                    .iter()
+                    .any(|(j, p, e)| j == &job && p == &programme && *e == exact)
+                {
+                    Ok(())
+                } else {
+                    Err("The programme guide changed. Refresh the list and try again.".to_string())
+                }
+            };
+            let (before, _) = iptv_core::recording_edits::padding(&job);
+            #[allow(clippy::cast_precision_loss)] // whole seconds
+            let future_start = (programme.start - before * 60) as f64;
+            publish_reviewed_edit(
+                wiring,
+                &frame,
+                &snapshot,
+                changes,
+                &format!("{}\n\n{}", labels[index], tr("Apply this time change?")),
+                Some(future_start),
+                Some(&still_current),
+            );
+            if let Some((list, dstatus)) = refresh {
+                render_scheduled_jobs(wiring, list, dstatus);
+            }
+        },
+    );
+}
+
+/// Scheduled Recordings > Find Another Airing... (Python `find_airing`).
+#[allow(clippy::too_many_lines)] // one dialog flow, as in Python
+fn find_another_airing(wiring: &Wiring, frame: Frame, list: ListCtrl, dstatus: Status) {
+    let Some(job) = selected_single_job(wiring, list) else {
+        return;
+    };
+    let model = wiring.browser.borrow().catalogue_model();
+    let config = config_value(wiring);
+    let views = job_views(wiring);
+    let search_job = job.clone();
+    let search_model = std::sync::Arc::clone(&model);
+    let wiring_done = clone_wiring(wiring);
+    dstatus.set_label(&tr("Searching..."));
+    run_in_background(
+        &frame,
+        move || -> Result<(Vec<iptv_core::recording_edits::Airing>, bool, Vec<String>), String> {
+            let (store, indexes) = open_guide_matcher()?;
+            let (rows, truncated) = iptv_core::recording_edits::other_airings(
+                &store,
+                &search_job,
+                search_model.channels(),
+                now_seconds(),
+                &|channel| guide_for_channel(&indexes, channel),
+                &|| false,
+                100,
+            )?;
+            let (before, after) = iptv_core::recording_edits::padding(&search_job);
+            #[allow(clippy::cast_precision_loss)] // whole seconds
+            let capacity = rows
+                .iter()
+                .map(|(channel, programme, _)| {
+                    let start = (programme.start - before * 60) as f64;
+                    let end = (programme.stop + after * 60) as f64;
+                    match iptv_core::recording_limits::peak_demand(
+                        &config,
+                        channel,
+                        start,
+                        end,
+                        &views,
+                        Some(&search_job.id),
+                    ) {
+                        None => {
+                            if iptv_core::recording_limits::warning(
+                                &config,
+                                channel,
+                                start,
+                                end,
+                                &views,
+                                Some(&search_job.id),
+                            )
+                            .is_empty()
+                            {
+                                String::new()
+                            } else {
+                                "Recording Conflicts".to_string()
+                            }
+                        }
+                        Some((peak, limit)) => {
+                            let mut label =
+                                format!("Connections needed: {peak}. Account limit: {limit}.");
+                            if peak > limit {
+                                label.push_str(" — Recording Conflicts");
+                            }
+                            label
+                        }
+                    }
+                })
+                .collect();
+            Ok((rows, truncated, capacity))
+        },
+        move |result| {
+            let wiring = &wiring_done;
+            dstatus.set_label("");
+            if !std::sync::Arc::ptr_eq(&model, &wiring.browser.borrow().catalogue_model()) {
+                operation_failed_box(&frame, "The channel list changed. Try again.");
+                return;
+            }
+            let (rows, truncated, capacity) = match result {
+                Ok(found) => found,
+                Err(error) => {
+                    operation_failed_box(&frame, &error);
+                    return;
+                }
+            };
+            if rows.is_empty() {
+                let message = MessageDialog::builder(
+                    &frame,
+                    &tr("No alternative airings were found in the next 14 days."),
+                    &tr("Find Another Airing..."),
+                )
+                .with_style(MessageDialogStyle::OK)
+                .build();
+                message.show_modal_tracked();
+                return;
+            }
+            let config = config_value(wiring);
+            let original_start = job
+                .program
+                .get("start")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let mut source_numbers: Vec<String> = Vec::new();
+            let mut labels: Vec<String> = rows
+                .iter()
+                .zip(&capacity)
+                .map(|((channel, programme, exact), capacity)| {
+                    let source = channel
+                        .unknown_attributes
+                        .get("provider-id")
+                        .or_else(|| channel.unknown_attributes.get("playlist-id"))
+                        .cloned()
+                        .unwrap_or_default();
+                    let mut alias = iptv_core::reminders::safe_title(
+                        &iptv_core::recording_limits::account_alias(&config, channel),
+                    );
+                    if alias.is_empty() && !source.is_empty() {
+                        let number = source_numbers
+                            .iter()
+                            .position(|s| s == &source)
+                            .unwrap_or_else(|| {
+                                source_numbers.push(source.clone());
+                                source_numbers.len() - 1
+                            })
+                            + 1;
+                        alias = trf("Source {number}", &[("number", &number.to_string())]);
+                    }
+                    let same_time =
+                        iptv_core::dvr::xmltv_from_ts(programme.start) == original_start;
+                    [
+                        programme.title.clone(),
+                        iptv_core::reminders::safe_title(&channel.name),
+                        alias,
+                        programme_window_label(programme.start, programme.stop),
+                        if *exact {
+                            tr("Same episode")
+                        } else {
+                            tr("Possible repeat")
+                        },
+                        if same_time {
+                            tr("Same time, different source")
+                        } else {
+                            String::new()
+                        },
+                        capacity
+                            .split(" — ")
+                            .map(tr)
+                            .collect::<Vec<_>>()
+                            .join(" — "),
+                    ]
+                    .into_iter()
+                    .filter(|part| !part.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" — ")
+                })
+                .collect();
+            let mut seen: std::collections::HashMap<String, usize> =
+                std::collections::HashMap::new();
+            for label in &mut labels {
+                let count = seen.entry(label.clone()).or_insert(0);
+                *count += 1;
+                if *count > 1 {
+                    label.push_str(" — ");
+                    label.push_str(&trf("Source {number}", &[("number", &count.to_string())]));
+                }
+            }
+            let caption = tr("Find Another Airing...");
+            let dialog = Dialog::builder(&frame, &caption)
+                .with_size(760, 420)
+                .build();
+            dialog.set_accessibility_label(&caption);
+            bind_escape_cancel(dialog);
+            let panel = Panel::builder(&dialog).build();
+            let heading = StaticText::builder(&panel)
+                .with_label(&tr("Programmes"))
+                .build();
+            let listing = ListBox::builder(&panel).build();
+            listing.set_accessibility_label(&tr("Programmes"));
+            for label in &labels {
+                listing.append(label);
+            }
+            listing.set_selection(0, true);
+            let note = truncated.then(|| {
+                StaticText::builder(&panel)
+                    .with_label(&tr("Only the first 100 results are shown."))
+                    .build()
+            });
+            let ok = Button::builder(&panel).with_label(&tr("OK")).build();
+            let cancel = Button::builder(&panel).with_label(&tr("Cancel")).build();
+            let sizer = BoxSizer::builder(Orientation::Vertical).build();
+            sizer.add(&heading, 0, SizerFlag::All, 8);
+            sizer.add(&listing, 1, SizerFlag::Expand | SizerFlag::All, 8);
+            if let Some(note) = &note {
+                sizer.add(note, 0, SizerFlag::All, 8);
+            }
+            let buttons = BoxSizer::builder(Orientation::Horizontal).build();
+            buttons.add(&ok, 0, SizerFlag::All, 4);
+            buttons.add(&cancel, 0, SizerFlag::All, 4);
+            sizer.add_sizer(&buttons, 0, SizerFlag::Expand, 0);
+            panel.set_sizer(sizer, true);
+            ok.on_click(move |_| dialog.end_modal(ID_OK));
+            cancel.on_click(move |_| dialog.end_modal(ID_CANCEL));
+            listing.set_focus();
+            if dialog.show_modal_tracked() != ID_OK {
+                return;
+            }
+            let Some(index) = listing
+                .get_selection()
+                .and_then(|i| usize::try_from(i).ok())
+                .filter(|i| *i < rows.len())
+            else {
+                return;
+            };
+            let (channel, programme, _) = rows[index].clone();
+            let format = if iptv_core::reminders::reminder_channel_key(&channel)
+                == iptv_core::reminders::reminder_channel_key(
+                    &iptv_core::dvr::channel_from_snapshot(&job.channel),
+                ) {
+                job.format.clone()
+            } else {
+                recording_format_for_channel(&wiring.persist, &wiring.media_probe.cache, &channel)
+            };
+            let snapshot = wiring.dvr.borrow().edit_snapshot();
+            let changes = iptv_core::recording_edits::move_airing(
+                &job,
+                &channel,
+                &programme,
+                &format,
+                &edit_snapshot_map(&snapshot),
+                now_seconds(),
+            );
+            let changes = match changes {
+                Ok(changes) => changes,
+                Err(error) => {
+                    operation_failed_box(&frame, &error);
+                    return;
+                }
+            };
+            let validate = || -> Result<(), String> {
+                if !std::sync::Arc::ptr_eq(&model, &wiring.browser.borrow().catalogue_model()) {
+                    return Err("The channel list changed. Try again.".to_string());
+                }
+                let store = iptv_core::epgstore::EpgStore::open(&epg_store_path())?;
+                let current = store.programme_details(
+                    &programme.channel_id,
+                    programme.start,
+                    programme.stop,
+                    &programme.title,
+                )?;
+                let unchanged = current.is_some_and(|c| {
+                    (
+                        c.episode.as_str(),
+                        c.subtitle.as_str(),
+                        c.description.as_str(),
+                    ) == (
+                        programme.episode.as_str(),
+                        programme.subtitle.as_str(),
+                        programme.description.as_str(),
+                    )
+                });
+                if unchanged {
+                    Ok(())
+                } else {
+                    Err("The programme guide changed. Refresh the list and try again.".to_string())
+                }
+            };
+            #[allow(clippy::cast_precision_loss)] // whole seconds
+            let future_start = programme.start as f64;
+            publish_reviewed_edit(
+                wiring,
+                &frame,
+                &snapshot,
+                changes,
+                &format!("{}\n{}", tr("Record this airing instead?"), labels[index]),
+                Some(future_start),
+                Some(&validate),
+            );
+            render_scheduled_jobs(wiring, list, dstatus);
+        },
+    );
 }
 
 /// The Scheduled Recordings dialog (audit R19): a multi-select
@@ -18608,6 +19596,28 @@ fn open_scheduled_dialog(wiring: &Wiring, main_status: Status) {
     list.insert_column(2, "Channel", ListColumnFormat::Left, 180);
     list.insert_column(3, "Status", ListColumnFormat::Left, 110);
     list.insert_column(4, "Format", ListColumnFormat::Left, 120);
+    // Python inserts this option right under the list.
+    let notify = CheckBox::builder(&panel)
+        .with_label(&tr(
+            "Notify me of recording time changes after guide updates",
+        ))
+        .build();
+    notify.set_value(
+        wiring
+            .persist
+            .config
+            .borrow()
+            .value("notify_recording_guide_changes")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true),
+    );
+    let wiring_n = clone_wiring(wiring);
+    notify.on_toggled(move |_| {
+        wiring_n.persist.set_and_save(
+            "notify_recording_guide_changes",
+            serde_json::json!(notify.is_checked()),
+        );
+    });
     let status_label = StaticText::builder(&panel)
         .with_label("Dialog status")
         .build();
@@ -18641,8 +19651,24 @@ fn open_scheduled_dialog(wiring: &Wiring, main_status: Status) {
         .with_label("Recording &Conflicts...")
         .build();
     view_conflicts.set_accessibility_label("Recording Conflicts...");
+    let repeat_weekdays = Button::builder(&panel)
+        .with_label(&tr("Repeat on Weekdays..."))
+        .build();
+    repeat_weekdays.set_accessibility_label(&tr("Repeat on Weekdays..."));
     let delete_job = Button::builder(&panel).with_label("&Delete").build();
     let refresh = Button::builder(&panel).with_label("&Refresh").build();
+    let review = Button::builder(&panel)
+        .with_label(&tr("Review Guide Changes..."))
+        .build();
+    review.set_accessibility_label(&tr("Review Guide Changes..."));
+    let wiring_w = clone_wiring(wiring);
+    repeat_weekdays.on_click(move |_| {
+        edit_selected_weekdays(&wiring_w, frame, list, dstatus);
+    });
+    let wiring_g = clone_wiring(wiring);
+    review.on_click(move |_| {
+        review_guide_changes(&wiring_g, frame, Some((list, dstatus)), false);
+    });
     let close = Button::builder(&panel).with_label("&Close").build();
     let wiring_c = clone_wiring(wiring);
     cancel_job.on_click(move |_| {
@@ -18705,6 +19731,7 @@ fn open_scheduled_dialog(wiring: &Wiring, main_status: Status) {
     // selects every row; Delete removes the selected finished
     // jobs. Matched keys are consumed.
     let wiring_k = clone_wiring(wiring);
+    let wiring_ctx = clone_wiring(wiring);
     list.bind_internal(EventType::KEY_DOWN, move |event| {
         if key_event_label(event) == Some("Ctrl+A".to_string()) {
             let count = list.get_item_count();
@@ -18732,6 +19759,31 @@ fn open_scheduled_dialog(wiring: &Wiring, main_status: Status) {
             menu.append_separator();
             menu.append(DVR_CTX_CANCEL, &tr("Cancel"), "", ItemKind::Normal);
             menu.append(DVR_CTX_DELETE, &tr("Delete\tDel"), "", ItemKind::Normal);
+            // Python's single-selection items for a pending entry.
+            if let Some(job) = selected_single_job(&wiring_ctx, list) {
+                if job.status == iptv_core::dvr::STATUS_SCHEDULED {
+                    menu.append(
+                        DVR_CTX_PADDING,
+                        &tr("Padding for This Recording..."),
+                        "",
+                        ItemKind::Normal,
+                    );
+                    menu.append(
+                        DVR_CTX_FIND_AIRING,
+                        &tr("Find Another Airing..."),
+                        "",
+                        ItemKind::Normal,
+                    );
+                    if iptv_core::dvr::TIME_REPEATS.contains(&job.repeat.as_str()) {
+                        menu.append(
+                            DVR_CTX_SKIP,
+                            &tr("Skip This Occurrence"),
+                            "",
+                            ItemKind::Normal,
+                        );
+                    }
+                }
+            }
         }
         list.popup_menu(&mut menu, None);
     });
@@ -18740,6 +19792,9 @@ fn open_scheduled_dialog(wiring: &Wiring, main_status: Status) {
         DVR_CTX_REFRESH => render_scheduled_jobs(&wiring_m, list, dstatus),
         DVR_CTX_CANCEL => cancel_first_selected_job(&wiring_m, list, dstatus),
         DVR_CTX_DELETE => delete_selected_finished_jobs(&wiring_m, list, dstatus),
+        DVR_CTX_PADDING => padding_for_selected(&wiring_m, frame, list, dstatus),
+        DVR_CTX_FIND_AIRING => find_another_airing(&wiring_m, frame, list, dstatus),
+        DVR_CTX_SKIP => skip_selected_occurrence(&wiring_m, frame, list, dstatus),
         _ => {}
     });
     close.on_click(move |_| frame.hide());

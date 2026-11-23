@@ -1325,7 +1325,7 @@ Checked and not gaps: Python's start-at-100-percent volume fix (Rust never reads
 
 ### Open
 
-- **C1, high: recording planning engine.** Review Guide Changes and its notice option, Find Another Airing, Skip This Occurrence, Repeat on Weekdays, Padding for This Recording, episode-aware rerun suppression, Partial and Stopped-by-user outcomes with later-airing rescheduling, unreadable-schedule backup. Python `dvr.py`, `recording_edits.py`, `planning_tools.py`, `recording_outcome.py`.
+- **C1, high: recording planning engine.** **Fixed 2026-11-23 (validation 0102); Schedule by Time for new recordings was also missing and is ported there.** Review Guide Changes and its notice option, Find Another Airing, Skip This Occurrence, Repeat on Weekdays, Padding for This Recording, episode-aware rerun suppression, Partial and Stopped-by-user outcomes with later-airing rescheduling, unreadable-schedule backup. Python `dvr.py`, `recording_edits.py`, `planning_tools.py`, `recording_outcome.py`.
 - **C2, medium: Recover from Channel Archive.** Python `main.py`.
 - **C3, medium: Prevent Automatic Sleep While Recording and Wake for Scheduled Recordings.** Python `recording_power.py`.
 - **C4, medium: Recording Space Monitor.** Python `storage_monitor.py`.

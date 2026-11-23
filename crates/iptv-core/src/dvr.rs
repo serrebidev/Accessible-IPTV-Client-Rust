@@ -476,6 +476,44 @@ fn slot_channel_key(job: &DvrJob) -> String {
     crate::reminders::reminder_channel_key(&channel_from_snapshot(&job.channel))
 }
 
+/// Python `manual_schedule.build_manual_job`: a by-time recording of
+/// `channel` with no guide programme and no padding.
+///
+/// # Errors
+/// Returns Python's messages for an invalid window and a title that
+/// is empty, longer than 240 characters, or holds control characters.
+#[allow(clippy::cast_possible_truncation)] // whole-second schedule times
+pub fn build_manual_job(
+    channel: &Channel,
+    title: &str,
+    start: f64,
+    end: f64,
+    format: &str,
+    now: f64,
+) -> Result<DvrJob, String> {
+    validate_window(start, end, now, false)?;
+    let title = title.trim();
+    if title.is_empty() || title.chars().count() > 240 || title.chars().any(|c| (c as u32) < 32) {
+        return Err("Enter a title of 1 to 240 characters.".to_string());
+    }
+    let spec = NewJob {
+        channel,
+        programme_title: title,
+        programme_start: start as i64,
+        programme_stop: end as i64,
+        format,
+        pre_padding_minutes: 0,
+        post_padding_minutes: 0,
+        repeat: "",
+        episode: "",
+        subtitle: "",
+        description: "",
+    };
+    let mut job = build_job(&spec, now)?;
+    job.manual = Some(true);
+    Ok(job)
+}
+
 /// What the scheduler wants the caller to do after a tick.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DvrAction {
@@ -1008,6 +1046,33 @@ impl DvrSchedule {
             };
             job.repeat = repeat.to_string();
             Ok(true)
+        })
+    }
+
+    /// Python `add_manual_job`: durable, duplicate-safe insertion of
+    /// a by-time recording; the same channel and window already
+    /// pending is refused.
+    ///
+    /// # Errors
+    /// Returns Python's messages for an invalid window or a
+    /// duplicate, and write errors.
+    #[allow(clippy::float_cmp)] // stored windows compare exactly, as Python's do
+    pub fn add_manual_job(&mut self, job: DvrJob, now: f64) -> Result<(), String> {
+        validate_window(job.start_ts, job.stop_ts, now, false)?;
+        let key = slot_channel_key(&job);
+        self.transaction(|jobs| {
+            let duplicate = jobs.iter().any(|old| {
+                old.id == job.id
+                    || (ACTIVE_STATUSES.contains(&old.status.as_str())
+                        && slot_channel_key(old) == key
+                        && old.start_ts == job.start_ts
+                        && old.stop_ts == job.stop_ts)
+            });
+            if duplicate {
+                return Err("This recording is already scheduled.".to_string());
+            }
+            jobs.push(job);
+            Ok(())
         })
     }
 
@@ -2326,6 +2391,46 @@ mod tests {
             .iter()
             .filter(|j| j.series_source.as_deref() == Some(rule.id.as_str()))
             .all(|j| j.status == STATUS_CANCELED && j.message == "Series recording canceled."));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn manual_jobs_validate_title_and_refuse_duplicates() {
+        let chan = channel();
+        let now = 1_000.0;
+        assert_eq!(
+            build_manual_job(&chan, " ", 2_000.0, 3_000.0, "provider_mkv", now),
+            Err("Enter a title of 1 to 240 characters.".to_string())
+        );
+        assert_eq!(
+            build_manual_job(
+                &chan,
+                &"x".repeat(241),
+                2_000.0,
+                3_000.0,
+                "provider_mkv",
+                now
+            ),
+            Err("Enter a title of 1 to 240 characters.".to_string())
+        );
+        assert_eq!(
+            build_manual_job(&chan, "Show", 500.0, 3_000.0, "provider_mkv", now),
+            Err("The recording start time has already passed.".to_string())
+        );
+        let job = build_manual_job(&chan, " Show ", 2_000.0, 3_000.0, "provider_mkv", now).unwrap();
+        assert_eq!(job.title, "Show");
+        assert_eq!(job.manual, Some(true));
+        assert_eq!((job.pre_padding_minutes, job.post_padding_minutes), (0, 0));
+        assert_eq!(job.program["start"], xmltv_from_ts(2_000));
+        let dir = temp_dir("manual");
+        let mut schedule = DvrSchedule::load(dir.join("scheduled_recordings.json"), 0.0);
+        schedule.add_manual_job(job.clone(), now).unwrap();
+        let mut again = job;
+        again.id = "other".to_string();
+        assert_eq!(
+            schedule.add_manual_job(again, now),
+            Err("This recording is already scheduled.".to_string())
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 

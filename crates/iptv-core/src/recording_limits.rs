@@ -286,7 +286,10 @@ pub struct ConflictRow {
     pub end: f64,
 }
 
-fn account_alias(config: &Value, channel: &Channel) -> String {
+/// The configured playlist name for a channel's account (never a URL
+/// or credential), empty when none is configured.
+#[must_use]
+pub fn account_alias(config: &Value, channel: &Channel) -> String {
     let provider = attr(channel, "provider-id");
     let playlist = attr(channel, "playlist-id");
     for entry in playlists(config) {
