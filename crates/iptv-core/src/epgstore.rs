@@ -575,6 +575,85 @@ impl EpgStore {
         Ok(out)
     }
 
+    /// Programmes on a channel starting in [from, to], by start then
+    /// stop (Python `start BETWEEN ? AND ?`), with episode fields.
+    ///
+    /// # Errors
+    /// Returns the `SQLite` error text when the query fails.
+    pub fn programmes_starting(
+        &self,
+        channel_id: &str,
+        from: i64,
+        to: i64,
+    ) -> Result<Vec<Programme>, String> {
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT channel, start, stop, title, description, episode, subtitle FROM programmes
+                 WHERE channel = ?1 AND start BETWEEN ?2 AND ?3
+                 ORDER BY start, stop",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = statement
+            .query_map(rusqlite::params![channel_id, from, to], row_programme)
+            .map_err(|e| e.to_string())?;
+        collect_rows(rows)
+    }
+
+    /// Programmes on any channel starting in (from, to] whose
+    /// trimmed title equals `title` ignoring ASCII case, by start,
+    /// channel, stop. Callers compare the full case-folded title.
+    ///
+    /// # Errors
+    /// Returns the `SQLite` error text when the query fails.
+    pub fn programmes_titled(
+        &self,
+        title: &str,
+        from: i64,
+        to: i64,
+    ) -> Result<Vec<Programme>, String> {
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT channel, start, stop, title, description, episode, subtitle FROM programmes
+                 WHERE start > ?2 AND start <= ?3 AND lower(trim(title)) = lower(trim(?1))
+                 ORDER BY start, channel, stop",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = statement
+            .query_map(rusqlite::params![title, from, to], row_programme)
+            .map_err(|e| e.to_string())?;
+        collect_rows(rows)
+    }
+
+    /// Python `programme_details`: one slot's sub-title, episode and
+    /// description, or `None` when the slot is gone.
+    ///
+    /// # Errors
+    /// Returns the `SQLite` error text when the query fails.
+    pub fn programme_details(
+        &self,
+        channel_id: &str,
+        start: i64,
+        stop: i64,
+        title: &str,
+    ) -> Result<Option<Programme>, String> {
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT channel, start, stop, title, description, episode, subtitle FROM programmes
+                 WHERE channel = ?1 AND start = ?2 AND stop = ?3 AND title = ?4",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = statement
+            .query_map(
+                rusqlite::params![channel_id, start, stop, title],
+                row_programme,
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(collect_rows(rows)?.into_iter().next())
+    }
+
     /// Programmes for a channel in [from, to), by start.
     ///
     /// # Errors

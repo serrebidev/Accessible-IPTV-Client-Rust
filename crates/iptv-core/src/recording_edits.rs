@@ -299,6 +299,296 @@ pub fn warnings(config: &Value, changes: &Changes, jobs: &Changes) -> Vec<String
     messages
 }
 
+/// Python `channel_identity.xmltv_id`: the guide's own id, without
+/// the application's per-source `epg:<40 hex>:` qualifier.
+#[must_use]
+pub fn xmltv_id(identity: &str) -> &str {
+    identity
+        .strip_prefix("epg:")
+        .and_then(|rest| rest.split_once(':'))
+        .filter(|(hex, _)| hex.len() == 40 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
+        .map_or(identity, |(_, id)| id)
+}
+
+/// Python `programme_reminders.media_identity`: the stream address
+/// with its request headers, so two entries for the same URL with
+/// different headers stay distinct.
+fn media_identity(channel: &Channel) -> (String, Vec<(String, String)>) {
+    let mut headers = crate::downloads::channel_headers(channel);
+    headers.sort();
+    (channel.url.clone(), headers)
+}
+
+fn fold(text: &str) -> String {
+    text.trim().to_lowercase()
+}
+
+/// A guide channel for a playlist channel: its id, and whether it
+/// comes from the user's own guide assignment (C10) rather than
+/// automatic matching.
+pub type GuideFor<'a> = dyn Fn(&Channel) -> Option<(String, bool)> + 'a;
+
+/// One booking the guide moved: the job, the guide's programme for
+/// it now, and whether the episode identity matches exactly.
+pub type GuideChange = (DvrJob, Programme, bool);
+
+/// Python `changed_guide_times`: for each pending guide booking (not
+/// manual, not a time repeat, not started), the programmes on its own
+/// guide channel within six hours of its original start that have the
+/// same title, a compatible episode, and new times; an unchanged
+/// broadcast clears the booking's candidates.
+///
+/// # Errors
+/// Returns the store's error text.
+pub fn changed_guide_times(
+    store: &crate::epgstore::EpgStore,
+    jobs: &[DvrJob],
+    now: f64,
+    guide_for: &GuideFor<'_>,
+    canceled: &dyn Fn() -> bool,
+) -> Result<Vec<GuideChange>, String> {
+    let mut results = Vec::new();
+    let mut channels: BTreeMap<String, Option<(String, bool)>> = BTreeMap::new();
+    for job in jobs {
+        if canceled() {
+            break;
+        }
+        if job.status != STATUS_SCHEDULED
+            || job.manual == Some(true)
+            || TIME_REPEATS.contains(&job.repeat.as_str())
+            || job.start_ts <= now
+        {
+            continue;
+        }
+        let (Ok(start), Ok(end)) = (programme_time(job, "start"), programme_time(job, "end"))
+        else {
+            continue;
+        };
+        let channel = dvr::channel_from_snapshot(&job.channel);
+        let key = crate::reminders::reminder_channel_key(&channel);
+        let Some((cid, assigned)) = channels
+            .entry(key)
+            .or_insert_with(|| guide_for(&channel))
+            .clone()
+        else {
+            continue;
+        };
+        let booked_id = job
+            .program
+            .get("channel_id")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if !booked_id.is_empty() && booked_id != cid {
+            continue;
+        }
+        let declared = channel.tvg_id.trim();
+        if !declared.is_empty()
+            && !assigned
+            && booked_id.is_empty()
+            && xmltv_id(&cid).to_lowercase() != xmltv_id(declared).to_lowercase()
+        {
+            continue; // A similarly named replacement station is not the booked source.
+        }
+        let title = fold(
+            job.program
+                .get("title")
+                .and_then(Value::as_str)
+                .unwrap_or(&job.title),
+        );
+        let identity = dvr::program_episode_key(&job.program);
+        let near = 6 * 3600;
+        let mut candidates = Vec::new();
+        for row in store.programmes_starting(&cid, start - near, start + near)? {
+            if fold(&row.title) != title {
+                continue;
+            }
+            let matched = dvr::program_episode_key(&programme_value(&row));
+            if identity.is_some() && matched.is_some() && identity != matched {
+                continue;
+            }
+            if (row.start, row.stop) == (start, end) {
+                candidates.clear();
+                break; // unchanged broadcast, even when a later repeat also matches
+            }
+            let exact = identity.is_some() && matched == identity;
+            if row.start >= row.stop || secs(row.start - job.pre_padding_minutes * 60) <= now {
+                continue;
+            }
+            if exact || (row.start < end && row.stop > start) {
+                candidates.push((job.clone(), row, exact));
+            }
+        }
+        results.extend(candidates);
+    }
+    Ok(results)
+}
+
+/// A playlist channel under its guide channel, keyed as Python's
+/// `(channel_key, media_identity)`.
+type GuideEntry = (String, (String, Vec<(String, String)>), Channel);
+
+/// One other airing: the playlist channel, the programme, and whether
+/// the episode number matches exactly.
+pub type Airing = (Channel, Programme, bool);
+
+/// Python `other_airings`: the same programme over the next 14 days
+/// on any playlist channel the guide covers, numbered episode matches
+/// first, then title-only possible repeats; the booking's own slot on
+/// its own source is left out. Returns up to `maximum` and whether
+/// more were found.
+///
+/// # Errors
+/// Returns the store's error text.
+#[allow(clippy::too_many_lines)] // one walk, as in Python
+pub fn other_airings(
+    store: &crate::epgstore::EpgStore,
+    job: &DvrJob,
+    channels: &[Channel],
+    now: f64,
+    guide_for: &GuideFor<'_>,
+    canceled: &dyn Fn() -> bool,
+    maximum: usize,
+) -> Result<(Vec<Airing>, bool), String> {
+    #[allow(clippy::cast_possible_truncation)] // whole seconds
+    let from = now as i64;
+    let to = from + 14 * 86_400;
+    let original_channel = dvr::channel_from_snapshot(&job.channel);
+    let mut original = job.program.clone();
+    if let (Some((source, _)), Ok(start), Ok(end)) = (
+        guide_for(&original_channel),
+        programme_time(job, "start"),
+        programme_time(job, "end"),
+    ) {
+        let title = original
+            .get("title")
+            .and_then(Value::as_str)
+            .unwrap_or(&job.title)
+            .to_string();
+        if let Some(info) = store.programme_details(&source, start, end, &title)? {
+            for (key, value) in [
+                ("subtitle", info.subtitle),
+                ("episode", info.episode),
+                ("description", info.description),
+            ] {
+                let missing = original
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .is_empty();
+                if missing && !value.is_empty() && original.is_object() {
+                    original[key] = value.into();
+                }
+            }
+        }
+    }
+    let identity = dvr::program_episode_key(&original);
+    let title = fold(
+        original
+            .get("title")
+            .and_then(Value::as_str)
+            .unwrap_or(&job.title),
+    );
+    let original_start = original
+        .get("start")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let rows = store.programmes_titled(&title, from, to)?;
+    if rows.is_empty() {
+        return Ok((Vec::new(), false));
+    }
+    let mut by_guide: BTreeMap<String, Vec<GuideEntry>> = BTreeMap::new();
+    for channel in channels {
+        if canceled() {
+            return Ok((Vec::new(), false));
+        }
+        let kind = channel
+            .unknown_attributes
+            .get("kind")
+            .map_or("", String::as_str);
+        if channel.url.is_empty() || matches!(kind, "series" | "movie") {
+            continue;
+        }
+        if let Some((gid, _)) = guide_for(channel) {
+            let key = (
+                crate::reminders::reminder_channel_key(channel),
+                media_identity(channel),
+            );
+            let entries = by_guide.entry(gid).or_default();
+            if !entries.iter().any(|(k, m, _)| (k, m) == (&key.0, &key.1)) {
+                entries.push((key.0, key.1, channel.clone()));
+            }
+        }
+    }
+    let source_of = |c: &Channel| {
+        c.unknown_attributes
+            .get("provider-id")
+            .or_else(|| c.unknown_attributes.get("playlist-id"))
+            .cloned()
+            .unwrap_or_default()
+    };
+    let original_source = source_of(&original_channel);
+    let numbered = identity.as_deref().is_some_and(|i| i.starts_with("ep:"));
+    let (mut confirmed, mut possible): (Vec<Airing>, Vec<Airing>) = (Vec::new(), Vec::new());
+    let mut total = 0_usize;
+    let finish = |confirmed: Vec<Airing>, possible: Vec<Airing>, more: bool| {
+        let mut all = confirmed;
+        all.extend(possible);
+        all.truncate(maximum);
+        (all, more)
+    };
+    for row in rows {
+        if canceled() {
+            return Ok((Vec::new(), false));
+        }
+        if fold(&row.title) != title || row.start >= row.stop {
+            continue;
+        }
+        let Some(entries) = by_guide.get(&row.channel_id) else {
+            continue;
+        };
+        let candidate = dvr::program_episode_key(&programme_value(&row));
+        if let (true, Some(candidate), Some(identity)) = (numbered, &candidate, &identity) {
+            if candidate.starts_with("ep:") && identity != candidate {
+                let (old_episode, old_part) =
+                    identity.split_once(":part").unwrap_or((identity, ""));
+                let (new_episode, new_part) =
+                    candidate.split_once(":part").unwrap_or((candidate, ""));
+                if old_episode != new_episode || (!old_part.is_empty() && !new_part.is_empty()) {
+                    continue;
+                }
+            }
+        }
+        let exact = numbered && identity == candidate;
+        let row_start = dvr::xmltv_from_ts(row.start);
+        for (_, _, channel) in entries {
+            if row_start == original_start {
+                let other_source = source_of(channel);
+                if original_source.is_empty()
+                    || other_source.is_empty()
+                    || original_source == other_source
+                {
+                    continue;
+                }
+                if !original_channel.url.is_empty()
+                    && media_identity(channel) == media_identity(&original_channel)
+                {
+                    continue;
+                }
+            }
+            total += 1;
+            let group = if exact { &mut confirmed } else { &mut possible };
+            if group.len() < maximum {
+                group.push((channel.clone(), row.clone(), exact));
+            }
+            if total > maximum && (confirmed.len() == maximum || !numbered) {
+                return Ok(finish(confirmed, possible, true));
+            }
+        }
+    }
+    Ok(finish(confirmed, possible, total > maximum))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -509,5 +799,131 @@ mod tests {
             Err(GUIDE_CHANGED.to_string())
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn guide_store(rows: &[(&str, f64, &str)]) -> crate::epgstore::EpgStore {
+        let mut store = crate::epgstore::EpgStore::open(std::path::Path::new(":memory:")).unwrap();
+        let mut programmes: std::collections::HashMap<String, Vec<Programme>> =
+            std::collections::HashMap::new();
+        for (channel, start, episode) in rows {
+            let mut row = show(*start, episode);
+            row.channel_id = (*channel).to_string();
+            programmes
+                .entry((*channel).to_string())
+                .or_default()
+                .push(row);
+        }
+        let channels = programmes
+            .keys()
+            .map(|id| crate::epg::EpgChannel {
+                id: id.clone(),
+                display_name: "Concert".to_string(),
+            })
+            .collect();
+        store
+            .import_source(
+                "k",
+                &crate::epg::EpgGuide {
+                    channels,
+                    programmes,
+                },
+                1_000,
+            )
+            .unwrap();
+        store
+    }
+
+    fn by_tvg_id(channel: &Channel) -> Option<(String, bool)> {
+        (!channel.tvg_id.is_empty()).then(|| (channel.tvg_id.clone(), false))
+    }
+
+    /// Python `test_find_confirm_and_move_one_airing_atomically`: the
+    /// booking's own slot and a different episode are left out, the
+    /// numbered match comes first, then the unnumbered airing; an
+    /// airing beyond 14 days is not offered.
+    #[test]
+    fn other_airings_rank_numbered_matches_first() {
+        let store = guide_store(&[
+            ("A", NOW + 3600.0, "1x01"),
+            ("A", NOW + 7200.0, "1x02"),
+            ("B", NOW + 3.0 * 3600.0, "S01E01"),
+            ("B", NOW + 4.0 * 3600.0, ""),
+            ("B", NOW + 400.0 * 3600.0, "1x01"),
+        ]);
+        let (one, two) = (channel("A", "first"), channel("B", "second"));
+        let parent = job(&one, &show(NOW + 3600.0, "1x01"), "weekly", 0, 2);
+        let (results, more) = other_airings(
+            &store,
+            &parent,
+            &[one, two],
+            NOW,
+            &by_tvg_id,
+            &|| false,
+            100,
+        )
+        .unwrap();
+        assert!(!more);
+        let got: Vec<(String, bool)> = results
+            .iter()
+            .map(|(c, _, exact)| (c.tvg_id.clone(), *exact))
+            .collect();
+        assert_eq!(got, [("B".to_string(), true), ("B".to_string(), false)]);
+    }
+
+    #[test]
+    fn guide_changes_find_moved_bookings_only() {
+        let a = channel("A", "first");
+        let booked = job(&a, &show(NOW + 7200.0, "1x01"), "", 0, 2);
+        // The episode moved 30 minutes later.
+        let store = guide_store(&[("A", NOW + 9000.0, "1x01")]);
+        let changes = changed_guide_times(
+            &store,
+            std::slice::from_ref(&booked),
+            NOW,
+            &by_tvg_id,
+            &|| false,
+        )
+        .unwrap();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].1.start, show(NOW + 9000.0, "").start);
+        assert!(changes[0].2);
+        // The original slot is still in the guide: no change, even
+        // though a later airing matches too.
+        let store = guide_store(&[("A", NOW + 7200.0, "1x01"), ("A", NOW + 9000.0, "1x01")]);
+        assert!(changed_guide_times(
+            &store,
+            std::slice::from_ref(&booked),
+            NOW,
+            &by_tvg_id,
+            &|| false
+        )
+        .unwrap()
+        .is_empty());
+        // Manual and clock-repeat bookings keep their own times.
+        let store = guide_store(&[("A", NOW + 9000.0, "1x01")]);
+        let mut manual = booked.clone();
+        manual.manual = Some(true);
+        let mut daily = booked.clone();
+        daily.repeat = "daily".to_string();
+        assert!(
+            changed_guide_times(&store, &[manual, daily], NOW, &by_tvg_id, &|| false)
+                .unwrap()
+                .is_empty()
+        );
+        // Without an episode identity only an overlapping slot counts.
+        let untitled = job(&a, &show(NOW + 7200.0, ""), "", 0, 2);
+        let store = guide_store(&[("A", NOW + 7800.0, ""), ("A", NOW + 20_000.0, "")]);
+        let changes = changed_guide_times(&store, &[untitled], NOW, &by_tvg_id, &|| false).unwrap();
+        assert_eq!(changes.len(), 1);
+        assert!(!changes[0].2);
+        assert_eq!(changes[0].1.start, show(NOW + 7800.0, "").start);
+    }
+
+    #[test]
+    fn xmltv_id_strips_only_the_app_qualifier() {
+        let qualified = format!("epg:{}:bbc.one.uk", "a".repeat(40));
+        assert_eq!(xmltv_id(&qualified), "bbc.one.uk");
+        assert_eq!(xmltv_id("epg:short:bbc.one.uk"), "epg:short:bbc.one.uk");
+        assert_eq!(xmltv_id("bbc.one.uk"), "bbc.one.uk");
     }
 }
