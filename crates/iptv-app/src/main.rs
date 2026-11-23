@@ -2859,32 +2859,42 @@ fn apply_series_programmes(
     programmes: Vec<Programme>,
 ) {
     let channel = channel_from_snapshot(&rule.channel);
+    let mut candidates = Vec::new();
     for programme in programmes {
         if programme.start <= now_epoch()
             || !iptv_core::dvr::series_title_matches(&rule.title, &programme.title)
         {
             continue;
         }
+        let (pre, post) = iptv_core::dvr::series_padding_at(
+            rule,
+            &iptv_core::dvr::xmltv_from_ts(programme.start),
+        );
         let spec = iptv_core::dvr::NewJob {
             channel: &channel,
             programme_title: &programme.title,
             programme_start: programme.start,
             programme_stop: programme.stop,
             format: &rule.format,
-            pre_padding_minutes: rule.pre_padding_minutes,
-            post_padding_minutes: rule.post_padding_minutes,
+            pre_padding_minutes: pre,
+            post_padding_minutes: post,
             repeat: "none",
+            episode: &programme.episode,
+            subtitle: &programme.subtitle,
+            description: &programme.description,
         };
-        let Ok(job) = iptv_core::dvr::build_job(&spec, now) else {
-            continue;
-        };
-        let mut dvr = wiring.dvr.borrow_mut();
-        if dvr.find_duplicate(&job).is_none() {
-            if let Err(error) = dvr.add_job(job) {
-                iptv_core::applog::error("dvr", &format!("Series episode not saved: {error}"));
-                break;
-            }
+        if let Ok(job) = iptv_core::dvr::build_job(&spec, now) {
+            candidates.push(job);
         }
+    }
+    // One transaction against the rule as it is now (Python
+    // `add_series_episodes`): no episode is booked twice.
+    let result = wiring
+        .dvr
+        .borrow_mut()
+        .add_series_episodes(rule, candidates, now_seconds());
+    if let Err(error) = result {
+        iptv_core::applog::error("dvr", &format!("Series episodes not saved: {error}"));
     }
 }
 
@@ -9141,6 +9151,9 @@ fn add_dvr_job(
             .and_then(serde_json::Value::as_i64)
             .unwrap_or(2),
         repeat,
+        episode: &programme.episode,
+        subtitle: &programme.subtitle,
+        description: &programme.description,
     };
     let job = match iptv_core::dvr::build_job(&spec, now_seconds()) {
         Ok(job) => job,

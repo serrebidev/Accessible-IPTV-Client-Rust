@@ -8,6 +8,7 @@ fs4.workspace = true
 chrono.workspace = true
 chrono-tz.workspace = true
 uuid.workspace = true
+sha1_smol.workspace = true
 rusqlite.workspace = true
 serde.workspace = true
 aes.workspace = true

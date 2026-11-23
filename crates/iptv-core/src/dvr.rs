@@ -162,7 +162,9 @@ fn hex_id(seed: &str) -> String {
     out
 }
 
-fn xmltv_from_ts(ts: i64) -> String {
+/// XMLTV `YYYYMMDDHHMMSS` (UTC) for an epoch second.
+#[must_use]
+pub fn xmltv_from_ts(ts: i64) -> String {
     chrono::Utc
         .timestamp_opt(ts, 0)
         .single()
@@ -239,6 +241,11 @@ pub struct NewJob<'a> {
     pub pre_padding_minutes: i64,
     pub post_padding_minutes: i64,
     pub repeat: &'a str,
+    /// Guide episode number, sub-title and description, kept in the
+    /// programme snapshot for rerun suppression and guide reviews.
+    pub episode: &'a str,
+    pub subtitle: &'a str,
+    pub description: &'a str,
 }
 
 /// Build a job from a channel and a programme window (port of
@@ -276,11 +283,23 @@ pub fn build_job(spec: &NewJob<'_>, now: f64) -> Result<DvrJob, String> {
         channel_name: chan_name.clone(),
         display_title: format!("{title} - {chan_name}"),
         channel: channel_snapshot(channel),
-        program: serde_json::json!({
-            "title": spec.programme_title,
-            "start": xmltv_from_ts(programme_start),
-            "end": xmltv_from_ts(programme_stop),
-        }),
+        program: {
+            let mut program = serde_json::json!({
+                "title": spec.programme_title,
+                "start": xmltv_from_ts(programme_start),
+                "end": xmltv_from_ts(programme_stop),
+            });
+            for (key, value) in [
+                ("episode", spec.episode),
+                ("subtitle", spec.subtitle),
+                ("description", spec.description),
+            ] {
+                if !value.is_empty() {
+                    program[key] = value.into();
+                }
+            }
+            program
+        },
         format: spec.format.to_string(),
         start_at: iso_from_ts(programme_start as f64),
         end_at: iso_from_ts(programme_stop as f64),
@@ -301,6 +320,158 @@ pub fn build_job(spec: &NewJob<'_>, now: f64) -> Result<DvrJob, String> {
         },
         ..DvrJob::default()
     })
+}
+
+/// One XMLTV `xmltv_ns` field: optional digits, optionally followed
+/// by a `/total`. `Ok(None)` is a field without its number; `Err`
+/// means the text is not a field.
+fn xmltv_ns_field(text: &str) -> Result<Option<u64>, ()> {
+    let (number, total) = match text.split_once('/') {
+        Some((number, total)) => (number.trim(), Some(total.trim())),
+        None => (text.trim(), None),
+    };
+    if total.is_some_and(|t| t.is_empty() || !t.bytes().all(|b| b.is_ascii_digit())) {
+        return Err(());
+    }
+    if number.is_empty() {
+        return Ok(None);
+    }
+    if number.len() > 9 || !number.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(());
+    }
+    number.parse().map(Some).map_err(|_| ())
+}
+
+/// `season.episode.part` in `xmltv_ns`, each field optional.
+fn xmltv_ns(text: &str) -> Option<[Option<u64>; 3]> {
+    let parts: Vec<&str> = text.split('.').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    Some([
+        xmltv_ns_field(parts[0]).ok()?,
+        xmltv_ns_field(parts[1]).ok()?,
+        xmltv_ns_field(parts[2]).ok()?,
+    ])
+}
+
+/// `S01E05` / `s2 e3` or `1x5`: (season, episode).
+fn onscreen_episode(text: &str) -> Option<(u64, u64)> {
+    let lower = text.to_ascii_lowercase();
+    let digits = |t: &str| {
+        (!t.is_empty() && t.len() <= 9 && t.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| t.parse::<u64>().ok())
+            .flatten()
+    };
+    if let Some(rest) = lower.strip_prefix('s') {
+        if let Some((season, episode)) = rest.split_once('e') {
+            if let (Some(s), Some(e)) = (digits(season.trim_end()), digits(episode)) {
+                return Some((s, e));
+            }
+        }
+    }
+    let (season, episode) = lower.split_once('x')?;
+    Some((digits(season)?, digits(episode)?))
+}
+
+/// Python `dvr.program_episode_key`: the stable identity of one
+/// episode, or `None` when the guide gives none. Strongest first:
+/// the episode number (`xmltv_ns` is zero-based; `S01E05` and `1x5`
+/// already one-based; any other text compared case-folded with
+/// punctuation stripped), then the sub-title, then a fingerprint of
+/// the description. A shared title alone never identifies one.
+#[must_use]
+pub fn program_episode_key(program: &serde_json::Value) -> Option<String> {
+    let field = |key: &str| {
+        program
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+    };
+    let mut episode = field("episode").trim().to_string();
+    let mut part = String::new();
+    if !episode.is_empty() {
+        if let Some([season, number, piece]) = xmltv_ns(&episode) {
+            if let Some(piece) = piece {
+                part = format!(":part{}", piece + 1);
+            }
+            if let Some(number) = number {
+                let season = season.map_or_else(|| "?".to_string(), |s| (s + 1).to_string());
+                return Some(format!("ep:{season}x{}{part}", number + 1));
+            }
+            episode.clear();
+        }
+        if let Some((season, number)) = onscreen_episode(&episode) {
+            return Some(format!("ep:{season}x{number}"));
+        }
+        let compact: String = episode
+            .to_lowercase()
+            .chars()
+            .filter(|c| c.is_alphanumeric())
+            .collect();
+        if !compact.is_empty() {
+            return Some(format!("ep:{compact}"));
+        }
+    }
+    let squash = |text: &str| {
+        text.split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_lowercase()
+    };
+    let subtitle = squash(field("subtitle"));
+    if !subtitle.is_empty() {
+        return Some(format!("sub:{subtitle}{part}"));
+    }
+    let description = squash(field("description"));
+    if !description.is_empty() {
+        let digest = sha1_smol::Sha1::from(description.as_bytes())
+            .digest()
+            .to_string();
+        return Some(format!("desc:{}{part}", &digest[..16]));
+    }
+    None
+}
+
+/// Python `dvr.taken_episode_keys`: the episodes a series rule
+/// already has. Active and successfully completed jobs count;
+/// failed, missed, partial, stopped and canceled ones do not.
+#[must_use]
+pub fn taken_episode_keys(jobs: &[DvrJob], rule_id: &str) -> std::collections::HashSet<String> {
+    jobs.iter()
+        .filter(|job| {
+            (ACTIVE_STATUSES.contains(&job.status.as_str()) || job.status == STATUS_COMPLETED)
+                && (job.id == rule_id || job.series_source.as_deref() == Some(rule_id))
+        })
+        .filter_map(|job| program_episode_key(&job.program))
+        .collect()
+}
+
+/// Python `dvr.series_padding_at`: a series rule's padding for an
+/// episode starting at `start` (XMLTV `YYYYMMDDHHMMSS`): the last
+/// change at or before it, else `future_padding`, else the rule's own.
+#[must_use]
+pub fn series_padding_at(rule: &DvrJob, start: &str) -> (i64, i64) {
+    if let Some(change) = rule
+        .series_padding_changes
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .rev()
+        .find(|change| change.0.as_str() <= start)
+    {
+        return (change.1, change.2);
+    }
+    rule.future_padding.map_or(
+        (rule.pre_padding_minutes, rule.post_padding_minutes),
+        |[pre, post]| (pre, post),
+    )
+}
+
+/// The channel identity series slots compare (Python passes
+/// `programme_reminders.channel_key`).
+fn slot_channel_key(job: &DvrJob) -> String {
+    crate::reminders::reminder_channel_key(&channel_from_snapshot(&job.channel))
 }
 
 /// What the scheduler wants the caller to do after a tick.
@@ -768,7 +939,13 @@ impl DvrSchedule {
             return Ok(false);
         }
         self.transaction(|jobs| {
-            jobs.retain(|j| j.id != job_id);
+            let series = jobs.iter().any(|j| j.id == job_id && j.repeat == "series");
+            jobs.retain(|j| {
+                j.id != job_id
+                    && !(series
+                        && j.series_source.as_deref() == Some(job_id)
+                        && j.status == STATUS_SCHEDULED)
+            });
             Ok(())
         })?;
         self.stopping_since.remove(job_id);
@@ -789,6 +966,14 @@ impl DvrSchedule {
             }
             job.status = STATUS_CANCELED.to_string();
             job.message = "Canceled by user.".to_string();
+            if job.repeat == "series" {
+                for child in jobs.iter_mut().filter(|j| {
+                    j.series_source.as_deref() == Some(job_id) && j.status == STATUS_SCHEDULED
+                }) {
+                    child.status = STATUS_CANCELED.to_string();
+                    child.message = "Series recording canceled.".to_string();
+                }
+            }
             Ok(true)
         })?;
         if cancelled {
@@ -816,6 +1001,76 @@ impl DvrSchedule {
                 return Ok(false);
             };
             job.repeat = repeat.to_string();
+            Ok(true)
+        })
+    }
+
+    /// Python `add_series_episodes`: book a guide scan's candidates
+    /// for a series rule in one transaction, against the rule as it
+    /// is now. A rule that changed or was canceled since the scan
+    /// publishes nothing; a slot already booked on the channel, an
+    /// ended airing and an episode the rule already has are skipped.
+    /// Returns whether anything was added.
+    ///
+    /// # Errors
+    /// Returns the write error; nothing is then added.
+    pub fn add_series_episodes(
+        &mut self,
+        rule: &DvrJob,
+        candidates: Vec<DvrJob>,
+        now: f64,
+    ) -> Result<bool, String> {
+        if candidates.is_empty() {
+            return Ok(false);
+        }
+        let Some(parent) = self.get(&rule.id).cloned() else {
+            return Ok(false);
+        };
+        let same = parent.status != STATUS_CANCELED
+            && parent.repeat == "series"
+            && parent.repeat == rule.repeat
+            && parent.channel == rule.channel
+            && parent.title == rule.title
+            && parent.format == rule.format
+            && parent.start_at == rule.start_at
+            && parent.end_at == rule.end_at
+            && parent.pre_padding_minutes == rule.pre_padding_minutes
+            && parent.post_padding_minutes == rule.post_padding_minutes
+            && parent.future_padding == rule.future_padding
+            && parent.series_padding_changes == rule.series_padding_changes;
+        if !same {
+            return Ok(false);
+        }
+        let channel = slot_channel_key(&parent);
+        let starts: BTreeSet<&str> = candidates.iter().map(|j| j.start_at.as_str()).collect();
+        let mut slots: BTreeSet<String> = self
+            .jobs
+            .iter()
+            .filter(|j| starts.contains(j.start_at.as_str()) && slot_channel_key(j) == channel)
+            .map(|j| j.start_at.clone())
+            .collect();
+        let mut episodes = taken_episode_keys(&self.jobs, &parent.id);
+        let mut added = Vec::new();
+        for mut job in candidates {
+            let episode = program_episode_key(&job.program);
+            if slots.contains(&job.start_at)
+                || job.stop_ts <= now
+                || episode.as_ref().is_some_and(|e| episodes.contains(e))
+            {
+                continue;
+            }
+            job.series_source = Some(parent.id.clone());
+            slots.insert(job.start_at.clone());
+            if let Some(episode) = episode {
+                episodes.insert(episode);
+            }
+            added.push(job);
+        }
+        if added.is_empty() {
+            return Ok(false);
+        }
+        self.transaction(|jobs| {
+            jobs.extend(added);
             Ok(true)
         })
     }
@@ -1579,6 +1834,9 @@ mod tests {
             pre_padding_minutes: pre,
             post_padding_minutes: post,
             repeat: "",
+            episode: "",
+            subtitle: "",
+            description: "",
         }
     }
 
@@ -1838,6 +2096,168 @@ mod tests {
             ("", Some(vec![]))
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Goldens printed by Python v1.151.6 `dvr.program_episode_key`.
+    #[test]
+    fn episode_keys_match_python() {
+        let cases = [
+            (r#"{"episode": "0.4."}"#, Some("ep:1x5")),
+            (r#"{"episode": "2.0."}"#, Some("ep:3x1")),
+            (r#"{"episode": "S01E05"}"#, Some("ep:1x5")),
+            (r#"{"episode": "1x5"}"#, Some("ep:1x5")),
+            (r#"{"episode": "s2 e3"}"#, Some("ep:2x3")),
+            (r#"{"episode": "S02E03"}"#, Some("ep:2x3")),
+            (r#"{"episode": "0.4.1/2"}"#, Some("ep:1x5:part2")),
+            (r#"{"episode": "0.4.0"}"#, Some("ep:1x5:part1")),
+            (r#"{"episode": ".4."}"#, Some("ep:?x5")),
+            (r#"{"episode": "0.."}"#, None),
+            (r#"{"episode": "0/3.4/10."}"#, Some("ep:1x5")),
+            (r#"{"episode": "..1/2"}"#, None),
+            (r#"{"episode": "EP-123 a"}"#, Some("ep:ep123a")),
+            (
+                r#"{"episode": "0.4.", "subtitle": "Other", "description": "Text"}"#,
+                Some("ep:1x5"),
+            ),
+            (
+                r#"{"subtitle": "The  Long Night"}"#,
+                Some("sub:the long night"),
+            ),
+            (
+                r#"{"subtitle": "the long night"}"#,
+                Some("sub:the long night"),
+            ),
+            (
+                r#"{"episode": "0..1", "subtitle": "Part Two"}"#,
+                Some("sub:part two:part2"),
+            ),
+            (
+                r#"{"episode": "0..1", "description": "Storms."}"#,
+                Some("desc:5b5590e8ffa992bd:part2"),
+            ),
+            (
+                r#"{"description": "An episode about storms."}"#,
+                Some("desc:062f7aacae190960"),
+            ),
+            (
+                r#"{"description": "  An episode about storms. "}"#,
+                Some("desc:062f7aacae190960"),
+            ),
+            ("{}", None),
+            (r#"{"title": "News Tonight"}"#, None),
+            (
+                r#"{"episode": " ", "subtitle": "", "description": ""}"#,
+                None,
+            ),
+            (r#"{"episode": "Ünïcode Ep 7"}"#, Some("ep:ünïcodeep7")),
+        ];
+        for (program, expected) in cases {
+            let value: serde_json::Value = serde_json::from_str(program).unwrap();
+            assert_eq!(
+                program_episode_key(&value).as_deref(),
+                expected,
+                "{program}"
+            );
+        }
+    }
+
+    fn episode_job(id: &str, episode: &str, status: &str, source: Option<&str>) -> DvrJob {
+        DvrJob {
+            id: id.to_string(),
+            status: status.to_string(),
+            program: serde_json::json!({"title": "Drama Hour", "episode": episode}),
+            series_source: source.map(str::to_string),
+            ..DvrJob::default()
+        }
+    }
+
+    #[test]
+    fn taken_keys_cover_rule_and_its_children_not_canceled() {
+        let mut rule = episode_job("rule", "0.0.", STATUS_SCHEDULED, None);
+        rule.repeat = "series".to_string();
+        let jobs = [
+            rule,
+            episode_job("child", "0.1.", STATUS_SCHEDULED, Some("rule")),
+            episode_job("gone", "0.2.", STATUS_CANCELED, Some("rule")),
+            episode_job("done", "0.4.", STATUS_COMPLETED, Some("rule")),
+            episode_job("stray", "0.3.", STATUS_SCHEDULED, Some("another-rule")),
+        ];
+        let taken = taken_episode_keys(&jobs, "rule");
+        let expected: std::collections::HashSet<String> =
+            ["ep:1x1", "ep:1x2", "ep:1x5"].map(str::to_string).into();
+        assert_eq!(taken, expected);
+    }
+
+    /// Python `add_series_episodes`: a taken episode, the rule's
+    /// own slot and an ended airing are skipped; an unidentified
+    /// airing is kept; a changed rule publishes nothing.
+    #[test]
+    fn series_scan_books_each_episode_once() {
+        let dir = temp_dir("series");
+        let mut schedule = DvrSchedule::load(dir.join("scheduled_recordings.json"), 0.0);
+        let chan = channel();
+        let episode = |title: &str, start: i64, number: &str| {
+            let mut job = build_job(&spec(&chan, title, start, start + 3600, 0, 0), 0.0).unwrap();
+            job.program["episode"] = number.into();
+            job
+        };
+        let mut rule = episode("Drama Hour", 10_000, "0.4.");
+        rule.repeat = "series".to_string();
+        schedule.add_job(rule.clone()).unwrap();
+        let candidates = vec![
+            episode("Drama Hour", 1_000, "0.6."),  // already ended at now
+            episode("Drama Hour", 10_000, "0.9."), // the rule's own slot
+            episode("Drama Hour", 20_000, "0.5."), // new episode: booked
+            episode("Drama Hour", 30_000, "0.4."), // rerun of the rule's episode
+            episode("Drama Hour", 40_000, ""),     // no identity: booked
+            episode("Drama Hour", 50_000, "0.5."), // rerun of the 20_000 booking
+        ];
+        assert!(schedule
+            .add_series_episodes(&rule, candidates.clone(), 5_000.0)
+            .unwrap());
+        let booked: Vec<String> = schedule
+            .jobs()
+            .iter()
+            .filter(|j| j.series_source.as_deref() == Some(rule.id.as_str()))
+            .map(|j| j.start_at.clone())
+            .collect();
+        assert_eq!(booked, [iso_from_ts(20_000.0), iso_from_ts(40_000.0)]);
+        assert!(!schedule
+            .add_series_episodes(&rule, candidates.clone(), 5_000.0)
+            .unwrap());
+        let mut changed = rule.clone();
+        changed.title = "Renamed".to_string();
+        assert!(!schedule
+            .add_series_episodes(&changed, candidates, 5_000.0)
+            .unwrap());
+
+        // Cancelling the rule cancels its pending episodes.
+        assert!(schedule.cancel_job(&rule.id).unwrap());
+        assert!(schedule
+            .jobs()
+            .iter()
+            .filter(|j| j.series_source.as_deref() == Some(rule.id.as_str()))
+            .all(|j| j.status == STATUS_CANCELED && j.message == "Series recording canceled."));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn series_padding_follows_the_rule_changes() {
+        let mut rule = DvrJob {
+            pre_padding_minutes: 2,
+            post_padding_minutes: 5,
+            ..DvrJob::default()
+        };
+        assert_eq!(series_padding_at(&rule, "20261201000000"), (2, 5));
+        rule.future_padding = Some([1, 3]);
+        assert_eq!(series_padding_at(&rule, "20261201000000"), (1, 3));
+        rule.series_padding_changes = Some(vec![
+            ("20261205000000".to_string(), 4, 6),
+            ("20261210000000".to_string(), 0, 0),
+        ]);
+        assert_eq!(series_padding_at(&rule, "20261204235959"), (1, 3));
+        assert_eq!(series_padding_at(&rule, "20261205000000"), (4, 6));
+        assert_eq!(series_padding_at(&rule, "20261220000000"), (0, 0));
     }
 
     #[test]
