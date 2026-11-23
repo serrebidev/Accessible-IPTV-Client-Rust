@@ -65,7 +65,9 @@ impl EpgStore {
                  start INTEGER NOT NULL,
                  stop INTEGER NOT NULL,
                  title TEXT NOT NULL,
-                 description TEXT NOT NULL
+                 description TEXT NOT NULL,
+                 episode TEXT NOT NULL DEFAULT '',
+                 subtitle TEXT NOT NULL DEFAULT ''
              );
              CREATE INDEX IF NOT EXISTS idx_programmes_channel_start
                  ON programmes(channel, start);
@@ -115,6 +117,20 @@ impl EpgStore {
             self.conn
                 .execute("ALTER TABLE channels ADD COLUMN last_seen INTEGER", [])
                 .map_err(|e| e.to_string())?;
+        }
+        // Python's store keeps the XMLTV episode number and
+        // sub-title (series rerun suppression, guide changes).
+        for column in ["episode", "subtitle"] {
+            if !self.column_exists("programmes", column)? {
+                self.conn
+                    .execute(
+                        &format!(
+                            "ALTER TABLE programmes ADD COLUMN {column} TEXT NOT NULL DEFAULT ''"
+                        ),
+                        [],
+                    )
+                    .map_err(|e| e.to_string())?;
+            }
         }
         if added_norm {
             let rows: Vec<(String, String)> = {
@@ -182,6 +198,20 @@ impl EpgStore {
             )
             .map_err(|e| e.to_string())?;
         Ok(())
+    }
+
+    fn column_exists(&self, table: &str, column: &str) -> Result<bool, String> {
+        let mut statement = self
+            .conn
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .map_err(|e| e.to_string())?;
+        let mut rows = statement.query([]).map_err(|e| e.to_string())?;
+        while let Some(row) = rows.next().map_err(|e| e.to_string())? {
+            if row.get::<_, String>(1).map_err(|e| e.to_string())? == column {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Commit one batch of programmes and PASSIVE-checkpoint the
@@ -463,6 +493,8 @@ impl EpgStore {
                     stop: row.get(2)?,
                     title: row.get(3)?,
                     description: String::new(),
+                    episode: String::new(),
+                    subtitle: String::new(),
                 })
             })
             .map_err(|e| e.to_string())?;
@@ -556,7 +588,7 @@ impl EpgStore {
         let mut statement = self
             .conn
             .prepare(
-                "SELECT channel, start, stop, title, description FROM programmes
+                "SELECT channel, start, stop, title, description, episode, subtitle FROM programmes
                  WHERE channel = ?1 AND stop > ?2 AND start < ?3
                  ORDER BY start ASC",
             )
@@ -635,6 +667,8 @@ impl EpgStore {
                     stop: row.get(3)?,
                     title: row.get(4)?,
                     description: row.get(5)?,
+                    episode: String::new(),
+                    subtitle: String::new(),
                 };
                 Ok((row.get::<_, String>(0)?, programme))
             })
@@ -706,6 +740,8 @@ impl EpgStore {
                         stop: row.get(3)?,
                         title: row.get(4)?,
                         description: row.get(5)?,
+                        episode: String::new(),
+                        subtitle: String::new(),
                     };
                     Ok((row.get::<_, String>(0)?, programme))
                 },
@@ -823,17 +859,27 @@ fn insert_programmes(
             .map_err(|e| e.to_string())?;
         let mut upsert = tx
             .prepare(
-                "INSERT INTO programmes (channel, start, stop, title, description)
-                 VALUES (?1, ?2, ?3, ?4, ?5)
+                "INSERT INTO programmes (channel, start, stop, title, description, episode, subtitle)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
                  ON CONFLICT(channel, start, stop) DO UPDATE SET
                    title = excluded.title,
+                   episode = CASE
+                     WHEN programmes.title != excluded.title THEN excluded.episode
+                     WHEN coalesce(programmes.episode, '') = '' THEN excluded.episode
+                     ELSE programmes.episode END,
+                   subtitle = CASE
+                     WHEN programmes.title != excluded.title THEN excluded.subtitle
+                     WHEN coalesce(programmes.subtitle, '') = '' THEN excluded.subtitle
+                     ELSE programmes.subtitle END,
                    description = CASE
                      WHEN programmes.title != excluded.title THEN excluded.description
                      WHEN length(excluded.description) > length(coalesce(programmes.description, ''))
                        THEN excluded.description
                      ELSE programmes.description END
                  WHERE programmes.title != excluded.title
-                    OR length(excluded.description) > length(coalesce(programmes.description, ''))",
+                    OR length(excluded.description) > length(coalesce(programmes.description, ''))
+                    OR (coalesce(programmes.episode, '') = '' AND excluded.episode != '')
+                    OR (coalesce(programmes.subtitle, '') = '' AND excluded.subtitle != '')",
             )
             .map_err(|e| e.to_string())?;
         for programme in programmes {
@@ -850,7 +896,9 @@ fn insert_programmes(
                     programme.start,
                     programme.stop,
                     programme.title,
-                    programme.description
+                    programme.description,
+                    programme.episode,
+                    programme.subtitle
                 ])
                 .map_err(|e| e.to_string())?;
             count += 1;
@@ -870,6 +918,9 @@ fn delete_channel(tx: &rusqlite::Transaction<'_>, id: &str) -> Result<(), String
     Ok(())
 }
 
+/// A programme row: channel, start, stop, title, description,
+/// then optionally episode and sub-title (queries that do not
+/// select them read them as empty).
 fn row_programme(row: &rusqlite::Row<'_>) -> rusqlite::Result<Programme> {
     Ok(Programme {
         channel_id: row.get(0)?,
@@ -877,6 +928,8 @@ fn row_programme(row: &rusqlite::Row<'_>) -> rusqlite::Result<Programme> {
         stop: row.get(2)?,
         title: row.get(3)?,
         description: row.get(4)?,
+        episode: row.get(5).unwrap_or_default(),
+        subtitle: row.get(6).unwrap_or_default(),
     })
 }
 
@@ -1104,6 +1157,8 @@ mod tests {
                 stop: 200,
                 title: "Morning Show".into(),
                 description: "Wake up.".into(),
+                episode: String::new(),
+                subtitle: String::new(),
             },
             Programme {
                 channel_id: "c1".into(),
@@ -1111,6 +1166,8 @@ mod tests {
                 stop: 300,
                 title: "Midday News".into(),
                 description: String::new(),
+                episode: String::new(),
+                subtitle: String::new(),
             },
         ];
         EpgGuide {
@@ -1163,6 +1220,8 @@ mod tests {
                     stop: row.get(2)?,
                     title: row.get(3)?,
                     description: row.get(4)?,
+                    episode: String::new(),
+                    subtitle: String::new(),
                 })
             })
             .unwrap();
@@ -1356,7 +1415,80 @@ mod tests {
             stop,
             title: title.into(),
             description: description.into(),
+            episode: String::new(),
+            subtitle: String::new(),
         }
+    }
+
+    fn episode_prog(title: &str, episode: &str, subtitle: &str) -> Programme {
+        Programme {
+            episode: episode.into(),
+            subtitle: subtitle.into(),
+            ..prog("c1", 100, 200, title, "")
+        }
+    }
+
+    /// Python's upsert: an empty stored episode or sub-title is
+    /// filled, a filled one is kept, and a changed title replaces
+    /// both.
+    #[test]
+    fn store_round_trips_episode_fields() {
+        let mut store = EpgStore::open(std::path::Path::new(":memory:")).unwrap();
+        let import = |store: &mut EpgStore, p: Programme| {
+            store
+                .import_source("k", &guide_with("c1", "One", vec![p]), 1_000)
+                .unwrap();
+            store.programmes_between("c1", 0, 400).unwrap().remove(0)
+        };
+        let row = import(&mut store, episode_prog("Show", "", ""));
+        assert_eq!((row.episode.as_str(), row.subtitle.as_str()), ("", ""));
+        let row = import(&mut store, episode_prog("Show", "0.4.", "Pilot"));
+        assert_eq!(
+            (row.episode.as_str(), row.subtitle.as_str()),
+            ("0.4.", "Pilot")
+        );
+        let row = import(&mut store, episode_prog("Show", "0.9.", "Other"));
+        assert_eq!(
+            (row.episode.as_str(), row.subtitle.as_str()),
+            ("0.4.", "Pilot")
+        );
+        let row = import(&mut store, episode_prog("Renamed", "1.0.", ""));
+        assert_eq!((row.episode.as_str(), row.subtitle.as_str()), ("1.0.", ""));
+    }
+
+    /// A database from a build without the columns gains them, and
+    /// its rows read back with empty episode and sub-title.
+    #[test]
+    fn migrates_old_store_without_episode_columns() {
+        let path = std::env::temp_dir().join(format!(
+            "iptv-epg-old-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE channels (id TEXT PRIMARY KEY, display_name TEXT NOT NULL);
+                 CREATE TABLE programmes (channel TEXT NOT NULL, start INTEGER NOT NULL,
+                     stop INTEGER NOT NULL, title TEXT NOT NULL, description TEXT NOT NULL);
+                 INSERT INTO channels VALUES ('c1', 'One');
+                 INSERT INTO programmes VALUES ('c1', 100, 200, 'Old', 'Kept.');",
+            )
+            .unwrap();
+        }
+        let store = EpgStore::open(&path).unwrap();
+        let rows = store.programmes_between("c1", 0, 400).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].description, "Kept.");
+        assert_eq!(
+            (rows[0].episode.as_str(), rows[0].subtitle.as_str()),
+            ("", "")
+        );
+        drop(store);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

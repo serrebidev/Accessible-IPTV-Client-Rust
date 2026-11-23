@@ -194,6 +194,7 @@ fn bench_e12_bulk_guide_at_500k() {
                 stop: base + (slot + 1) * 3600,
                 title: format!("Show {slot}"),
                 description: format!("Description {slot}"),
+                ..Programme::default()
             })
             .collect();
         programmes.insert(channel.id.clone(), rows);

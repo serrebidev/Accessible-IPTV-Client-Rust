@@ -362,6 +362,8 @@ mod tests {
             stop: start + 3600,
             title: "Evening News".to_string(),
             description: String::new(),
+            episode: String::new(),
+            subtitle: String::new(),
         }
     }
 

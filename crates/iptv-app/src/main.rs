@@ -21032,6 +21032,7 @@ mod tests {
                 stop: 3600,
                 title: "News Hour".to_owned(),
                 description: String::new(),
+                ..Programme::default()
             },
             playlist_index: Some(0),
         }];
@@ -21051,6 +21052,7 @@ mod tests {
             description: String::new(),
             start: 0,
             stop: 3600,
+            ..Programme::default()
         };
         let next = Programme {
             title: "Movie".to_owned(),

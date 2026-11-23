@@ -20,13 +20,18 @@ pub struct EpgChannel {
 }
 
 /// One programme; `start`/`stop` are Unix epoch seconds.
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// `episode` is the XMLTV episode number (the `xmltv_ns` text when
+/// present, else the first other system's) and `subtitle` the
+/// first `<sub-title>`, as Python's import stores them.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Programme {
     pub channel_id: String,
     pub start: i64,
     pub stop: i64,
     pub title: String,
     pub description: String,
+    pub episode: String,
+    pub subtitle: String,
 }
 
 /// The programme on at one instant and the one after it, for one
@@ -669,6 +674,10 @@ struct PendingProgramme {
     end_attr: Option<i64>,
     length: Option<(String, String)>,
     duration: Option<String>,
+    /// The open `<episode-num>` is `system="xmltv_ns"`.
+    episode_is_ns: bool,
+    /// An `xmltv_ns` number has been kept; nothing replaces it.
+    episode_ns_found: bool,
 }
 
 impl PendingProgramme {
@@ -814,13 +823,25 @@ fn start_element(
                     stop: attr(element, "stop")
                         .and_then(|v| parse_xmltv_time(&v))
                         .unwrap_or(0),
-                    title: String::new(),
-                    description: String::new(),
+                    ..Programme::default()
                 },
                 end_attr: attr(element, "end").and_then(|v| parse_xmltv_time(&v)),
                 length: None,
                 duration: None,
+                episode_is_ns: false,
+                episode_ns_found: false,
             });
+        }
+        "sub-title" if programme.is_some() => {
+            *capture = Some("sub-title");
+            text.clear();
+        }
+        "episode-num" if programme.is_some() => {
+            if let Some(p) = programme.as_mut() {
+                p.episode_is_ns = attr(element, "system").as_deref() == Some("xmltv_ns");
+            }
+            *capture = Some("episode-num");
+            text.clear();
         }
         "display-name" if channel.is_some() => {
             *capture = Some("display-name");
@@ -885,10 +906,29 @@ fn end_element(
                 }
             }
         }
-        "display-name" | "title" | "desc" | "length" | "duration" => {
+        "display-name" | "title" | "desc" | "length" | "duration" | "sub-title" | "episode-num" => {
             if let Some(kind) = capture.take() {
                 let value = text.trim().to_string();
                 match kind {
+                    "sub-title" => {
+                        if let Some(p) = programme.as_mut() {
+                            if p.row.subtitle.is_empty() {
+                                p.row.subtitle = value;
+                            }
+                        }
+                    }
+                    "episode-num" => {
+                        if let Some(p) = programme.as_mut() {
+                            if !value.is_empty() && !p.episode_ns_found {
+                                if p.episode_is_ns {
+                                    p.row.episode = value;
+                                    p.episode_ns_found = true;
+                                } else if p.row.episode.is_empty() {
+                                    p.row.episode = value;
+                                }
+                            }
+                        }
+                    }
                     "display-name" => {
                         if let Some((_, display)) = channel.as_mut() {
                             if display.is_empty() {
@@ -1972,6 +2012,7 @@ pub struct EpgReadJob {
 }
 
 #[derive(Clone, Debug)]
+#[allow(clippy::large_enum_variant)] // one transient value per guide read; boxing buys nothing
 pub enum EpgReadValue {
     UsableData(bool),
     NowNext(Option<NowNext>),
@@ -2587,6 +2628,33 @@ fn fetch_epg_source_once(source: &str) -> Result<EpgGuide, String> {
 #[cfg(test)]
 mod tests {
 
+    /// Python `playlist.py` import: the `xmltv_ns` episode number
+    /// wins over any other system; otherwise the first non-empty
+    /// one is kept; the first non-empty sub-title is kept.
+    #[test]
+    fn parses_episode_and_subtitle() {
+        let xml = r#"<tv>
+<programme channel="a" start="20261123200000 +0000" stop="20261123210000 +0000">
+<title>Show</title>
+<sub-title>  </sub-title><sub-title> The Pilot </sub-title>
+<episode-num system="onscreen">S01E05</episode-num>
+<episode-num system="xmltv_ns"> 0.4. </episode-num>
+</programme>
+<programme channel="a" start="20261123210000 +0000" stop="20261123220000 +0000">
+<title>Other</title>
+<episode-num system="dd_progid"></episode-num>
+<episode-num system="onscreen">S02E01</episode-num>
+<episode-num system="dd_progid">EP123</episode-num>
+</programme>
+</tv>"#;
+        let guide = super::parse_xmltv(xml);
+        let rows = &guide.programmes["a"];
+        assert_eq!(rows[0].episode, "0.4.");
+        assert_eq!(rows[0].subtitle, "The Pilot");
+        assert_eq!(rows[1].episode, "S02E01");
+        assert_eq!(rows[1].subtitle, "");
+    }
+
     #[test]
     #[allow(clippy::too_many_lines)] // One end-to-end worker test covers all request variants.
     fn cold_read_worker_returns_channel_now_next_and_programmes_from_store() {
@@ -2623,6 +2691,8 @@ mod tests {
                     stop: 200,
                     title: "Evening News".into(),
                     description: "A full description.".into(),
+                    episode: String::new(),
+                    subtitle: String::new(),
                 }],
             )]),
         };
@@ -3252,6 +3322,8 @@ mod tests {
             stop,
             title: title.to_string(),
             description: description.to_string(),
+            episode: String::new(),
+            subtitle: String::new(),
         }
     }
 
