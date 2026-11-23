@@ -172,6 +172,7 @@ mod tests {
             output_path: String::new(),
             message: String::new(),
             repeat: String::new(),
+            ..DvrJob::default()
         }
     }
 

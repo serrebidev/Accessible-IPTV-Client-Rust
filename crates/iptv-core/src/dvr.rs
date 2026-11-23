@@ -18,23 +18,38 @@ pub const STATUS_WAITING: &str = "waiting";
 pub const STATUS_RECORDING: &str = "recording";
 pub const STATUS_STOPPING: &str = "stopping";
 pub const STATUS_COMPLETED: &str = "completed";
+pub const STATUS_PARTIAL: &str = "partial";
+pub const STATUS_STOPPED: &str = "stopped";
 pub const STATUS_FAILED: &str = "failed";
 pub const STATUS_MISSED: &str = "missed";
 pub const STATUS_CANCELED: &str = "canceled";
+pub const STATUS_SKIPPED: &str = "skipped";
 
 pub const DONE_STATUSES: &[&str] = &[
     STATUS_COMPLETED,
+    STATUS_PARTIAL,
+    STATUS_STOPPED,
     STATUS_FAILED,
     STATUS_MISSED,
     STATUS_CANCELED,
+    STATUS_SKIPPED,
 ];
+const ACTIVE_STATUSES: &[&str] = &[STATUS_SCHEDULED, STATUS_RECORDING, STATUS_STOPPING];
+/// Clock-based repeats (Python `TIME_REPEATS`); `series` follows the guide.
+pub const TIME_REPEATS: &[&str] = &["daily", "weekly", "weekdays"];
+
+pub const UNREADABLE_WARNING: &str = "The recording schedule could not be read. The original file was preserved at {path}. Check your scheduled recordings before adding new ones.";
+pub const BLOCKED_WARNING: &str = "The recording schedule could not be read or backed up. Changes are disabled to protect the original file. Check the file permissions and available disk space, then restart the application.";
 const STOP_TIMEOUT_SECONDS: f64 = 1800.0;
 
 pub const DEFAULT_PRE_PADDING_MINUTES: i64 = 2;
 pub const DEFAULT_POST_PADDING_MINUTES: i64 = 5;
 
-/// One scheduled recording, serialized with the reference's field names.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// One scheduled recording, serialized with the reference's field
+/// names. Every field defaults, and fields this port does not model
+/// ride in `extra`, so a schedule Python wrote survives a Rust save.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct DvrJob {
     pub id: String,
     pub status: String,
@@ -57,17 +72,36 @@ pub struct DvrJob {
     /// The recording actually began after the programme's own
     /// start (padding already consumed): a successful finish
     /// carries the missed-beginning warning (issue #130).
-    #[serde(default)]
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub started_late: bool,
     /// Why a waiting job is waiting (the connection conflict's
     /// user-visible reason); kept after the wait ends so the
     /// outcome stays explainable (issues #134/#135).
-    #[serde(default)]
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub wait_reason: String,
     pub recording_id: Option<String>,
     pub output_path: String,
     pub message: String,
     pub repeat: String,
+    /// Monday = 0 … Sunday = 6, for `repeat == "weekdays"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub weekdays: Option<Vec<u8>>,
+    /// Padding (before, after) for later occurrences of a recurring
+    /// recording whose own padding was changed for this one only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub future_padding: Option<[i64; 2]>,
+    /// A series rule's padding changes: (XMLTV start from which it
+    /// applies, before, after), ascending.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub series_padding_changes: Option<Vec<(String, i64, i64)>>,
+    /// The series rule that booked this episode.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub series_source: Option<String>,
+    /// Scheduled by time, not from the guide.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manual: Option<bool>,
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 #[allow(clippy::cast_possible_truncation)] // schedule times are whole seconds
@@ -265,6 +299,7 @@ pub fn build_job(spec: &NewJob<'_>, now: f64) -> Result<DvrJob, String> {
         } else {
             String::new()
         },
+        ..DvrJob::default()
     })
 }
 
@@ -298,30 +333,191 @@ pub struct DvrSchedule {
     /// Transient, like `resolving`.
     holds: BTreeSet<String>,
     path: PathBuf,
+    /// Python's `load_warning`: what went wrong reading the file,
+    /// for the app to show once. Empty when the load was clean.
+    pub load_warning: String,
+    /// Where the unreadable file was preserved (empty when it could
+    /// not be), so the app can translate [`UNREADABLE_WARNING`]
+    /// before filling in the path.
+    pub load_warning_backup: String,
+    /// The unreadable file could not be backed up: every write is
+    /// refused so the original bytes survive (Python `_load_error`).
+    load_error: bool,
+}
+
+/// Python `checked_weekdays`: Monday 0 to Sunday 6, sorted and
+/// deduplicated.
+///
+/// # Errors
+/// Returns Python's message for anything else.
+pub fn checked_weekdays(value: &serde_json::Value) -> Result<Vec<u8>, String> {
+    let message = || "Choose weekdays from Monday to Sunday.".to_string();
+    let items = value.as_array().ok_or_else(message)?;
+    let mut days = BTreeSet::new();
+    for item in items {
+        let day = item
+            .as_u64()
+            .filter(|d| *d <= 6 && !item.is_f64())
+            .ok_or_else(message)?;
+        days.insert(u8::try_from(day).map_err(|_| message())?);
+    }
+    Ok(days.into_iter().collect())
+}
+
+fn is_int_in(value: &serde_json::Value, max: i64) -> bool {
+    value.as_i64().is_some_and(|n| (0..=max).contains(&n)) && !value.is_f64()
+}
+
+fn valid_padding_pair(value: &serde_json::Value) -> bool {
+    value
+        .as_array()
+        .is_some_and(|pair| pair.len() == 2 && pair.iter().all(|n| is_int_in(n, 180)))
+}
+
+fn valid_series_padding(value: &serde_json::Value) -> bool {
+    let Some(changes) = value.as_array() else {
+        return false;
+    };
+    let mut previous = String::new();
+    for change in changes {
+        let Some(row) = change.as_array() else {
+            return false;
+        };
+        let Some(start) = row.first().and_then(serde_json::Value::as_str) else {
+            return false;
+        };
+        if row.len() != 3
+            || start.len() != 14
+            || !start.bytes().all(|b| b.is_ascii_digit())
+            || start <= previous.as_str()
+            || !valid_padding_pair(&serde_json::Value::Array(row[1..].to_vec()))
+        {
+            return false;
+        }
+        previous = start.to_string();
+    }
+    true
+}
+
+fn number_or(value: Option<&serde_json::Value>, default: f64) -> f64 {
+    value
+        .and_then(serde_json::Value::as_f64)
+        .filter(|n| n.is_finite())
+        .unwrap_or(default)
+}
+
+/// Python `_valid_stored_job`: a stored entry the scheduler can run.
+/// Rust's own `waiting` status is accepted too.
+fn valid_stored_job(job: &serde_json::Value) -> bool {
+    let Some(map) = job.as_object() else {
+        return false;
+    };
+    let status_ok = map
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|s| {
+            ACTIVE_STATUSES.contains(&s) || DONE_STATUSES.contains(&s) || s == STATUS_WAITING
+        });
+    let id_ok = match map.get("id") {
+        Some(serde_json::Value::String(id)) => !id.is_empty(),
+        Some(serde_json::Value::Number(n)) => n.as_i64().is_some_and(|n| n != 0),
+        _ => false,
+    };
+    if !status_ok || !id_ok {
+        return false;
+    }
+    if map
+        .get("future_padding")
+        .is_some_and(|v| !valid_padding_pair(v))
+    {
+        return false;
+    }
+    if map
+        .get("series_padding_changes")
+        .is_some_and(|v| !valid_series_padding(v))
+    {
+        return false;
+    }
+    let repeat = match map.get("repeat") {
+        None | Some(serde_json::Value::Null) => "",
+        Some(serde_json::Value::String(r)) => r.as_str(),
+        Some(_) => return false,
+    };
+    if !matches!(repeat, "" | "daily" | "weekly" | "series" | "weekdays") {
+        return false;
+    }
+    if repeat == "weekdays" {
+        match map.get("weekdays").map(checked_weekdays) {
+            Some(Ok(days)) if !days.is_empty() => {}
+            _ => return false,
+        }
+    }
+    if TIME_REPEATS.contains(&repeat) {
+        let start = number_or(map.get("start_ts"), -1.0);
+        let stop = number_or(map.get("stop_ts"), 0.0);
+        return 0.0 <= start && start < stop && stop <= 253_402_300_799.0;
+    }
+    true
+}
+
+fn unique_suffix(seed: &str) -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    hex_id(&format!("{seed}:{}:{nanos}", std::process::id()))
 }
 
 impl DvrSchedule {
     /// Load (or start empty) from the store path, re-arming jobs that
-    /// were mid-recording when the app last closed.
+    /// were mid-recording when the app last closed. An unreadable file,
+    /// or one with invalid entries, is copied to
+    /// `<path>.corrupt-<hex>` first (Python `load`); valid entries
+    /// still load.
     #[must_use]
     pub fn load(path: PathBuf, now: f64) -> Self {
         let mut schedule = Self {
-            jobs: Vec::new(),
-            stopping_since: std::collections::BTreeMap::new(),
-            resolving: BTreeSet::new(),
-            holds: BTreeSet::new(),
             path,
+            ..Self::default()
         };
-        let Ok(text) = std::fs::read_to_string(&schedule.path) else {
+        let bytes = match std::fs::read(&schedule.path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return schedule,
+            Err(_) => {
+                schedule.preserve_unreadable();
+                return schedule;
+            }
+        };
+        let list = serde_json::from_slice::<serde_json::Value>(&bytes)
+            .ok()
+            .and_then(|value| match value {
+                serde_json::Value::Object(mut map) => map.remove("jobs"),
+                other => Some(other),
+            });
+        let Some(serde_json::Value::Array(list)) = list else {
+            schedule.preserve_unreadable();
             return schedule;
         };
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
-            return schedule;
-        };
-        let list = value.get("jobs").cloned().unwrap_or_else(|| value.clone());
-        let Ok(mut jobs) = serde_json::from_value::<Vec<DvrJob>>(list) else {
-            return schedule;
-        };
+        let mut seen = BTreeSet::new();
+        let mut invalid = false;
+        let mut jobs = Vec::new();
+        for mut value in list {
+            if !valid_stored_job(&value) {
+                invalid = true;
+                continue;
+            }
+            for key in ["id", "recording_id"] {
+                if let Some(id) = value.get(key).and_then(serde_json::Value::as_i64) {
+                    value[key] = id.to_string().into();
+                }
+            }
+            match serde_json::from_value::<DvrJob>(value) {
+                Ok(job) if seen.insert(job.id.clone()) => jobs.push(job),
+                _ => invalid = true,
+            }
+        }
+        if invalid {
+            schedule.preserve_unreadable();
+        }
         for job in &mut jobs {
             if job.status == STATUS_WAITING {
                 // A wait is not replayed after a restart: the job
@@ -345,22 +541,97 @@ impl DvrSchedule {
         schedule
     }
 
-    /// Persist the store (atomic temp + rename, sorted by start).
-    pub fn save(&self) {
-        let mut jobs: Vec<&DvrJob> = self.jobs.iter().collect();
-        jobs.sort_by(|a, b| a.start_ts.total_cmp(&b.start_ts));
-        let text = serde_json::to_string_pretty(&serde_json::json!({
+    /// Keep the exact bytes before a new schedule may replace them
+    /// (Python `_preserve_corrupt_schedule`); when that fails, block
+    /// every write.
+    fn preserve_unreadable(&mut self) {
+        let mut name = self.path.as_os_str().to_owned();
+        name.push(format!(".corrupt-{}", unique_suffix("corrupt")));
+        let backup = PathBuf::from(name);
+        let copied = (|| -> std::io::Result<()> {
+            let bytes = std::fs::read(&self.path)?;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&backup)?;
+            std::io::Write::write_all(&mut file, &bytes)?;
+            file.sync_all()
+        })();
+        if copied.is_ok() {
+            self.load_warning_backup = backup.display().to_string();
+            self.load_warning = UNREADABLE_WARNING.replace("{path}", &self.load_warning_backup);
+        } else {
+            let _ = std::fs::remove_file(&backup);
+            self.load_error = true;
+            self.load_warning = BLOCKED_WARNING.to_string();
+        }
+        crate::applog::error("dvr", &self.load_warning);
+    }
+
+    /// Persist the store: a complete, synced temp file renamed over
+    /// the old one, sorted by start (Python `_write_proposal`).
+    ///
+    /// # Errors
+    /// Returns the load warning while writes are blocked, or the
+    /// I/O error; the previous file is then untouched.
+    pub fn save(&self) -> Result<(), String> {
+        self.write(&self.jobs)
+    }
+
+    fn write(&self, jobs: &[DvrJob]) -> Result<(), String> {
+        if self.load_error {
+            return Err(self.load_warning.clone());
+        }
+        let mut sorted: Vec<&DvrJob> = jobs.iter().collect();
+        sorted.sort_by(|a, b| a.start_ts.total_cmp(&b.start_ts));
+        let text = serde_json::to_string(&serde_json::json!({
             "version": 1,
-            "jobs": jobs,
+            "jobs": sorted,
         }))
-        .unwrap_or_default();
-        if let Some(parent) = self.path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+        .map_err(|e| e.to_string())?;
+        let directory = self
+            .path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        std::fs::create_dir_all(directory).map_err(|e| e.to_string())?;
+        let temporary = directory.join(format!("schedule-{}.tmp", &unique_suffix("save")[..16]));
+        let written = (|| -> std::io::Result<()> {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary)?;
+            std::io::Write::write_all(&mut file, text.as_bytes())?;
+            file.sync_all()?;
+            drop(file);
+            std::fs::rename(&temporary, &self.path)
+        })();
+        if let Err(error) = written {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(error.to_string());
         }
-        let tmp = self.path.with_extension("json.tmp");
-        if std::fs::write(&tmp, text).is_ok() {
-            let _ = std::fs::rename(&tmp, &self.path);
+        Ok(())
+    }
+
+    /// A clock-driven save: a failure is logged, never turned into a
+    /// job state (Python `_save_schedule`).
+    pub fn save_logged(&self) {
+        if let Err(error) = self.save() {
+            crate::applog::error("dvr", &format!("Could not save the DVR schedule: {error}"));
         }
+    }
+
+    /// Apply a user edit to a copy, write it, and only then make it
+    /// current: a failed write leaves the schedule as it was.
+    fn transaction<T>(
+        &mut self,
+        change: impl FnOnce(&mut Vec<DvrJob>) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let mut proposal = self.jobs.clone();
+        let result = change(&mut proposal)?;
+        self.write(&proposal)?;
+        self.jobs = proposal;
+        Ok(result)
     }
 
     #[must_use]
@@ -388,11 +659,17 @@ impl DvrSchedule {
             .count()
     }
 
-    pub fn add_job(&mut self, job: DvrJob) -> String {
+    /// Add one job durably.
+    ///
+    /// # Errors
+    /// Returns the write error; the job is then not added.
+    pub fn add_job(&mut self, job: DvrJob) -> Result<String, String> {
         let id = job.id.clone();
-        self.jobs.push(job);
-        self.save();
-        id
+        self.transaction(|jobs| {
+            jobs.push(job);
+            Ok(())
+        })?;
+        Ok(id)
     }
 
     /// Python `edit_timing`: retime one scheduled or recording
@@ -402,7 +679,8 @@ impl DvrSchedule {
     ///
     /// # Errors
     /// Returns Python's messages for a stale or changed job, a
-    /// running job's start move, and an invalid window.
+    /// running job's start move, an invalid window, and a failed
+    /// write (the schedule is then unchanged).
     #[allow(clippy::float_cmp)] // the expected snapshot compares exactly, as Python's does
     #[allow(clippy::cast_possible_truncation)] // programme times are whole seconds
     pub fn edit_timing(
@@ -413,85 +691,106 @@ impl DvrSchedule {
         expected: (f64, f64, &str),
         now: f64,
     ) -> Result<DvrJob, String> {
-        let Some(job) = self.jobs.iter_mut().find(|j| j.id == job_id) else {
-            return Err("The recording changed. Reopen its timing dialog.".to_string());
-        };
-        if (job.status != STATUS_SCHEDULED && job.status != STATUS_RECORDING)
-            || job.start_ts != expected.0
-            || job.stop_ts != expected.1
-            || job.status != expected.2
-        {
-            return Err("The recording changed. Reopen its timing dialog.".to_string());
-        }
-        let running = job.status == STATUS_RECORDING;
-        if running && start != job.start_ts {
-            return Err("A running recording's start time cannot be changed.".to_string());
-        }
-        validate_window(start, end, now, running)?;
-        job.start_ts = start;
-        job.stop_ts = end;
-        job.start_at = iso_from_ts(start);
-        job.end_at = iso_from_ts(end);
-        job.pre_padding_minutes = 0;
-        job.post_padding_minutes = 0;
-        if let Some(program) = job.program.as_object_mut() {
-            program.insert(
-                "start".to_string(),
-                serde_json::json!(xmltv_from_ts(start as i64)),
-            );
-            program.insert(
-                "end".to_string(),
-                serde_json::json!(xmltv_from_ts(end as i64)),
-            );
-        }
-        let updated = job.clone();
-        self.save();
-        Ok(updated)
+        self.transaction(|jobs| {
+            let Some(job) = jobs.iter_mut().find(|j| j.id == job_id) else {
+                return Err("The recording changed. Reopen its timing dialog.".to_string());
+            };
+            if (job.status != STATUS_SCHEDULED && job.status != STATUS_RECORDING)
+                || job.start_ts != expected.0
+                || job.stop_ts != expected.1
+                || job.status != expected.2
+            {
+                return Err("The recording changed. Reopen its timing dialog.".to_string());
+            }
+            let running = job.status == STATUS_RECORDING;
+            if running && start != job.start_ts {
+                return Err("A running recording's start time cannot be changed.".to_string());
+            }
+            validate_window(start, end, now, running)?;
+            job.start_ts = start;
+            job.stop_ts = end;
+            job.start_at = iso_from_ts(start);
+            job.end_at = iso_from_ts(end);
+            job.pre_padding_minutes = 0;
+            job.post_padding_minutes = 0;
+            if let Some(program) = job.program.as_object_mut() {
+                program.insert(
+                    "start".to_string(),
+                    serde_json::json!(xmltv_from_ts(start as i64)),
+                );
+                program.insert(
+                    "end".to_string(),
+                    serde_json::json!(xmltv_from_ts(end as i64)),
+                );
+            }
+            Ok(job.clone())
+        })
     }
 
     /// Delete a job outright (finished jobs only, like Python's
     /// Scheduled Recordings dialog Delete).
-    pub fn remove_job(&mut self, job_id: &str) -> bool {
-        let Some(job) = self.jobs.iter().find(|j| j.id == job_id) else {
-            return false;
-        };
-        if !DONE_STATUSES.contains(&job.status.as_str()) {
-            return false;
+    ///
+    /// # Errors
+    /// Returns the write error; the job then stays.
+    pub fn remove_job(&mut self, job_id: &str) -> Result<bool, String> {
+        let removable = self
+            .jobs
+            .iter()
+            .any(|j| j.id == job_id && DONE_STATUSES.contains(&j.status.as_str()));
+        if !removable {
+            return Ok(false);
         }
-        self.jobs.retain(|j| j.id != job_id);
+        self.transaction(|jobs| {
+            jobs.retain(|j| j.id != job_id);
+            Ok(())
+        })?;
         self.stopping_since.remove(job_id);
-        self.save();
-        true
+        Ok(true)
     }
 
-    pub fn cancel_job(&mut self, job_id: &str) -> bool {
-        let Some(job) = self.jobs.iter_mut().find(|j| j.id == job_id) else {
-            return false;
-        };
-        if DONE_STATUSES.contains(&job.status.as_str()) {
-            return false;
+    /// Cancel a job that has not finished.
+    ///
+    /// # Errors
+    /// Returns the write error; the job then keeps its status.
+    pub fn cancel_job(&mut self, job_id: &str) -> Result<bool, String> {
+        let cancelled = self.transaction(|jobs| {
+            let Some(job) = jobs.iter_mut().find(|j| j.id == job_id) else {
+                return Ok(false);
+            };
+            if DONE_STATUSES.contains(&job.status.as_str()) {
+                return Ok(false);
+            }
+            job.status = STATUS_CANCELED.to_string();
+            job.message = "Canceled by user.".to_string();
+            Ok(true)
+        })?;
+        if cancelled {
+            self.resolving.remove(job_id);
+            self.holds.remove(job_id);
         }
-        self.resolving.remove(job_id);
-        self.holds.remove(job_id);
-        job.status = STATUS_CANCELED.to_string();
-        job.message = "Canceled by user.".to_string();
-        self.save();
-        true
+        Ok(cancelled)
     }
 
     /// Change a job's repeat rule (port of Python `dvr.set_repeat`):
     /// only `daily`, `weekly` and `series` are accepted, and the job
-    /// must exist. Persists on success.
-    pub fn set_repeat(&mut self, job_id: &str, repeat: &str) -> bool {
+    /// must still be scheduled, recording or stopping.
+    ///
+    /// # Errors
+    /// Returns the write error; the rule is then unchanged.
+    pub fn set_repeat(&mut self, job_id: &str, repeat: &str) -> Result<bool, String> {
         if !matches!(repeat, "daily" | "weekly" | "series") {
-            return false;
+            return Ok(false);
         }
-        let Some(job) = self.jobs.iter_mut().find(|j| j.id == job_id) else {
-            return false;
-        };
-        job.repeat = repeat.to_string();
-        self.save();
-        true
+        self.transaction(|jobs| {
+            let Some(job) = jobs
+                .iter_mut()
+                .find(|j| j.id == job_id && ACTIVE_STATUSES.contains(&j.status.as_str()))
+            else {
+                return Ok(false);
+            };
+            job.repeat = repeat.to_string();
+            Ok(true)
+        })
     }
 
     /// The id of the first non-done job that duplicates `candidate`
@@ -562,7 +861,7 @@ impl DvrSchedule {
         if let Some(job) = self.jobs.iter_mut().find(|j| j.id == job_id) {
             note_started(job, now);
         }
-        self.save();
+        self.save_logged();
     }
 
     /// Apply a successful asynchronous provider resolution to a still-pending
@@ -581,7 +880,7 @@ impl DvrSchedule {
         if let Some(job) = self.jobs.iter_mut().find(|j| j.id == job_id) {
             note_started(job, now);
         }
-        self.save();
+        self.save_logged();
         true
     }
 
@@ -590,7 +889,7 @@ impl DvrSchedule {
     pub fn mark_resolving(&mut self, job_id: &str) {
         self.resolving.insert(job_id.to_string());
         self.set_status(job_id, STATUS_SCHEDULED, "");
-        self.save();
+        self.save_logged();
     }
 
     /// Return a failed or unavailable resolution to the normal due-job path.
@@ -620,7 +919,7 @@ impl DvrSchedule {
         } else {
             self.set_status(job_id, STATUS_SCHEDULED, "");
         }
-        self.save();
+        self.save_logged();
     }
 
     /// Advance due jobs (port of `tick`): start what's due, stop what's
@@ -748,7 +1047,7 @@ impl DvrSchedule {
             }
         }
         if changed {
-            self.save();
+            self.save_logged();
         }
         actions
     }
@@ -806,7 +1105,7 @@ impl DvrSchedule {
         now: f64,
     ) {
         self.mark_finished_inner(job_id, success, output_path, message, now);
-        self.save();
+        self.save_logged();
     }
 
     fn schedule_next_occurrence(&mut self, job: &DvrJob, now: f64) {
@@ -1052,6 +1351,144 @@ mod tests {
         }
     }
 
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "iptv-dvr-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn corrupt_copies(dir: &Path) -> Vec<PathBuf> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|n| n.to_str())
+                    .and_then(|n| n.strip_prefix("scheduled_recordings.json.corrupt-"))
+                    .is_some_and(|hex| {
+                        hex.len() == 32 && hex.chars().all(|c| c.is_ascii_hexdigit())
+                    })
+            })
+            .collect()
+    }
+
+    /// A job as Python v1.151.6 writes it, with every field this
+    /// port must carry through untouched.
+    fn python_job() -> serde_json::Value {
+        serde_json::json!({
+            "id": "0123456789abcdef0123456789abcdef",
+            "status": "scheduled",
+            "title": "Evening News",
+            "channel_name": "News",
+            "display_title": "Evening News - News",
+            "channel": {"name": "News", "url": "http://example.com/s", "provider-id": "p1"},
+            "program": {"title": "Evening News", "start": "20261124180000", "end": "20261124190000",
+                        "episode": "0.4.", "subtitle": "Pilot", "description": "Text.", "channel_id": "news.hu"},
+            "format": "provider_mkv",
+            "start_at": "2026-11-24T18:00:00+00:00",
+            "end_at": "2026-11-24T19:00:00+00:00",
+            "start_ts": 1_795_543_200.0,
+            "stop_ts": 1_795_546_920.0,
+            "pre_padding_minutes": 0,
+            "post_padding_minutes": 2,
+            "created_at": "2026-11-23T10:00:00+00:00",
+            "recording_id": null,
+            "output_path": "",
+            "message": "",
+            "repeat": "weekdays",
+            "weekdays": [0, 2, 4],
+            "future_padding": [1, 3],
+            "series_padding_changes": [["20261201000000", 2, 4]],
+            "series_source": "fedcba9876543210fedcba9876543210",
+            "manual": true,
+            "a_future_python_field": {"kept": [1, 2]}
+        })
+    }
+
+    #[test]
+    fn python_schedule_round_trips() {
+        let dir = temp_dir("roundtrip");
+        let path = dir.join("scheduled_recordings.json");
+        let job = python_job();
+        std::fs::write(
+            &path,
+            serde_json::json!({"version": 1, "jobs": [job.clone()]}).to_string(),
+        )
+        .unwrap();
+        let schedule = DvrSchedule::load(path.clone(), 1_795_000_000.0);
+        assert!(
+            schedule.load_warning.is_empty(),
+            "{}",
+            schedule.load_warning
+        );
+        assert_eq!(schedule.jobs().len(), 1);
+        schedule.save().unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved["version"], 1);
+        assert_eq!(saved["jobs"][0], job);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn unreadable_schedule_is_preserved() {
+        let dir = temp_dir("corrupt");
+        let path = dir.join("scheduled_recordings.json");
+        std::fs::write(&path, b"{not json").unwrap();
+        let schedule = DvrSchedule::load(path.clone(), 0.0);
+        assert!(schedule.jobs().is_empty());
+        let copies = corrupt_copies(&dir);
+        assert_eq!(copies.len(), 1);
+        assert_eq!(std::fs::read(&copies[0]).unwrap(), b"{not json");
+        assert!(schedule.load_warning.starts_with(
+            "The recording schedule could not be read. The original file was preserved at "
+        ));
+        schedule.save().unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+
+        let dir = temp_dir("invalid-job");
+        let path = dir.join("scheduled_recordings.json");
+        let mut bad = python_job();
+        bad["status"] = "bogus".into();
+        let mut dup = python_job();
+        dup["title"] = "Duplicate id".into();
+        let text = serde_json::json!({"version": 1, "jobs": [python_job(), bad, dup]}).to_string();
+        std::fs::write(&path, &text).unwrap();
+        let schedule = DvrSchedule::load(path, 0.0);
+        assert_eq!(schedule.jobs().len(), 1);
+        assert_eq!(schedule.jobs()[0].title, "Evening News");
+        let copies = corrupt_copies(&dir);
+        assert_eq!(copies.len(), 1);
+        assert_eq!(std::fs::read_to_string(&copies[0]).unwrap(), text);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A schedule that can be neither read nor backed up (here a
+    /// directory where the file should be) blocks every write.
+    #[test]
+    fn blocked_when_backup_fails() {
+        let dir = temp_dir("blocked");
+        let path = dir.join("scheduled_recordings.json");
+        std::fs::create_dir_all(&path).unwrap();
+        let mut schedule = DvrSchedule::load(path, 0.0);
+        assert!(schedule.load_warning.starts_with(
+            "The recording schedule could not be read or backed up. Changes are disabled"
+        ));
+        let chan = channel();
+        let job = build_job(&spec(&chan, "Show", 1000, 4600, 0, 0), 900.0).unwrap();
+        assert_eq!(schedule.add_job(job), Err(schedule.load_warning.clone()));
+        assert!(schedule.jobs().is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     #[allow(clippy::float_cmp)] // whole-second schedule values are exact in f64
     fn build_job_applies_padding_and_titles() {
@@ -1074,8 +1511,8 @@ mod tests {
         let missed = build_job(&spec(&chan, "Old", 10, 20, 0, 0), 0.0).expect("j");
         let missed_id = missed.id.clone();
         let due_id = due.id.clone();
-        schedule.add_job(due);
-        schedule.add_job(missed);
+        schedule.add_job(due).unwrap();
+        schedule.add_job(missed).unwrap();
         let actions = schedule.tick(150.0);
         assert_eq!(actions, vec![DvrAction::Start(due_id.clone())]);
         assert_eq!(schedule.get(&due_id).expect("due").status, STATUS_RECORDING);
@@ -1095,7 +1532,7 @@ mod tests {
         let channel = stalker_channel();
         let job = build_job(&spec(&channel, "Due", 100, 200, 0, 0), 0.0).expect("job");
         let id = job.id.clone();
-        schedule.add_job(job);
+        schedule.add_job(job).unwrap();
 
         let actions = schedule.tick(150.0);
         assert_eq!(
@@ -1120,7 +1557,7 @@ mod tests {
         let mut schedule = DvrSchedule::load(path, 0.0);
         let due = build_job(&spec(&channel(), "Due", 100, 200, 0, 0), 0.0).expect("job");
         let id = due.id.clone();
-        schedule.add_job(due);
+        schedule.add_job(due).unwrap();
 
         assert_eq!(schedule.tick(150.0), vec![DvrAction::Start(id.clone())]);
         schedule.mark_resolving(&id);
@@ -1139,7 +1576,7 @@ mod tests {
         let mut schedule = DvrSchedule::load(path, 0.0);
         let due = build_job(&spec(&channel(), "Due", 100, 200, 0, 0), 0.0).expect("job");
         let id = due.id.clone();
-        schedule.add_job(due);
+        schedule.add_job(due).unwrap();
 
         assert_eq!(schedule.tick(150.0), vec![DvrAction::Start(id.clone())]);
         schedule.mark_resolving(&id);
@@ -1161,10 +1598,10 @@ mod tests {
         let mut schedule = DvrSchedule::load(path, 0.0);
         let due = build_job(&spec(&channel(), "Due", 100, 200, 0, 0), 0.0).expect("job");
         let id = due.id.clone();
-        schedule.add_job(due);
+        schedule.add_job(due).unwrap();
         assert_eq!(schedule.tick(150.0), vec![DvrAction::Start(id.clone())]);
         schedule.mark_resolving(&id);
-        assert!(schedule.cancel_job(&id));
+        assert!(schedule.cancel_job(&id).unwrap());
         schedule.defer_resolution(&id, 160.0);
         assert_eq!(schedule.get(&id).expect("job").status, STATUS_CANCELED);
         let _ = std::fs::remove_dir_all(&dir);
@@ -1178,10 +1615,10 @@ mod tests {
         let mut schedule = DvrSchedule::load(path, 0.0);
         let due = build_job(&spec(&stalker_channel(), "Due", 100, 200, 0, 0), 0.0).expect("job");
         let id = due.id.clone();
-        schedule.add_job(due);
+        schedule.add_job(due).unwrap();
         assert_eq!(schedule.tick(150.0).len(), 1);
         schedule.mark_resolving(&id);
-        assert!(schedule.cancel_job(&id));
+        assert!(schedule.cancel_job(&id).unwrap());
         assert!(!schedule.resolution_succeeded(&id, 150.0));
         assert_eq!(schedule.get(&id).expect("job").status, STATUS_CANCELED);
         let _ = std::fs::remove_dir_all(&dir);
@@ -1197,7 +1634,7 @@ mod tests {
         // the padded start is 880.
         let late = build_job(&spec(&chan, "Late", 1000, 2000, 2, 5), 0.0).expect("j");
         let late_id = late.id.clone();
-        schedule.add_job(late);
+        schedule.add_job(late).unwrap();
         // First tick lands after the programme itself began.
         assert_eq!(schedule.tick(1001.0).len(), 1);
         let job = schedule.get(&late_id).expect("job");
@@ -1233,7 +1670,7 @@ mod tests {
         let chan = channel();
         let job = build_job(&spec(&chan, "Padded", 1000, 2000, 2, 5), 0.0).expect("j");
         let id = job.id.clone();
-        schedule.add_job(job);
+        schedule.add_job(job).unwrap();
         assert_eq!(schedule.tick(900.0).len(), 1); // padded start 880, programme 1000
         assert!(!schedule.get(&id).expect("job").started_late);
         schedule.mark_finished(&id, true, "/tmp/out.mkv", "", 2301.0);
@@ -1249,7 +1686,7 @@ mod tests {
         let chan = channel();
         let job = build_job(&spec(&chan, "Show", 100, 200, 0, 0), 0.0).expect("j");
         let id = job.id.clone();
-        schedule.add_job(job);
+        schedule.add_job(job).unwrap();
         let mut blocked = |_: &DvrJob| Some("All 1 provider connection(s) are in use.".to_string());
         let actions = schedule.tick_gated(150.0, &mut blocked);
         assert_eq!(actions, vec![DvrAction::Conflict(id.clone())]);
@@ -1279,7 +1716,7 @@ mod tests {
         let chan = channel();
         let job = build_job(&spec(&chan, "Show", 100, 200, 0, 0), 0.0).expect("j");
         let id = job.id.clone();
-        schedule.add_job(job);
+        schedule.add_job(job).unwrap();
         let mut blocked = |_: &DvrJob| Some("busy".to_string());
         let _ = schedule.tick_gated(150.0, &mut blocked);
         let _ = schedule.tick_gated(250.0, &mut blocked);
@@ -1297,7 +1734,7 @@ mod tests {
         let chan = channel();
         let job = build_job(&spec(&chan, "Show", 100, 200, 0, 0), 0.0).expect("j");
         let id = job.id.clone();
-        schedule.add_job(job);
+        schedule.add_job(job).unwrap();
         schedule.hold_job(&id);
         // Past the whole window while held: nothing happens.
         assert!(schedule.tick(500.0).is_empty());
@@ -1309,10 +1746,10 @@ mod tests {
         // A waiting job can be canceled like any other.
         let job2 = build_job(&spec(&chan, "Two", 100, 200, 0, 0), 1.0).expect("j");
         let id2 = job2.id.clone();
-        schedule.add_job(job2);
+        schedule.add_job(job2).unwrap();
         let _ = schedule.tick_gated(150.0, &mut |_| Some("busy".to_string()));
         assert_eq!(schedule.get(&id2).expect("job").status, STATUS_WAITING);
-        assert!(schedule.cancel_job(&id2));
+        assert!(schedule.cancel_job(&id2).unwrap());
         assert_eq!(schedule.get(&id2).expect("job").status, STATUS_CANCELED);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1325,7 +1762,7 @@ mod tests {
         let chan = channel();
         let job = build_job(&spec(&chan, "Show", 100, 200, 0, 0), 0.0).expect("j");
         let id = job.id.clone();
-        schedule.add_job(job);
+        schedule.add_job(job).unwrap();
         let _ = schedule.tick_gated(150.0, &mut |_| Some("busy".to_string()));
         assert_eq!(schedule.get(&id).expect("job").status, STATUS_WAITING);
         // The persisted waiting job comes back scheduled: the
@@ -1345,8 +1782,8 @@ mod tests {
         let later = build_job(&spec(&chan, "Later", 300, 900, 0, 0), 0.0).expect("j");
         let earlier = build_job(&spec(&chan, "Earlier", 100, 900, 0, 0), 0.0).expect("j");
         let (later_id, earlier_id) = (later.id.clone(), earlier.id.clone());
-        schedule.add_job(later);
-        schedule.add_job(earlier);
+        schedule.add_job(later).unwrap();
+        schedule.add_job(earlier).unwrap();
         // One slot only: the gate frees exactly its first caller.
         let mut calls = 0;
         let mut one_slot = |_: &DvrJob| {
@@ -1377,8 +1814,8 @@ mod tests {
         let first = build_job(&spec(&chan, "First", 100, 900, 0, 0), 0.0).expect("j");
         let second = build_job(&spec(&chan, "Second", 100, 900, 0, 0), 1.0).expect("j");
         let (first_id, second_id) = (first.id.clone(), second.id.clone());
-        schedule.add_job(first);
-        schedule.add_job(second);
+        schedule.add_job(first).unwrap();
+        schedule.add_job(second).unwrap();
         let mut calls = 0;
         let mut one_slot = |_: &DvrJob| {
             calls += 1;
@@ -1404,8 +1841,8 @@ mod tests {
         let blocked = build_job(&spec(&chan, "Blocked", 100, 900, 0, 0), 0.0).expect("j");
         let free = build_job(&spec(&chan, "Free", 100, 900, 0, 0), 1.0).expect("j");
         let (blocked_id, free_id) = (blocked.id.clone(), free.id.clone());
-        schedule.add_job(blocked);
-        schedule.add_job(free);
+        schedule.add_job(blocked).unwrap();
+        schedule.add_job(free).unwrap();
         let mut gate = |job: &DvrJob| {
             if job.title == "Blocked" {
                 Some("busy".to_string())
@@ -1428,7 +1865,7 @@ mod tests {
         let chan = channel();
         let job = build_job(&spec(&chan, "Show", 100, 200, 0, 0), 0.0).expect("j");
         let id = job.id.clone();
-        schedule.add_job(job);
+        schedule.add_job(job).unwrap();
         let _ = schedule.tick_gated(150.0, &mut |_| Some("busy".to_string()));
         // Capacity frees exactly as the window closes: expiry
         // wins the race, the job is missed with its reason.
@@ -1448,7 +1885,7 @@ mod tests {
         let chan = channel();
         let job = build_job(&spec(&chan, "Show", 100, 200, 0, 0), 0.0).expect("j");
         let id = job.id.clone();
-        schedule.add_job(job);
+        schedule.add_job(job).unwrap();
         let _ = schedule.tick_gated(150.0, &mut |_| Some("busy".to_string()));
         assert_eq!(schedule.get(&id).expect("job").status, STATUS_WAITING);
         drop(schedule);
@@ -1478,19 +1915,19 @@ mod tests {
         let chan = channel();
         let job = build_job(&spec(&chan, "Show", 100, 200, 0, 0), 0.0).expect("j");
         let id = job.id.clone();
-        schedule.add_job(job);
+        schedule.add_job(job).unwrap();
         for repeat in ["daily", "weekly", "series"] {
-            assert!(schedule.set_repeat(&id, repeat));
+            assert!(schedule.set_repeat(&id, repeat).unwrap());
             assert_eq!(schedule.get(&id).expect("job").repeat, repeat);
         }
         // The last setting is persisted, not just in memory.
         let reloaded = DvrSchedule::load(path, 0.0);
         assert_eq!(reloaded.get(&id).expect("job").repeat, "series");
         // Anything else, and unknown ids, are refused.
-        assert!(!schedule.set_repeat(&id, "none"));
-        assert!(!schedule.set_repeat(&id, "bogus"));
-        assert!(!schedule.set_repeat(&id, ""));
-        assert!(!schedule.set_repeat("no-such-job", "daily"));
+        assert!(!schedule.set_repeat(&id, "none").unwrap());
+        assert!(!schedule.set_repeat(&id, "bogus").unwrap());
+        assert!(!schedule.set_repeat(&id, "").unwrap());
+        assert!(!schedule.set_repeat("no-such-job", "daily").unwrap());
         assert_eq!(schedule.get(&id).expect("job").repeat, "series");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1544,7 +1981,7 @@ mod tests {
         let chan = channel();
         let existing = build_job(&spec(&chan, "Show", 1000, 4600, 0, 0), 0.0).expect("j");
         let existing_id = existing.id.clone();
-        schedule.add_job(existing);
+        schedule.add_job(existing).unwrap();
         // Same channel and programme window (built later, so a
         // different id) duplicates the stored job.
         let candidate = build_job(&spec(&chan, "Show", 1000, 4600, 0, 0), 1.0).expect("j");
@@ -1557,7 +1994,7 @@ mod tests {
         let other_end = build_job(&spec(&chan, "Show", 1000, 5000, 0, 0), 2.0).expect("j");
         assert_eq!(schedule.find_duplicate(&other_end), None);
         // A done job no longer counts as a duplicate.
-        assert!(schedule.cancel_job(&existing_id));
+        assert!(schedule.cancel_job(&existing_id).unwrap());
         assert_eq!(schedule.find_duplicate(&candidate), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1570,7 +2007,7 @@ mod tests {
         let chan = channel();
         let existing = build_job(&spec(&chan, "Show", 1000, 2000, 0, 0), 0.0).expect("j");
         let existing_id = existing.id.clone();
-        schedule.add_job(existing);
+        schedule.add_job(existing).unwrap();
         // Touching windows (candidate starts exactly at the stored
         // stop) do not overlap.
         let touching = build_job(&spec(&chan, "Next", 2000, 3000, 0, 0), 0.0).expect("j");
@@ -1579,7 +2016,7 @@ mod tests {
         let partial = build_job(&spec(&chan, "Partial", 1500, 2500, 0, 0), 0.0).expect("j");
         assert_eq!(schedule.overlapping(&partial), vec![existing_id.clone()]);
         // Done jobs are excluded.
-        assert!(schedule.cancel_job(&existing_id));
+        assert!(schedule.cancel_job(&existing_id).unwrap());
         assert!(schedule.overlapping(&partial).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1628,9 +2065,9 @@ mod tests {
         let chan = channel();
         let job = build_job(&spec(&chan, "Show", 100, 200, 0, 0), 0.0).expect("j");
         let id = job.id.clone();
-        schedule.add_job(job);
+        schedule.add_job(job).unwrap();
         assert_eq!(schedule.tick(150.0).len(), 1);
-        assert!(schedule.cancel_job(&id));
+        assert!(schedule.cancel_job(&id).unwrap());
         // The capture that was starting when the cancel landed
         // ends now: the job stays Canceled with the user's reason.
         schedule.mark_finished(&id, true, "/tmp/out.mkv", "", 160.0);

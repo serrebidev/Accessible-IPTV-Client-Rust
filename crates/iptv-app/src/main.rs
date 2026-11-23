@@ -1402,10 +1402,36 @@ fn bind_housekeeping(frame: Frame, wiring: &Wiring) {
     let last_check = Rc::new(std::cell::Cell::new(now_seconds()));
     let last_playlist_refresh = Rc::new(std::cell::Cell::new(now_seconds()));
     let config_dir = iptv_core::config::user_config_dir();
+    let dvr_warning_shown = std::cell::Cell::new(false);
     wiring.housekeeping.on_tick(move |_| {
         if iptv_core::instance::take_show_request(&config_dir) {
             frame.show(true);
             frame.raise();
+        }
+        // Python shows the schedule's load warning once, after the
+        // window is up (`wx.CallAfter` in `_start_dvr_scheduler`).
+        if !dvr_warning_shown.replace(true) {
+            let dvr = tick_wiring.dvr.borrow();
+            let warning = if dvr.load_warning.is_empty() {
+                String::new()
+            } else if dvr.load_warning_backup.is_empty() {
+                tr(iptv_core::dvr::BLOCKED_WARNING)
+            } else {
+                trf(
+                    iptv_core::dvr::UNREADABLE_WARNING,
+                    &[("path", &dvr.load_warning_backup)],
+                )
+            };
+            drop(dvr);
+            if !warning.is_empty() {
+                show_or_queue_notification(
+                    frame,
+                    &warning,
+                    &tr("Scheduled Recordings"),
+                    MessageDialogStyle::OK | MessageDialogStyle::IconWarning,
+                    None,
+                );
+            }
         }
         let now = now_seconds();
         // N19: the delayed startup check falls due once,
@@ -1540,7 +1566,7 @@ fn bind_main_close(frame: Frame, wiring: &Wiring) {
                     );
                 }
             }
-            dvr.save();
+            dvr.save_logged();
         }
         close_buffers.borrow_mut().close_all();
         close_player.borrow_mut().app_voice.close();
@@ -2351,7 +2377,7 @@ fn poll_providers(wiring: &Wiring, controls: Controls) {
                                 status,
                             );
                         }
-                        Err(error) => status.set_label(&error),
+                        Err(error) => status.set_label(&tr(&error)),
                     },
                     Some(PendingResolve::Dvr(job_id)) => {
                         handle_dvr_resolve(wiring, status, &job_id, result);
@@ -2360,7 +2386,7 @@ fn poll_providers(wiring: &Wiring, controls: Controls) {
                         Ok(url) => {
                             begin_catchup_download(wiring, &channel, &programme, url, status);
                         }
-                        Err(error) => status.set_label(&error),
+                        Err(error) => status.set_label(&tr(&error)),
                     },
                     None => {}
                 }
@@ -2833,7 +2859,6 @@ fn apply_series_programmes(
     programmes: Vec<Programme>,
 ) {
     let channel = channel_from_snapshot(&rule.channel);
-    let mut added = false;
     for programme in programmes {
         if programme.start <= now_epoch()
             || !iptv_core::dvr::series_title_matches(&rule.title, &programme.title)
@@ -2855,12 +2880,11 @@ fn apply_series_programmes(
         };
         let mut dvr = wiring.dvr.borrow_mut();
         if dvr.find_duplicate(&job).is_none() {
-            dvr.add_job(job);
-            added = true;
+            if let Err(error) = dvr.add_job(job) {
+                iptv_core::applog::error("dvr", &format!("Series episode not saved: {error}"));
+                break;
+            }
         }
-    }
-    if added {
-        wiring.dvr.borrow_mut().save();
     }
 }
 
@@ -4150,7 +4174,7 @@ fn toggle_recording(
                 .build()
                 .show_modal_tracked();
         }
-        Err(error) => status.set_label(&error),
+        Err(error) => status.set_label(&tr(&error)),
     }
 }
 
@@ -9132,11 +9156,15 @@ fn add_dvr_job(
     {
         let mut dvr = wiring.dvr.borrow_mut();
         if let Some(duplicate_id) = dvr.find_duplicate(&job) {
-            if repeat != "none" && dvr.set_repeat(&duplicate_id, repeat) {
-                dvr.save();
-                status.set_label("Recording updated to repeat.");
+            let updated = if repeat == "none" {
+                Ok(false)
             } else {
-                status.set_label("This programme is already scheduled to record.");
+                dvr.set_repeat(&duplicate_id, repeat)
+            };
+            match updated {
+                Ok(true) => status.set_label("Recording updated to repeat."),
+                Ok(false) => status.set_label("This programme is already scheduled to record."),
+                Err(error) => status.set_label(&tr(&error)),
             }
             return;
         }
@@ -9169,10 +9197,11 @@ fn add_dvr_job(
             return;
         }
     }
-    let mut dvr = wiring.dvr.borrow_mut();
-    dvr.add_job(job);
-    dvr.save();
-    drop(dvr);
+    let added = wiring.dvr.borrow_mut().add_job(job);
+    if let Err(error) = added {
+        status.set_label(&tr(&error));
+        return;
+    }
     if repeat == "series" {
         // Fill the new rule from the guide on the next tick.
         wiring.series_last_scan.set(0.0);
@@ -9354,7 +9383,7 @@ fn play_catchup_for(wiring: &Wiring, channel: &Channel, programme: &Programme, s
             );
             status.set_label("Resolving catch-up link...");
         }
-        Err(error) => status.set_label(&error),
+        Err(error) => status.set_label(&tr(&error)),
     }
 }
 
@@ -17914,13 +17943,13 @@ fn open_conflict_dialog(wiring: &Wiring, job: &iptv_core::dvr::DvrJob, main_stat
     let frame_c = frame;
     let name_c = name.clone();
     cancel.on_click(move |_| {
-        if wiring_c2.dvr.borrow_mut().cancel_job(&job_id) {
-            player_status(
-                main_status,
-                &wiring_c2.persist,
-                &format!("Recording of {name_c} canceled."),
-                1,
-            );
+        let message = match wiring_c2.dvr.borrow_mut().cancel_job(&job_id) {
+            Ok(true) => format!("Recording of {name_c} canceled."),
+            Ok(false) => String::new(),
+            Err(error) => tr(&error),
+        };
+        if !message.is_empty() {
+            player_status(main_status, &wiring_c2.persist, &message, 1);
         }
         frame_c.hide();
     });
@@ -18007,8 +18036,13 @@ fn cancel_first_selected_job(wiring: &Wiring, list: ListCtrl, dstatus: Status) {
         return;
     };
     let mut dvr = wiring.dvr.borrow_mut();
-    if dvr.cancel_job(&id) {
-        dvr.save();
+    let cancelled = dvr.cancel_job(&id);
+    if let Err(error) = &cancelled {
+        drop(dvr);
+        dstatus.set_label(&tr(error));
+        return;
+    }
+    if cancelled == Ok(true) {
         drop(dvr);
         wiring.recordings.borrow_mut().stop(&format!("dvr:{id}"));
         wiring.dvr_resolve.borrow_mut().remove(&id);
@@ -18032,12 +18066,15 @@ fn delete_selected_finished_jobs(wiring: &Wiring, list: ListCtrl, dstatus: Statu
     {
         let mut dvr = wiring.dvr.borrow_mut();
         for id in &ids {
-            if dvr.remove_job(id) {
-                removed += 1;
+            match dvr.remove_job(id) {
+                Ok(true) => removed += 1,
+                Ok(false) => {}
+                Err(error) => {
+                    drop(dvr);
+                    dstatus.set_label(&tr(&error));
+                    return;
+                }
             }
-        }
-        if removed > 0 {
-            dvr.save();
         }
     }
     if removed == 0 {
@@ -18878,7 +18915,7 @@ fn start_catchup_download(
             );
             status.set_label("Resolving the download link...");
         }
-        Err(error) => status.set_label(&error),
+        Err(error) => status.set_label(&tr(&error)),
     }
 }
 
