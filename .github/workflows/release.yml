@@ -22,6 +22,7 @@ on:
 
 permissions:
   contents: write
+  actions: read
 
 jobs:
   build:
@@ -219,12 +220,29 @@ jobs:
         with:
           ref: ${{ inputs.tag || github.ref }}
 
-      - name: Collect packages
-        uses: actions/download-artifact@v8
-        with:
-          pattern: package-*
-          path: dist
-          merge-multiple: true
+      - name: Collect and verify packages
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          api="repos/$GITHUB_REPOSITORY/actions"
+          artifacts="$(gh api "$api/runs/$GITHUB_RUN_ID/artifacts")"
+          archive="$RUNNER_TEMP/iptv-package.zip"
+          mkdir -p dist
+          for spec in windows-x64:zip linux-x64:tar.gz macos-arm64:dmg; do
+            name="package-${spec%:*}"
+            file="accessible-iptv-client.${spec#*:}"
+            read -r id digest < <(jq -er --arg name "$name" '
+              [.artifacts[] | select(.name == $name and .expired == false)] |
+              if length == 1 then .[0] | [.id, .digest] | @tsv
+              else error("expected exactly one current artifact named " + $name) end
+            ' <<< "$artifacts")
+            [[ "$id" =~ ^[0-9]+$ && "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+            gh api "$api/artifacts/$id/zip" > "$archive"
+            printf '%s  %s\n' "${digest#sha256:}" "$archive" | sha256sum --check
+            unzip -p "$archive" "$file" > "dist/$file"
+            test -s "dist/$file"
+          done
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -310,7 +328,10 @@ jobs:
             curl -sf -H "$h" -H 'Content-Type: application/json' -d @- "$api/releases" | jq -r .id)"
           for file in dist/*; do
             name="$(basename "$file")"
-            curl -sf -o /dev/null -H "$h" -F "attachment=@$file" "$api/releases/$id/assets?name=$name"
+            printf 'Uploading %s (%s bytes) at %s\n' "$name" "$(wc -c < "$file")" "$(date -u +%FT%TZ)"
+            curl -fsS -o /dev/null -H "$h" -F "attachment=@$file" \
+              -w 'HTTP %{http_code}, sent %{size_upload} bytes in %{time_total}s\n' \
+              "$api/releases/$id/assets?name=$name"
             echo "Attached $name"
           done
           present="$(curl -sf -H "$h" "$api/releases/$id" | jq -r '.assets[].name')"
