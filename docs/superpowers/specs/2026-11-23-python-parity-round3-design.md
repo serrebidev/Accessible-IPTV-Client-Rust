@@ -73,6 +73,8 @@ C10. Assign Programme Guide: per-playlist/provider override of the guide channel
 
 C11. Saved Programme Searches: up to 30 rules, scope all/selected channel/named-list snapshot, run after imports and every 15 minutes over 14 days, 500 results, new-match announcements, results create reminders or recordings. Python: `saved_searches.py`, `personal_tools_ui.py`. Rust: new core module, `epgstore.rs`, `background.rs`. Depends on M9 for the named-list snapshot scope; Claude does C11 after M9 merges.
 
+C12. Guide ids scoped per guide source: `epg:<source_key>:<id>` splitting on collision or rename, `channels.xmltv_id` and `channel_sources`, and `choose_source_collision` in matching. Python: `playlist.py`, `channel_identity.py`. Rust: `epg.rs`, `epgstore.rs`, `guide_match.rs`. Done together with C10. Added by the scope sweep.
+
 ### muse.ai (easy)
 
 M1. Mute / Unmute (Ctrl+Shift+M main window, M in player, survives channel change and reconnect) and Player > Remember Volume for Each Channel (off by default, per playlist/provider). Python: `channel_preferences.py`, `internal_player.py`, `accessible_tools_ui.py`, `shortcuts.py`.
@@ -95,6 +97,10 @@ M9. View > Favourite Lists (50 lists of 2000, ordering, missing channels kept), 
 
 M10. Programme Guide by Time (local date and time, scope all/favourites/named list, rows with channel, title, start, end; schedule or remind) and Programme Details. Python: `personal_tools_ui.py`, `dialogs_misc.py`. Rust: `epgstore.rs`, `guide.rs`. The named-list scope arrives with M9; if M9 has not merged, M10 ships all/favourites and adds named lists after.
 
+M11. Recently Watched keyed per playlist source (`favorites.history_key`, `history_channels`, `history_labels`) and `playlist_index.channel_number` for Go to Channel. Python: `favorites.py`, `playlist_index.py`. Rust: `favorites.rs`. Added by the scope sweep.
+
+The scope sweep also folds series padding into C1, subtitle-speech reset on seek into M2, reminder alert choice into M4, and start-at-problem-time seek into C7.
+
 ## How muse.ai works
 
 - Claude briefs muse.ai through `muse-cli` in a side chat titled "IPTV Rust parity round 3" and watches Forgejo for its pull requests. Progress is tracked in the round-3 section of `docs/feature-parity-audit.md`, so work can resume in a later session from the repo alone. (Claude's call.)
@@ -104,14 +110,14 @@ M10. Programme Guide by Time (local date and time, scope all/favourites/named li
 - Before opening: `cargo test -p iptv-core`, `cargo clippy -p iptv-core --all-targets`, `cargo fmt --check`. The VM has 2 CPUs; the full app build is optional there.
 - PR body: what landed, Python files it follows, how to check it in the app with NVDA, residuals.
 - Do not edit `.github/workflows`, do not bump versions, do not release, do not merge.
-- Order: M1 to M10 as listed, M9 before M10 if possible.
+- Order: M1 to M11 as listed, M9 before M10 if possible.
 
 ## How Claude works
 
 - Branches `parity-round3/c<N>-<slug>` from newest `main`, merged by Claude after the full suite (`cargo test --workspace`), clippy and a Windows build pass.
 - Each muse.ai PR: pull, review against the Python source, run the same gate, fix or request changes, merge to Forgejo `main`.
 - Scope sweep (Claude's call): the 21 groups came from Python's user-guide diff. Before C1, Claude reads the code diffs of Python PRs #118, #119, #33, #34, #36, #39 and #42 (the range `6afe6014..a29ad9a3`) for behavior the guide does not describe: reliability fixes, data-recovery rules, new settings. Anything found joins the ledger as a new C or M entry, or is recorded as not ported with the reason.
-- Order: housekeeping (CI pin, audit round 3), scope sweep, then C1, C9, C10, C3, C4, C2, C7, C8, C5, C6, C11. C1 first because most other recording work builds on its schedule shape; C9 next because it fixes the data format the swap depends on.
+- Order: housekeeping (CI pin, audit round 3), scope sweep, then C1, C9, C10, C3, C4, C2, C7, C8, C5, C6, C11. C12 goes with C10. C1 first because most other recording work builds on its schedule shape; C9 next because it fixes the data format the swap depends on.
 - Each closed group gets a validation note under `docs/validation/` and its ledger entry marked fixed, as in rounds 1 and 2.
 
 ## Acceptance

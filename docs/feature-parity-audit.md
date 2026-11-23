@@ -1336,6 +1336,7 @@ Checked and not gaps: Python's start-at-100-percent volume fix (Rust never reads
 - **C9, high: full backup (`accessible-iptv-settings-v2`).** Python `full_backup.py`.
 - **C10, medium: Assign Programme Guide.** Python `accessible_tools_ui.py`.
 - **C11, medium: Saved Programme Searches.** Python `saved_searches.py`.
+- **C12, high: guide ids scoped per guide source.** Python's EPG import keeps a shared XMLTV id but splits it into `epg:<source_key>:<id>` when two sources collide or a source renames a shared id (`channels.xmltv_id`, `channel_sources`), and matching resolves an unscoped duplicate by one exact, number-safe display name (`choose_source_collision`). Python `playlist.py:1473`, `:2120`, `channel_identity.py`. Found by the scope sweep.
 - **M1, medium: Mute / Unmute and Remember Volume for Each Channel.** Python `channel_preferences.py`.
 - **M2, medium: on-demand seek keys, Go to Time, time announcement.** Python `media_navigation.py`.
 - **M3, low: Named Bookmarks.** Python `named_bookmarks.py`.
@@ -1346,5 +1347,8 @@ Checked and not gaps: Python's start-at-100-percent volume fix (Rust never reads
 - **M8, low: Recording Library CSV export.** Python `recording_library_ui.py`.
 - **M9, medium: Favourite Lists with export, import and relink.** Python `favorite_collections.py`, `favourite_transfer.py`.
 - **M10, low: Programme Guide by Time and Programme Details.** Python `personal_tools_ui.py`.
+- **M11, medium: Recently Watched keyed per playlist source.** Plain M3U entries use `m3u-history:<sha256(playlist-id)>:<channel key>` while favourite keys stay unchanged; lookup accepts legacy keys, refuses ambiguous matches, and labels same-named channels with their source alias. Also `playlist_index.channel_number` (canonical decimal digits, Unicode digits folded) for Go to Channel. Without the keys, Recently Watched written by Python does not resolve after the swap. Python `favorites.py` (`history_key`, `history_channels`, `history_labels`), `playlist_index.py`. Found by the scope sweep.
+
+Scope sweep (2026-11-23): every function added in `6afe6014..a29ad9a3` outside tests and tools was mapped to an entry above. Folded in rather than listed: series padding (`dvr.series_padding_at`) into C1; subtitle-speech history reset on seek (`subtitle_pipeline.seeked`) into M2; reminder alert choice and source names (`programme_reminders`, `planning_ui`) into M4; start-at-problem-time seek (`_choose_recording_position`, `_apply_recording_seek`) into C7.
 
 The CI pin and the playlist goldens moved to `a29ad9a3` with this section; the goldens changed only in their revision headers.
