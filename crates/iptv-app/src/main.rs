@@ -446,6 +446,18 @@ impl Status {
     }
 }
 
+/// Announce a main-window message under a per-event category
+/// (M6): the status text always updates; the speech fires
+/// only when the category's switch is on - Python's main
+/// `_speak(text, category)`. Used for the guide category's
+/// announcements (guide load results, playlist refreshes).
+fn announce_categorized(status: Status, persist: &Persist, message: &str, category: &str) {
+    status.set_silent(message);
+    if !message.is_empty() && persist.config.borrow().announce_event_enabled(category) {
+        live_region::announce_with_priority(status.label, message, live_region::Priority::Medium);
+    }
+}
+
 /// Player status announcements, gated by the announcement
 /// level (issue #102, Python's `live_announce` law): the visual
 /// surfaces (status bar + details) always update; speech fires
@@ -456,14 +468,15 @@ impl Status {
 fn player_status(status: Status, persist: &Persist, message: &str, priority: i64) {
     let message = &tr(message);
     status.set_silent(message);
-    let level = persist
-        .config
-        .borrow()
+    let config = persist.config.borrow();
+    let level = config
         .value("announcement_level")
         .and_then(serde_json::Value::as_i64)
         .unwrap_or(2)
         .clamp(0, 3);
-    if !message.is_empty() && level >= priority {
+    // The per-event Playback switch gates beside the level
+    // (M6, Python's player `_speak` category check).
+    if !message.is_empty() && level >= priority && config.announce_event_enabled("playback") {
         live_region::announce_with_priority(status.label, message, live_region::Priority::Medium);
     }
 }
@@ -502,14 +515,13 @@ fn update_player_status(
     let line = &tr(&line);
     status.set_silent(line);
     if prefix.is_some() && !line.is_empty() {
-        let level = persist
-            .config
-            .borrow()
+        let config = persist.config.borrow();
+        let level = config
             .value("announcement_level")
             .and_then(serde_json::Value::as_i64)
             .unwrap_or(2)
             .clamp(0, 3);
-        if level >= priority {
+        if level >= priority && config.announce_event_enabled("playback") {
             live_region::announce_with_priority(status.label, line, live_region::Priority::Medium);
         }
     }
@@ -2596,14 +2608,19 @@ fn poll_epg(wiring: &Wiring, frame: Frame, status: Status) {
                 if notify {
                     review_guide_changes(wiring, frame, None, true);
                 }
-                status.set_label(&trf(
-                    "Guide loaded: {channels} channels, {programmes} programmes.{note}",
-                    &[
-                        ("channels", &counts.0.to_string()),
-                        ("programmes", &counts.1.to_string()),
-                        ("note", &store_note),
-                    ],
-                ));
+                announce_categorized(
+                    status,
+                    &wiring.persist,
+                    &trf(
+                        "Guide loaded: {channels} channels, {programmes} programmes.{note}",
+                        &[
+                            ("channels", &counts.0.to_string()),
+                            ("programmes", &counts.1.to_string()),
+                            ("note", &store_note),
+                        ],
+                    ),
+                    "guide",
+                );
                 if notify {
                     report_epg_import_finished(frame, true);
                 }
@@ -6420,6 +6437,7 @@ pub const AUTO_CHECK_UPDATES: i32 = 5198;
 pub const EXPORT_SETTINGS: i32 = 5199;
 pub const IMPORT_SETTINGS: i32 = 5200;
 pub const ANNOUNCE_BASE: i32 = 5165;
+pub const ANNOUNCE_EVENT_BASE: i32 = 5169;
 pub const SPEAK_SUBTITLES: i32 = 5185;
 pub const READ_CURRENT_SUBTITLE: i32 = 5186;
 pub const KEYBOARD_SHORTCUTS: i32 = 5190;
@@ -6845,7 +6863,9 @@ fn build_language_menu(config: &Config) -> Menu {
     language_sub
 }
 
-/// The Options > Automatic Announcements radio submenu.
+/// The Options > Automatic Announcements submenu: the level
+/// radios, then the per-event switches (M6, Python PR #118) -
+/// Playback, Subtitles, Guide check items under a separator.
 fn build_announce_menu(config: &Config) -> Menu {
     let announce_sub = Menu::builder().build();
     let level = config
@@ -6859,6 +6879,19 @@ fn build_announce_menu(config: &Config) -> Menu {
         let id = ANNOUNCE_BASE + i32::try_from(offset).unwrap_or(0);
         menu_add(&announce_sub, id, name, "", ItemKind::Radio);
         announce_sub.check_item(id, i64::try_from(offset).unwrap_or(0) == level);
+    }
+    announce_sub.append_separator();
+    for (offset, (category, name)) in [
+        ("playback", "Playback"),
+        ("subtitles", "Subtitles"),
+        ("guide", "Guide"),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let id = ANNOUNCE_EVENT_BASE + i32::try_from(offset).unwrap_or(0);
+        menu_add(&announce_sub, id, name, "", ItemKind::Check);
+        announce_sub.check_item(id, config.announce_event_enabled(category));
     }
     announce_sub
 }
@@ -8130,6 +8163,23 @@ fn menu_radio_action(id: i32, wiring: &Wiring, status: Status) -> bool {
     }
     if (ANNOUNCE_BASE..ANNOUNCE_BASE + 4).contains(&id) {
         persist.set_and_save("announcement_level", serde_json::json!(id - ANNOUNCE_BASE));
+        return true;
+    }
+    if (ANNOUNCE_EVENT_BASE..ANNOUNCE_EVENT_BASE + 3).contains(&id) {
+        // Per-event switch (Python `_set_announce_event`): flip
+        // the category in the announce_events map and save.
+        let category =
+            iptv_core::config::ANNOUNCE_EVENT_CATEGORIES[(id - ANNOUNCE_EVENT_BASE) as usize];
+        let config = persist.config.borrow();
+        let enabled = config.announce_event_enabled(category);
+        let mut events = config
+            .value("announce_events")
+            .and_then(serde_json::Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        drop(config);
+        events.insert(category.to_string(), serde_json::json!(!enabled));
+        persist.set_and_save("announce_events", serde_json::Value::Object(events));
         return true;
     }
     false
@@ -14353,7 +14403,16 @@ fn speak_cue_text(
     };
     match act {
         Act::ScreenReader(text) => {
-            live_region::announce_with_priority(status.label, &text, live_region::Priority::Medium);
+            // The per-event Subtitles switch (M6): Python's
+            // player speaks the subtitle label through its
+            // "subtitles" category check.
+            if persist.config.borrow().announce_event_enabled("subtitles") {
+                live_region::announce_with_priority(
+                    status.label,
+                    &text,
+                    live_region::Priority::Medium,
+                );
+            }
         }
         Act::Note(Some(text)) => {
             live_region::announce_with_priority(status.label, text, live_region::Priority::High);
@@ -14943,8 +15002,15 @@ fn manager_refresh_sources(
             }
         }
         reload_sources_mode(wiring, true);
-        status.set_label("Refreshing all playlists...");
-        mstatus.set_label("Refreshing all playlists...");
+        // Python speaks this through its guide-category
+        // `_speak`; both status texts still update.
+        status.set_silent(&tr("Refreshing all playlists..."));
+        announce_categorized(
+            mstatus,
+            &wiring.persist,
+            &tr("Refreshing all playlists..."),
+            "guide",
+        );
         return;
     }
     let Some((_, entry)) = selected else {

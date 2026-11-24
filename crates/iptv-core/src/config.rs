@@ -82,6 +82,24 @@ fn defaults() -> Map<String, Value> {
     map
 }
 
+/// The per-event announcement categories (Python's
+/// `ANNOUNCE_EVENT_CATEGORIES` in options.py), in menu order.
+pub const ANNOUNCE_EVENT_CATEGORIES: [&str; 3] = ["playback", "subtitles", "guide"];
+
+/// Python truthiness for a JSON value (`bool(value)`): only
+/// null, false, zero, and empty string/array/object are false.
+#[must_use]
+pub fn python_truthy(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::Bool(flag) => *flag,
+        Value::Number(number) => number.as_f64().is_some_and(|n| n != 0.0),
+        Value::String(text) => !text.is_empty(),
+        Value::Array(items) => !items.is_empty(),
+        Value::Object(map) => !map.is_empty(),
+    }
+}
+
 /// Python `coerce_bool`: booleans pass through, numbers are truthy-tested,
 /// and the strings 1/true/yes/on and 0/false/no/off/"" are recognized.
 #[must_use]
@@ -238,6 +256,23 @@ impl Config {
         let level = coerce_f64(self.values.get("announcement_level")).map_or(2, |n| n as i64);
         self.values
             .insert("announcement_level".to_string(), json!(level.clamp(0, 3)));
+        // Per-event announcement switches (Python
+        // `normalize_announce_events`): one bool per known
+        // category; missing or malformed values fall back to
+        // every category on.
+        let raw_events = self.values.get("announce_events");
+        let events: serde_json::Map<String, Value> = ANNOUNCE_EVENT_CATEGORIES
+            .iter()
+            .map(|category| {
+                let enabled = raw_events
+                    .and_then(Value::as_object)
+                    .and_then(|map| map.get(*category))
+                    .is_none_or(python_truthy);
+                ((*category).to_string(), json!(enabled))
+            })
+            .collect();
+        self.values
+            .insert("announce_events".to_string(), Value::Object(events));
         let settings = self.internal_player_settings();
         self.values.insert(
             "internal_player_buffer_seconds".to_string(),
@@ -251,6 +286,18 @@ impl Config {
             "internal_player_variant_max_mbps".to_string(),
             json!(settings.variant_max_mbps),
         );
+    }
+
+    /// True unless the per-event switches explicitly turn the
+    /// category off (Python `announce_event_enabled`): a
+    /// missing or malformed map, or a missing category, is on.
+    #[must_use]
+    pub fn announce_event_enabled(&self, category: &str) -> bool {
+        self.values
+            .get("announce_events")
+            .and_then(Value::as_object)
+            .and_then(|map| map.get(category))
+            .is_none_or(python_truthy)
     }
 
     /// Python `_apply_internal_player_bounds`, including the legacy
@@ -508,6 +555,38 @@ mod tests {
 
     fn config_from(text: &str) -> Config {
         Config::from_json(serde_json::from_str(text).expect("json")).expect("object")
+    }
+
+    #[test]
+    fn announce_events_normalize_and_gate() {
+        // Missing entirely: every category on, and normalize
+        // seeds the full map.
+        let config = config_from(r"{}");
+        for category in ANNOUNCE_EVENT_CATEGORIES {
+            assert!(config.announce_event_enabled(category));
+        }
+        assert_eq!(
+            config.raw()["announce_events"],
+            json!({"playback": true, "subtitles": true, "guide": true})
+        );
+        // An explicit off survives; Python truthiness applies
+        // to hand-edited values (0 off, "false" the string on).
+        let config = config_from(
+            r#"{"announce_events": {"subtitles": false, "guide": 0, "playback": "false"}}"#,
+        );
+        assert!(config.announce_event_enabled("playback"));
+        assert!(!config.announce_event_enabled("subtitles"));
+        assert!(!config.announce_event_enabled("guide"));
+        assert_eq!(config.raw()["announce_events"]["playback"], json!(true));
+        // A malformed map enables everything.
+        let config = config_from(r#"{"announce_events": [1, 2]}"#);
+        assert!(config.announce_event_enabled("guide"));
+        // Unknown categories are dropped by normalize, as in Python.
+        let config = config_from(r#"{"announce_events": {"other": false}}"#);
+        assert_eq!(
+            config.raw()["announce_events"],
+            json!({"playback": true, "subtitles": true, "guide": true})
+        );
     }
 
     #[test]
