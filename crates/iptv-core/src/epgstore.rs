@@ -1127,6 +1127,61 @@ fn row_programme(row: &rusqlite::Row<'_>) -> rusqlite::Result<Programme> {
     })
 }
 
+/// Python `programmes_at`'s channel labels for a scoped
+/// result: a channel name shared by several rows gains
+/// "({guide channel id})"; a label still repeated after
+/// that gains " — {source alias, }Source {number}", the
+/// number being the row's position inside its repeated
+/// group and the alias coming from `source_names` for the
+/// row's provider-id or playlist-id. `rows` are
+/// (channel name, guide channel id, source) triples in
+/// result order; `source_template` is the translated
+/// "Source {number}" supplied by the app.
+#[must_use]
+pub fn at_channel_labels(
+    rows: &[(String, String, Option<String>)],
+    aliases: &std::collections::BTreeMap<String, String>,
+    source_template: &str,
+) -> Vec<String> {
+    use std::collections::HashMap;
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for (name, _, _) in rows {
+        *counts.entry(name.to_lowercase()).or_default() += 1;
+    }
+    let mut labels: Vec<String> = rows
+        .iter()
+        .map(|(name, channel_id, _)| {
+            if counts[&name.to_lowercase()] > 1 {
+                format!("{name} ({channel_id})")
+            } else {
+                name.clone()
+            }
+        })
+        .collect();
+    let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
+    for (index, label) in labels.iter().enumerate() {
+        groups.entry(label.to_lowercase()).or_default().push(index);
+    }
+    for group in groups.values() {
+        if group.len() < 2 {
+            continue;
+        }
+        for (position, &index) in group.iter().enumerate() {
+            let alias = rows[index]
+                .2
+                .as_ref()
+                .and_then(|source| aliases.get(source))
+                .filter(|alias| !alias.is_empty());
+            let ordinal = source_template.replace("{number}", &(position + 1).to_string());
+            labels[index] = match alias {
+                Some(alias) => format!("{} — {}, {}", labels[index], alias, ordinal),
+                None => format!("{} — {}", labels[index], ordinal),
+            };
+        }
+    }
+    labels
+}
+
 fn collect_rows(
     rows: rusqlite::MappedRows<'_, impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<Programme>>,
 ) -> Result<Vec<Programme>, String> {
@@ -1339,9 +1394,37 @@ pub fn store_missing_columns(path: &Path) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::EpgStore;
+    use super::{at_channel_labels, EpgStore};
     use crate::epg::{EpgChannel, EpgGuide, Programme};
     use std::collections::HashMap;
+
+    #[test]
+    fn at_channel_labels_disambiguate_like_python() {
+        let rows: Vec<(String, String, Option<String>)> = vec![
+            ("News".into(), "n1".into(), Some("a".into())),
+            ("News".into(), "n2".into(), Some("b".into())),
+            ("Film".into(), "f1".into(), None),
+        ];
+        let aliases: std::collections::BTreeMap<String, String> =
+            [("a".to_string(), "First".to_string())]
+                .into_iter()
+                .collect();
+        // Shared names gain the guide id; unique names stay plain.
+        assert_eq!(
+            at_channel_labels(&rows, &aliases, "Source {number}"),
+            vec!["News (n1)", "News (n2)", "Film"]
+        );
+        // Same name AND same guide id from two sources: the
+        // Source pass separates them, alias first when known.
+        let rows: Vec<(String, String, Option<String>)> = vec![
+            ("News".into(), "n1".into(), Some("a".into())),
+            ("News".into(), "n1".into(), Some("b".into())),
+        ];
+        assert_eq!(
+            at_channel_labels(&rows, &aliases, "Source {number}"),
+            vec!["News (n1) — First, Source 1", "News (n1) — Source 2"]
+        );
+    }
 
     fn sample_guide() -> EpgGuide {
         let programmes = vec![
