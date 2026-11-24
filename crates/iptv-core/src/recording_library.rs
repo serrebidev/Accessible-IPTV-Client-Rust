@@ -1091,10 +1091,147 @@ pub fn remember(input: &RememberInput) -> Result<(), String> {
     write_index(parent, &rows)
 }
 
+/// One CSV cell with spreadsheet formula protection (Python
+/// `planning_tools.csv_cell`): quoting does not stop formula
+/// execution, so a value whose first non-space character is
+/// one of = + - @, or that starts with a tab or newline,
+/// gains a leading apostrophe.
+#[must_use]
+pub fn csv_cell(value: &str) -> String {
+    let trimmed = value.trim_start();
+    if trimmed.starts_with(['=', '+', '-', '@']) || value.starts_with(['\t', '\r', '\n']) {
+        format!("'{value}")
+    } else {
+        value.to_string()
+    }
+}
+
+/// One field in Python's csv module default dialect:
+/// quote when the field contains a comma, quote, CR or LF;
+/// internal quotes double.
+fn csv_field(value: &str) -> String {
+    if value.contains([',', '"', '\r', '\n']) {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_string()
+    }
+}
+
+/// The Recording Library CSV export (Python
+/// `planning_tools.recording_csv`): a UTF-8 BOM, then the
+/// header and one row per library row, CRLF line endings.
+/// No paths or URLs are included. The header and status
+/// labels arrive translated from the app, as Python
+/// translates them at write time: `header` is (Title,
+/// Channel, Date, Duration (seconds), Status, Size
+/// (bytes)); `status_labels` is (Completed, Partial,
+/// Stopped by user, Failed, Unknown).
+#[must_use]
+pub fn recording_csv(
+    rows: &[LibraryRow],
+    header: &[&str; 6],
+    status_labels: &[&str; 5],
+) -> Vec<u8> {
+    let mut out = String::from("\u{feff}");
+    let mut line = |fields: &[String]| {
+        let cells: Vec<String> = fields.iter().map(|f| csv_field(f)).collect();
+        out.push_str(&cells.join(","));
+        out.push_str("\r\n");
+    };
+    line(&header.iter().map(|h| (*h).to_string()).collect::<Vec<_>>());
+    for row in rows {
+        let status = match row.status.as_str() {
+            "completed" => status_labels[0],
+            "partial" => status_labels[1],
+            "stopped" => status_labels[2],
+            "failed" => status_labels[3],
+            _ => status_labels[4],
+        };
+        line(&[
+            csv_cell(&row.title),
+            csv_cell(&row.channel),
+            csv_cell(&row.date),
+            row.duration.map_or_else(String::new, |d| format!("{d}")),
+            status.to_string(),
+            row.size.to_string(),
+        ]);
+    }
+    out.into_bytes()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write as _;
+
+    fn csv_row(title: &str, status: &str) -> LibraryRow {
+        LibraryRow {
+            path: "/secret/path.mkv".to_string(),
+            title: title.to_string(),
+            channel: "Chan, One".to_string(),
+            duration: Some(90.0),
+            status: status.to_string(),
+            size: 2048,
+            modified_ns: 0,
+            date: "2026-11-01 20:00".to_string(),
+            directory: "/secret".to_string(),
+            trash_id: None,
+            original_name: None,
+        }
+    }
+
+    #[test]
+    fn recording_csv_shape_protection_and_no_paths() {
+        let header = [
+            "Title",
+            "Channel",
+            "Date",
+            "Duration (seconds)",
+            "Status",
+            "Size (bytes)",
+        ];
+        let labels = [
+            "Completed",
+            "Partial",
+            "Stopped by user",
+            "Failed",
+            "Unknown",
+        ];
+        let mut second = csv_row("Plain", "weird");
+        second.duration = None;
+        let bytes = recording_csv(&[csv_row("=2+5", "stopped"), second], &header, &labels);
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.starts_with('\u{feff}'));
+        let lines: Vec<&str> = text
+            .strip_prefix('\u{feff}')
+            .unwrap()
+            .split("\r\n")
+            .collect();
+        assert_eq!(
+            lines[0],
+            "Title,Channel,Date,Duration (seconds),Status,Size (bytes)"
+        );
+        assert_eq!(
+            lines[1],
+            "'=2+5,\"Chan, One\",2026-11-01 20:00,90,Stopped by user,2048"
+        );
+        assert_eq!(
+            lines[2],
+            "Plain,\"Chan, One\",2026-11-01 20:00,,Unknown,2048"
+        );
+        assert!(!text.contains("/secret"));
+    }
+
+    #[test]
+    fn csv_cell_prefix_rules() {
+        assert_eq!(csv_cell("=x"), "'=x");
+        assert_eq!(csv_cell("  +x"), "'  +x");
+        assert_eq!(csv_cell("-x"), "'-x");
+        assert_eq!(csv_cell("@x"), "'@x");
+        assert_eq!(csv_cell("\tx"), "'\tx");
+        assert_eq!(csv_cell(" x"), " x");
+        assert_eq!(csv_cell(""), "");
+    }
     use std::sync::mpsc;
     use std::time::Duration;
 

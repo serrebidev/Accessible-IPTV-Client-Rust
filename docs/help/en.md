@@ -318,6 +318,8 @@ Search by title, channel or date. Play / Resume opens the selected file and offe
 
 Move to Recording Trash moves a file into the application's trash within its recording folder; this does not free disk space. Show Deleted Recordings lists these files. Restore Recording returns a file to its original folder without overwriting an existing file. Delete Recording File in this view permanently deletes it after confirmation. Removing an entry from Scheduled Recordings does not delete the media file.
 
+Recording Library > Export List to CSV exports the currently filtered and sorted list with title, channel, date, duration, status and size. It excludes file paths and stream URLs; spreadsheet formula prefixes in text are protected. The library remembers its folder, search, status filter, sort and direction when closed. Deleted Recordings is always off on reopening. Exports run only when requested, without rescanning media.
+
 All Recording Folders combines the configured folders. Filter by status and sort by date, title, duration or file size; Descending reverses the order. Ctrl+A selects all visible rows. Selected count and total size are shown. Trash, permanent deletion and restore support multiple selections; playback and title renaming require one. Disk scans and filtering run in the background; closing the window does not cancel a confirmed file action.
 
 ### Recording format {#recording-formats}

@@ -16616,6 +16616,7 @@ struct LibraryControls {
     add_folder: Button,
     remove_folder: Button,
     refresh: Button,
+    export_list: Button,
 }
 
 const LIBRARY_STATUS_VALUES: [&str; 6] =
@@ -16825,6 +16826,7 @@ fn library_render(ui: &Rc<RefCell<LibraryUi>>, controls: &LibraryControls) {
         .enable(ready && folder_selection > 0 && folder_selection < guard.directories.len());
     controls.add_folder.enable(ready);
     controls.refresh.enable(ready);
+    controls.export_list.enable(ready && !guard.view.is_empty());
     if busy {
         controls
             .status_label
@@ -17006,6 +17008,84 @@ fn library_delete_selected(
 #[allow(clippy::too_many_lines)]
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // list rows and durations
 #[allow(clippy::cast_possible_wrap, clippy::cast_precision_loss)] // row counts and MiB display
+/// Write bytes atomically (Python `planning_tools.
+/// atomic_export`): a temporary file in the same directory,
+/// then rename over the target; an existing file is
+/// preserved on failure. (Lives here until the planning
+/// tools core module lands; see PR #88.)
+fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
+    use std::io::Write as _;
+    let directory = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let mut temporary = directory.to_path_buf();
+    temporary.push(format!(".iptv-export-{}.tmp", std::process::id()));
+    let write = (|| -> std::io::Result<()> {
+        let mut file = std::fs::File::create(&temporary)?;
+        file.write_all(bytes)?;
+        file.sync_all()
+    })();
+    if let Err(error) = write {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error.to_string());
+    }
+    std::fs::rename(&temporary, path).map_err(|error| {
+        let _ = std::fs::remove_file(&temporary);
+        error.to_string()
+    })
+}
+
+/// Python's `planning_tools_ui.export_file`: ask for a save
+/// path, append the extension when the chosen name lacks it
+/// (with a replace confirmation when the appended path
+/// exists), write the bytes atomically, and report the
+/// outcome in a message box under the same caption.
+fn run_export_file(frame: Frame, title: &str, wildcard: &str, extension: &str, bytes: &[u8]) {
+    let title = tr(title);
+    // Python translates the filter description only; the
+    // pattern after '|' is literal.
+    let wildcard = match wildcard.split_once('|') {
+        Some((description, pattern)) => format!("{}|{pattern}", tr(description)),
+        None => tr(wildcard),
+    };
+    let dialog = FileDialog::builder(&frame, &title)
+        .with_style(FileDialogStyle::Save | FileDialogStyle::OverwritePrompt)
+        .with_wildcard(&wildcard)
+        .build();
+    if dialog.show_modal_tracked() != ID_OK {
+        return;
+    }
+    let mut path = dialog.file_path();
+    if path.is_empty() {
+        return;
+    }
+    if !path.to_lowercase().ends_with(extension) {
+        path = format!("{path}{extension}");
+        if std::path::Path::new(&path).exists() {
+            let confirm =
+                MessageDialog::builder(&frame, &tr("Replace the existing export file?"), &title)
+                    .with_style(MessageDialogStyle::YesNo | MessageDialogStyle::IconQuestion)
+                    .build();
+            if confirm.show_modal_tracked() != ID_YES {
+                return;
+            }
+        }
+    }
+    let result = atomic_write(std::path::Path::new(&path), bytes);
+    let (message, style) = match result {
+        Ok(()) => (
+            tr("Export saved."),
+            MessageDialogStyle::OK | MessageDialogStyle::IconInformation,
+        ),
+        Err(error) => (
+            trf("The operation failed:\n{error}", &[("error", &error)]),
+            MessageDialogStyle::OK | MessageDialogStyle::IconError,
+        ),
+    };
+    let dialog = MessageDialog::builder(&frame, &message, &title)
+        .with_style(style)
+        .build();
+    dialog.show_modal_tracked();
+}
+
 fn open_recording_library(wiring: &Wiring, main_status: Status) {
     let frame = Frame::builder()
         .with_title(&tr("Recording Library"))
@@ -17101,6 +17181,10 @@ fn open_recording_library(wiring: &Wiring, main_status: Status) {
         .with_label(&tr("Restore Recording"))
         .build();
     let refresh = Button::builder(&panel).with_label(&tr("Refresh")).build();
+    let export_list = Button::builder(&panel)
+        .with_label(&tr("Export List to CSV..."))
+        .build();
+    export_list.set_accessibility_label("Export List to CSV...");
     let close = Button::builder(&panel).with_label(&tr("Close")).build();
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     sizer.add(&search_label, 0, SizerFlag::All, 4);
@@ -17121,7 +17205,15 @@ fn open_recording_library(wiring: &Wiring, main_status: Status) {
     sizer.add(&list, 1, SizerFlag::Expand | SizerFlag::All, 4);
     sizer.add(&status_bar, 0, SizerFlag::Expand | SizerFlag::All, 4);
     let buttons = BoxSizer::builder(Orientation::Horizontal).build();
-    for button in [&play, &rename, &remove, &restore, &refresh, &close] {
+    for button in [
+        &play,
+        &rename,
+        &remove,
+        &restore,
+        &refresh,
+        &export_list,
+        &close,
+    ] {
         buttons.add(button, 0, SizerFlag::All, 4);
     }
     sizer.add_sizer(&buttons, 0, SizerFlag::Expand, 0);
@@ -17141,6 +17233,7 @@ fn open_recording_library(wiring: &Wiring, main_status: Status) {
         add_folder,
         remove_folder,
         refresh,
+        export_list,
     };
     let ui = Rc::new(RefCell::new(LibraryUi {
         task: iptv_core::background::LatestTask::new(),
@@ -17233,6 +17326,44 @@ fn open_recording_library(wiring: &Wiring, main_status: Status) {
     let ui_refresh = Rc::clone(&ui);
     refresh.on_click(move |_| {
         library_refresh(&wiring_refresh, &ui_refresh, &controls);
+    });
+    // Export List to CSV... (M8, Python's export_csv): the
+    // currently filtered and sorted view rows; a no-op while
+    // a scan or operation is busy or the list is empty.
+    let ui_export = Rc::clone(&ui);
+    export_list.on_click(move |_| {
+        let rows = {
+            let guard = ui_export.borrow();
+            if guard.busy || guard.op_busy || guard.view.is_empty() {
+                return;
+            }
+            guard.view.clone()
+        };
+        let header_owned = [
+            tr("Title"),
+            tr("Channel"),
+            tr("Date"),
+            tr("Duration (seconds)"),
+            tr("Status"),
+            tr("Size (bytes)"),
+        ];
+        let labels_owned = [
+            tr("Completed"),
+            tr("Partial"),
+            tr("Stopped by user"),
+            tr("Failed"),
+            tr("Unknown"),
+        ];
+        let header: [&str; 6] = header_owned.each_ref().map(|s| s.as_str());
+        let labels: [&str; 5] = labels_owned.each_ref().map(|s| s.as_str());
+        let bytes = iptv_core::recording_library::recording_csv(&rows, &header, &labels);
+        run_export_file(
+            frame,
+            "Export List to CSV...",
+            "CSV file (*.csv)|*.csv",
+            ".csv",
+            &bytes,
+        );
     });
     // Add / remove library folders (persisted as the extra
     // folders only; the primary folder is implicit).
