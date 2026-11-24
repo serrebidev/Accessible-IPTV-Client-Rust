@@ -179,6 +179,8 @@ If an imported guide does not show up for a channel, check that the source cover
 
 ### What's on Now {#whats-on-now}
 
+In Programme Guide by Time, enter a local date and time, choose all channels, favourites or a named list, then select Show Programmes. Each row gives the channel, title, start and end. Select a programme to schedule a recording or set a reminder.
+
 File > What's on Now (Ctrl+W) lists every programme on air right now across all channels, as "programme - channel".
 
 - Typing letters jumps to the first programme that starts with them.
@@ -186,6 +188,8 @@ File > What's on Now (Ctrl+W) lists every programme on air right now across all 
 - Enter or the Play button plays the channel.
 - Schedule Recording, or the programme's menu, schedules a recording of it.
 - Escape closes the window.
+
+In Programme Guide by Time, select a row and choose Programme Details to read the description, episode title and number supplied by the guide. Escape returns to the selected row.
 
 ### Continue Watching {#continue-watching}
 

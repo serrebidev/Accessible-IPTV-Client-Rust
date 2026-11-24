@@ -606,6 +606,16 @@ enum PendingEpgReadUi {
         count_label: StaticText,
         status: Status,
     },
+    GuideAtSnapshot {
+        model: Arc<iptv_core::BrowseModel>,
+        rows: Rc<RefCell<Vec<GuideAtRow>>>,
+        list: ListBox,
+        status: Status,
+        frame: Frame,
+        scope: Option<Rc<std::collections::HashSet<usize>>>,
+        generation: u64,
+        generation_cell: Rc<std::cell::Cell<u64>>,
+    },
 }
 
 /// One finished saved-search scan (C11), delivered by the
@@ -3392,6 +3402,120 @@ fn drain_epg_reads(wiring: &Wiring) {
                 } else {
                     status.set_silent("Select a programme to play or schedule.");
                 }
+            }
+            (
+                PendingEpgReadUi::GuideAtSnapshot {
+                    model,
+                    rows,
+                    list,
+                    status,
+                    frame,
+                    scope,
+                    generation,
+                    generation_cell,
+                },
+                Ok(iptv_core::epg::EpgReadValue::Snapshot(snapshot_rows)),
+            ) => {
+                // Python GuideAtDialog: a superseded search
+                // (the time or scope changed since) drops its
+                // result silently; a changed channel list is
+                // an error the user must retry from.
+                if generation_cell.get() != generation {
+                    continue;
+                }
+                if !std::sync::Arc::ptr_eq(&model, &wiring.browser.borrow().catalogue_model()) {
+                    status.set_label("");
+                    operation_failed_box(&frame, "The channel list changed. Try again.");
+                    continue;
+                }
+                let aliases = iptv_core::reminders::source_names(&config_value(wiring));
+                let loaded: Vec<(Channel, Programme)> = snapshot_rows
+                    .into_iter()
+                    .filter(|(index, _)| scope.as_ref().is_none_or(|keep| keep.contains(index)))
+                    .filter_map(|(index, programme)| {
+                        model
+                            .channels()
+                            .get(index)
+                            .cloned()
+                            .map(|channel| (channel, programme))
+                    })
+                    .collect();
+                let triples: Vec<(String, String, Option<String>)> = loaded
+                    .iter()
+                    .map(|(channel, programme)| {
+                        let provider = channel
+                            .unknown_attributes
+                            .get("provider-id")
+                            .map_or("", |value| value.trim());
+                        let source = if provider.is_empty() {
+                            channel
+                                .unknown_attributes
+                                .get("playlist-id")
+                                .map(|value| value.trim())
+                                .filter(|value| !value.is_empty())
+                                .map(str::to_string)
+                        } else {
+                            Some(provider.to_string())
+                        };
+                        (channel.name.clone(), programme.channel_id.clone(), source)
+                    })
+                    .collect();
+                let labels = iptv_core::epgstore::at_channel_labels(
+                    &triples,
+                    &aliases,
+                    &tr("Source {number}"),
+                );
+                let guide_rows: Vec<GuideAtRow> = loaded
+                    .into_iter()
+                    .zip(labels)
+                    .map(|((channel, programme), label)| GuideAtRow {
+                        time_label: format!(
+                            "{} – {}",
+                            iptv_core::epg::local_datetime(programme.start),
+                            iptv_core::epg::local_datetime(programme.stop)
+                        ),
+                        channel,
+                        programme,
+                        label,
+                    })
+                    .collect();
+                let items: Vec<String> = guide_rows
+                    .iter()
+                    .map(|row| {
+                        let title = if row.programme.title.is_empty() {
+                            tr("(No title)")
+                        } else {
+                            row.programme.title.clone()
+                        };
+                        let channel = if row.label.is_empty() {
+                            tr("Unknown")
+                        } else {
+                            row.label.clone()
+                        };
+                        format!("{channel} – {title} – {}", row.time_label)
+                    })
+                    .collect();
+                let count = guide_rows.len();
+                *rows.borrow_mut() = guide_rows;
+                list.set_items(&items.iter().map(String::as_str).collect::<Vec<_>>());
+                status.set_label(&trf("{count} programs", &[("count", &count.to_string())]));
+                if count == 0 {
+                    let dialog = MessageDialog::builder(
+                        &frame,
+                        &tr("No programmes were found for this time and channel selection."),
+                        &tr("Programme Guide by Time"),
+                    )
+                    .with_style(MessageDialogStyle::OK | MessageDialogStyle::IconInformation)
+                    .build();
+                    dialog.show_modal_tracked();
+                } else {
+                    list.set_selection(0, true);
+                    list.set_focus();
+                }
+            }
+            (PendingEpgReadUi::GuideAtSnapshot { status, frame, .. }, Err(error)) => {
+                status.set_label("");
+                operation_failed_box(&frame, &error);
             }
             (
                 PendingEpgReadUi::ChannelProgrammes { status, .. }
@@ -7098,6 +7222,7 @@ pub const SHOW_DOWNLOADS: i32 = 5129;
 pub const ASSIGN_GUIDE: i32 = 5130;
 pub const SAVED_SEARCHES: i32 = 5132;
 pub const NOTIFICATION_HISTORY_ID: i32 = 5470;
+pub const GUIDE_BY_TIME: i32 = 5133;
 pub const PLAYER_RADIO_BASE: i32 = 5131;
 pub const CUSTOM_PLAYER: i32 = 5163;
 pub const PREFERRED_AUDIO: i32 = 5164;
@@ -7378,6 +7503,13 @@ fn build_file_menu(keys: &std::collections::BTreeMap<String, String>) -> Menu {
         &file_menu,
         IMPORT_EPG,
         &menu_label(keys, "Import EPG to &DB", "import_epg"),
+        "",
+        ItemKind::Normal,
+    );
+    menu_add(
+        &file_menu,
+        GUIDE_BY_TIME,
+        "Programme Guide by &Time...",
         "",
         ItemKind::Normal,
     );
@@ -8567,6 +8699,7 @@ fn menu_dialog_action(id: i32, wiring: &Wiring, status: Status, scope_choice: Ch
         PLAYLIST_MANAGER => open_playlist_manager(wiring, status, scope_choice),
         EPG_MANAGER => open_epg_manager(wiring, status),
         WHATS_ON_NOW => open_whats_on_now(wiring, status),
+        GUIDE_BY_TIME => open_guide_by_time(wiring, status),
         ACCOUNT_INFO => open_account_info(wiring, status),
         CONTINUE_WATCHING => open_continue_watching(wiring, status),
         RECENT_CHANNELS => open_recent_channels(wiring, status),
@@ -8585,7 +8718,7 @@ fn menu_item_topic(id: i32) -> Option<&'static str> {
         PLAYLIST_MANAGER => "playlist-manager",
         EPG_MANAGER => "epg-manager",
         IMPORT_EPG => "import-epg",
-        WHATS_ON_NOW => "whats-on-now",
+        WHATS_ON_NOW | GUIDE_BY_TIME => "whats-on-now",
         CONTINUE_WATCHING => "continue-watching",
         ASSIGN_GUIDE => "epg",
         SAVED_SEARCHES | FAVOURITE_LISTS => "personal-tools",
@@ -19346,6 +19479,398 @@ fn open_whats_on_now(wiring: &Wiring, status: Status) {
             status: dstatus,
         },
     );
+}
+
+/// One Programme Guide by Time row: the playlist channel,
+/// the programme airing at the chosen instant, and the
+/// pre-rendered channel / time labels (Python's row dict).
+#[derive(Clone)]
+struct GuideAtRow {
+    channel: Channel,
+    programme: Programme,
+    label: String,
+    time_label: String,
+}
+
+/// File > Programme Guide by Time (Python `GuideAtDialog`):
+/// what airs at one local instant, across all channels, the
+/// favourites, or — once the favourite-lists port lands —
+/// a named list. Rows carry Programme Details, Schedule
+/// Recording, Set Reminder and Export to Calendar.
+#[allow(clippy::too_many_lines)] // guide-by-time dialog, as in Python
+fn open_guide_by_time(wiring: &Wiring, status: Status) {
+    let (frame, panel, list, dstatus) =
+        list_dialog("Programme Guide by Time", "Programme Guide by Time");
+    let time_label = StaticText::builder(&panel)
+        .with_label(&tr("Local date and time (YYYY-MM-DD HH:MM)"))
+        .build();
+    let time = TextCtrl::builder(&panel)
+        .with_value(&iptv_core::epg::local_datetime(now_epoch()))
+        .build();
+    time.set_accessibility_label(&tr("Local date and time (YYYY-MM-DD HH:MM)"));
+    let channels_label = StaticText::builder(&panel)
+        .with_label(&tr("Channels"))
+        .build();
+    let scope = Choice::builder(&panel).build();
+    scope.append(&tr("All Channels"));
+    scope.append(&tr("Favorites"));
+    scope.set_selection(0);
+    scope.set_accessibility_label(&tr("Channels"));
+    let show = Button::builder(&panel)
+        .with_label(&tr("Show Programmes"))
+        .build();
+    let details = Button::builder(&panel)
+        .with_label(&tr("Programme Details..."))
+        .build();
+    details.set_accessibility_label(&tr("Programme Details..."));
+    let schedule = Button::builder(&panel)
+        .with_label(&tr("Schedule Recording"))
+        .build();
+    schedule.set_accessibility_label(&tr("Schedule Recording"));
+    let remind = Button::builder(&panel)
+        .with_label(&tr("Set Reminder..."))
+        .build();
+    remind.set_accessibility_label(&tr("Set Reminder..."));
+    let export = Button::builder(&panel)
+        .with_label(&tr("Export to Calendar..."))
+        .build();
+    export.set_accessibility_label(&tr("Export to Calendar..."));
+    let close = Button::builder(&panel).with_label("&Close").build();
+    let layout = BoxSizer::builder(Orientation::Vertical).build();
+    layout.add(&time_label, 0, SizerFlag::All, 8);
+    layout.add(&time, 0, SizerFlag::Expand | SizerFlag::All, 8);
+    layout.add(&channels_label, 0, SizerFlag::All, 8);
+    layout.add(&scope, 0, SizerFlag::Expand | SizerFlag::All, 8);
+    layout.add(&show, 0, SizerFlag::All, 8);
+    layout.add(&list, 1, SizerFlag::Expand | SizerFlag::All, 8);
+    layout.add(&dstatus.details, 0, SizerFlag::Expand | SizerFlag::All, 8);
+    let buttons = BoxSizer::builder(Orientation::Horizontal).build();
+    buttons.add(&details, 0, SizerFlag::All, 4);
+    buttons.add(&schedule, 0, SizerFlag::All, 4);
+    buttons.add(&remind, 0, SizerFlag::All, 4);
+    buttons.add(&export, 0, SizerFlag::All, 4);
+    buttons.add(&close, 0, SizerFlag::All, 4);
+    layout.add_sizer(&buttons, 0, SizerFlag::Expand, 0);
+    panel.set_sizer(layout, true);
+
+    let rows: Rc<RefCell<Vec<GuideAtRow>>> = Rc::new(RefCell::new(Vec::new()));
+    let generation = Rc::new(std::cell::Cell::new(0_u64));
+    let model_slot: Rc<RefCell<Option<Arc<iptv_core::BrowseModel>>>> = Rc::new(RefCell::new(None));
+
+    // Python `invalidate`: editing the time or the scope
+    // discards the loaded rows and bumps the generation, so
+    // a late result for the old input is dropped on delivery.
+    let invalidate = {
+        let rows = Rc::clone(&rows);
+        let generation = Rc::clone(&generation);
+        move |list: ListBox, dstatus: Status| {
+            generation.set(generation.get().wrapping_add(1));
+            rows.borrow_mut().clear();
+            list.set_items(&[]);
+            dstatus.set_label("");
+        }
+    };
+    let invalidate_t = invalidate.clone();
+    time.bind_internal(EventType::TEXT, move |_| invalidate_t(list, dstatus));
+    let invalidate_s = invalidate.clone();
+    scope.on_selection_changed(move |_| invalidate_s(list, dstatus));
+
+    let wiring_search = clone_wiring(wiring);
+    let rows_search = Rc::clone(&rows);
+    let generation_search = Rc::clone(&generation);
+    let model_search = Rc::clone(&model_slot);
+    show.on_click(move |_| {
+        let text = time.get_value();
+        let stamp_value =
+            match field_timestamp(&frame, &text, &tr("Local date and time (YYYY-MM-DD HH:MM)")) {
+                Ok(Some(value)) => value,
+                Ok(None) => return,
+                Err(error) => {
+                    operation_failed_box(&frame, &error);
+                    return;
+                }
+            };
+        #[allow(clippy::cast_possible_truncation)] // whole-second instants
+        let at = stamp_value as i64;
+        rows_search.borrow_mut().clear();
+        list.set_items(&[]);
+        let model = wiring_search.browser.borrow().catalogue_model();
+        *model_search.borrow_mut() = Some(Arc::clone(&model));
+        let scope_indexes = if scope.get_selection() == Some(1) {
+            let raw = config_value(&wiring_search);
+            let favorites =
+                iptv_core::favorites::FavoriteSet::from_stored(match raw.get("favorites") {
+                    Some(serde_json::Value::Array(items)) => items
+                        .iter()
+                        .filter_map(|item| item.as_str().map(str::to_string))
+                        .collect::<Vec<_>>(),
+                    _ => Vec::new(),
+                });
+            Some(Rc::new(
+                favorites
+                    .favorite_indexes(model.channels())
+                    .into_iter()
+                    .collect::<std::collections::HashSet<usize>>(),
+            ))
+        } else {
+            None
+        };
+        let search_generation = generation_search.get().wrapping_add(1);
+        generation_search.set(search_generation);
+        dstatus.set_label(&tr("Loading guide channels..."));
+        let snapshot = wiring_search.epg.borrow().clone();
+        submit_epg_read(
+            &wiring_search,
+            iptv_core::epg::EpgReadKind::Snapshot {
+                at,
+                model: Arc::clone(&model),
+                snapshot,
+            },
+            PendingEpgReadUi::GuideAtSnapshot {
+                model,
+                rows: Rc::clone(&rows_search),
+                list,
+                status: dstatus,
+                frame,
+                scope: scope_indexes,
+                generation: search_generation,
+                generation_cell: Rc::clone(&generation_search),
+            },
+        );
+    });
+
+    // Python `selected()`: the row's channel and programme,
+    // refused when the channel list changed since the search.
+    let selected_row = {
+        let rows = Rc::clone(&rows);
+        let model_slot = Rc::clone(&model_slot);
+        move |wiring: &Wiring, frame: Frame, list: ListBox| -> Option<GuideAtRow> {
+            let index = list.get_selection()?;
+            let row = rows
+                .borrow()
+                .get(usize::try_from(index).unwrap_or(usize::MAX))
+                .cloned()?;
+            let current = wiring.browser.borrow().catalogue_model();
+            if model_slot
+                .borrow()
+                .as_ref()
+                .is_some_and(|model| !Arc::ptr_eq(model, &current))
+            {
+                operation_failed_box(&frame, "The channel list changed. Try again.");
+                return None;
+            }
+            Some(row)
+        }
+    };
+
+    let wiring_d = clone_wiring(wiring);
+    let selected_d = selected_row.clone();
+    details.on_click(move |_| {
+        let Some(row) = selected_d(&wiring_d, frame, list) else {
+            return;
+        };
+        guide_at_details(frame, list, &row);
+    });
+    let wiring_s = clone_wiring(wiring);
+    let selected_s = selected_row.clone();
+    schedule.on_click(move |_| {
+        let Some(row) = selected_s(&wiring_s, frame, list) else {
+            return;
+        };
+        add_dvr_job(
+            &wiring_s,
+            frame,
+            &row.channel,
+            &row.programme,
+            status,
+            "none",
+        );
+    });
+    let wiring_dc = clone_wiring(wiring);
+    let selected_dc = selected_row.clone();
+    list.on_item_double_clicked(move |_| {
+        let Some(row) = selected_dc(&wiring_dc, frame, list) else {
+            return;
+        };
+        add_dvr_job(
+            &wiring_dc,
+            frame,
+            &row.channel,
+            &row.programme,
+            status,
+            "none",
+        );
+    });
+    let wiring_r = clone_wiring(wiring);
+    let selected_r = selected_row.clone();
+    remind.on_click(move |_| {
+        let Some(row) = selected_r(&wiring_r, frame, list) else {
+            return;
+        };
+        add_reminder(&wiring_r, frame, &row.channel, &row.programme, status);
+    });
+    let wiring_e = clone_wiring(wiring);
+    let selected_e = selected_row.clone();
+    export.on_click(move |_| {
+        let Some(row) = selected_e(&wiring_e, frame, list) else {
+            return;
+        };
+        export_programme_calendar(frame, &row.channel, &row.programme);
+    });
+    close.on_click(move |_| frame.hide());
+    frame.show(true);
+    time.set_focus();
+}
+
+/// Programme Details... for one Guide by Time row (Python
+/// `GuideAtDialog.show_details`): the guide's sub-title,
+/// episode and description for the exact slot, read off the
+/// UI thread; a slot that vanished since the search is the
+/// guide-changed error.
+fn guide_at_details(frame: Frame, list: ListBox, row: &GuideAtRow) {
+    let channel_id = row.programme.channel_id.clone();
+    let (start, stop, title) = (
+        row.programme.start,
+        row.programme.stop,
+        row.programme.title.clone(),
+    );
+    let label = row.label.clone();
+    let time_label = row.time_label.clone();
+    let row_title = row.programme.title.clone();
+    run_in_background(
+        &frame,
+        move || {
+            let store = iptv_core::epgstore::EpgStore::open(&epg_store_path())?;
+            store.programme_details(&channel_id, start, stop, &title)
+        },
+        move |result| {
+            let info = match result {
+                Ok(Some(info)) => info,
+                Ok(None) => {
+                    operation_failed_box(
+                        &frame,
+                        "The programme guide changed. Refresh the list and try again.",
+                    );
+                    return;
+                }
+                Err(error) => {
+                    operation_failed_box(&frame, &error);
+                    return;
+                }
+            };
+            let mut lines = vec![
+                row_title.clone(),
+                if label.is_empty() {
+                    tr("Unknown")
+                } else {
+                    label.clone()
+                },
+                time_label.clone(),
+            ];
+            if !info.subtitle.is_empty() {
+                lines.push(info.subtitle.clone());
+            }
+            if !info.episode.is_empty() {
+                lines.push(trf("Episode: {episode}", &[("episode", &info.episode)]));
+            }
+            lines.push(if info.description.is_empty() {
+                tr("No description available for this programme.")
+            } else {
+                info.description.clone()
+            });
+            let dialog = Dialog::builder(&frame, &tr("Programme Details..."))
+                .with_size(640, 420)
+                .build();
+            dialog.set_accessibility_label(&tr("Programme Details..."));
+            bind_escape_cancel(dialog);
+            let panel = Panel::builder(&dialog).build();
+            let field = TextCtrl::builder(&panel)
+                .with_value(&lines.join("\n\n"))
+                .with_style(TextCtrlStyle::ReadOnly | TextCtrlStyle::MultiLine)
+                .build();
+            field.set_accessibility_label(&tr("Details"));
+            let close = Button::builder(&panel).with_label("&Close").build();
+            close.set_accessibility_label("Close");
+            let layout = BoxSizer::builder(Orientation::Vertical).build();
+            layout.add(&field, 1, SizerFlag::Expand | SizerFlag::All, 8);
+            layout.add(&close, 0, SizerFlag::All, 8);
+            panel.set_sizer(layout, true);
+            close.on_click(move |_| dialog.end_modal(ID_OK));
+            field.set_insertion_point(0);
+            field.set_focus();
+            dialog.show_modal_tracked();
+            list.set_focus();
+        },
+    );
+}
+
+/// Export to Calendar... for one programme (Python
+/// `planning_tools_ui.export_programme`): the same save flow
+/// as the reminder export, keyed on the channel identity.
+fn export_programme_calendar(frame: Frame, channel: &Channel, programme: &Programme) {
+    let title = tr("Export to Calendar...");
+    let bytes = match iptv_core::planning_tools::programme_calendar(
+        &iptv_core::reminders::safe_title(&programme.title),
+        &iptv_core::reminders::safe_title(&channel_display_name(channel)),
+        programme.start,
+        programme.stop,
+        &iptv_core::reminders::reminder_channel_key(channel),
+        now_epoch(),
+    ) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            let dialog = MessageDialog::builder(&frame, &tr(&error), &title)
+                .with_style(MessageDialogStyle::OK | MessageDialogStyle::IconError)
+                .build();
+            dialog.show_modal_tracked();
+            return;
+        }
+    };
+    let dialog = FileDialog::builder(&frame)
+        .with_message(&title)
+        .with_wildcard("Calendar file (*.ics)|*.ics")
+        .with_style(FileDialogStyle::Save | FileDialogStyle::OverwritePrompt)
+        .build();
+    if dialog.show_modal_tracked() != ID_OK {
+        return;
+    }
+    let Some(mut path) = dialog.get_path() else {
+        return;
+    };
+    if !path.to_lowercase().ends_with(".ics") {
+        path.push_str(".ics");
+        if std::path::Path::new(&path).exists() {
+            let confirm =
+                MessageDialog::builder(&frame, &tr("Replace the existing export file?"), &title)
+                    .with_style(
+                        MessageDialogStyle::YesNo
+                            | MessageDialogStyle::NoDefault
+                            | MessageDialogStyle::IconWarning,
+                    )
+                    .build();
+            if confirm.show_modal_tracked() != ID_YES {
+                return;
+            }
+        }
+    }
+    let (message, error) =
+        match iptv_core::planning_tools::atomic_export(std::path::Path::new(&path), &bytes) {
+            Ok(()) => (tr("Export saved."), false),
+            Err(error) => (
+                trf("The operation failed:\n{error}", &[("error", &error)]),
+                true,
+            ),
+        };
+    let mut style = MessageDialogStyle::OK;
+    style |= if error {
+        MessageDialogStyle::IconError
+    } else {
+        MessageDialogStyle::IconInformation
+    };
+    let dialog = MessageDialog::builder(&frame, &message, &title)
+        .with_style(style)
+        .build();
+    dialog.show_modal_tracked();
 }
 
 /// Format a millisecond duration as M:SS or H:MM:SS.
