@@ -5,6 +5,15 @@ adjacent releases were part of the same fix stream, they are combined with a
 version range such as `0.2.2-0.2.3`. Each release's section below is its
 Forgejo release note, taken from this file by the release workflow.
 
+## 0.4.36
+
+- Scheduled Recordings now offers Weekday repeats, skipping one occurrence, extra time before and after, finding another airing, and checking what changed in the guide. Series rules skip episodes you already have, and recordings say when they were partly recorded or stopped by you.
+- Backups now keep the whole setup: settings, scheduled recordings, reminders and searches, in the same file the Python client writes, so you can swap between them.
+- View gains Assign Programme Guide: pin a channel to a guide entry, or go back to automatic matching, and every guide view follows the assignment. Guide entries that clash between sources stay separate instead of overwriting each other.
+- A missed recording can be recovered from the channel archive. The app can keep the computer awake while recording and wake it for a scheduled recording, warn when the drive is running out of space, and save what you just watched as a clip.
+- The player can now read subtitles built into a recording and step through its chapters. Recordings also gain a playback queue that starts at a problem time, and series can roll straight into the next episode after a short countdown.
+- Reminders gain Remind Again in 5 Minutes, Remind at Programme Start, and Export to Calendar.
+
 ## 0.4.35
 
 - Updated the desktop runtime and media-library dependencies. Release builds reuse compatible cached artifacts and use current packaging tools.
