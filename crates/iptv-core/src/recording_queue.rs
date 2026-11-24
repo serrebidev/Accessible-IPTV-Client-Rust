@@ -279,7 +279,12 @@ mod tests {
         assert_eq!(queue.pending()[0].title, "A");
         assert_eq!(queue.pending()[1].title, "B");
         // A later add of a known path is skipped.
-        assert_eq!(queue.add(vec![row("C:\\B.mkv", "B again")]), 2);
+        assert_eq!(queue.add(vec![row("C:\\b.mkv", "B again")]), 2);
+        // os.path.normcase folds case only on Windows.
+        #[cfg(windows)]
+        {
+            assert_eq!(queue.add(vec![row("C:\\B.mkv", "B again")]), 2);
+        }
     }
 
     #[test]
