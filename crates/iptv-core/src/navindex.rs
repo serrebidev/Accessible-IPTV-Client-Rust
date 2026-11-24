@@ -13,6 +13,44 @@
 use crate::Channel;
 use std::collections::HashMap;
 
+/// Python `playlist_index.channel_number`: the canonical
+/// form of a channel number — decimal digits only (Unicode
+/// decimal digits fold to ASCII), leading zeros stripped,
+/// anything else empty. Even malformed very long input is
+/// handled as text, never parsed to an integer.
+/// The Unicode decimal-digit blocks (general category Nd):
+/// each is ten contiguous codepoints, zero first. Rust's
+/// `char::to_digit` covers ASCII only, while Python's
+/// `str.isdecimal` accepts every Nd block.
+const DECIMAL_BLOCKS: &[u32] = &[
+    0x0030, 0x0660, 0x06F0, 0x07C0, 0x0966, 0x09E6, 0x0A66, 0x0AE6, 0x0B66, 0x0BE6, 0x0C66, 0x0CE6,
+    0x0D66, 0x0DE6, 0x0E50, 0x0ED0, 0x0F20, 0x1040, 0x1090, 0x17E0, 0x1810, 0x1946, 0x19D0, 0x1A80,
+    0x1A90, 0x1B50, 0x1BB0, 0x1C40, 0x1C50, 0xA620, 0xA8D0, 0xA900, 0xA9D0, 0xA9F0, 0xAA60, 0xABF0,
+    0xFF10, 0x104A0, 0x11066, 0x110F0, 0x11136, 0x111D0, 0x112F0, 0x11450, 0x114D0, 0x11650,
+    0x116C0, 0x11730, 0x118E0, 0x11950, 0x11C50, 0x11D50, 0x11DA0, 0x11F50, 0x16A60, 0x16AC0,
+    0x16B50, 0x1D7CE, 0x1E140, 0x1E2F0,
+];
+
+fn decimal_value(c: char) -> Option<u32> {
+    let code = c as u32;
+    DECIMAL_BLOCKS
+        .iter()
+        .find_map(|&start| (start..start + 10).contains(&code).then(|| code - start))
+}
+
+#[must_use]
+pub fn channel_number(value: &str) -> String {
+    let value = value.trim();
+    if value.is_empty() || !value.chars().all(|c| decimal_value(c).is_some()) {
+        return String::new();
+    }
+    let digits: String = value
+        .chars()
+        .filter_map(|c| decimal_value(c).and_then(|d| char::from_digit(d, 10)))
+        .collect();
+    digits.trim_start_matches('0').to_string()
+}
+
 /// Positions and normalized names for one published catalogue.
 #[derive(Debug)]
 pub struct NavIndex {
@@ -117,6 +155,20 @@ impl NavIndex {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn channel_number_canonicalizes_like_python() {
+        assert_eq!(channel_number("02"), "2");
+        assert_eq!(channel_number(" 7 "), "7");
+        assert_eq!(channel_number("0"), "");
+        assert_eq!(channel_number(""), "");
+        assert_eq!(channel_number("12a"), "");
+        assert_eq!(channel_number("-3"), "");
+        // Arabic-Indic decimal digits fold to ASCII.
+        assert_eq!(channel_number("٠٢"), "2");
+        // Very long input stays text, never an integer.
+        assert_eq!(channel_number(&"9".repeat(4900)).len(), 4900);
+    }
 
     fn channel(name: &str, group: &str, scope: Option<&str>) -> Channel {
         let mut attributes = BTreeMap::new();

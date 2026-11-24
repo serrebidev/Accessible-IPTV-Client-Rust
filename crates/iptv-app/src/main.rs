@@ -52,7 +52,7 @@ use iptv_core::{
         should_auto_import_epg, should_run_epg_search, EpgSnapshot, EpgWorker, NowNext, Programme,
         SuffixJob, SuffixWorker, SEARCH_EPG_RESULT_LIMIT,
     },
-    favorites::{channel_key, remember_recent, FavoriteSet, Toggle},
+    favorites::{channel_key, FavoriteSet, Toggle},
     playback::{
         candidate_executables, detect_from_path, external_argv, player_choice, EngineAction,
         EngineEvent, LaunchGate, PlaybackRequest, PlaybackSession, PlayerChoice, SessionState,
@@ -8749,13 +8749,13 @@ fn bind_menu_actions(frame: Frame, wiring: &Wiring, controls: Controls) {
             FAVORITE => toggle_selected_favorite(&wiring, list, status),
             GO_TO_FAVORITES => go_to_favorites(frame, &wiring, category_box, status),
             PREVIOUS_CHANNEL => {
-                // The second entry of the persisted MRU
-                // (P17): playing it promotes it to the front,
-                // so repeated Previous toggles A/B.
-                let recent = resolved_recent(&wiring);
-                match recent.get(1) {
+                // Python `_play_previous_channel` (P17, M11):
+                // the history behind the current entry,
+                // resolved on its own; playing it promotes it
+                // to the front, so repeated Previous toggles
+                // A/B.
+                match resolved_previous(&wiring) {
                     Some(channel) => {
-                        let channel = channel.clone();
                         play_channel(
                             &wiring.player,
                             persist,
@@ -9367,13 +9367,13 @@ fn menu_go_to_channel_number(wiring: &Wiring, frame: Frame, list: ListCtrl, stat
         let Some(text) = dialog.get_value() else {
             return;
         };
-        let value = text.trim();
-        let number = if !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()) {
-            value.parse::<usize>().unwrap_or(usize::MAX)
-        } else {
-            0
-        };
-        if number == 0 {
+        // Python canonicalizes both the entry and each
+        // channel's own number with `channel_number`
+        // (playlist_index): leading zeros and Unicode
+        // decimal digits fold, so "03" and "٠٢" both mean 2,
+        // and a huge entry stays text, never an integer.
+        let digits = iptv_core::navindex::channel_number(&text);
+        if digits.is_empty() {
             let dialog = MessageDialog::builder(
                 &frame,
                 "Enter a positive channel number.",
@@ -9384,36 +9384,46 @@ fn menu_go_to_channel_number(wiring: &Wiring, frame: Frame, list: ListCtrl, stat
             dialog.show_modal_tracked();
             return;
         }
+        let own_number = |channel: &Channel| -> String {
+            let raw = channel
+                .unknown_attributes
+                .get("number")
+                .filter(|own| !own.is_empty())
+                .or_else(|| channel.unknown_attributes.get("tvg-chno"))
+                .map_or("", |own| own.as_str());
+            iptv_core::navindex::channel_number(raw)
+        };
         // Python matches the channel's own number first
         // (`number`, then `tvg-chno`), then falls back to
-        // the 1-based position in the scoped list.
+        // the 1-based position — only when the channel at
+        // that position carries no number of its own.
         let mut row = None;
         for candidate in 0..row_count {
             let Some(channel) = model.channel(candidate) else {
                 continue;
             };
-            let own = channel
-                .unknown_attributes
-                .get("number")
-                .filter(|own| !own.is_empty())
-                .or_else(|| channel.unknown_attributes.get("tvg-chno"));
-            if own.is_some_and(|own| own == value) {
+            if own_number(&channel) == digits {
                 row = Some(candidate);
                 break;
             }
         }
-        let row = row.or_else(|| (number <= row_count).then(|| number - 1));
+        let row = row.or_else(|| {
+            if digits.len() > row_count.to_string().len() {
+                return None;
+            }
+            let position = digits.parse::<usize>().ok()?;
+            if position == 0 || position > row_count {
+                return None;
+            }
+            let channel = model.channel(position - 1)?;
+            own_number(&channel).is_empty().then_some(position - 1)
+        });
         let Some(row) = row else {
-            let number_text = if number == usize::MAX {
-                value.to_string()
-            } else {
-                number.to_string()
-            };
             let dialog = MessageDialog::builder(
                 &frame,
                 &trf(
                     "Channel number {number} was not found.",
-                    &[("number", &number_text)],
+                    &[("number", &digits)],
                 ),
                 "Go to Channel Number",
             )
@@ -9425,7 +9435,7 @@ fn menu_go_to_channel_number(wiring: &Wiring, frame: Frame, list: ListCtrl, stat
         let Some(index) = model.playlist_index(row) else {
             return;
         };
-        (row, index, number)
+        (row, index, digits)
     };
     let row_i64 = i64::try_from(row).unwrap_or(0);
     list.set_item_state(
@@ -9438,7 +9448,7 @@ fn menu_go_to_channel_number(wiring: &Wiring, frame: Frame, list: ListCtrl, stat
     if let Some(channel) = wiring.browser.borrow().channel(index) {
         status.set_label(&trf(
             "Channel {number}: {name}",
-            &[("number", &number.to_string()), ("name", &channel.name)],
+            &[("number", &number), ("name", &channel.name)],
         ));
     }
 }
@@ -11051,11 +11061,13 @@ fn play_channel_at(
 /// engine confirms Playing (see the poll loops), the external
 /// route when the launch is accepted and spawned.
 fn record_recent(persist: &Persist, channel: &Channel) {
-    let key = channel_key(channel);
-    if key.is_empty() {
+    // Python `_remember_played_channel`: the entry is stored
+    // under its history key, so the same channel name from
+    // two M3U playlists stays two history entries (M11).
+    if iptv_core::favorites::history_key(channel).is_empty() {
         return;
     }
-    let keys = remember_recent(&persist.recent_keys(), &key);
+    let keys = iptv_core::favorites::remember_recent_history(&persist.recent_keys(), channel);
     persist.save_recent_keys(&keys);
 }
 
@@ -21553,22 +21565,26 @@ fn wire_continue_watching(
 }
 
 /// Resolve the persisted recent-channels keys against the
-/// current catalogue (P17): later duplicate keys win; stored
-/// keys with no current match stay persisted but are skipped
-/// here, so renewed URLs resolve to the fresh entries.
+/// current catalogue (P17, M11): Python's
+/// `favorites.history_channels` — source-qualified history
+/// keys, legacy plain keys still resolve, and a key matching
+/// two distinct streams resolves to nothing instead of
+/// guessing the wrong source.
 fn resolved_recent(wiring: &Wiring) -> Vec<Channel> {
     let keys = wiring.persist.recent_keys();
     let channels = wiring.browser.borrow().all_channels();
-    let mut by_key: BTreeMap<String, Channel> = BTreeMap::new();
-    for channel in channels {
-        let key = channel_key(&channel);
-        if !key.is_empty() {
-            by_key.insert(key, channel);
-        }
-    }
-    keys.iter()
-        .filter_map(|key| by_key.get(key).cloned())
-        .collect()
+    iptv_core::favorites::history_channels(&keys, &channels)
+}
+
+/// Python `_play_previous_channel`'s resolution: the history
+/// behind the current entry, resolved on its own — an
+/// unresolvable current entry does not shift the answer.
+fn resolved_previous(wiring: &Wiring) -> Option<Channel> {
+    let keys = wiring.persist.recent_keys();
+    let channels = wiring.browser.borrow().all_channels();
+    iptv_core::favorites::history_channels(&keys[1.min(keys.len())..], &channels)
+        .into_iter()
+        .next()
 }
 
 /// View > Recently Watched...: the persisted history (P17),
@@ -21581,7 +21597,15 @@ fn open_recent_channels(wiring: &Wiring, status: Status) {
     }
     let (frame, panel, list, dstatus) =
         list_dialog("Recently Watched", "Recently watched channels");
-    let labels: Vec<String> = history.iter().map(|c| c.name.clone()).collect();
+    // Python's labels: repeated names gain their source so
+    // the same channel from two playlists can be told apart.
+    let aliases = iptv_core::reminders::source_names(&config_value(wiring));
+    let labels = iptv_core::favorites::history_labels(
+        &history,
+        &aliases,
+        &tr("Source {number}"),
+        &tr("IPTV Stream"),
+    );
     list.set_items(&labels.iter().map(String::as_str).collect::<Vec<_>>());
     list.set_selection(0, true);
     dstatus.set_label(&trf(

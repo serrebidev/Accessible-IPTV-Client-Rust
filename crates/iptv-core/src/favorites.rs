@@ -6,6 +6,7 @@
 //! favorites survive playlist refreshes and never persist credentials. Plain
 //! M3U channels fall back to their display name.
 use crate::Channel;
+use sha2::Digest as _;
 
 /// Stored sentinel for the Favorites category. Compared and persisted in this
 /// exact form; localization happens only where it is displayed.
@@ -77,6 +78,201 @@ pub fn normalize_keys(values: impl IntoIterator<Item = String>) -> Vec<String> {
 
 /// The persisted recent-channels MRU cap (Python keeps 20).
 pub const MAX_RECENT_CHANNELS: usize = 20;
+
+fn attribute<'a>(channel: &'a Channel, key: &str) -> &'a str {
+    channel
+        .unknown_attributes
+        .get(key)
+        .map_or("", |value| value.trim())
+}
+
+/// Python `history_key`: qualify ordinary M3U entries by
+/// their playlist source, without changing default favourite
+/// keys. Provider channels keep the plain key; an M3U channel
+/// (playlist-id but no provider-id) is keyed
+/// "m3u-history:<sha256 of playlist-id>:<channel key>", so
+/// the same channel name from two playlists stays distinct
+/// in the recently-watched history.
+#[must_use]
+pub fn history_key(channel: &Channel) -> String {
+    let key = channel_key(channel);
+    if key.is_empty()
+        || !attribute(channel, "provider-id").is_empty()
+        || attribute(channel, "playlist-id").is_empty()
+    {
+        return key;
+    }
+    let digest = sha2::Sha256::digest(attribute(channel, "playlist-id").as_bytes());
+    let source: String = digest.iter().fold(String::with_capacity(64), |mut out, b| {
+        use std::fmt::Write as _;
+        let _ = write!(out, "{b:02x}");
+        out
+    });
+    format!("m3u-history:{source}:{key}")
+}
+
+/// The legacy (plain channel key) form of a stored history
+/// key: for "m3u-history:" keys, everything after the second
+/// colon; any other key is itself.
+fn legacy_history_name(key: &str) -> String {
+    if let Some(rest) = key.strip_prefix("m3u-history:") {
+        return match rest.split_once(':') {
+            Some((_, tail)) => tail.to_string(),
+            None => rest.to_string(),
+        };
+    }
+    key.to_string()
+}
+
+/// Python `history_channels`: resolve stored history keys
+/// against the current channels. A key matching two distinct
+/// streams resolves to nothing (ambiguity is dropped, never
+/// guessed); legacy plain keys recorded before source
+/// qualification still resolve. Order follows the keys, and
+/// one channel appears at most once.
+#[must_use]
+pub fn history_channels(keys: &[String], channels: &[Channel]) -> Vec<Channel> {
+    use std::collections::{HashMap, HashSet};
+    let wanted: HashSet<&str> = keys.iter().map(String::as_str).collect();
+    if wanted.is_empty() {
+        return Vec::new();
+    }
+    let legacy_names: HashSet<String> = keys.iter().map(|k| legacy_history_name(k)).collect();
+    let mut matches: HashMap<String, Option<Channel>> = HashMap::new();
+    for channel in channels {
+        let old = channel_key(channel);
+        if !legacy_names.contains(&old) {
+            continue;
+        }
+        let current = history_key(channel);
+        for key in [old, current.clone()] {
+            if !wanted.contains(key.as_str()) {
+                continue;
+            }
+            match matches.entry(key) {
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert(Some(channel.clone()));
+                }
+                std::collections::hash_map::Entry::Occupied(mut slot) => {
+                    if let Some(previous) = slot.get() {
+                        if history_key(previous) != current || previous.url != channel.url {
+                            slot.insert(None);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut result = Vec::new();
+    let mut seen: HashSet<(String, String)> = HashSet::new();
+    for key in keys {
+        if let Some(Some(channel)) = matches.get(key) {
+            let identity = (channel_key(channel), channel.url.clone());
+            if seen.insert(identity) {
+                result.push(channel.clone());
+            }
+        }
+    }
+    result
+}
+
+/// Python `history_labels`: display names for the history
+/// list, disambiguated only when needed. A name shared by
+/// several channels gains " — {source alias or Source
+/// {number}}"; a label still repeated after that gains
+/// "({Source {number}})". Source numbers are assigned in
+/// first-appearance order across both passes, as Python's
+/// shared counter does. `source_template` is the translated
+/// "Source {number}" and `fallback_name` the translated
+/// "IPTV Stream", supplied by the app.
+#[must_use]
+pub fn history_labels(
+    channels: &[Channel],
+    aliases: &std::collections::BTreeMap<String, String>,
+    source_template: &str,
+    fallback_name: &str,
+) -> Vec<String> {
+    use std::collections::HashMap;
+    let source_of = |channel: &Channel| -> Option<String> {
+        let provider = attribute(channel, "provider-id");
+        if !provider.is_empty() {
+            return Some(provider.to_string());
+        }
+        let playlist = attribute(channel, "playlist-id");
+        if playlist.is_empty() {
+            None
+        } else {
+            Some(playlist.to_string())
+        }
+    };
+    let mut names: Vec<String> = channels
+        .iter()
+        .map(|channel| {
+            let name = display_name(channel);
+            if name.is_empty() {
+                fallback_name.to_string()
+            } else {
+                name.to_string()
+            }
+        })
+        .collect();
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for name in &names {
+        *counts.entry(name.to_lowercase()).or_default() += 1;
+    }
+    let mut sources: HashMap<Option<String>, usize> = HashMap::new();
+    let number_for = |sources: &mut HashMap<Option<String>, usize>, source: Option<String>| {
+        let next = sources.len() + 1;
+        *sources.entry(source).or_insert(next)
+    };
+    for (index, channel) in channels.iter().enumerate() {
+        if counts[&names[index].to_lowercase()] > 1 {
+            let source = source_of(channel);
+            let number = number_for(&mut sources, source.clone());
+            let label = source
+                .as_ref()
+                .and_then(|key| aliases.get(key))
+                .filter(|alias| !alias.is_empty())
+                .cloned()
+                .unwrap_or_else(|| source_template.replace("{number}", &number.to_string()));
+            names[index] = format!("{} — {}", names[index], label);
+        }
+    }
+    let mut repeated: HashMap<String, usize> = HashMap::new();
+    for name in &names {
+        *repeated.entry(name.to_lowercase()).or_default() += 1;
+    }
+    for (index, channel) in channels.iter().enumerate() {
+        if repeated[&names[index].to_lowercase()] > 1 {
+            let source = source_of(channel);
+            let number = number_for(&mut sources, source);
+            let number_label = source_template.replace("{number}", &number.to_string());
+            names[index] = format!("{} ({})", names[index], number_label);
+        }
+    }
+    names
+}
+
+/// Python `_remember_played_channel` (P17): record a played
+/// channel under its history key. The plain channel key is
+/// removed from the tail too, so a channel recorded before
+/// source qualification does not appear twice.
+#[must_use]
+pub fn remember_recent_history(keys: &[String], channel: &Channel) -> Vec<String> {
+    let key = history_key(channel);
+    if key.is_empty() || keys.first().is_some_and(|front| front == &key) {
+        return keys.to_vec();
+    }
+    let plain = channel_key(channel);
+    let mut next = vec![key.clone()];
+    next.extend(
+        keys.iter()
+            .filter(|existing| existing.as_str() != key && existing.as_str() != plain)
+            .cloned(),
+    );
+    next.truncate(MAX_RECENT_CHANNELS);
+    next
+}
 
 /// Record one played channel in the recent-channels MRU
 /// (Python `_remember_played_channel`, P17): the key moves to
@@ -190,6 +386,94 @@ mod tests {
 
     fn channel(text: &str) -> Channel {
         parse_m3u(text).into_iter().next().unwrap()
+    }
+
+    fn station(source: &str, name: &str) -> Channel {
+        channel(&format!(
+            "#EXTINF:-1 playlist-id=\"{source}\" tvg-id=\"{name}\",{name}\nhttps://example.invalid/{source}/regular\n"
+        ))
+    }
+
+    #[test]
+    fn history_key_qualifies_plain_m3u_only() {
+        let a = station("a", "Concert");
+        let b = station("b", "Concert");
+        assert_eq!(channel_key(&a), channel_key(&b));
+        assert_ne!(history_key(&a), history_key(&b));
+        assert!(history_key(&a).starts_with("m3u-history:"));
+        assert!(history_key(&a).ends_with(&channel_key(&a)));
+        // Provider channels keep the plain key.
+        let provider = channel(
+            "#EXTINF:-1 provider-id=\"acct\" playlist-id=\"p1\" tvg-id=\"x\",Chan\nhttp://a/1\n",
+        );
+        assert_eq!(history_key(&provider), channel_key(&provider));
+    }
+
+    #[test]
+    fn history_channels_drop_ambiguity_and_keep_legacy_keys() {
+        // Mirrors Python's test_previous_and_legacy_history.
+        let a = station("a", "Concert");
+        let b = station("b", "Concert");
+        let news = station("a", "News");
+        // A legacy plain key matching two sources resolves to nothing.
+        assert!(history_channels(&[channel_key(&a)], &[a.clone(), b.clone()]).is_empty());
+        assert_eq!(
+            history_channels(&[channel_key(&a)], std::slice::from_ref(&a)),
+            vec![a.clone()]
+        );
+        // Recorded history keys resolve per source.
+        let keys = remember_recent_history(&[], &a);
+        let keys = remember_recent_history(&keys, &news);
+        assert_eq!(
+            history_channels(&keys, &[b.clone(), news.clone()]),
+            vec![news.clone()]
+        );
+        // Previous channel: keys[1..] resolves the earlier channel.
+        assert_eq!(
+            history_channels(&keys[1..], &[a.clone(), b.clone()]),
+            vec![a.clone()]
+        );
+    }
+
+    #[test]
+    fn history_labels_disambiguate_by_source() {
+        let a = station("a", "Concert");
+        let b = station("b", "Concert");
+        let aliases: std::collections::BTreeMap<String, String> = [
+            ("a".to_string(), "First".to_string()),
+            ("b".to_string(), "Second".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            history_labels(
+                &[a.clone(), b.clone()],
+                &aliases,
+                "Source {number}",
+                "IPTV Stream"
+            ),
+            vec!["Concert — First", "Concert — Second"]
+        );
+        let same: std::collections::BTreeMap<String, String> = [
+            ("a".to_string(), "Home".to_string()),
+            ("b".to_string(), "Home".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            history_labels(&[a, b], &same, "Source {number}", "IPTV Stream"),
+            vec!["Concert — Home (Source 1)", "Concert — Home (Source 2)"]
+        );
+    }
+
+    #[test]
+    fn remember_recent_history_replaces_the_plain_key() {
+        let a = station("a", "Concert");
+        let keys = vec![channel_key(&a), "other".to_string()];
+        let keys = remember_recent_history(&keys, &a);
+        assert_eq!(keys, vec![history_key(&a), "other".to_string()]);
+        // Already at the front: unchanged.
+        assert_eq!(remember_recent_history(&keys, &a), keys);
     }
 
     #[test]
