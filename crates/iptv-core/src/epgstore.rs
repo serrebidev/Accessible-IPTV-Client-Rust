@@ -870,6 +870,40 @@ impl EpgStore {
         Ok(results)
     }
 
+    /// Saved-programme-search rows (Python `saved_searches.scan`):
+    /// programmes in the window whose title (and, when `description`
+    /// is set, description) contains `query`, case-insensitive,
+    /// starting within `from..=to`, ordered by start then channel.
+    ///
+    /// # Errors
+    /// Returns the `SQLite` error text when the query cannot run.
+    pub fn saved_search_programmes(
+        &self,
+        query: &str,
+        description: bool,
+        from: i64,
+        to: i64,
+    ) -> Result<Vec<Programme>, String> {
+        // `instr(lower(x), lower(?))` is SQLite's casefold for this
+        // port (Python's `search_fold`); the query text travels as a
+        // bound value, never interpolated into the SQL.
+        let where_clause = if description {
+            "instr(lower(title), lower(?1)) > 0 OR instr(lower(description), lower(?1)) > 0"
+        } else {
+            "instr(lower(title), lower(?1)) > 0"
+        };
+        let sql = format!(
+            "SELECT channel, start, stop, title, description, episode, subtitle FROM programmes
+             WHERE start >= ?2 AND start <= ?3 AND ({where_clause})
+             ORDER BY start ASC, channel ASC, title ASC"
+        );
+        let mut statement = self.conn.prepare(&sql).map_err(|e| e.to_string())?;
+        let rows = statement
+            .query_map(rusqlite::params![query, from, to], row_programme)
+            .map_err(|e| e.to_string())?;
+        collect_rows(rows)
+    }
+
     fn query_one(&self, sql: &str, channel_id: &str, at: i64) -> Result<Option<Programme>, String> {
         let mut statement = self.conn.prepare(sql).map_err(|e| e.to_string())?;
         let mut rows = statement

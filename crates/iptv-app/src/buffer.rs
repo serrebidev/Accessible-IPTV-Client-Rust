@@ -120,6 +120,21 @@ impl BufferSession {
         Ok(session)
     }
 
+    /// The spool directory holding the segment files.
+    #[must_use]
+    pub fn dir(&self) -> &PathBuf {
+        &self.dir
+    }
+
+    /// The retained timeline (Python `window.snapshot()`).
+    #[must_use]
+    pub fn snapshot(&self) -> Vec<iptv_core::timeshift::Segment> {
+        self.core
+            .lock()
+            .map(|core| core.window().snapshot().to_vec())
+            .unwrap_or_default()
+    }
+
     /// The playlist URL for a view id handed out by `cursor`.
     #[must_use]
     pub fn view_url(&self, view_id: u64) -> String {

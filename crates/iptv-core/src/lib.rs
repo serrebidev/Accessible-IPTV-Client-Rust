@@ -33,6 +33,7 @@ pub fn hidden_command(program: impl AsRef<std::ffi::OsStr>) -> std::process::Com
 
 pub mod account_info;
 pub mod applog;
+pub mod archive_recovery;
 pub mod audiotracks;
 pub mod background;
 pub mod bookmarks;
@@ -68,6 +69,9 @@ pub mod recording_edits;
 pub mod recording_library;
 pub mod recording_limits;
 pub mod recording_log;
+pub mod recording_media;
+pub mod recording_power;
+pub mod recording_queue;
 pub mod reminders;
 pub mod saved_searches;
 pub mod search;
@@ -75,6 +79,7 @@ pub mod settings_backup;
 pub mod shortcuts;
 pub mod sources;
 pub mod speech;
+pub mod storage_monitor;
 pub mod subtitles;
 pub mod timeshift;
 pub mod vod;

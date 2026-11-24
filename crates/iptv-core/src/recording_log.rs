@@ -868,6 +868,57 @@ pub struct ProblemTimes {
     /// Media times where known, clock times otherwise, deduped:
     /// the times the dialog lists.
     pub jump_times: Vec<String>,
+    /// Play-from-here positions (C7, Python `positions`):
+    /// `(time, estimated)` deduped per occurrence — `true`
+    /// when the time is the clock fallback, `false` when ffmpeg
+    /// reported a media `time=` for it.
+    pub positions: Vec<(String, bool)>,
+}
+
+/// One seek-mode row of the Recording Problem Times dialog
+/// (C7, Python `RecordingProblemTimesDialog` with `seek=True`):
+/// the display label and the start position in milliseconds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SeekRow {
+    pub label: String,
+    pub position_ms: i64,
+}
+
+/// Parse an `h:mm:ss` clock stamp into milliseconds (Python's
+/// `"{time} – {message}"` row conversion). `None` for a
+/// malformed stamp.
+#[must_use]
+pub fn clock_to_ms(stamp: &str) -> Option<i64> {
+    let mut parts = stamp.split(':');
+    let hours: i64 = parts.next()?.parse().ok()?;
+    let minutes: i64 = parts.next()?.parse().ok()?;
+    let seconds: i64 = parts.next()?.parse().ok()?;
+    if parts.next().is_some() || minutes < 0 || seconds < 0 {
+        return None;
+    }
+    Some((hours * 3600 + minutes * 60 + seconds) * 1000)
+}
+
+/// The seek-mode rows for a problems list (C7): one row per
+/// position, "{time} (estimated) – {message}" when the time is
+/// the clock fallback, "{time} – {message}" when ffmpeg
+/// reported a media time (Python's `positions` rendering).
+#[must_use]
+pub fn seek_rows(problems: &[ProblemTimes]) -> Vec<SeekRow> {
+    let mut rows = Vec::new();
+    for problem in problems {
+        for (stamp, estimated) in &problem.positions {
+            let label = if *estimated {
+                format!("{stamp} (estimated) – {}", problem.message)
+            } else {
+                format!("{stamp} – {}", problem.message)
+            };
+            if let Some(position_ms) = clock_to_ms(stamp) {
+                rows.push(SeekRow { label, position_ms });
+            }
+        }
+    }
+    rows
 }
 
 /// When problems were logged, in seconds into the recording
@@ -909,6 +960,21 @@ pub fn recording_problem_times(path: &Path, max_times: usize) -> Vec<ProblemTime
                 jump_times.push(chosen);
             }
         }
+        // Python `positions`: per occurrence the media time
+        // where known, else the clock stamp, deduped with the
+        // estimated flag riding along.
+        let media_all: Vec<String> = media.clone();
+        let mut positions: Vec<(String, bool)> = Vec::new();
+        for (media_time, clock_time) in media_all.iter().zip(stamps.iter()) {
+            let entry = if media_time.is_empty() {
+                (clock_time.clone(), true)
+            } else {
+                (media_time.clone(), false)
+            };
+            if !positions.contains(&entry) {
+                positions.push(entry);
+            }
+        }
         results.push(ProblemTimes {
             message: kind.message.clone(),
             level: kind.level.clone(),
@@ -916,6 +982,7 @@ pub fn recording_problem_times(path: &Path, max_times: usize) -> Vec<ProblemTime
             clock_times: stamps,
             media_times: media.into_iter().filter(|s| !s.is_empty()).collect(),
             jump_times,
+            positions,
         });
     }
     results.sort_by(|a, b| a.clock_times.first().cmp(&b.clock_times.first()));
@@ -1149,5 +1216,69 @@ Last message repeated 2 times
         // Python rounds half to even: 2.5 s reads as 2, 3.5 as 4.
         assert_eq!(format_duration(Some(2.5)), "00:02");
         assert_eq!(format_duration(Some(3.5)), "00:04");
+    }
+
+    #[test]
+    fn seek_rows_label_estimated_and_media_times() {
+        assert_eq!(clock_to_ms("1:02:03"), Some(3_723_000));
+        assert_eq!(clock_to_ms("0:00:00"), Some(0));
+        assert_eq!(clock_to_ms("0:00"), None);
+        assert_eq!(clock_to_ms("a:b:c"), None);
+        // C7: a media-timed occurrence is exact, a clock-only one
+        // is marked estimated (Python `positions`).
+        let problems = vec![
+            ProblemTimes {
+                message: "decode error".to_string(),
+                level: "error".to_string(),
+                count: 2,
+                clock_times: vec!["0:01:00".to_string()],
+                media_times: Vec::new(),
+                jump_times: vec!["0:01:00".to_string()],
+                positions: vec![("0:01:00".to_string(), true)],
+            },
+            ProblemTimes {
+                message: "bad frame".to_string(),
+                level: "warning".to_string(),
+                count: 1,
+                clock_times: vec!["0:02:00".to_string()],
+                media_times: vec!["0:01:59".to_string()],
+                jump_times: vec!["0:01:59".to_string()],
+                positions: vec![("0:01:59".to_string(), false)],
+            },
+        ];
+        let rows = seek_rows(&problems);
+        assert_eq!(
+            rows,
+            vec![
+                SeekRow {
+                    label: "0:01:00 (estimated) – decode error".to_string(),
+                    position_ms: 60_000,
+                },
+                SeekRow {
+                    label: "0:01:59 – bad frame".to_string(),
+                    position_ms: 119_000,
+                },
+            ]
+        );
+        assert!(seek_rows(&[]).is_empty());
+    }
+
+    #[test]
+    fn problem_times_carry_positions() {
+        let path = temp_log("positions", SAMPLE);
+        let problems = recording_problem_times(&path, PROBLEM_TIMES_LIMIT);
+        assert_eq!(problems.len(), 1);
+        assert!(!problems[0].positions.is_empty());
+        for (stamp, _) in &problems[0].positions {
+            assert!(clock_to_ms(stamp).is_some(), "position {stamp}");
+        }
+        // The seek rows are the dialog's model: labels
+        // carry the message, positions are in range.
+        let rows = seek_rows(&problems);
+        assert!(!rows.is_empty());
+        for row in &rows {
+            assert!(row.position_ms >= 0);
+            assert!(row.label.contains(&problems[0].message));
+        }
     }
 }

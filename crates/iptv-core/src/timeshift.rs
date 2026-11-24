@@ -887,6 +887,144 @@ impl LiveBuffer {
     }
 }
 
+/// Largest excerpt the history prompt accepts, in seconds
+/// (Python `buffer_clip.select_segments`).
+pub const MAX_CLIP_SECONDS: f64 = 24.0 * 3600.0;
+
+/// One staged segment copy chunk (Python `64 * 1024`).
+pub const CLIP_COPY_CHUNK: usize = 64 * 1024;
+
+/// A Save Recent Broadcast failure, carrying Python's
+/// user-facing text (`buffer_clip.py`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ClipError {
+    /// `ValueError('No buffered audio or video is available.')`.
+    NoBuffered,
+    /// `ValueError('The selected buffer segment is no longer available.')`.
+    SegmentGone,
+    /// `OSError('There is not enough free space to save the buffered programme.')`.
+    NoSpace,
+    /// `OSError('The buffered programme could not be saved.')`.
+    SaveFailed,
+    /// `InterruptedError('Canceled')`.
+    Canceled,
+    /// `FileExistsError('A file with this name already exists in the selected folder.')`.
+    AlreadyExists,
+}
+
+impl fmt::Display for ClipError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let text = match self {
+            Self::NoBuffered => "No buffered audio or video is available.",
+            Self::SegmentGone => "The selected buffer segment is no longer available.",
+            Self::NoSpace => "There is not enough free space to save the buffered programme.",
+            Self::SaveFailed => "The buffered programme could not be saved.",
+            Self::Canceled => "Canceled",
+            Self::AlreadyExists => "A file with this name already exists in the selected folder.",
+        };
+        f.write_str(text)
+    }
+}
+
+impl std::error::Error for ClipError {}
+
+/// Python `buffer_clip.select_segments`: the rows whose end is
+/// strictly after `last.end - seconds`. The excerpt may start
+/// slightly earlier than `seconds` back because only complete
+/// segments are used.
+///
+/// # Errors
+/// [`ClipError::NoBuffered`] when `rows` is empty or `seconds`
+/// is not in `(0, MAX_CLIP_SECONDS]`.
+pub fn select_clip_segments(rows: &[Segment], seconds: f64) -> Result<Vec<Segment>, ClipError> {
+    if rows.is_empty() || !(0.0 < seconds && seconds <= MAX_CLIP_SECONDS) {
+        return Err(ClipError::NoBuffered);
+    }
+    let floor = rows[rows.len() - 1].end() - seconds;
+    Ok(rows
+        .iter()
+        .filter(|row| row.end() > floor)
+        .cloned()
+        .collect())
+}
+
+/// The staged playlist for one excerpt (Python
+/// `buffer_clip._stage`'s manifest): one `#EXTINF` per segment
+/// with a `#EXT-X-DISCONTINUITY` before each discontinuous
+/// segment, ending with `#EXT-X-ENDLIST` and a trailing newline.
+/// Segments are renamed to `000000.ts`, `000001.ts`, ... in
+/// order.
+///
+/// # Errors
+/// [`ClipError::NoBuffered`] when `rows` is empty (Python has
+/// no valid target duration to compute there).
+pub fn clip_manifest(rows: &[Segment]) -> Result<String, ClipError> {
+    use std::fmt::Write as _;
+    if rows.is_empty() {
+        return Err(ClipError::NoBuffered);
+    }
+    let max_duration = rows.iter().fold(0.0_f64, |acc, row| acc.max(row.duration));
+    // Python: max(1, int(max duration + 1)); int() truncates.
+    #[allow(clippy::cast_possible_truncation)]
+    let target = ((max_duration + 1.0) as i64).max(1);
+    let mut text = format!("#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:{target}\n");
+    for (index, row) in rows.iter().enumerate() {
+        if row.discontinuity {
+            text += "#EXT-X-DISCONTINUITY\n";
+        }
+        let _ = write!(text, "#EXTINF:{:.6},\n{index:06}.ts\n", row.duration);
+    }
+    text += "#EXT-X-ENDLIST\n";
+    Ok(text)
+}
+
+/// The ffmpeg remux command for one excerpt (Python
+/// `buffer_clip.save`'s args): stream copy to an MPEG-TS file.
+#[must_use]
+pub fn clip_ffmpeg_args(manifest: &str, output: &str) -> Vec<String> {
+    vec![
+        "ffmpeg".to_string(),
+        "-nostdin".to_string(),
+        "-hide_banner".to_string(),
+        "-loglevel".to_string(),
+        "error".to_string(),
+        "-y".to_string(),
+        "-protocol_whitelist".to_string(),
+        "file".to_string(),
+        "-i".to_string(),
+        manifest.to_string(),
+        "-map".to_string(),
+        "0".to_string(),
+        "-c".to_string(),
+        "copy".to_string(),
+        "-f".to_string(),
+        "mpegts".to_string(),
+        output.to_string(),
+    ]
+}
+
+/// Python `buffer_clip.save`'s free-space rule: one bounded
+/// snapshot at the destination plus the remux, so the recording
+/// reserve must fit on both volumes and the staged copy needs
+/// its own room beside the destination — doubled when the
+/// destination and the buffer share one device. Arithmetic
+/// saturates: a huge `size` reads as "not enough room", never
+/// as enough.
+#[must_use]
+pub fn clip_space_sufficient(
+    dest_free: u64,
+    window_free: u64,
+    same_device: bool,
+    size: u64,
+    reserve_mib: u64,
+) -> bool {
+    let reserve = reserve_mib.saturating_mul(1024 * 1024);
+    let copies = if same_device { 2 } else { 1 };
+    let dest_need = reserve.saturating_add(size.saturating_mul(copies));
+    let window_need = reserve.saturating_add(size);
+    dest_free >= dest_need && window_free >= window_need
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1227,5 +1365,166 @@ mod tests {
         // Lease release is idempotent, as in Python.
         buffer.release_lease(0);
         assert!(buffer.is_closed());
+    }
+
+    fn clip_row(name: &str, start: f64, duration: f64, discontinuity: bool) -> Segment {
+        Segment {
+            name: name.to_string(),
+            sequence: 0,
+            start,
+            duration,
+            size: 1024,
+            discontinuity,
+        }
+    }
+
+    #[test]
+    fn clip_selection_matches_python_buffer_clip() {
+        // Three 4-second segments span 0..12.
+        let rows = vec![
+            clip_row("seg-000000000.ts", 0.0, 4.0, false),
+            clip_row("seg-000000001.ts", 4.0, 4.0, true),
+            clip_row("seg-000000002.ts", 8.0, 4.0, false),
+        ];
+        // Last 5 s: floor 7.0, so the final two segments
+        // (ends 8 and 12) qualify.
+        let picked = select_clip_segments(&rows, 5.0).unwrap();
+        assert_eq!(picked.len(), 2);
+        assert_eq!(picked[0].name, "seg-000000001.ts");
+        // A floor exactly on a segment end excludes it.
+        let picked = select_clip_segments(&rows, 4.0).unwrap();
+        assert_eq!(picked.len(), 1);
+        assert_eq!(picked[0].name, "seg-000000002.ts");
+        // A full 12 s takes every segment, and the 24-hour cap passes.
+        assert_eq!(select_clip_segments(&rows, 12.0).unwrap().len(), 3);
+        assert_eq!(
+            select_clip_segments(&rows, MAX_CLIP_SECONDS).unwrap().len(),
+            3
+        );
+        for seconds in [0.0, -1.0, f64::NAN, MAX_CLIP_SECONDS + 1.0] {
+            assert_eq!(
+                select_clip_segments(&rows, seconds),
+                Err(ClipError::NoBuffered)
+            );
+        }
+        assert_eq!(select_clip_segments(&[], 10.0), Err(ClipError::NoBuffered));
+        assert_eq!(
+            ClipError::NoBuffered.to_string(),
+            "No buffered audio or video is available."
+        );
+        assert_eq!(
+            ClipError::SegmentGone.to_string(),
+            "The selected buffer segment is no longer available."
+        );
+        assert_eq!(ClipError::Canceled.to_string(), "Canceled");
+    }
+
+    #[test]
+    fn clip_manifest_matches_python_stage_output() {
+        // int(2.5 + 1) = 3, so the target duration is 3; the
+        // discontinuity line precedes its segment.
+        let rows = vec![
+            clip_row("seg-000000000.ts", 0.0, 2.5, false),
+            clip_row("seg-000000001.ts", 2.5, 2.0, true),
+        ];
+        assert_eq!(
+            clip_manifest(&rows).unwrap(),
+            "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:3\n\
+             #EXTINF:2.500000,\n000000.ts\n#EXT-X-DISCONTINUITY\n\
+             #EXTINF:2.000000,\n000001.ts\n#EXT-X-ENDLIST\n"
+        );
+        // int(0.5 + 1) = 1, so a sub-second longest segment
+        // yields target 1.
+        let rows = vec![clip_row("seg-000000000.ts", 0.0, 0.5, false)];
+        assert!(clip_manifest(&rows)
+            .unwrap()
+            .contains("#EXT-X-TARGETDURATION:1\n"));
+        assert_eq!(clip_manifest(&[]), Err(ClipError::NoBuffered));
+    }
+
+    #[test]
+    fn clip_space_and_ffmpeg_args_match_python() {
+        let mib = 1024 * 1024_u64;
+        // Reserve 10 MiB, 100 MiB of segments: same device needs
+        // reserve + 2x for the destination; different devices 1x.
+        assert!(clip_space_sufficient(
+            210 * mib,
+            110 * mib,
+            true,
+            100 * mib,
+            10
+        ));
+        assert!(!clip_space_sufficient(
+            209 * mib,
+            110 * mib,
+            true,
+            100 * mib,
+            10
+        ));
+        assert!(clip_space_sufficient(
+            110 * mib,
+            110 * mib,
+            false,
+            100 * mib,
+            10
+        ));
+        assert!(!clip_space_sufficient(
+            109 * mib,
+            110 * mib,
+            false,
+            100 * mib,
+            10
+        ));
+        assert!(!clip_space_sufficient(
+            110 * mib,
+            109 * mib,
+            false,
+            100 * mib,
+            10
+        ));
+        // A saturating reserve cannot wrap into "fits".
+        assert!(!clip_space_sufficient(
+            u64::MAX - 1,
+            u64::MAX - 1,
+            true,
+            u64::MAX,
+            u64::MAX
+        ));
+        let args = clip_ffmpeg_args("index.m3u8", "out.ts");
+        let expected: Vec<String> = [
+            "ffmpeg",
+            "-nostdin",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-protocol_whitelist",
+            "file",
+            "-i",
+            "index.m3u8",
+            "-map",
+            "0",
+            "-c",
+            "copy",
+            "-f",
+            "mpegts",
+            "out.ts",
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+        assert_eq!(args, expected);
+        assert_eq!(
+            ClipError::NoSpace.to_string(),
+            "There is not enough free space to save the buffered programme."
+        );
+        assert_eq!(
+            ClipError::SaveFailed.to_string(),
+            "The buffered programme could not be saved."
+        );
+        assert_eq!(
+            ClipError::AlreadyExists.to_string(),
+            "A file with this name already exists in the selected folder."
+        );
     }
 }

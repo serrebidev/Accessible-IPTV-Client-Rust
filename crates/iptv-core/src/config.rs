@@ -66,6 +66,9 @@ fn defaults() -> Map<String, Value> {
     put("recording_pre_padding_minutes", json!(0));
     put("recording_post_padding_minutes", json!(2));
     put("shutdown_after_recordings", json!(false));
+    put("prevent_sleep_while_recording", json!(true));
+    put("wake_for_recordings", json!(false));
+    put("auto_next_episode", json!(false));
     put("favorites", json!([]));
     put("recent_channels", json!([]));
     put("live_buffer_enabled", json!(false));
@@ -233,6 +236,19 @@ impl Config {
             let flag = coerce_bool(self.values.get(key), false);
             self.values.insert(key.to_string(), json!(flag));
         }
+        // Python `normalize_config`: recording power stays
+        // on by default, waking for scheduled recordings off.
+        let flag = coerce_bool(self.values.get("prevent_sleep_while_recording"), true);
+        self.values
+            .insert("prevent_sleep_while_recording".to_string(), json!(flag));
+        let flag = coerce_bool(self.values.get("wake_for_recordings"), false);
+        self.values
+            .insert("wake_for_recordings".to_string(), json!(flag));
+        // Python `options.normalize_config`: automatically
+        // playing the next episode is off by default.
+        let flag = coerce_bool(self.values.get("auto_next_episode"), false);
+        self.values
+            .insert("auto_next_episode".to_string(), json!(flag));
         // Truncation is the Python int() behavior; clamped to 0..=3 below.
         #[allow(clippy::cast_possible_truncation)]
         let level = coerce_f64(self.values.get("announcement_level")).map_or(2, |n| n as i64);

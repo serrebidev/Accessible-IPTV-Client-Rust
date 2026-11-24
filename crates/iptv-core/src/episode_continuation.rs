@@ -74,6 +74,37 @@ pub fn following_item(current: &Channel, episodes: &[Channel]) -> Option<Channel
     adjacent_item(current, episodes, 1)
 }
 
+/// Python `natural_end`: a VOD playback that was seen playing
+/// and was not manually stopped, ending within 2.5 s (or 5% of
+/// the media, whichever is smaller) before the end or at most
+/// 1 s past it. Positions and lengths are integer milliseconds.
+#[must_use]
+pub fn natural_end(
+    kind: &str,
+    seen_playing: bool,
+    manual_stop: bool,
+    position: i64,
+    length: i64,
+) -> bool {
+    kind == "vod"
+        && seen_playing
+        && !manual_stop
+        && length > 0
+        && length - (2_500).min(length / 20) <= position
+        && position <= length + 1_000
+}
+
+/// Python `NextEpisodeDialog`'s countdown length in seconds.
+pub const COUNTDOWN_SECONDS: i64 = 10;
+
+/// Python's per-tick label seconds: at least 1, rounding the
+/// remaining time up, so a tick one step into the countdown
+/// still reads the full ten.
+#[must_use]
+pub fn countdown_seconds(remaining_ms: i64) -> i64 {
+    (remaining_ms.max(1) + 999) / 1_000
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -140,6 +171,47 @@ mod tests {
         let duplicate = episodes[1].clone();
         episodes.push(duplicate);
         assert!(adjacent_item(&episodes[1], &episodes, 1).is_none());
+    }
+
+    #[test]
+    fn natural_end_matches_python() {
+        // (kind, seen, manual, position, length, expected)
+        let cases = [
+            ("vod", true, false, 10_000, 10_000, true),
+            ("vod", true, false, 9_500, 10_000, true), // 5% of 10 s = 500 ms
+            ("vod", true, false, 9_499, 10_000, false),
+            ("vod", true, false, 11_000, 10_000, true), // 1 s past the end
+            ("vod", true, false, 11_001, 10_000, false),
+            ("vod", true, false, 59_000, 60_000, true), // capped at 2.5 s
+            ("vod", true, false, 57_499, 60_000, false),
+            ("live", true, false, 10_000, 10_000, false),
+            ("vod", false, false, 10_000, 10_000, false),
+            ("vod", true, true, 10_000, 10_000, false),
+            ("vod", true, false, 0, 0, false),
+            ("vod", true, false, 100, -5, false),
+            ("vod", true, false, -1, 10_000, false),
+        ];
+        for (kind, seen, manual, position, length, expected) in cases {
+            assert_eq!(
+                natural_end(kind, seen, manual, position, length),
+                expected,
+                "{kind} seen={seen} manual={manual} pos={position} len={length}"
+            );
+        }
+    }
+
+    #[test]
+    fn countdown_ticks_down_and_floors_at_one() {
+        assert_eq!(COUNTDOWN_SECONDS, 10);
+        assert_eq!(countdown_seconds(10_000), 10);
+        assert_eq!(countdown_seconds(9_750), 10);
+        assert_eq!(countdown_seconds(9_001), 10);
+        assert_eq!(countdown_seconds(9_000), 9);
+        assert_eq!(countdown_seconds(1_001), 2);
+        assert_eq!(countdown_seconds(1_000), 1);
+        assert_eq!(countdown_seconds(1), 1);
+        assert_eq!(countdown_seconds(0), 1);
+        assert_eq!(countdown_seconds(-500), 1);
     }
 
     #[test]

@@ -121,6 +121,8 @@ Video on demand works best with Xtream Codes accounts, which describe their cata
 
 Playback > Previous Episode (Ctrl+PageUp) and Next Episode (Ctrl+PageDown) switch manually within the current series. These shortcuts are configurable. The current media keeps playing during lookup; an unavailable or ambiguous episode leaves it unchanged. A newer playback or playlist request invalidates the lookup.
 
+Player > Automatically Play the Next Episode is off by default. When enabled, a series episode that finishes normally opens a 10-second countdown before the next identified episode. Play Now starts immediately; Cancel or Escape stops the continuation. A manual stop or an early playback failure does not trigger it. Changing playback or the playlist cancels an outdated continuation; if no unambiguous next episode is available, playback ends.
+
 Continue Watching now has a Type choice for Video on Demand or Recordings. Local positions remain in a separate store. Checking a recording searches only the configured recording folders in the background and requires its exact path and file signature. Missing or replaced files are not played. Removing or clearing positions affects only the selected type.
 
 ## Playlist Manager {#playlist-manager}
@@ -254,6 +256,8 @@ Keys in the player:
 
 The same commands are on the player's Playback menu. The player reconnects on its own when a live stream drops, and keeps the audio track you chose.
 
+With the local live buffer active, Playback > Save Recent Broadcast saves the last seconds or minutes as a new MPEG-TS file. Choose the duration and a filename. Only complete local segments are used, so the excerpt may start slightly earlier. Cancel stops the export and keeps existing files.
+
 ### Audio tracks {#audio-tracks}
 
 Channels can carry several audio tracks, such as other languages or audio description. Press A to move to the next track, use Playback > Audio Track, or Tab to Choose Audio Track, which always names the track that is playing.
@@ -262,7 +266,9 @@ A track you choose is remembered for that channel and comes back next time. See 
 
 ### Subtitle speech {#subtitle-speech}
 
-Subtitle text appears in the video when the stream provides it. Playback > Load Subtitle File accepts an external subtitle file. Turn on Playback > Speak Subtitles (Shift+S) and the selected voice reads each subtitle of a loaded SRT, ASS, SSA or WebVTT file as it appears, also while the player window is hidden. The current subtitle is also shown as text at the end of the player controls. The built-in player cannot yet read stream-embedded subtitles aloud.
+During playback of a local MKV recording, choose **Playback > Read Embedded Subtitle Track** and select the language and track you want. With **Speak Subtitles** on, the player reads the selected text in time with the recording. You can also review the current or previous cue. Image-based subtitles are identified in the list. Choosing another subtitle source or stopping playback ends reading of this track.
+
+Subtitle text appears in the video when the stream provides it. Playback > Load Subtitle File accepts an external subtitle file. Turn on Playback > Speak Subtitles (Shift+S) and the selected voice reads each subtitle of a loaded SRT, ASS, SSA or WebVTT file as it appears, also while the player window is hidden. The current subtitle is also shown as text at the end of the player controls. The built-in player cannot read subtitles embedded in live streams aloud.
 
 Playback > Read Current Subtitle (C) reads the subtitle on screen, or the last one shown when none is on screen. Playback > Previous Subtitle (Page Up) and Next Subtitle (Page Down) move through the subtitles already shown, so you can hear a line you missed again. They never read ahead of playback, and they work whether Speak Subtitles is on or off.
 
@@ -316,6 +322,8 @@ Recording what you are watching in the built-in player uses the same connection 
 
 Stopping a recording can take a moment while its file is finalized. When the application exits, any recordings still in progress are also stopped; the program first gives them a short grace period to finalize their files.
 
+Recordings > Recording Space Monitor checks free space every five seconds while recording. Warning is enabled by default below 1024 MiB. Automatic stopping is off by default; enable it and choose a stop threshold, initially 256 MiB, to request graceful file closure before the drive fills up. The warning threshold must not be lower than the stop threshold. Recordings on the same drive share one warning; if stopping is enabled, all affected recordings are stopped. The check cannot reserve space or guarantee file closure on a full or disconnected drive.
+
 Recordings > Recording Library lists finished files from up to 20 folders, including the current recording folder. Add Folder adds an existing folder; it does not change where new recordings are saved. Remove Folder from Library leaves its files untouched. The current recording folder cannot be removed.
 
 Search by title, channel or date. Play / Resume opens the selected file and offers its saved position when available. Duration and completion status appear when known; older files may show Unknown. Active recordings and files currently playing in the built-in player are excluded. Rename Title changes only the displayed title, preserving the filename, resume position and bookmarks. Refresh updates the list.
@@ -323,6 +331,8 @@ Search by title, channel or date. Play / Resume opens the selected file and offe
 Move to Recording Trash moves a file into the application's trash within its recording folder; this does not free disk space. Show Deleted Recordings lists these files. Restore Recording returns a file to its original folder without overwriting an existing file. Delete Recording File in this view permanently deletes it after confirmation. Removing an entry from Scheduled Recordings does not delete the media file.
 
 All Recording Folders combines the configured folders. Filter by status and sort by date, title, duration or file size; Descending reverses the order. Ctrl+A selects all visible rows. Selected count and total size are shown. Trash, permanent deletion and restore support multiple selections; playback and title renaming require one. Disk scans and filtering run in the background; closing the window does not cancel a confirmed file action.
+
+Recording Library > Add to Playback Queue adds the selected recordings to a session queue, and Recording Playback Queue opens the queue: reorder with Move Up and Move Down (Ctrl+Up and Ctrl+Down), remove with Remove from Queue (Delete), Play Queue to play from the first one, or Stop after Current Recording to stop after the current one finishes. The queue checks each file when it reaches it, and stops at a recording whose file is missing, changed or still being recorded, naming it. When a recording contains chapters, **Playback > Recording Chapters** lists their names and start times. Select a chapter and press Enter to jump to it. Recording Problem Times lists when warnings and errors happened in a recording; choose one and Play from This Time starts there. Times with no media time from FFmpeg are marked as estimated.
 
 ### Recording format {#recording-formats}
 
@@ -337,6 +347,8 @@ Recordings > Recording Format chooses how recordings are saved:
 
 To record a programme in the future, choose Schedule Recording on a programme in View EPG, What's on Now or a programme row in the search results. Schedule Recording on a channel opens its guide so you can choose the programme first.
 
+In Scheduled Recordings, for a missed, failed or partial recording, Recover from Channel Archive downloads a separate copy if the programme is still available and the recording connection limit allows it.
+
 Recordings > Scheduled Recordings lists every scheduled, running and finished recording with its time, title, channel, status and format.
 
 - The Applications key or Shift+F10 on a recording opens its menu: Refresh, Cancel and Delete.
@@ -350,6 +362,10 @@ Scheduled recordings start by themselves while the program is running, even when
 When a new recording overlaps another scheduled recording, the program warns you before adding it. Your provider may limit how many streams can run at once.
 
 The program asks before it closes while any scheduled recordings are still waiting to start, because they can only start while the program is running. If you close it anyway, the waiting recordings will not start.
+
+On Windows, Recordings > Prevent Automatic Sleep While Recording is enabled by default. It requests that Windows remain awake during recordings; it does not keep the display on or prevent sleep initiated by the user, such as closing a laptop lid.
+
+Wake for Scheduled Recordings (Windows) is off by default. When enabled, it requests a wake timer 60 seconds before the next recording's start, including schedule padding. The application must stay open, and Windows power settings and hardware must support wake timers. This cannot start a shut-down computer. Changing or cancelling the schedule updates the timer; exiting removes it.
 
 Recording Conflicts in Scheduled Recordings lists overlaps for one selected entry, including padding. Details include the channel, configured account alias and actual recording window. Edit Times opens the existing timing editor. A conflict confirmation also offers these details and Schedule Anyway. Known account budgets restrict the comparison to that account; unknown budgets show time overlaps without claiming a provider limit.
 
@@ -475,6 +491,12 @@ Lists of sources in the Playlist Manager and EPG Manager:
 
 - F2: rename.
 - Delete: delete.
+
+## Personal tools {#personal-tools}
+
+Keep the application open for recording schedules, reminders and saved-search alerts. Reminders and search alerts do not wake a sleeping computer. Scheduled recordings can request a wake timer on Windows when the option described under Scheduled recordings is enabled.
+
+- View > Saved Programme Searches stores up to 30 title or description searches. Choose all channels, the selected channel or a snapshot of a named favourite list. Searches run after guide imports and every 15 minutes over the next 14 days. Each search shows up to 500 matches; narrow truncated searches. New matches are announced according to announcement settings. Results can create reminders or recordings.
 
 ## Getting help {#support}
 

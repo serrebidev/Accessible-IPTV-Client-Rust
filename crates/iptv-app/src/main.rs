@@ -75,7 +75,7 @@ use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
     rc::Rc,
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 use wxdragon::event::EventType;
 use wxdragon::prelude::*;
@@ -595,6 +595,13 @@ enum PendingEpgReadUi {
     },
 }
 
+/// One finished saved-search scan (C11), delivered by the
+/// background thread and drained by the 60 s tick.
+struct ScanOutcome {
+    signature: String,
+    result: Result<(Vec<iptv_core::saved_searches::RuleResult>, usize), String>,
+}
+
 #[derive(Clone)]
 struct Wiring {
     browser: Rc<RefCell<BrowserWorker>>,
@@ -646,6 +653,14 @@ struct Wiring {
     /// E11): row suffixes track programme boundaries even when
     /// every worker is idle.
     epg_timer: Rc<Timer<Frame>>,
+    /// Saved Programme Searches (C11, Python `saved_searches`):
+    /// the latest scan results, the status line, and the
+    /// background scan's outcome slot, drained by the 60 s tick.
+    search_results: Rc<RefCell<Vec<iptv_core::saved_searches::RuleResult>>>,
+    search_status: Rc<RefCell<String>>,
+    search_outcome: Arc<Mutex<Option<ScanOutcome>>>,
+    search_pending: Rc<std::cell::Cell<bool>>,
+    search_last_scan: Rc<std::cell::Cell<f64>>,
     reminders: Rc<RefCell<Vec<Reminder>>>,
     provider_worker: Rc<ProviderWorker>,
     provider_pending: Rc<std::cell::Cell<bool>>,
@@ -757,6 +772,27 @@ struct Wiring {
     /// loading is not disturbed; the housekeeping tick fires
     /// it when the time comes.
     auto_check_due: Rc<std::cell::Cell<f64>>,
+    /// The recording power manager (C3, Python
+    /// `recording_power.RecordingPower`): started once at
+    /// startup and on the menu toggles, closed at app exit.
+    recording_power: Rc<RefCell<Option<iptv_core::recording_power::RecordingPower>>>,
+    /// Errors the manager thread reported, drained onto the
+    /// UI thread by the housekeeping tick (Python
+    /// `_recording_power_failed` via `wx.CallAfter`).
+    recording_power_errors: Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
+    /// The recording space monitor's per-drive memory (C4,
+    /// Python `storage_monitor.SpaceMonitor`): remembers
+    /// what each drive was last told, cleared when no
+    /// recording is left.
+    space_monitor: Rc<RefCell<iptv_core::storage_monitor::SpaceMonitor>>,
+    /// Last space-check time, seconds; the check runs
+    /// every 5 s while recordings are active (Python's
+    /// recording-space thread).
+    space_last_check: Rc<std::cell::Cell<f64>>,
+    /// The session recording playback queue (C7, Python's
+    /// `RecordingQueue`): pending library rows plus the
+    /// in-flight hand-off validation.
+    recording_queue: Rc<RefCell<QueueInner>>,
 }
 
 /// Built-in player window state, created lazily on first use.
@@ -775,6 +811,17 @@ type VlcLoadReply = std::sync::Arc<std::sync::Mutex<Option<Result<(), String>>>>
 /// A subtitle file load's result slot (P09): (generation,
 /// parsed cues or the load error).
 type PendingSubtitles = std::sync::Arc<std::sync::Mutex<Option<(u64, Result<Vec<Cue>, String>)>>>;
+
+/// An embedded-track listing worker's result slot (C6):
+/// (generation, tracks or the listing error).
+type PendingEmbeddedTracks = std::sync::Arc<
+    std::sync::Mutex<
+        Option<(
+            u64,
+            Result<Vec<iptv_core::recording_media::EmbeddedTrack>, String>,
+        )>,
+    >,
+>;
 
 // The player state is a flat bag of session flags by design —
 // one struct the poll loop and the menu/key dispatchers share.
@@ -865,6 +912,17 @@ struct PlayerState {
     /// generation guards delivery, the slot carries the result.
     subtitle_generation: u64,
     pending_subtitles: Option<PendingSubtitles>,
+    /// C6: embedded-subtitle speech (Python's
+    /// `_embedded_speech`): cues extracted from a local MKV
+    /// recording's embedded track. They are spoken without
+    /// binding to a visual SPU track, and cleared wherever
+    /// cues are cleared. The two slots carry the ffmpeg
+    /// listing worker's and the extraction worker's results;
+    /// the flag stops an in-flight ffmpeg child.
+    embedded_speech: bool,
+    pending_embedded_listing: Option<PendingEmbeddedTracks>,
+    pending_embedded_cues: Option<PendingSubtitles>,
+    embedded_cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Per-channel audio memory supplied for the current
     /// channel (P06): its key, remembered name and slot.
     audio_key: String,
@@ -907,6 +965,15 @@ struct PlayerState {
     episode_nav_token: u64,
     episode_nav_busy: bool,
     episode_nav_rx: Option<EpisodeNavRx>,
+    /// The automatic next-episode continuation (C8, Python
+    /// `episode_continuation_ui.finished`): the playback
+    /// generation and playlist pointer the pending lookup
+    /// belongs to, and the worker's reply slot. A newer
+    /// playback (generation moves) or a playlist change
+    /// (pointer moves) invalidates it.
+    auto_next_generation: u64,
+    auto_next_playlist: usize,
+    auto_next_rx: Option<EpisodeNavRx>,
     /// The resume store the current channel writes to
     /// (`playback_bookmarks`, or `recording_playback_bookmarks`
     /// for local recordings), its bookmark key, and whether a
@@ -914,6 +981,16 @@ struct PlayerState {
     resume_store: String,
     resume_key: String,
     resume_write_pending: bool,
+    /// The recording playback queue's current ticket and the
+    /// session generation it was launched under (C7, Python's
+    /// `_queue_ticket` + `_vlc_generation`): the end-of-item
+    /// advance fires only while both match.
+    queue_ticket: Option<u64>,
+    queue_generation: u64,
+    /// The Save Recent Broadcast progress dialog while an
+    /// export runs (C5, Python `_buffer_clip_dialog`); choosing
+    /// the menu again raises it.
+    clip_dialog: Option<Dialog>,
 }
 
 impl Default for PlayerState {
@@ -968,6 +1045,10 @@ impl Default for PlayerState {
             file_subtitle_track: None,
             subtitle_generation: 0,
             pending_subtitles: None,
+            embedded_speech: false,
+            pending_embedded_listing: None,
+            pending_embedded_cues: None,
+            embedded_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             audio_key: String::new(),
             supply_audio_name: None,
             supply_audio_index: None,
@@ -990,9 +1071,15 @@ impl Default for PlayerState {
             episode_nav_token: 0,
             episode_nav_busy: false,
             episode_nav_rx: None,
+            auto_next_generation: 0,
+            auto_next_playlist: 0,
+            auto_next_rx: None,
             resume_store: "playback_bookmarks".to_string(),
             resume_key: String::new(),
             resume_write_pending: false,
+            queue_ticket: None,
+            queue_generation: 0,
+            clip_dialog: None,
         }
     }
 }
@@ -1336,6 +1423,13 @@ fn bind_browser(
         epg_recheck: Rc::new(std::cell::Cell::new(false)),
         epg_import_notify: Rc::new(std::cell::Cell::new(false)),
         epg_timer: Rc::new(Timer::new(&frame)),
+        search_results: Rc::new(RefCell::new(Vec::new())),
+        search_status: Rc::new(RefCell::new(String::new())),
+        search_outcome: Arc::new(Mutex::new(None)),
+        search_pending: Rc::new(std::cell::Cell::new(false)),
+        // Python's first scan lands 30 s after startup
+        // (`wx.CallLater(30000, ...)`); the 60 s tick picks it up.
+        search_last_scan: Rc::new(std::cell::Cell::new(now_seconds() - 900.0 + 30.0)),
         reminders: Rc::new(RefCell::new(Vec::new())),
         provider_worker: Rc::new(ProviderWorker::new()),
         provider_pending: Rc::new(std::cell::Cell::new(false)),
@@ -1391,6 +1485,14 @@ fn bind_browser(
         media_probe_token: Rc::new(std::cell::Cell::new(0)),
         format_menu_state: Rc::new(RefCell::new(String::new())),
         auto_check_due: Rc::new(std::cell::Cell::new(0.0)),
+        recording_power: Rc::new(RefCell::new(None)),
+        recording_power_errors: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
+        space_monitor: Rc::new(RefCell::new(iptv_core::storage_monitor::SpaceMonitor::new())),
+        space_last_check: Rc::new(std::cell::Cell::new(0.0)),
+        recording_queue: Rc::new(RefCell::new(QueueInner {
+            queue: iptv_core::recording_queue::RecordingQueue::new(),
+            validation: None,
+        })),
     };
     wiring.player.borrow_mut().shared = Some(PlayerShared {
         buffers: Rc::clone(&wiring.buffers),
@@ -1424,6 +1526,9 @@ fn bind_browser(
     {
         assert!(wiring.timer.start(50, false));
     }
+    // Python's deferred startup: the scheduler starts, then
+    // recording power, then the playlist load.
+    start_recording_power(&wiring);
     reload_sources(&wiring);
     reload_epg(&wiring);
     // N09: restore the saved playlist scope before the first
@@ -1556,6 +1661,17 @@ fn bind_housekeeping(frame: Frame, wiring: &Wiring) {
         // N16: a media-type probe whose selection has settled
         // for 1.5 s starts on this tick.
         poll_media_probe_schedule(&tick_wiring);
+        // C3: keep the recording power snapshot fresh; the
+        // manager thread polls it every 5 s on its own, so a
+        // 1 s sync makes schedule changes, toggles and
+        // recordings starting or finishing land within a
+        // second (Python refreshes at those points).
+        sync_recording_power(&tick_wiring);
+        drain_recording_power_errors(frame, &tick_wiring);
+        // C4: the recording space check runs every 5 s
+        // while recordings are active (Python's
+        // recording-space thread).
+        poll_space_monitor(frame, &tick_wiring);
     });
     let _ = wiring.housekeeping.start(1000, false);
 }
@@ -1578,6 +1694,7 @@ fn bind_main_close(frame: Frame, wiring: &Wiring) {
     let close_downloads = Rc::clone(&wiring.downloads);
     let close_exit_requested = Rc::clone(&wiring.exit_requested);
     let close_exit_forced = Rc::clone(&wiring.exit_forced);
+    let close_power = Rc::clone(&wiring.recording_power);
     frame.bind_internal(EventType::CLOSE_WINDOW, move |event| {
         if !close_exit_forced.get()
             && close_persist
@@ -1657,6 +1774,11 @@ fn bind_main_close(frame: Frame, wiring: &Wiring) {
             }
             dvr.save_logged();
         }
+        // C3: exit removes the wake timer and the
+        // execution-state request (Python's `on_close`).
+        if let Some(manager) = close_power.borrow_mut().take() {
+            manager.close();
+        }
         close_buffers.borrow_mut().close_all();
         close_player.borrow_mut().app_voice.close();
         for timer in close_player.borrow_mut().player_timers.drain(..) {
@@ -1676,6 +1798,7 @@ fn bind_main_close(frame: Frame, wiring: &Wiring) {
 /// it skips while the window is hidden in the tray.
 fn bind_epg_timer(frame: Frame, wiring: &Wiring, controls: Controls) {
     let list = controls.list;
+    let main_status = controls.status;
     let tick = clone_wiring(wiring);
     wiring.epg_timer.on_tick(move |_| {
         if !frame.is_shown() {
@@ -1689,6 +1812,14 @@ fn bind_epg_timer(frame: Frame, wiring: &Wiring, controls: Controls) {
         // result and queues the next refresh.
         drain_suffix_results(&tick, list);
         request_suffix_refresh(&tick);
+        // Saved searches (C11): drain a finished scan, then run
+        // the next one every 15 minutes of wall time (Python's
+        // timer), 30 s after start.
+        drain_saved_search(&tick, main_status);
+        if now_seconds() - tick.search_last_scan.get() >= 900.0 {
+            tick.search_last_scan.set(now_seconds());
+            scan_saved_searches(&tick);
+        }
     });
     let _ = wiring.epg_timer.start(60_000, false);
 }
@@ -1699,6 +1830,265 @@ fn bind_epg_timer(frame: Frame, wiring: &Wiring, controls: Controls) {
 /// action to revive polling.
 fn ensure_polling(wiring: &Wiring) {
     let _ = wiring.timer.start(50, false);
+}
+
+/// Start the recording power manager once (C3, Python
+/// `_start_recording_power`): a no-op where unsupported or
+/// already started.
+fn start_recording_power(wiring: &Wiring) {
+    if !iptv_core::recording_power::supported() || wiring.recording_power.borrow().is_some() {
+        return;
+    }
+    let errors = Arc::clone(&wiring.recording_power_errors);
+    let manager = iptv_core::recording_power::RecordingPower::start(
+        Arc::new(std::sync::Mutex::new(
+            iptv_core::recording_power::PowerSnapshot::default(),
+        )),
+        Box::new(move |error: String| {
+            if let Ok(mut queue) = errors.lock() {
+                queue.push_back(error);
+            }
+        }),
+    );
+    *wiring.recording_power.borrow_mut() = Some(manager);
+    sync_recording_power(wiring);
+}
+
+/// Rebuild the manager's snapshot and wake it now (C3,
+/// Python `manager.refresh()` plus the `snapshot()` read):
+/// config, whether the recorder has an active recording, and
+/// the scheduler's jobs without done ones.
+fn sync_recording_power(wiring: &Wiring) {
+    let manager = wiring.recording_power.borrow();
+    let Some(manager) = manager.as_ref() else {
+        return;
+    };
+    let config = wiring.persist.config.borrow().clone();
+    let active = wiring.recordings.borrow().active_count() > 0;
+    let jobs = wiring
+        .dvr
+        .borrow()
+        .jobs()
+        .iter()
+        .filter(|job| !iptv_core::dvr::DONE_STATUSES.contains(&job.status.as_str()))
+        .cloned()
+        .collect();
+    if let Ok(mut snapshot) = manager.snapshot().lock() {
+        snapshot.config = config;
+        snapshot.active = active;
+        snapshot.jobs = jobs;
+    }
+    manager.refresh();
+}
+
+/// Drain recording power failures onto the UI thread (C3,
+/// Python `_recording_power_failed`): one queued box per
+/// failure, suppressed while the manager is closing.
+fn drain_recording_power_errors(frame: Frame, wiring: &Wiring) {
+    let errors: Vec<String> = wiring
+        .recording_power_errors
+        .lock()
+        .map_or_else(|_| Vec::new(), |mut queue| queue.drain(..).collect());
+    if errors.is_empty() {
+        return;
+    }
+    if wiring
+        .recording_power
+        .borrow()
+        .as_ref()
+        .is_some_and(iptv_core::recording_power::RecordingPower::is_stopping)
+    {
+        return;
+    }
+    for error in &errors {
+        show_or_queue_notification(
+            frame,
+            &trf(
+                "Recording power management failed:\n{error}",
+                &[("error", error)],
+            ),
+            &tr("Recording"),
+            MessageDialogStyle::OK | MessageDialogStyle::IconWarning,
+            None,
+        );
+    }
+}
+
+/// One 5 s space check while recordings are active (C4,
+/// Python the recording-space thread): snapshot the
+/// running recordings, check each drive's free space, and
+/// warn or gracefully stop per `storage_monitor`. With no
+/// recording left, the per-drive memory clears, as when
+/// Python's thread exits.
+fn poll_space_monitor(frame: Frame, wiring: &Wiring) {
+    let now = now_seconds();
+    if now - wiring.space_last_check.get() < 5.0 {
+        return;
+    }
+    let rows: Vec<iptv_core::storage_monitor::SpaceRecording> = wiring
+        .recordings
+        .borrow_mut()
+        .active_recordings()
+        .into_iter()
+        .map(|info| iptv_core::storage_monitor::SpaceRecording {
+            id: info.key,
+            path: info.out_path,
+            stopping: info.stopping,
+        })
+        .collect();
+    if rows.is_empty() {
+        wiring.space_monitor.borrow_mut().clear();
+        return;
+    }
+    wiring.space_last_check.set(now);
+    let prefs = iptv_core::storage_monitor::settings(&wiring.persist.config.borrow());
+    let buffers = Rc::clone(&wiring.buffers);
+    let recordings = Rc::clone(&wiring.recordings);
+    let mut stop = move |key: &str| {
+        recordings.borrow_mut().stop_for(key, "storage");
+        release_recording_lease(&buffers, key);
+    };
+    let mut notify = move |state: iptv_core::storage_monitor::SpaceState,
+                           dir: &std::path::Path,
+                           free_mib: u64,
+                           count: usize| {
+        let path = dir.display().to_string();
+        let text = match state {
+            iptv_core::storage_monitor::SpaceState::Unavailable => trf(
+                "Free space could not be checked while recording:\n{path}",
+                &[("path", &path)],
+            ),
+            iptv_core::storage_monitor::SpaceState::Stopping => trf(
+                "Recording space is critically low ({free} MiB). The {count} recording(s) on this drive are being stopped safely.\n{path}",
+                &[
+                    ("free", &free_mib.to_string()),
+                    ("count", &count.to_string()),
+                    ("path", &path),
+                ],
+            ),
+            iptv_core::storage_monitor::SpaceState::Warning => trf(
+                "Recording space is running low: {free} MiB remains.\n{path}",
+                &[("free", &free_mib.to_string()), ("path", &path)],
+            ),
+        };
+        show_or_queue_notification(
+            frame,
+            &text,
+            &tr("Recording Storage"),
+            MessageDialogStyle::OK | MessageDialogStyle::IconWarning,
+            None,
+        );
+    };
+    wiring.space_monitor.borrow_mut().check(
+        &rows,
+        &prefs,
+        |dir| recording::free_space_bytes(dir).ok(),
+        &mut notify,
+        &mut stop,
+    );
+}
+
+/// Recordings > Recording Space Monitor... (C4; Python
+/// `SpaceSettingsDialog`): whether to watch free space
+/// while recording, and the warning and stop thresholds
+/// in MiB. The warning threshold must be at least the
+/// stop threshold, or the dialog stays open.
+fn show_space_monitor_dialog(wiring: &Wiring, frame: Frame, status: Status) {
+    let prefs = iptv_core::storage_monitor::settings(&wiring.persist.config.borrow());
+    let dialog = Dialog::builder(&frame, &tr("Recording Space Monitor")).build();
+    dialog.set_accessibility_label(&tr("Recording Space Monitor"));
+    bind_escape_cancel(dialog);
+    let panel = Panel::builder(&dialog).build();
+    let enabled = CheckBox::builder(&panel)
+        .with_label(&tr("Monitor free space while recording"))
+        .build();
+    enabled.set_accessibility_label(&tr("Monitor free space while recording"));
+    enabled.set_value(prefs.enabled);
+    let warn_label = StaticText::builder(&panel)
+        .with_label(&tr("Warn below (MiB):"))
+        .build();
+    let warning = SpinCtrl::builder(&panel)
+        .with_range(
+            i32::try_from(iptv_core::storage_monitor::MIN_MIB).unwrap_or(0),
+            i32::try_from(iptv_core::storage_monitor::MAX_MIB).unwrap_or(0),
+        )
+        .build();
+    warning.set_accessibility_label(&tr("Warn below (MiB):"));
+    warning.set_value(i32::try_from(prefs.warning_mib).unwrap_or(0));
+    let stop = CheckBox::builder(&panel)
+        .with_label(&tr("Stop recordings safely when space is critically low"))
+        .build();
+    stop.set_accessibility_label(&tr("Stop recordings safely when space is critically low"));
+    stop.set_value(prefs.auto_stop);
+    let stop_label = StaticText::builder(&panel)
+        .with_label(&tr("Stop below (MiB):"))
+        .build();
+    let critical = SpinCtrl::builder(&panel)
+        .with_range(
+            i32::try_from(iptv_core::storage_monitor::MIN_MIB).unwrap_or(0),
+            i32::try_from(iptv_core::storage_monitor::MAX_MIB).unwrap_or(0),
+        )
+        .build();
+    critical.set_accessibility_label(&tr("Stop below (MiB):"));
+    critical.set_value(i32::try_from(prefs.stop_mib).unwrap_or(0));
+    let ok = Button::builder(&panel).with_label("&OK").build();
+    ok.set_accessibility_label("OK");
+    let cancel = Button::builder(&panel).with_label("&Cancel").build();
+    cancel.set_accessibility_label("Cancel");
+    bind_f1_help(&dialog, wiring, "recordings", status);
+    bind_f1_help(&enabled, wiring, "recordings", status);
+    bind_f1_help(&warning, wiring, "recordings", status);
+    bind_f1_help(&stop, wiring, "recordings", status);
+    bind_f1_help(&critical, wiring, "recordings", status);
+    let sizer = BoxSizer::builder(Orientation::Vertical).build();
+    sizer.add(&enabled, 0, SizerFlag::All, 8);
+    sizer.add(&warn_label, 0, SizerFlag::All, 8);
+    sizer.add(&warning, 0, SizerFlag::All, 8);
+    sizer.add(&stop, 0, SizerFlag::All, 8);
+    sizer.add(&stop_label, 0, SizerFlag::All, 8);
+    sizer.add(&critical, 0, SizerFlag::All, 8);
+    let buttons = BoxSizer::builder(Orientation::Horizontal).build();
+    buttons.add(&ok, 0, SizerFlag::All, 4);
+    buttons.add(&cancel, 0, SizerFlag::All, 4);
+    sizer.add_sizer(&buttons, 0, SizerFlag::Expand, 0);
+    panel.set_sizer(sizer, true);
+    let persist = wiring.persist.clone();
+    let dialog_ok = dialog;
+    let dialog_cancel = dialog;
+    ok.on_click(move |_| {
+        // Python validates on OK and keeps the dialog
+        // open with the error when the thresholds cross.
+        if warning.value() < critical.value() {
+            operation_failed_box(
+                &dialog_ok,
+                &tr("The warning threshold must be at least as high as the stop threshold."),
+            );
+            return;
+        }
+        let mut config = persist.config.borrow_mut();
+        config.set_value(
+            "recording_monitor_space",
+            serde_json::json!(enabled.get_value()),
+        );
+        config.set_value(
+            "recording_warn_free_mib",
+            serde_json::json!(warning.value()),
+        );
+        config.set_value(
+            "recording_stop_free_mib",
+            serde_json::json!(critical.value()),
+        );
+        config.set_value(
+            "recording_stop_low_space",
+            serde_json::json!(stop.get_value()),
+        );
+        let _ = config.save(&persist.path);
+        dialog_ok.end_modal(ID_OK);
+    });
+    cancel.on_click(move |_| {
+        dialog_cancel.end_modal(ID_CANCEL);
+    });
+    dialog.show_modal_tracked();
 }
 
 fn bind_completion(frame: Frame, wiring: &Wiring, controls: Controls) {
@@ -1773,6 +2163,8 @@ fn bind_completion(frame: Frame, wiring: &Wiring, controls: Controls) {
             }
         }
         poll_providers(&completed, controls);
+        queue_poll(&completed, status);
+        auto_continuation_poll(&completed, status);
         poll_recordings(&completed, frame, status);
         poll_vod(&completed, status);
         poll_cast(&completed, status);
@@ -1794,6 +2186,8 @@ fn bind_completion(frame: Frame, wiring: &Wiring, controls: Controls) {
                 .any(|r| r.status == ReminderStatus::Scheduled)
             && completed.recordings.borrow().active_count() == 0
             && completed.dvr.borrow().pending_count() == 0
+            && !completed.recording_queue.borrow().queue.playing()
+            && !completed.recording_queue.borrow().queue.loading()
             && !completed.vod_pending.get()
             && !completed.cast_pending.get()
             && !completed.downloads_active.get()
@@ -2192,6 +2586,11 @@ enum PendingResolve {
     Download {
         channel: Channel,
         programme: Programme,
+        /// The schedule padding for the download window: a
+        /// recovered recording asks for its booked span again
+        /// (Python's `schedule_padding`), a plain catch-up
+        /// download uses the configured padding.
+        schedule_padding: Option<(i64, i64)>,
     },
 }
 
@@ -2471,9 +2870,20 @@ fn poll_providers(wiring: &Wiring, controls: Controls) {
                     Some(PendingResolve::Dvr(job_id)) => {
                         handle_dvr_resolve(wiring, status, &job_id, result);
                     }
-                    Some(PendingResolve::Download { channel, programme }) => match result {
+                    Some(PendingResolve::Download {
+                        channel,
+                        programme,
+                        schedule_padding,
+                    }) => match result {
                         Ok(url) => {
-                            begin_catchup_download(wiring, &channel, &programme, url, status);
+                            begin_catchup_download_with_padding(
+                                wiring,
+                                &channel,
+                                &programme,
+                                url,
+                                status,
+                                schedule_padding,
+                            );
                         }
                         Err(error) => status.set_label(&tr(&error)),
                     },
@@ -2552,6 +2962,7 @@ fn report_epg_import_finished(frame: Frame, success: bool) {
     }
 }
 
+#[allow(clippy::too_many_lines)] // EPG poll: worker, reload and notify legs, as in Python
 fn poll_epg(wiring: &Wiring, frame: Frame, status: Status) {
     if let Some(result) = wiring.epg_worker.try_recv() {
         wiring.epg_pending.set(false);
@@ -2607,6 +3018,10 @@ fn poll_epg(wiring: &Wiring, frame: Frame, status: Status) {
                 if notify {
                     report_epg_import_finished(frame, true);
                 }
+                // Saved searches run after every guide import
+                // (C11, Python `_scan_saved_searches`).
+                wiring.search_last_scan.set(now_seconds());
+                scan_saved_searches(wiring);
                 // Sources changed while this load ran (a provider
                 // finished after it started): run the load the
                 // change asked for, as Python does.
@@ -6243,6 +6658,11 @@ fn clone_wiring(wiring: &Wiring) -> Wiring {
         epg_recheck: Rc::clone(&wiring.epg_recheck),
         epg_import_notify: Rc::clone(&wiring.epg_import_notify),
         epg_timer: Rc::clone(&wiring.epg_timer),
+        search_results: Rc::clone(&wiring.search_results),
+        search_status: Rc::clone(&wiring.search_status),
+        search_outcome: Arc::clone(&wiring.search_outcome),
+        search_pending: Rc::clone(&wiring.search_pending),
+        search_last_scan: Rc::clone(&wiring.search_last_scan),
         reminders: Rc::clone(&wiring.reminders),
         provider_worker: Rc::clone(&wiring.provider_worker),
         provider_pending: Rc::clone(&wiring.provider_pending),
@@ -6298,6 +6718,11 @@ fn clone_wiring(wiring: &Wiring) -> Wiring {
         media_probe_token: Rc::clone(&wiring.media_probe_token),
         format_menu_state: Rc::clone(&wiring.format_menu_state),
         auto_check_due: Rc::clone(&wiring.auto_check_due),
+        recording_power: Rc::clone(&wiring.recording_power),
+        recording_power_errors: Arc::clone(&wiring.recording_power_errors),
+        space_monitor: Rc::clone(&wiring.space_monitor),
+        space_last_check: Rc::clone(&wiring.space_last_check),
+        recording_queue: Rc::clone(&wiring.recording_queue),
     }
 }
 
@@ -6460,6 +6885,7 @@ pub const SHOW_PLAYER: i32 = 5111;
 pub const PLAY_PAUSE: i32 = 5112;
 pub const STOP: i32 = 5113;
 pub const CAST_CONNECT: i32 = 5114;
+pub const AUTO_NEXT_EPISODE: i32 = 5115;
 pub const VIEW_LIVE: i32 = 5121;
 pub const VIEW_VOD: i32 = 5122;
 pub const CONTINUE_WATCHING: i32 = 5123;
@@ -6470,6 +6896,7 @@ pub const RECENT_CHANNELS: i32 = 5127;
 pub const CHANNEL_NUMBER: i32 = 5128;
 pub const SHOW_DOWNLOADS: i32 = 5129;
 pub const ASSIGN_GUIDE: i32 = 5130;
+pub const SAVED_SEARCHES: i32 = 5132;
 pub const PLAYER_RADIO_BASE: i32 = 5131;
 pub const CUSTOM_PLAYER: i32 = 5163;
 pub const PREFERRED_AUDIO: i32 = 5164;
@@ -6514,6 +6941,9 @@ pub const REC_SHUTDOWN_AFTER: i32 = 5223;
 pub const REC_PROBLEM_TIMES: i32 = 5224;
 pub const REC_FORMAT_CHECKING: i32 = 5225;
 pub const REC_BY_TIME: i32 = 5226;
+pub const REC_PREVENT_SLEEP: i32 = 5227;
+pub const REC_WAKE_RECORDINGS: i32 = 5228;
+pub const REC_SPACE_MONITOR: i32 = 5229;
 
 /// The Recording Format submenu inside the Recordings menu
 /// (found by its label, the same fetch-by-parent pattern the
@@ -6690,7 +7120,8 @@ fn build_menu(frame: Frame, wiring: &Wiring, controls: Controls) {
     let raw = serde_json::Value::Object(config.raw().clone());
     let keys = iptv_core::shortcuts::effective(&raw, "main");
     let file_menu = build_file_menu(&keys);
-    let player_menu = build_player_menu(&keys);
+    let auto_next = config.bool_or("auto_next_episode", false);
+    let player_menu = build_player_menu(&keys, auto_next);
     let view_menu = build_view_menu(&keys);
     let options_menu = build_options_menu(&config);
     let recordings_menu = build_recordings_menu(&config);
@@ -6781,7 +7212,7 @@ fn build_file_menu(keys: &std::collections::BTreeMap<String, String>) -> Menu {
     file_menu
 }
 
-fn build_player_menu(keys: &std::collections::BTreeMap<String, String>) -> Menu {
+fn build_player_menu(keys: &std::collections::BTreeMap<String, String>, auto_next: bool) -> Menu {
     let player_menu = Menu::builder().build();
     menu_add(
         &player_menu,
@@ -6811,6 +7242,16 @@ fn build_player_menu(keys: &std::collections::BTreeMap<String, String>) -> Menu 
         "",
         ItemKind::Normal,
     );
+    // Python's `_add_sound_tools_menu`: the automatic
+    // next-episode check, off by default.
+    menu_add(
+        &player_menu,
+        AUTO_NEXT_EPISODE,
+        "Automatically Play the Next Episode",
+        "",
+        ItemKind::Check,
+    );
+    player_menu.check_item(AUTO_NEXT_EPISODE, auto_next);
 
     player_menu
 }
@@ -6879,6 +7320,13 @@ fn build_view_menu(keys: &std::collections::BTreeMap<String, String>) -> Menu {
         &view_menu,
         ASSIGN_GUIDE,
         "Assign Programme Guide...",
+        "",
+        ItemKind::Normal,
+    );
+    menu_add(
+        &view_menu,
+        SAVED_SEARCHES,
+        "Saved Programme Searches...",
         "",
         ItemKind::Normal,
     );
@@ -6961,6 +7409,13 @@ fn build_recordings_menu(config: &Config) -> Menu {
     );
     menu_add(
         &menu,
+        REC_SPACE_MONITOR,
+        "Recording Space Monitor...",
+        "",
+        ItemKind::Normal,
+    );
+    menu_add(
+        &menu,
         REC_LIBRARY,
         "Recording &Library...",
         "",
@@ -7037,6 +7492,35 @@ fn build_recordings_menu(config: &Config) -> Menu {
         REC_SHUTDOWN_AFTER,
         config.bool_or("shutdown_after_recordings", false),
     );
+    // Python's `_add_recording_power_menu`: two check items,
+    // disabled where recording power is unsupported (Windows
+    // only); labels are Python's exact msgids so translations
+    // match.
+    let power_supported = iptv_core::recording_power::supported();
+    menu_add(
+        &menu,
+        REC_PREVENT_SLEEP,
+        "Prevent Automatic Sleep While Recording",
+        "",
+        ItemKind::Check,
+    );
+    menu.check_item(
+        REC_PREVENT_SLEEP,
+        config.bool_or("prevent_sleep_while_recording", true),
+    );
+    menu.enable_item(REC_PREVENT_SLEEP, power_supported);
+    menu_add(
+        &menu,
+        REC_WAKE_RECORDINGS,
+        "Wake for Scheduled Recordings (Windows)",
+        "",
+        ItemKind::Check,
+    );
+    menu.check_item(
+        REC_WAKE_RECORDINGS,
+        config.bool_or("wake_for_recordings", false),
+    );
+    menu.enable_item(REC_WAKE_RECORDINGS, power_supported);
     menu
 }
 
@@ -7841,7 +8325,8 @@ fn menu_item_topic(id: i32) -> Option<&'static str> {
         WHATS_ON_NOW => "whats-on-now",
         CONTINUE_WATCHING => "continue-watching",
         ASSIGN_GUIDE => "epg",
-        VIEW_VOD => "video-on-demand",
+        SAVED_SEARCHES => "personal-tools",
+        VIEW_VOD | AUTO_NEXT_EPISODE => "video-on-demand",
         FAVORITE | GO_TO_FAVORITES | CTX_FAVORITE => "favorites",
         ACCOUNT_INFO => "account-info",
         CAST_TO | CAST_CONNECT => "casting",
@@ -7850,7 +8335,8 @@ fn menu_item_topic(id: i32) -> Option<&'static str> {
         KEYBOARD_SHORTCUTS => "keyboard-shortcuts",
         WHATS_NEW => "updates",
         REC_START | REC_STOP | REC_STOP_ALL | REC_STORAGE | REC_MIN_FREE | REC_SET_FOLDER
-        | REC_OPEN_FOLDER | REC_PROBLEM_TIMES | REC_LIBRARY | CTX_RECORD => "recordings",
+        | REC_OPEN_FOLDER | REC_PROBLEM_TIMES | REC_LIBRARY | REC_PREVENT_SLEEP
+        | REC_WAKE_RECORDINGS | REC_SPACE_MONITOR | CTX_RECORD => "recordings",
         REC_REMINDERS | CTX_REMINDER => "reminders",
         REC_SCHEDULED | CTX_SCHEDULE => "scheduled-recordings",
         REC_PADDING => "schedule-padding",
@@ -7958,6 +8444,13 @@ fn bind_menu_actions(frame: Frame, wiring: &Wiring, controls: Controls) {
                 }
             }
             PLAY_PAUSE | STOP => menu_player_transport(&wiring, id == PLAY_PAUSE),
+            AUTO_NEXT_EPISODE => {
+                // Python's `_add_sound_tools_menu` toggle: save
+                // the new value; the menu item's own check state
+                // is wx's to flip.
+                let next = !persist.config.borrow().bool_or("auto_next_episode", false);
+                persist.set_and_save("auto_next_episode", serde_json::json!(next));
+            }
             VIEW_LIVE => status.set_label("Live TV and catch-up view."),
             VIEW_VOD => open_vod_window(&wiring, status),
             FAVORITE => toggle_selected_favorite(&wiring, list, status),
@@ -7983,6 +8476,7 @@ fn bind_menu_actions(frame: Frame, wiring: &Wiring, controls: Controls) {
             }
             CHANNEL_NUMBER => menu_go_to_channel_number(&wiring, frame, list, status),
             ASSIGN_GUIDE => open_assign_programme_guide(&wiring, frame, list, status),
+            SAVED_SEARCHES => open_saved_searches_dialog(&wiring, frame, list, status),
             _ => {}
         }
     });
@@ -8072,6 +8566,7 @@ fn menu_recordings_action(
         REC_SCHEDULED => open_scheduled_dialog(wiring, status),
         REC_BY_TIME => schedule_by_time(wiring, &frame, list, status),
         REC_STORAGE => show_recording_storage(wiring, frame, status),
+        REC_SPACE_MONITOR => show_space_monitor_dialog(wiring, frame, status),
         REC_LIBRARY => open_recording_library(wiring, status),
         REC_MIN_FREE => prompt_min_free_space(wiring, frame, status),
         REC_PADDING => prompt_schedule_padding(wiring, frame, status),
@@ -8115,6 +8610,22 @@ fn menu_recordings_action(
             } else {
                 "Shutdown after recordings is off."
             });
+        }
+        REC_PREVENT_SLEEP | REC_WAKE_RECORDINGS => {
+            // Python's recording-power toggle: save the new
+            // value, make sure the manager is running, and
+            // refresh it. `set_and_save` never fails (a failed
+            // write is logged, as elsewhere), so there is no
+            // check-state to revert.
+            let (key, default) = if id == REC_PREVENT_SLEEP {
+                ("prevent_sleep_while_recording", true)
+            } else {
+                ("wake_for_recordings", false)
+            };
+            let next = !persist.config.borrow().bool_or(key, default);
+            persist.set_and_save(key, serde_json::json!(next));
+            start_recording_power(wiring);
+            sync_recording_power(wiring);
         }
         REC_FORMAT_BASE..=5219 => {
             let offset = usize::try_from(id - REC_FORMAT_BASE).unwrap_or(0);
@@ -10110,6 +10621,21 @@ fn play_channel(
     channel: &Channel,
     status: Status,
 ) {
+    play_channel_at(player, persist, media, channel, status, None);
+}
+
+/// Play with an explicit start position (C7): `Some(ms)`
+/// starts there with no resume offer (queue hand-off and
+/// play-from-problem-time); `None` runs the saved-position
+/// offer as before.
+fn play_channel_at(
+    player: &Rc<RefCell<PlayerState>>,
+    persist: &Persist,
+    media: &MediaProbe,
+    channel: &Channel,
+    status: Status,
+    start_ms: Option<i64>,
+) {
     // N16: playback preempts any classification probe
     // (Python `_terminate_media_probe` at the play entry).
     terminate_media_probes(media);
@@ -10121,8 +10647,10 @@ fn play_channel(
         state.vlc_error = None;
     }
     let probe = PlaybackRequest::for_channel(channel, None);
-    let mut resume = None;
-    if !probe.live {
+    // C7: an explicit start (queue hand-off, play from a
+    // problem time) skips the resume offer entirely.
+    let mut resume = start_ms;
+    if !probe.live && resume.is_none() {
         // Python's prepare_vod_resume: the outgoing stream's
         // checkpoint is force-saved before the lookup, and a
         // saved position is offered, never silently applied
@@ -10602,6 +11130,8 @@ fn play_builtin(
     state.episode_nav_token += 1;
     state.episode_nav_busy = false;
     state.episode_nav_rx = None;
+    state.auto_next_generation = 0;
+    state.auto_next_rx = None;
     state.resume_store = if channel.unknown_attributes.contains_key("local-recording") {
         "recording_playback_bookmarks"
     } else {
@@ -10651,6 +11181,12 @@ fn play_builtin(
     state.last_spoken_cue = None;
     state.subtitle_generation += 1;
     state.pending_subtitles = None;
+    state.embedded_speech = false;
+    state.pending_embedded_listing = None;
+    state.pending_embedded_cues = None;
+    state
+        .embedded_cancel
+        .store(true, std::sync::atomic::Ordering::Relaxed);
     // Review starts empty on a new stream (P11), history
     // recording re-arms (P17), and an adopted resume position
     // is protected until the seek is confirmed (P16).
@@ -11167,6 +11703,7 @@ const PM_AUDIO_DEVICE: i32 = 5325;
 const PM_LIVE_BUFFER: i32 = 5326;
 const PM_REWIND: i32 = 5327;
 const PM_RETURN_LIVE: i32 = 5328;
+const PM_SAVE_CLIP: i32 = 5329;
 const PM_CAST: i32 = 5330;
 const PM_FULLSCREEN: i32 = 5331;
 const PM_WHATS_PLAYING: i32 = 5332;
@@ -11175,6 +11712,8 @@ const PM_EXIT: i32 = 5334;
 const PM_PREV_EPISODE: i32 = 5335;
 const PM_NEXT_EPISODE: i32 = 5336;
 const PM_SUBTITLE_TIMING: i32 = 5337;
+const PM_READ_EMBEDDED: i32 = 5338;
+const PM_CHAPTERS: i32 = 5339;
 const PM_TRACK_BASE: i32 = 5340;
 const PM_SUB_BASE: i32 = 5400;
 
@@ -11209,6 +11748,13 @@ fn playback_transport_items(menu: &Menu, keys: &std::collections::BTreeMap<Strin
         menu,
         PM_RETURN_LIVE,
         "Return to &Live",
+        "",
+        ItemKind::Normal,
+    );
+    menu_add(
+        menu,
+        PM_SAVE_CLIP,
+        "Save Recent &Broadcast...",
         "",
         ItemKind::Normal,
     );
@@ -11270,6 +11816,15 @@ fn build_playback_menu(
         &menu,
         PM_LOAD_SUBS,
         "Load Subtitle &File...",
+        "",
+        ItemKind::Normal,
+    );
+    // C6: Python's order — the embedded-track reader follows
+    // Load Subtitle File, before Speak Subtitles.
+    menu_add(
+        &menu,
+        PM_READ_EMBEDDED,
+        "Read Embedded Subtitle &Track...",
         "",
         ItemKind::Normal,
     );
@@ -11356,6 +11911,15 @@ fn build_playback_menu(
         "",
         ItemKind::Normal,
     );
+    // C6: Python's Recording Chapters follows Subtitle Timing
+    // (neither carries a shortcut).
+    menu_add(
+        &menu,
+        PM_CHAPTERS,
+        "Recording &Chapters...",
+        "",
+        ItemKind::Normal,
+    );
     menu.append_separator();
     menu_add(
         &menu,
@@ -11382,6 +11946,7 @@ fn build_playback_menu(
 
 /// One Playback-menu selection. The menu mirrors the buttons and
 /// the player shortcuts; every arm reuses their helpers.
+#[allow(clippy::too_many_lines)]
 fn dispatch_player_menu(
     player: &Rc<RefCell<PlayerState>>,
     persist: &Persist,
@@ -11415,6 +11980,7 @@ fn dispatch_player_menu(
         PM_LIVE_BUFFER => prompt_live_buffer_config(player, win.frame, persist, status),
         PM_REWIND => prompt_rewind(player, win.frame, persist, status),
         PM_RETURN_LIVE => return_to_live(player, win.frame, persist, status),
+        PM_SAVE_CLIP => prompt_save_recent_broadcast(player, win.frame, persist, status),
         PM_RECORD => {
             let state = player.borrow();
             if let (Some(shared), Some(channel)) = (&state.shared, &state.current_channel) {
@@ -11434,6 +12000,7 @@ fn dispatch_player_menu(
         }
         PM_AUDIO_DEVICE => prompt_audio_device(player, win.frame, persist, status),
         PM_LOAD_SUBS => prompt_subtitle_file(player, win.frame, persist, status),
+        PM_READ_EMBEDDED => prompt_read_embedded(player, persist, status),
         PM_SPEAK_SUBS => {
             let next = !persist.config.borrow().bool_or("speak_subtitles", false);
             persist.set_and_save("speak_subtitles", serde_json::json!(next));
@@ -11460,6 +12027,7 @@ fn dispatch_player_menu(
         PM_PREV_EPISODE => episode_navigate(player, persist, status, -1),
         PM_NEXT_EPISODE => episode_navigate(player, persist, status, 1),
         PM_SUBTITLE_TIMING => prompt_subtitle_timing(player, win.frame, persist, status),
+        PM_CHAPTERS => prompt_recording_chapters(player, win.frame, persist, status),
         PM_CAST => {
             let state = player.borrow();
             if let Some(shared) = &state.shared {
@@ -11620,6 +12188,9 @@ fn select_subtitle_track(
         state.file_subtitle_track = None;
         state.subtitle_generation += 1;
         state.pending_subtitles = None;
+        // Python's `_set_subtitle_cues([])`: embedded speech
+        // ends with the cues.
+        state.embedded_speech = false;
         // The file's cues are discarded: review starts
         // empty for the new source (P11).
         state.review.reset();
@@ -12036,6 +12607,20 @@ struct PlayerButtons {
 /// resume checkpointing, subtitle speech, engine state,
 /// the sleep timer and the window chrome.
 fn player_tick(player: &Rc<RefCell<PlayerState>>, persist: &Persist, status: Status) {
+    // C8: a naturally finished episode owes the main timer a
+    // wake-up for the automatic continuation.
+    {
+        let state = player.borrow();
+        if matches!(
+            state.session.state(),
+            iptv_core::playback::SessionState::Ended
+        ) && persist.config.borrow().bool_or("auto_next_episode", false)
+        {
+            if let Some(shared) = &state.shared {
+                let _ = shared.timer.start(50, false);
+            }
+        }
+    }
     drain_fullscreen_layout(player);
     deliver_vlc_load(player, persist, status);
     deliver_buffer_pending(player, persist, status);
@@ -12193,6 +12778,12 @@ fn wire_player_events(
         state.last_label_cue = None;
         state.subtitle_generation += 1;
         state.pending_subtitles = None;
+        state.embedded_speech = false;
+        state.pending_embedded_listing = None;
+        state.pending_embedded_cues = None;
+        state
+            .embedded_cancel
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         state.review.reset();
         state.active_cue_index = None;
         state.last_shown_cue = None;
@@ -12954,6 +13545,463 @@ fn return_to_live(
     .show_modal_tracked();
 }
 
+/// Whether two directories live on one device (Python's
+/// `st_dev` compare): the drive letter on Windows, the device
+/// number on Unix. A failed stat counts as shared, the safer
+/// answer for the free-space rule.
+#[cfg(windows)]
+fn same_device(a: &std::path::Path, b: &std::path::Path) -> bool {
+    fn letter(path: &std::path::Path) -> Option<String> {
+        match path.components().next() {
+            Some(std::path::Component::Prefix(prefix)) => {
+                Some(prefix.as_os_str().to_string_lossy().to_lowercase())
+            }
+            _ => None,
+        }
+    }
+    match (letter(a), letter(b)) {
+        (Some(x), Some(y)) => x == y,
+        _ => true,
+    }
+}
+
+/// Unix half of [`same_device`].
+#[cfg(all(not(windows), unix))]
+fn same_device(a: &std::path::Path, b: &std::path::Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (std::fs::metadata(a), std::fs::metadata(b)) {
+        (Ok(x), Ok(y)) => x.dev() == y.dev(),
+        _ => true,
+    }
+}
+
+/// Other platforms: assume shared.
+#[cfg(all(not(windows), not(unix)))]
+fn same_device(_a: &std::path::Path, _b: &std::path::Path) -> bool {
+    true
+}
+
+/// Cancellation poll inside the clip worker (Python `_check`).
+fn clip_canceled(canceled: &std::sync::atomic::AtomicBool) -> Result<(), String> {
+    if canceled.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err(tr("Canceled"));
+    }
+    Ok(())
+}
+
+/// Copy one window segment into `target`, hard link first like
+/// Python, with `CLIP_COPY_CHUNK` reads and cancellation.
+fn stage_clip_segment(
+    source: &std::path::Path,
+    target: &std::path::Path,
+    expected_size: u64,
+    canceled: &std::sync::atomic::AtomicBool,
+) -> Result<(), String> {
+    use std::io::{Read, Write};
+    let copied = if std::fs::hard_link(source, target).is_ok() {
+        true
+    } else if source.is_file() {
+        let mut input = std::fs::File::open(source)
+            .map_err(|e| format!("The selected buffer segment is no longer available.: {e}"))?;
+        let mut output = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(target)
+            .map_err(|e| format!("The selected buffer segment is no longer available.: {e}"))?;
+        let mut buf = vec![0_u8; iptv_core::timeshift::CLIP_COPY_CHUNK];
+        loop {
+            clip_canceled(canceled)?;
+            let read = input
+                .read(&mut buf)
+                .map_err(|e| format!("The selected buffer segment is no longer available.: {e}"))?;
+            if read == 0 {
+                break;
+            }
+            output
+                .write_all(&buf[..read])
+                .map_err(|e| format!("The selected buffer segment is no longer available.: {e}"))?;
+        }
+        true
+    } else {
+        false
+    };
+    if !copied {
+        // The eviction race Python maps to the same sentence.
+        return Err(tr("The selected buffer segment is no longer available."));
+    }
+    if std::fs::metadata(target).map_or(0, |meta| meta.len()) != expected_size {
+        return Err(tr("The selected buffer segment is no longer available."));
+    }
+    Ok(())
+}
+
+/// Is `path` a name that must not be replaced (Python's
+/// destination exists-or-symlink check)?
+fn clip_destination_taken(path: &std::path::Path) -> bool {
+    path.symlink_metadata().is_ok()
+}
+
+/// One clip save on the worker thread (Python `buffer_clip.save`):
+/// free-space rule, staged hard links, ffmpeg remux, fsync and
+/// exclusive publish. The staging lease is released once the
+/// segments are staged (`on_staged`).
+#[allow(clippy::too_many_lines)]
+fn save_buffer_clip(
+    session: &std::sync::Arc<buffer::BufferSession>,
+    lease: u64,
+    rows: &[iptv_core::timeshift::Segment],
+    destination: &std::path::Path,
+    reserve_mib: u64,
+    canceled: &std::sync::atomic::AtomicBool,
+) -> Result<(), String> {
+    clip_canceled(canceled)?;
+    if rows.is_empty() {
+        return Err(tr("No buffered audio or video is available."));
+    }
+    let size: u64 = rows
+        .iter()
+        .map(|row| row.size)
+        .fold(0_u64, u64::saturating_add);
+    let window_dir = session.dir().clone();
+    let dest_parent = destination
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let same = same_device(dest_parent, &window_dir);
+    let dest_free = recording::free_space_bytes(dest_parent)?;
+    let window_free = recording::free_space_bytes(&window_dir)?;
+    if !iptv_core::timeshift::clip_space_sufficient(dest_free, window_free, same, size, reserve_mib)
+    {
+        return Err(tr(
+            "There is not enough free space to save the buffered programme.",
+        ));
+    }
+    std::fs::create_dir_all(dest_parent).map_err(|e| e.to_string())?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let stage_dir = window_dir
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join(format!("iptv-clip-{}-{stamp}", std::process::id()));
+    std::fs::create_dir_all(&stage_dir).map_err(|e| e.to_string())?;
+    // Stage, then remux; the temp dir only disappears with us.
+    // The lease is released at `on_staged`, and on any earlier
+    // failure so it never dangles.
+    let mut staged = false;
+    let result: Result<(), String> = (|| {
+        for (index, row) in rows.iter().enumerate() {
+            clip_canceled(canceled)?;
+            let target = stage_dir.join(format!("{index:06}.ts"));
+            stage_clip_segment(&window_dir.join(&row.name), &target, row.size, canceled)?;
+        }
+        clip_canceled(canceled)?;
+        let manifest_text = iptv_core::timeshift::clip_manifest(rows)
+            .map_err(|e: iptv_core::timeshift::ClipError| e.to_string())?;
+        let manifest = stage_dir.join("index.m3u8");
+        std::fs::write(&manifest, manifest_text.as_bytes()).map_err(|e| e.to_string())?;
+        // Staged: eviction may take the segment files again.
+        staged = true;
+        session.release(lease);
+        let part = dest_parent.join(format!(".iptv-clip-{}-{stamp}.part", std::process::id()));
+        let args = iptv_core::timeshift::clip_ffmpeg_args(
+            &manifest.to_string_lossy(),
+            &part.to_string_lossy(),
+        );
+        clip_canceled(canceled)?;
+        let mut command = iptv_core::hidden_command(&args[0]);
+        command
+            .args(&args[1..])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let mut child = command.spawn().map_err(|e| e.to_string())?;
+        loop {
+            if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+                if !status.success() {
+                    return Err(tr("The buffered programme could not be saved."));
+                }
+                break;
+            }
+            if canceled.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(tr("Canceled"));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        // The remux must have written media (R09's rule, shared).
+        if std::fs::metadata(&part).map_or(0, |meta| meta.len()) == 0 {
+            return Err(tr("The buffered programme could not be saved."));
+        }
+        std::fs::File::open(&part)
+            .and_then(|file| file.sync_all())
+            .map_err(|e| e.to_string())?;
+        clip_canceled(canceled)?;
+        // The destination was checked free; publishing keeps it
+        // exclusive rather than overwriting a late arrival.
+        if clip_destination_taken(destination) {
+            return Err(tr(
+                "A file with this name already exists in the selected folder.",
+            ));
+        }
+        std::fs::rename(&part, destination).map_err(|e| e.to_string())?;
+        Ok(())
+    })();
+    if !staged {
+        session.release(lease);
+    }
+    let _ = std::fs::remove_dir_all(&stage_dir);
+    // The remux part only remains when the publish failed.
+    let part = dest_parent.join(format!(".iptv-clip-{}-{stamp}.part", std::process::id()));
+    if destination != part {
+        let _ = std::fs::remove_file(&part);
+    }
+    result
+}
+
+/// Playback > Save Recent Broadcast... (Python
+/// `_save_recent_broadcast`): history prompt, save dialog,
+/// cancellable export from the buffer's completed segments.
+/// Starts by raising the running export's dialog when one
+/// exists, as Python does.
+#[allow(clippy::too_many_lines)] // One flow: prompts, save dialog, export.
+fn prompt_save_recent_broadcast(
+    player: &Rc<RefCell<PlayerState>>,
+    frame: Frame,
+    persist: &Persist,
+    status: Status,
+) {
+    let title = tr("Save Recent Broadcast...");
+    if player.borrow().clip_dialog.is_some() {
+        if let Some(dialog) = &player.borrow().clip_dialog {
+            dialog.raise();
+        }
+        return;
+    }
+    let (session, rows): (
+        Option<std::sync::Arc<buffer::BufferSession>>,
+        Vec<iptv_core::timeshift::Segment>,
+    ) = buffers_of(player)
+        .and_then(|buffers| {
+            buffers
+                .borrow()
+                .current
+                .as_ref()
+                .map(|current| (Some(current.session.clone()), current.session.snapshot()))
+        })
+        .unwrap_or((None, Vec::new()));
+    let Some(session) = &session else {
+        let no_buffer = MessageDialog::builder(
+            &frame,
+            &tr("No buffered audio or video is available."),
+            &title,
+        )
+        .with_style(MessageDialogStyle::OK)
+        .build();
+        no_buffer.show_modal_tracked();
+        return;
+    };
+    if rows.is_empty() {
+        let no_buffer = MessageDialog::builder(
+            &frame,
+            &tr("No buffered audio or video is available."),
+            &title,
+        )
+        .with_style(MessageDialogStyle::OK)
+        .build();
+        no_buffer.show_modal_tracked();
+        return;
+    }
+    let total = (rows[rows.len() - 1].end() - rows[0].start).ceil();
+    // Python int(total) truncates toward zero; the span is
+    // non-negative.
+    #[allow(clippy::cast_possible_truncation)]
+    let seconds = if total.is_finite() {
+        (total as i64).max(1)
+    } else {
+        1
+    };
+    let prompt = trf(
+        "Available history: {seconds} seconds.",
+        &[("seconds", &seconds.to_string())],
+    );
+    let dialog = TextEntryDialog::builder(&frame, &prompt, &tr("Duration (seconds)"))
+        .with_default_value(&seconds.min(300).to_string())
+        .build();
+    if dialog.show_modal_tracked() != ID_OK {
+        return;
+    }
+    let text = dialog.get_value().unwrap_or_default();
+    let Ok(wanted) = text.trim().parse::<i64>() else {
+        status.set_label(&trf(
+            "\"{text}\" is not a whole number of seconds.",
+            &[("text", &text)],
+        ));
+        return;
+    };
+    let wanted = wanted.clamp(1, seconds);
+    // Whole seconds to f64, as Python.
+    #[allow(clippy::cast_precision_loss)]
+    let wanted_secs = wanted as f64;
+    let selected = match iptv_core::timeshift::select_clip_segments(&rows, wanted_secs) {
+        Ok(selected) => selected,
+        Err(error) => {
+            let _ = MessageDialog::builder(&frame, &error.to_string(), &title)
+                .with_style(MessageDialogStyle::OK | MessageDialogStyle::IconError)
+                .build()
+                .show_modal_tracked();
+            return;
+        }
+    };
+    let folder = recordings_dir(persist);
+    let name = {
+        let name = player
+            .borrow()
+            .current_channel
+            .as_ref()
+            .map(|channel| channel.name.clone())
+            .unwrap_or_default();
+        let base = recording::sanitize_filename(if name.is_empty() { "IPTV" } else { &name });
+        let stamp = chrono::Local::now().format("-%Y%m%d-%H%M%S").to_string();
+        format!("{base}{stamp}.ts")
+    };
+    let picker = FileDialog::builder(&frame)
+        .with_message(&title)
+        .with_default_dir(&folder.to_string_lossy())
+        .with_default_file(&name)
+        .with_wildcard("MPEG-TS (*.ts)|*.ts")
+        .with_style(FileDialogStyle::Save)
+        .build();
+    if picker.show_modal_tracked() != ID_OK {
+        return;
+    }
+    let Some(mut path) = picker.get_path() else {
+        return;
+    };
+    if !path.to_lowercase().ends_with(".ts") {
+        path.push_str(".ts");
+    }
+    let destination = std::path::PathBuf::from(&path);
+    if clip_destination_taken(&destination) {
+        let _ = MessageDialog::builder(
+            &frame,
+            &tr("A file with this name already exists in the selected folder."),
+            &title,
+        )
+        .with_style(MessageDialogStyle::OK | MessageDialogStyle::IconError)
+        .build()
+        .show_modal_tracked();
+        return;
+    }
+    let lease = match session.acquire() {
+        Ok(lease) => lease,
+        Err(error) => {
+            let _ = MessageDialog::builder(&frame, &error, &title)
+                .with_style(MessageDialogStyle::OK | MessageDialogStyle::IconError)
+                .build()
+                .show_modal_tracked();
+            return;
+        }
+    };
+    let session = std::sync::Arc::clone(session);
+    let reserve = recording::normalize_reserve_mib(
+        persist
+            .config
+            .borrow()
+            .value("recording_min_free_mib")
+            .and_then(serde_json::Value::as_i64),
+    );
+    let monitor = iptv_core::storage_monitor::settings(&persist.config.borrow());
+    let reserve = if monitor.enabled && monitor.auto_stop {
+        reserve.max(monitor.stop_mib)
+    } else {
+        reserve
+    };
+    // Progress dialog: Cancel sets the flag the worker polls.
+    let progress = Dialog::builder(&frame, &title).build();
+    let panel = Panel::builder(&progress).build();
+    let label = StaticText::builder(&panel)
+        .with_label(&tr("Saving the broadcast excerpt..."))
+        .build();
+    let cancel = Button::builder(&panel).with_label("&Cancel").build();
+    let sizer = BoxSizer::builder(Orientation::Vertical).build();
+    sizer.add(&label, 0, SizerFlag::All, 10);
+    sizer.add(&cancel, 0, SizerFlag::All, 8);
+    panel.set_sizer(sizer, true);
+    let canceled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let cancel_dialog = progress;
+    let cancel_flag = std::sync::Arc::clone(&canceled);
+    cancel.on_click(move |_| {
+        cancel_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        cancel_dialog.end_modal(ID_CANCEL);
+    });
+    player.borrow_mut().clip_dialog = Some(progress);
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let outcome_cell: std::sync::Arc<std::sync::Mutex<Option<Result<(), String>>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
+    let thread_cancel = std::sync::Arc::clone(&canceled);
+    std::thread::spawn(move || {
+        let outcome = save_buffer_clip(
+            &session,
+            lease,
+            &selected,
+            &destination,
+            reserve,
+            &thread_cancel,
+        );
+        let _ = sender.send(outcome);
+    });
+    let timer = Rc::new(Timer::new(&progress));
+    let timer_tick = Rc::clone(&timer);
+    let dialog_tick = progress;
+    let outcome_tick = std::sync::Arc::clone(&outcome_cell);
+    timer.on_tick(move |_| {
+        if let Ok(outcome) = receiver.try_recv() {
+            if let Ok(mut cell) = outcome_tick.lock() {
+                *cell = Some(outcome);
+            }
+            timer_tick.stop();
+            dialog_tick.end_modal(ID_OK);
+        }
+    });
+    assert!(timer.start(200, false));
+    cancel.set_focus();
+    let accepted = progress.show_modal_tracked() == ID_OK;
+    timer.stop();
+    player.borrow_mut().clip_dialog = None;
+    if !accepted {
+        canceled.store(true, std::sync::atomic::Ordering::Relaxed);
+        return;
+    }
+    let outcome = outcome_cell
+        .lock()
+        .map(|mut cell| cell.take())
+        .ok()
+        .flatten();
+    let Some(outcome) = outcome else {
+        return;
+    };
+    match outcome {
+        Ok(()) => {
+            let message = trf("Saved to {path}.", &[("path", &path)]);
+            let _ = MessageDialog::builder(&frame, &message, &title)
+                .with_style(MessageDialogStyle::OK | MessageDialogStyle::IconInformation)
+                .build()
+                .show_modal_tracked();
+            status.set_label(&message);
+        }
+        Err(error) => {
+            if error != tr("Canceled") {
+                let _ = MessageDialog::builder(&frame, &error, &title)
+                    .with_style(MessageDialogStyle::OK | MessageDialogStyle::IconError)
+                    .build()
+                    .show_modal_tracked();
+                status.set_label(&error);
+            }
+        }
+    }
+}
+
 /// Release a recording's buffer lease, if it held one.
 fn release_recording_lease(buffers: &Rc<RefCell<buffer::BufferRegistry>>, key: &str) {
     if let Some((session, lease)) = buffers.borrow_mut().recording_leases.remove(key) {
@@ -12987,6 +14035,12 @@ fn player_stop(player: &Rc<RefCell<PlayerState>>, persist: &Persist, status: Sta
     state.last_label_cue = None;
     state.subtitle_generation += 1;
     state.pending_subtitles = None;
+    state.embedded_speech = false;
+    state.pending_embedded_listing = None;
+    state.pending_embedded_cues = None;
+    state
+        .embedded_cancel
+        .store(true, std::sync::atomic::Ordering::Relaxed);
     state.review.reset();
     state.active_cue_index = None;
     state.last_shown_cue = None;
@@ -13828,6 +14882,371 @@ fn deliver_episode_navigation(
     }
 }
 
+/// C8: spawn the following-episode lookup (Python
+/// `episode_continuation_ui.finished`'s worker). An Xtream
+/// episode on a configured account is re-fetched strictly;
+/// otherwise the launch snapshot serves.
+fn spawn_following_episode(
+    current: Channel,
+    queue: Vec<Channel>,
+    account: Option<iptv_core::providers::ProviderAccount>,
+) -> EpisodeNavRx {
+    let series_id = current
+        .unknown_attributes
+        .get("series_id")
+        .cloned()
+        .unwrap_or_default();
+    let resume_type = current
+        .unknown_attributes
+        .get("resume-type")
+        .cloned()
+        .unwrap_or_default();
+    let provider_id = current
+        .unknown_attributes
+        .get("provider-id")
+        .cloned()
+        .unwrap_or_default();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let episodes = match (&account, resume_type.as_str()) {
+            (Some(iptv_core::providers::ProviderAccount::Xtream(cfg)), "episode")
+                if !series_id.is_empty() =>
+            {
+                let client = iptv_core::providers::XtreamClient::new(cfg.clone());
+                iptv_core::vod::xtream_series_episodes(&client, &series_id, &provider_id, "").map(
+                    |items| {
+                        items
+                            .into_iter()
+                            .filter_map(|item| item.channel)
+                            .collect::<Vec<Channel>>()
+                    },
+                )
+            }
+            _ => Ok(queue),
+        };
+        let outcome = episodes.map(|episodes| {
+            let item = iptv_core::episode_continuation::following_item(&current, &episodes);
+            (episodes, item)
+        });
+        let _ = tx.send((0, 0, outcome));
+    });
+    rx
+}
+
+/// C8: resolve the Xtream account behind an episode channel
+/// (the same lookup `episode_navigate` does inline).
+fn episode_account(
+    persist: &Persist,
+    current: &Channel,
+) -> Option<iptv_core::providers::ProviderAccount> {
+    let provider_id = current
+        .unknown_attributes
+        .get("provider-id")
+        .cloned()
+        .unwrap_or_default();
+    let config = persist.config.borrow();
+    config
+        .raw()
+        .get("playlists")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|entries| {
+            entries.iter().find_map(|entry| {
+                let account = iptv_core::providers::ProviderAccount::from_config(entry)?;
+                (account.provider_id().as_deref() == Some(provider_id.as_str())
+                    && matches!(account, iptv_core::providers::ProviderAccount::Xtream(_)))
+                .then_some(account)
+            })
+        })
+}
+
+/// C8: the automatic next-episode continuation (Python
+/// `episode_continuation_ui.finished`), polled on the main
+/// timer. A naturally finished VOD episode with the option on
+/// starts one lookup per generation; the result lands here,
+/// and a found episode opens the 10-second countdown dialog.
+fn auto_continuation_poll(wiring: &Wiring, status: Status) {
+    let persist = &wiring.persist;
+    let player = &wiring.player;
+    // Delivery first: a finished lookup is handled before a
+    // new trigger is considered.
+    let delivered = {
+        let mut state = player.borrow_mut();
+        match state.auto_next_rx.take() {
+            Some(rx) => match rx.try_recv() {
+                Ok(message) => Some(message),
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    state.auto_next_rx = Some(rx);
+                    None
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => None,
+            },
+            None => None,
+        }
+    };
+    if let Some((_token, _generation, outcome)) = delivered {
+        deliver_auto_continuation(wiring, status, outcome);
+        return;
+    }
+    // Trigger: a natural VOD end with the option on. A manual
+    // stop leaves the session Idle, so Ended already implies
+    // "not manually stopped" here.
+    if !persist.config.borrow().bool_or("auto_next_episode", false) {
+        return;
+    }
+    let playlist_ptr = wiring.model.borrow().playlist_ptr();
+    let trigger = {
+        let state = player.borrow();
+        let ended = matches!(
+            state.session.state(),
+            iptv_core::playback::SessionState::Ended
+        );
+        let generation = state.session.generation();
+        let already = state.auto_next_generation == generation && generation != 0;
+        if !ended || already || state.auto_next_rx.is_some() {
+            return;
+        }
+        let Some(request) = state.session.current() else {
+            return;
+        };
+        if request.live {
+            return;
+        }
+        let Some(current) = state.episode_channel.clone() else {
+            return;
+        };
+        // Local recordings carry no episode queue (Python
+        // `prepare` empties it), so they never continue.
+        if current.unknown_attributes.contains_key("local-recording") {
+            return;
+        }
+        // A non-episode channel only continues when it was
+        // launched from an episode queue holding it (Python's
+        // `finished` guard).
+        let resume_type = current
+            .unknown_attributes
+            .get("resume-type")
+            .map_or("", String::as_str);
+        if resume_type != "episode" {
+            let key = iptv_core::bookmarks::item_key(&current);
+            if key.is_empty()
+                || !state
+                    .episode_queue
+                    .iter()
+                    .any(|item| iptv_core::bookmarks::item_key(item) == key)
+            {
+                return;
+            }
+        }
+        let (position, length) = position_length(&state);
+        if !iptv_core::episode_continuation::natural_end(
+            "vod",
+            state.session.played_once(),
+            false,
+            position,
+            length,
+        ) {
+            return;
+        }
+        (current, state.episode_queue.clone(), generation)
+    };
+    let (current, queue, generation) = trigger;
+    let account = episode_account(persist, &current);
+    let rx = spawn_following_episode(current, queue, account);
+    {
+        let mut state = player.borrow_mut();
+        state.auto_next_generation = generation;
+        state.auto_next_playlist = playlist_ptr;
+        state.auto_next_rx = Some(rx);
+    }
+    assert!(wiring.timer.start(50, false));
+}
+
+/// C8: a pending continuation is still the latest word: the
+/// playback generation and playlist pointer have not moved,
+/// the episode still ended normally, and the option is on.
+fn auto_continuation_valid(wiring: &Wiring, generation: u64, playlist_ptr: usize) -> bool {
+    let state = wiring.player.borrow();
+    state.session.generation() == generation
+        && state.auto_next_playlist == playlist_ptr
+        && wiring.model.borrow().playlist_ptr() == playlist_ptr
+        && matches!(
+            state.session.state(),
+            iptv_core::playback::SessionState::Ended
+        )
+        && wiring
+            .persist
+            .config
+            .borrow()
+            .bool_or("auto_next_episode", false)
+}
+
+/// C8: land a finished following-episode lookup (Python's
+/// `ready`). Errors are reported as Python's warning box; no
+/// episode ends quietly; a found episode opens the countdown,
+/// which plays it only if still valid at acceptance.
+fn deliver_auto_continuation(
+    wiring: &Wiring,
+    status: Status,
+    outcome: Result<(Vec<Channel>, Option<Channel>), String>,
+) {
+    let persist = &wiring.persist;
+    let player = &wiring.player;
+    let (generation, playlist_ptr) = {
+        let state = player.borrow();
+        (state.auto_next_generation, state.auto_next_playlist)
+    };
+    if !auto_continuation_valid(wiring, generation, playlist_ptr) {
+        return;
+    }
+    let (episodes, item) = match outcome {
+        Err(error) => {
+            let frame = wiring.player.borrow().window.as_ref().map(|win| win.frame);
+            match frame {
+                Some(parent) => {
+                    show_or_queue_notification(
+                        parent,
+                        &trf("Could not load episodes:\n{error}", &[("error", &error)]),
+                        &tr("Next Episode"),
+                        MessageDialogStyle::OK | MessageDialogStyle::IconWarning,
+                        None,
+                    );
+                }
+                None => {
+                    status.set_label(&trf(
+                        "Could not load episodes:\n{error}",
+                        &[("error", &error)],
+                    ));
+                }
+            }
+            return;
+        }
+        Ok(pair) => pair,
+    };
+    let Some(item) = item else {
+        return;
+    };
+    // Do not enter a second modal loop while another question
+    // owns input (Python's modal-box guard).
+    if modal_box_is_open() {
+        return;
+    }
+    let frame = wiring.player.borrow().window.as_ref().map(|win| win.frame);
+    let Some(parent) = frame else {
+        return;
+    };
+    let title = if item.name.is_empty() {
+        tr("Next Episode")
+    } else {
+        item.name.clone()
+    };
+    let wiring_dialog = clone_wiring(wiring);
+    let player_dialog = Rc::clone(player);
+    let valid_dialog: Rc<dyn Fn() -> bool> =
+        Rc::new(move || auto_continuation_valid(&wiring_dialog, generation, playlist_ptr));
+    let accepted = show_next_episode_dialog(&parent, wiring, status, &title, &valid_dialog);
+    if accepted && auto_continuation_valid(wiring, generation, playlist_ptr) {
+        let media = {
+            let state = player_dialog.borrow();
+            state
+                .shared
+                .as_ref()
+                .map(|shared| shared.media_probe.clone())
+        };
+        let Some(media) = media else {
+            return;
+        };
+        player_dialog.borrow_mut().pending_episode_queue = Some(episodes);
+        play_channel(&player_dialog, persist, &media, &item, status);
+    }
+}
+
+/// C8: Python's `NextEpisodeDialog`: a 10-second countdown
+/// with Play Now and Cancel (focused; Escape cancels), whose
+/// tick cancels a continuation that newer playback or a
+/// playlist change has invalidated. Returns true on Play Now
+/// or timeout.
+fn show_next_episode_dialog(
+    parent: &Frame,
+    wiring: &Wiring,
+    status: Status,
+    title: &str,
+    valid: &Rc<dyn Fn() -> bool>,
+) -> bool {
+    let dialog_title = tr("Next Episode");
+    let dialog = Dialog::builder(parent, &dialog_title).build();
+    dialog.set_accessibility_label(&dialog_title);
+    bind_escape_cancel(dialog);
+    let panel = Panel::builder(&dialog).build();
+    let episode_title = title.to_string();
+    let label_text = trf(
+        "The next episode starts in {seconds} seconds: {title}",
+        &[
+            (
+                "seconds",
+                &iptv_core::episode_continuation::COUNTDOWN_SECONDS.to_string(),
+            ),
+            ("title", &episode_title),
+        ],
+    );
+    let label = StaticText::builder(&panel).with_label(&label_text).build();
+    label.set_accessibility_label(&label_text);
+    let play = Button::builder(&panel).with_label(&tr("Play Now")).build();
+    play.set_accessibility_label(&tr("Play Now"));
+    let cancel = Button::builder(&panel).with_label(&tr("Cancel")).build();
+    cancel.set_accessibility_label(&tr("Cancel"));
+    bind_f1_help(&dialog, wiring, "video-on-demand", status);
+    bind_f1_help(&label, wiring, "video-on-demand", status);
+    bind_f1_help(&play, wiring, "video-on-demand", status);
+    bind_f1_help(&cancel, wiring, "video-on-demand", status);
+    let sizer = BoxSizer::builder(Orientation::Vertical).build();
+    sizer.add(&label, 0, SizerFlag::All, 12);
+    let buttons = BoxSizer::builder(Orientation::Horizontal).build();
+    buttons.add(&play, 0, SizerFlag::All, 8);
+    buttons.add(&cancel, 0, SizerFlag::All, 8);
+    sizer.add_sizer(&buttons, 0, SizerFlag::AlignRight, 0);
+    panel.set_sizer(sizer, true);
+    let started = std::time::Instant::now();
+    let timer = Rc::new(Timer::new(&dialog));
+    let timer_tick = Rc::clone(&timer);
+    let valid_tick = Rc::clone(valid);
+    let label_tick = label;
+    let title_tick = episode_title.clone();
+    let dialog_tick = dialog;
+    timer.on_tick(move |_| {
+        if !valid_tick() {
+            timer_tick.stop();
+            dialog_tick.end_modal(ID_CANCEL);
+            return;
+        }
+        let elapsed_ms = i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
+        let total_ms = iptv_core::episode_continuation::COUNTDOWN_SECONDS * 1_000;
+        if elapsed_ms >= total_ms {
+            timer_tick.stop();
+            dialog_tick.end_modal(ID_OK);
+            return;
+        }
+        let seconds = iptv_core::episode_continuation::countdown_seconds(total_ms - elapsed_ms);
+        let text = trf(
+            "The next episode starts in {seconds} seconds: {title}",
+            &[("seconds", &seconds.to_string()), ("title", &title_tick)],
+        );
+        label_tick.set_label(&text);
+    });
+    let dialog_play = dialog;
+    play.on_click(move |_| {
+        dialog_play.end_modal(ID_OK);
+    });
+    let dialog_cancel = dialog;
+    cancel.on_click(move |_| {
+        dialog_cancel.end_modal(ID_CANCEL);
+    });
+    assert!(timer.start(250, false));
+    cancel.set_focus();
+    let accepted = dialog.show_modal_tracked() == ID_OK;
+    timer.stop();
+    accepted
+}
+
 /// PR #36: apply a subtitle delay (Python
 /// `_apply_subtitle_timing`): validate, set on libVLC in
 /// microseconds, then reset the cue state so display and
@@ -14207,6 +15626,394 @@ fn deliver_subtitles(player: &Rc<RefCell<PlayerState>>, persist: &Persist, statu
     }
 }
 
+/// C6: one playback-menu item "Read Embedded Subtitle Track..."
+/// (Python's `_read_embedded_track`): list a local Matroska
+/// recording's embedded subtitle tracks on a worker, let the
+/// user pick one, then extract its cues for speech. A newer
+/// choice or a stop cancels the in-flight ffmpeg child through
+/// the cancel flag, and stale results are dropped by the
+/// subtitle generation, as Python's `LatestTask` worker does.
+fn prompt_read_embedded(player: &Rc<RefCell<PlayerState>>, persist: &Persist, status: Status) {
+    let (path, recording_id) = {
+        let state = player.borrow();
+        let path = state
+            .current_channel
+            .as_ref()
+            .and_then(|channel| channel.unknown_attributes.get("local-recording"))
+            .cloned()
+            .unwrap_or_default();
+        let recording_id = state
+            .current_channel
+            .as_ref()
+            .and_then(|channel| channel.unknown_attributes.get("provider-id"))
+            .cloned()
+            .unwrap_or_default();
+        (path, recording_id)
+    };
+    let suffix = std::path::Path::new(&path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(str::to_lowercase)
+        .unwrap_or_default();
+    if path.is_empty() || (suffix != "mkv" && suffix != "mka") {
+        player_status(
+            status,
+            persist,
+            "Open a local Matroska recording to read its embedded subtitles.",
+            2,
+        );
+        return;
+    }
+    let (generation, cancel) = fresh_embedded_worker(player);
+    let slot: PendingEmbeddedTracks = std::sync::Arc::new(std::sync::Mutex::new(None));
+    player.borrow_mut().pending_embedded_listing = Some(std::sync::Arc::clone(&slot));
+    std::thread::spawn(move || {
+        let result = iptv_core::recording_media::subtitle_tracks(
+            "ffmpeg",
+            std::path::Path::new(&path),
+            &|| cancel.load(std::sync::atomic::Ordering::Relaxed),
+            &recording_id,
+        );
+        if let Ok(mut guard) = slot.lock() {
+            *guard = Some((generation, result));
+        }
+    });
+}
+
+/// Cancel the embedded worker's ffmpeg child, supersede it, and
+/// hand out the generation and the new cancel flag (Python's
+/// `LatestTask` replacement).
+fn fresh_embedded_worker(
+    player: &Rc<RefCell<PlayerState>>,
+) -> (u64, std::sync::Arc<std::sync::atomic::AtomicBool>) {
+    let mut state = player.borrow_mut();
+    state
+        .embedded_cancel
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    state.embedded_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    state.subtitle_generation += 1;
+    (
+        state.subtitle_generation,
+        std::sync::Arc::clone(&state.embedded_cancel),
+    )
+}
+
+/// Python's embedded-track label: "Track {id} — language —
+/// title — codec — Unavailable for speech", with empty parts
+/// dropped. Image tracks keep their line and say so.
+fn embedded_track_label(track: &iptv_core::recording_media::EmbeddedTrack) -> String {
+    let mut parts = vec![trf("Track {id}", &[("id", &track.index.to_string())])];
+    for part in [&track.language, &track.title, &track.codec] {
+        if !part.is_empty() {
+            parts.push(part.clone());
+        }
+    }
+    if !track.readable {
+        parts.push(tr("Unavailable for speech"));
+    }
+    parts.join(" — ")
+}
+
+/// Deliver a finished embedded-track listing (C6): a stale
+/// generation is dropped silently; an error or an empty list
+/// is announced; otherwise Python's choice dialog opens (its
+/// title, message and subtitle-speech help topic verbatim).
+fn deliver_embedded_listing(player: &Rc<RefCell<PlayerState>>, persist: &Persist, status: Status) {
+    let delivered = {
+        let state = player.borrow();
+        let Some(slot) = &state.pending_embedded_listing else {
+            return;
+        };
+        let Ok(mut guard) = slot.lock() else {
+            return;
+        };
+        guard.take()
+    };
+    let Some((generation, result)) = delivered else {
+        return;
+    };
+    let frame = {
+        let mut state = player.borrow_mut();
+        if generation != state.subtitle_generation {
+            return; // stale work from a superseded request
+        }
+        state.pending_embedded_listing = None;
+        state.window.clone().map(|win| win.frame)
+    };
+    let Some(frame) = frame else {
+        return;
+    };
+    let rows = match result {
+        Ok(rows) => rows,
+        Err(error) => {
+            player_status(status, persist, &error, 1);
+            return;
+        }
+    };
+    if rows.is_empty() {
+        player_status(
+            status,
+            persist,
+            "No embedded subtitle tracks were found.",
+            1,
+        );
+        return;
+    }
+    let labels: Vec<String> = rows.iter().map(embedded_track_label).collect();
+    let dialog = SingleChoiceDialog::builder(
+        &frame,
+        &tr("Choose a subtitle track for speech:"),
+        &tr("Read Embedded Subtitle Track..."),
+        &labels.iter().map(String::as_str).collect::<Vec<_>>(),
+    )
+    .build();
+    dialog.set_selection(0);
+    if dialog.show_modal_tracked() != ID_OK {
+        return;
+    }
+    let selection = dialog.get_selection();
+    if selection < 0 {
+        return;
+    }
+    let Some(track) = rows
+        .get(usize::try_from(selection).unwrap_or(usize::MAX))
+        .cloned()
+    else {
+        return;
+    };
+    if !track.readable {
+        player_status(
+            status,
+            persist,
+            "This subtitle track cannot be read aloud.",
+            1,
+        );
+        return;
+    }
+    // Choosing a track replaces any existing cues (Python's
+    // `_set_subtitle_cues([])`) and starts extraction.
+    let path = player
+        .borrow()
+        .current_channel
+        .as_ref()
+        .and_then(|channel| channel.unknown_attributes.get("local-recording"))
+        .cloned()
+        .unwrap_or_default();
+    if path.is_empty() {
+        return;
+    }
+    start_embedded_extraction(player, &path, track);
+}
+
+/// Replace the cues with nothing (Python's
+/// `_set_subtitle_cues([])`) and extract one embedded track
+/// on a worker.
+fn start_embedded_extraction(
+    player: &Rc<RefCell<PlayerState>>,
+    path: &str,
+    track: iptv_core::recording_media::EmbeddedTrack,
+) {
+    let (generation, cancel) = {
+        let mut state = player.borrow_mut();
+        state
+            .embedded_cancel
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        state.embedded_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        state.subtitle_generation += 1;
+        state.subtitle_cues.clear();
+        state.last_spoken_cue = None;
+        state.last_label_cue = None;
+        state.embedded_speech = false;
+        state.review.reset();
+        state.active_cue_index = None;
+        state.last_shown_cue = None;
+        state.shown_cues.clear();
+        if let Some(win) = &state.window {
+            win.subtitle_label.set_label("");
+        }
+        (
+            state.subtitle_generation,
+            std::sync::Arc::clone(&state.embedded_cancel),
+        )
+    };
+    let slot: PendingSubtitles = std::sync::Arc::new(std::sync::Mutex::new(None));
+    player.borrow_mut().pending_embedded_cues = Some(std::sync::Arc::clone(&slot));
+    let path = path.to_string();
+    std::thread::spawn(move || {
+        let result = iptv_core::recording_media::embedded_cues(
+            "ffmpeg",
+            std::path::Path::new(&path),
+            &track,
+            &|| cancel.load(std::sync::atomic::Ordering::Relaxed),
+        );
+        if let Ok(mut guard) = slot.lock() {
+            *guard = Some((generation, result));
+        }
+    });
+}
+
+/// Deliver a finished embedded-cue extraction (C6, Python's
+/// `loaded`): the cues join the speech and review machinery
+/// as embedded speech.
+fn deliver_embedded_cues(player: &Rc<RefCell<PlayerState>>, persist: &Persist, status: Status) {
+    let delivered = {
+        let state = player.borrow();
+        let Some(slot) = &state.pending_embedded_cues else {
+            return;
+        };
+        let Ok(mut guard) = slot.lock() else {
+            return;
+        };
+        guard.take()
+    };
+    let Some((generation, result)) = delivered else {
+        return;
+    };
+    let mut state = player.borrow_mut();
+    if generation != state.subtitle_generation {
+        return; // stale work from a superseded choice
+    }
+    state.pending_embedded_cues = None;
+    match result {
+        Ok(cues) if !cues.is_empty() => {
+            state.subtitle_cues = cues;
+            state.last_spoken_cue = None;
+            state.last_label_cue = None;
+            state.review.reset();
+            state.active_cue_index = None;
+            state.last_shown_cue = None;
+            state.shown_cues.clear();
+            state.file_subtitle_track = None;
+            state.embedded_speech = true;
+            drop(state);
+            player_status(
+                status,
+                persist,
+                "The selected subtitle track is ready for speech.",
+                2,
+            );
+        }
+        Ok(_) => {
+            drop(state);
+            player_status(status, persist, "No subtitle text found in this file.", 1);
+        }
+        Err(error) => {
+            drop(state);
+            player_status(status, persist, &error, 1);
+        }
+    }
+}
+
+/// C6: one playback-menu item "Recording Chapters..."
+/// (Python's `_recording_chapters`): list the recording's
+/// chapters and jump to the chosen one (Enter jumps).
+fn prompt_recording_chapters(
+    player: &Rc<RefCell<PlayerState>>,
+    frame: Frame,
+    persist: &Persist,
+    status: Status,
+) {
+    let is_recording = {
+        let state = player.borrow();
+        state
+            .current_channel
+            .as_ref()
+            .and_then(|channel| channel.unknown_attributes.get("local-recording"))
+            .is_some_and(|path| !path.is_empty())
+    };
+    if !is_recording {
+        player_status(
+            status,
+            persist,
+            "Open a local recording to browse its chapters.",
+            2,
+        );
+        return;
+    }
+    let (title, rows, current) = {
+        let state = player.borrow();
+        let title = state
+            .current_channel
+            .as_ref()
+            .map_or_else(String::new, |channel| channel.name.clone());
+        let (rows, current) = match &state.vlc {
+            Some(engine) => (engine.chapters(), engine.chapter()),
+            None => (Vec::new(), -1),
+        };
+        (title, rows, current)
+    };
+    if rows.is_empty() {
+        player_status(status, persist, "This recording has no chapters.", 2);
+        return;
+    }
+    let labels: Vec<String> = rows
+        .iter()
+        .map(|(index, start, name)| {
+            let trimmed = name.trim();
+            let head = if trimmed.is_empty() {
+                let number = index + 1;
+                trf("Chapter {number}", &[("number", &number.to_string())])
+            } else {
+                trimmed.to_string()
+            };
+            format!(
+                "{head} — {}",
+                iptv_core::recording_media::clock_text(*start)
+            )
+        })
+        .collect();
+    let dialog = SingleChoiceDialog::builder(
+        &frame,
+        &tr("Choose a chapter:"),
+        &tr("Recording Chapters..."),
+        &labels.iter().map(String::as_str).collect::<Vec<_>>(),
+    )
+    .build();
+    let initial = usize::try_from(current)
+        .unwrap_or(0)
+        .min(labels.len().saturating_sub(1));
+    dialog.set_selection(i32::try_from(initial).unwrap_or(0));
+    if dialog.show_modal_tracked() != ID_OK {
+        return;
+    }
+    let selection = dialog.get_selection();
+    if selection < 0 {
+        return;
+    }
+    let index = usize::try_from(selection).unwrap_or(usize::MAX);
+    let Some(label) = labels.get(index).cloned() else {
+        return;
+    };
+    // Python ignores a chapter choice made after playback
+    // moved on: the channel must still be the one the dialog
+    // opened for.
+    let still_current = {
+        let state = player.borrow();
+        state
+            .current_channel
+            .as_ref()
+            .is_some_and(|channel| channel.name == title)
+    };
+    if !still_current {
+        return;
+    }
+    let outcome = {
+        let state = player.borrow();
+        match &state.vlc {
+            Some(engine) if engine.is_seekable() => {
+                engine.set_chapter(rows[index].0);
+                true
+            }
+            _ => false,
+        }
+    };
+    if outcome {
+        player_status(status, persist, &label, 2);
+    } else {
+        player_status(status, persist, "This stream does not support seeking.", 1);
+    }
+}
+
 /// The 150 ms subtitle tick (P10): deliver finished parses,
 /// adopt the sidecar's VLC track once it binds, and sample
 /// the active cue for the label and for speech — a cue lying
@@ -14216,6 +16023,8 @@ fn subtitle_tick(player: &Rc<RefCell<PlayerState>>, persist: &Persist, status: S
     run_pending_play(player, persist, status);
     deliver_vlc_load(player, persist, status);
     deliver_subtitles(player, persist, status);
+    deliver_embedded_listing(player, persist, status);
+    deliver_embedded_cues(player, persist, status);
     deliver_episode_navigation(player, persist, status);
     // PR #36: while a load still owes its subtitle-timing
     // restore and a delay is stored, cues are neither shown nor
@@ -14228,7 +16037,10 @@ fn subtitle_tick(player: &Rc<RefCell<PlayerState>>, persist: &Persist, status: S
     }
     {
         let mut state = player.borrow_mut();
-        if !state.subtitle_cues.is_empty() && state.file_subtitle_track.is_none() {
+        if !state.subtitle_cues.is_empty()
+            && state.file_subtitle_track.is_none()
+            && !state.embedded_speech
+        {
             if let Some(engine) = &state.vlc {
                 let spu = engine.subtitle_track();
                 if spu >= 0 {
@@ -14300,7 +16112,7 @@ fn update_subtitle_label(player: &Rc<RefCell<PlayerState>>) {
     let Some(win) = state.window.clone() else {
         return;
     };
-    if state.selected_spu == -1 {
+    if state.selected_spu == -1 && !state.embedded_speech {
         if state.last_label_cue.is_some() {
             state.last_label_cue = None;
             win.subtitle_label.set_label("");
@@ -14454,7 +16266,7 @@ fn speak_subtitle_cue(player: &Rc<RefCell<PlayerState>>, persist: &Persist, stat
     if !persist.config.borrow().bool_or("speak_subtitles", false) {
         return;
     }
-    if player.borrow().selected_spu == -1 {
+    if player.borrow().selected_spu == -1 && !player.borrow().embedded_speech {
         return; // Subtitles Off: nothing is presented or spoken.
     }
     let position = subtitle_position(&player.borrow());
@@ -15975,6 +17787,10 @@ struct StagedDownload {
     channel: Channel,
     programme: Programme,
     url: String,
+    /// The schedule padding for the download window (see
+    /// `PendingResolve::Download`): a recovered recording asks
+    /// for its booked span again.
+    schedule_padding: Option<(i64, i64)>,
     /// N13: headers the direct-file probe verified for the
     /// (possibly redirected) URL; `launch_staged_capture` uses
     /// these instead of the channel's own when the probe found
@@ -16643,6 +18459,169 @@ type LibraryScanDeliveries = std::sync::Arc<
 /// a play, and the built channel for a play.
 type LibraryActionRx = std::sync::mpsc::Receiver<(bool, Result<Option<Channel>, String>)>;
 
+/// The session recording playback queue's state (C7,
+/// Python's `RecordingQueue`): pending library rows plus the
+/// hand-off validation reply slot. The validation runs on its
+/// own thread and the main timer delivers it.
+struct QueueInner {
+    queue: iptv_core::recording_queue::RecordingQueue,
+    validation: Option<std::sync::mpsc::Receiver<(u64, Result<Channel, String>)>>,
+}
+
+/// Start the queue at its head (Python `RecordingQueue.start`,
+/// focus on the player): any in-flight validation is
+/// discarded and the head is handed off.
+fn queue_start(wiring: &Wiring, status: Status) {
+    let has_items = wiring.recording_queue.borrow_mut().queue.start().is_some();
+    if has_items {
+        queue_next(wiring, status);
+    }
+    assert!(wiring.timer.start(50, false));
+}
+
+/// Hand off the head row (Python `RecordingQueue.next`): the
+/// file is validated on its own thread because only at
+/// hand-off is a missing, changed or still-recording file
+/// discovered; delivery happens on the main timer.
+fn queue_next(wiring: &Wiring, status: Status) {
+    let head = {
+        let mut inner = wiring.recording_queue.borrow_mut();
+        inner.validation = None;
+        inner.queue.begin_next(wiring.exit_requested.get())
+    };
+    let Some((row, ticket)) = head else {
+        return;
+    };
+    let _ = status;
+    let active = library_active_paths(wiring);
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let result = iptv_core::recording_library::playback_channel(
+            Path::new(&row.directory),
+            &row,
+            &active,
+        );
+        let _ = sender.send((ticket, result));
+    });
+    wiring.recording_queue.borrow_mut().validation = Some(receiver);
+    assert!(wiring.timer.start(50, false));
+}
+
+/// Deliver a finished hand-off (Python `ready`): on success
+/// the head is consumed, the channel plays from the start
+/// (Python passes `initial_position_ms=0` — no resume offer),
+/// and the ticket ties the playback to this queue session;
+/// on failure the queue stops at that title.
+fn queue_poll(wiring: &Wiring, status: Status) {
+    let delivered = {
+        let mut inner = wiring.recording_queue.borrow_mut();
+        match inner.validation.as_ref() {
+            Some(receiver) => match receiver.try_recv() {
+                Ok(delivered) => {
+                    inner.validation = None;
+                    Some(delivered)
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    inner.validation = None;
+                    None
+                }
+            },
+            None => None,
+        }
+    };
+    let Some((ticket, result)) = delivered else {
+        queue_maybe_advance(wiring, status);
+        return;
+    };
+    let (channel_result, stopped_at) = match result {
+        Ok(channel) => (Some(channel), None),
+        Err(error) => {
+            let stopped = {
+                let mut inner = wiring.recording_queue.borrow_mut();
+                inner
+                    .queue
+                    .finish_next(ticket, wiring.exit_requested.get(), Some(error))
+            };
+            (None, stopped)
+        }
+    };
+    if let Some(message) = stopped_at {
+        let frame = wiring.player.borrow().window.as_ref().map(|win| win.frame);
+        match frame {
+            Some(parent) => {
+                show_or_queue_notification(
+                    parent,
+                    &message,
+                    &tr("Recording Playback Queue"),
+                    MessageDialogStyle::OK | MessageDialogStyle::IconInformation,
+                    None,
+                );
+            }
+            None => {
+                status.set_label(&message);
+            }
+        }
+        return;
+    }
+    let Some(channel) = channel_result else {
+        return;
+    };
+    play_channel_at(
+        &wiring.player,
+        &wiring.persist,
+        &wiring.media_probe,
+        &channel,
+        status,
+        Some(0),
+    );
+    {
+        let mut inner = wiring.recording_queue.borrow_mut();
+        if inner
+            .queue
+            .finish_next(ticket, wiring.exit_requested.get(), None)
+            .is_none()
+        {
+            let generation = wiring.player.borrow().session.generation();
+            let mut state = wiring.player.borrow_mut();
+            state.queue_ticket = Some(ticket);
+            state.queue_generation = generation;
+        }
+    }
+    queue_maybe_advance(wiring, status);
+}
+
+/// Advance after a natural end (Python `ended`): within one
+/// ticket, the Ended session state separates a natural
+/// finish from a manual stop (which leaves the session Idle).
+fn queue_maybe_advance(wiring: &Wiring, status: Status) {
+    let (_ticket, _generation, should) = {
+        let inner = wiring.recording_queue.borrow();
+        let state = wiring.player.borrow();
+        let (queue_ticket, queue_generation) = (state.queue_ticket, state.queue_generation);
+        let current = state.session.generation();
+        let ended = matches!(
+            state.session.state(),
+            iptv_core::playback::SessionState::Ended
+        );
+        (
+            inner.queue.ticket(),
+            current,
+            ended
+                && inner.queue.should_advance(
+                    queue_ticket,
+                    queue_generation,
+                    current,
+                    false,
+                    false,
+                ),
+        )
+    };
+    if should {
+        queue_next(wiring, status);
+    }
+}
+
 /// The Recording Library dialog's shared state (PR #36,
 /// Python's `RecordingLibraryDialog`).
 #[allow(clippy::struct_excessive_bools)] // independent dialog state flags, as in Python
@@ -16671,6 +18650,9 @@ struct LibraryControls {
     list: ListCtrl,
     status_label: StaticText,
     play: Button,
+    add_queue: Button,
+    queue_editor: Button,
+    problems: Button,
     rename: Button,
     remove: Button,
     restore: Button,
@@ -16874,6 +18856,12 @@ fn library_render(ui: &Rc<RefCell<LibraryUi>>, controls: &LibraryControls) {
         .play
         .enable(ready && selected_rows.len() == 1 && !trash_view);
     controls
+        .add_queue
+        .enable(ready && !selected_rows.is_empty() && !trash_view);
+    controls
+        .problems
+        .enable(ready && selected_rows.len() == 1 && !trash_view);
+    controls
         .rename
         .enable(ready && selected_rows.len() == 1 && !trash_view);
     controls
@@ -17061,6 +19049,316 @@ fn library_delete_selected(
     });
 }
 
+/// Add the selected rows to the playback queue (C7, Python
+/// `queue_selected`): dedupe by path and announce the count.
+fn library_queue_selected(
+    wiring: &Wiring,
+    ui: &Rc<RefCell<LibraryUi>>,
+    controls: &LibraryControls,
+) {
+    let guard = ui.borrow();
+    let selected = library_selected(controls, guard.view.len());
+    let rows: Vec<iptv_core::recording_library::LibraryRow> = selected
+        .iter()
+        .filter_map(|index| guard.view.get(*index).cloned())
+        .collect();
+    drop(guard);
+    if rows.is_empty() || ui.borrow().trash_view {
+        return;
+    }
+    let count = wiring.recording_queue.borrow_mut().queue.add(rows);
+    let text = trf(
+        "Recordings in the playback queue: {count}.",
+        &[("count", &count.to_string())],
+    );
+    controls.status_label.set_label(&text);
+    live_region::announce_with_priority(
+        controls.status_label,
+        &text,
+        live_region::Priority::Medium,
+    );
+}
+
+/// Play a selected recording from a chosen problem time (C7,
+/// Python `show_problems`): read the log's problem times,
+/// let the user pick one, then play at that position. The
+/// log read runs synchronously; it is one tail read.
+fn library_show_problems(
+    wiring: &Wiring,
+    frame: &Frame,
+    ui: &Rc<RefCell<LibraryUi>>,
+    controls: &LibraryControls,
+    status: Status,
+) {
+    let guard = ui.borrow();
+    let selected = library_selected(controls, guard.view.len());
+    let Some(row) = selected
+        .first()
+        .and_then(|index| guard.view.get(*index).cloned())
+    else {
+        return;
+    };
+    drop(guard);
+    let active = library_active_paths(wiring);
+    let log =
+        match iptv_core::recording_library::problem_log(Path::new(&row.directory), &row, &active) {
+            Ok(log) => log,
+            Err(error) => {
+                operation_failed_box(frame, &error);
+                return;
+            }
+        };
+    let problems = iptv_core::recording_log::recording_problem_times(
+        &log,
+        iptv_core::recording_log::PROBLEM_TIMES_LIMIT,
+    );
+    let Some(position_ms) = choose_recording_position(frame, &row.title, &problems) else {
+        return;
+    };
+    let active = library_active_paths(wiring);
+    match iptv_core::recording_library::playback_channel(Path::new(&row.directory), &row, &active) {
+        Ok(channel) => play_channel_at(
+            &wiring.player,
+            &wiring.persist,
+            &wiring.media_probe,
+            &channel,
+            status,
+            Some(position_ms),
+        ),
+        Err(error) => operation_failed_box(frame, &error),
+    }
+}
+
+/// The Recording Playback Queue editor (C7, Python
+/// `show_editor`): listbox of upcoming recordings, Move Up /
+/// Move Down (Ctrl+Up/Down), Remove from Queue (Delete),
+/// Play Queue, and Stop after Current Recording. Returns
+/// true when the user chose Play Queue. Help topic is Python
+/// `recordings`, as in the library.
+#[allow(clippy::too_many_lines)] // queue editor: list, pickers and persistence, as in Python
+fn show_recording_queue_editor(wiring: &Wiring, parent: Frame, status: Status) -> bool {
+    let dialog = Dialog::builder(&parent, &tr("Recording Playback Queue"))
+        .with_size(520, 420)
+        .build();
+    dialog.set_accessibility_label(&tr("Recording Playback Queue"));
+    bind_escape_cancel(dialog);
+    bind_f1_help(&dialog, wiring, "recordings", status);
+    let panel = Panel::builder(&dialog).build();
+    let list = ListBox::builder(&panel).build();
+    list.set_accessibility_label(&tr("Upcoming recordings"));
+    let up = Button::builder(&panel).with_label(&tr("Move Up")).build();
+    let down = Button::builder(&panel).with_label(&tr("Move Down")).build();
+    let remove = Button::builder(&panel)
+        .with_label(&tr("Remove from Queue"))
+        .build();
+    let play = Button::builder(&panel)
+        .with_label(&tr("Play Queue"))
+        .build();
+    let halt = Button::builder(&panel)
+        .with_label(&tr("Stop after Current Recording"))
+        .build();
+    let sizer = BoxSizer::builder(Orientation::Vertical).build();
+    sizer.add(&list, 1, SizerFlag::Expand | SizerFlag::All, 12);
+    let controls_row = BoxSizer::builder(Orientation::Horizontal).build();
+    for button in [&up, &down, &remove] {
+        controls_row.add(button, 0, SizerFlag::All, 4);
+    }
+    sizer.add_sizer(&controls_row, 0, SizerFlag::Expand, 0);
+    let buttons = BoxSizer::builder(Orientation::Horizontal).build();
+    buttons.add(&play, 0, SizerFlag::All, 4);
+    buttons.add(&halt, 0, SizerFlag::All, 4);
+    sizer.add_sizer(&buttons, 0, SizerFlag::Expand, 0);
+    panel.set_sizer(sizer, true);
+    let wiring_refresh = clone_wiring(wiring);
+    let refresh = Rc::new(move |preferred: Option<usize>| {
+        let inner = wiring_refresh.recording_queue.borrow();
+        let pending = inner.queue.pending();
+        let count = pending.len();
+        let labels: Vec<String> = pending
+            .iter()
+            .enumerate()
+            .map(|(index, row)| {
+                iptv_core::recording_queue::item_label(index + 1, count, &row.title)
+            })
+            .collect();
+        list.set_items(&labels.iter().map(String::as_str).collect::<Vec<_>>());
+        let index = preferred.unwrap_or(0);
+        if count > 0 {
+            list.set_selection(u32::try_from(index.min(count - 1)).unwrap_or(0), true);
+        }
+        let selected = usize::try_from(list.get_selection().unwrap_or(0)).unwrap_or(0);
+        up.enable(selected > 0);
+        down.enable(count > 0 && selected < count - 1);
+        remove.enable(count > 0);
+        play.enable(count > 0 && !inner.queue.playing());
+        halt.enable(inner.queue.playing());
+    });
+    refresh(None);
+    let wiring_edit = clone_wiring(wiring);
+    let edit = Rc::new({
+        let refresh = Rc::clone(&refresh);
+        move |delta: Option<i32>| {
+            let selected = usize::try_from(list.get_selection().unwrap_or(0)).unwrap_or(0);
+            let (restart, index) = {
+                let mut inner = wiring_edit.recording_queue.borrow_mut();
+                let outcome = inner.queue.edit(selected, delta);
+                (outcome.restart && inner.queue.playing(), outcome.index)
+            };
+            if restart {
+                // Python discards the replaced head validation.
+                queue_next(&wiring_edit, status);
+            }
+            refresh(Some(index));
+            list.set_focus();
+        }
+    });
+    let edit_up = Rc::clone(&edit);
+    up.on_click(move |_| {
+        (edit_up)(Some(-1));
+    });
+    let edit_down = Rc::clone(&edit);
+    down.on_click(move |_| {
+        (edit_down)(Some(1));
+    });
+    let edit_remove = Rc::clone(&edit);
+    remove.on_click(move |_| {
+        (edit_remove)(None);
+    });
+    let key_edit = Rc::clone(&edit);
+    list.bind_internal(EventType::KEY_DOWN, move |event| {
+        if key_event_label(event) == Some("Ctrl+Up".to_string()) {
+            (key_edit)(Some(-1));
+            event.skip(false);
+            return;
+        }
+        if key_event_label(event) == Some("Ctrl+Down".to_string()) {
+            (key_edit)(Some(1));
+            event.skip(false);
+            return;
+        }
+        if matches!(event.get_key_code(), Some(127 | 390)) {
+            (key_edit)(None);
+            event.skip(false);
+            return;
+        }
+        event.skip(true);
+    });
+    let halt_refresh = Rc::clone(&refresh);
+    let queue_ref = Rc::clone(&wiring.recording_queue);
+    halt.on_click(move |_| {
+        queue_ref.borrow_mut().queue.stop();
+        halt_refresh(None);
+    });
+    let play_answer = Rc::new(std::cell::Cell::new(false));
+    let play_flag = Rc::clone(&play_answer);
+    let dialog_play = dialog;
+    play.on_click(move |_| {
+        play_flag.set(true);
+        dialog_play.end_modal(ID_OK);
+    });
+    list.set_focus();
+    dialog.show_modal_tracked();
+    play_answer.get()
+}
+
+/// Choose a problem time to start from (C7, Python
+/// `_choose_recording_position` in seek mode): the list has
+/// one row per position, Enter plays from the selected one.
+fn choose_recording_position(
+    parent: &Frame,
+    title: &str,
+    problems: &[iptv_core::recording_log::ProblemTimes],
+) -> Option<i64> {
+    let rows = iptv_core::recording_log::seek_rows(problems);
+    let lines: Vec<String> = if rows.is_empty() {
+        vec![tr("No timed problems were found for this recording.")]
+    } else {
+        rows.iter().map(|row| row.label.clone()).collect()
+    };
+    let dialog = Dialog::builder(parent, &tr("Recording Problem Times"))
+        .with_size(620, 460)
+        .build();
+    dialog.set_accessibility_label(&tr("Recording Problem Times"));
+    bind_escape_cancel(dialog);
+    let panel = Panel::builder(&dialog).build();
+    let heading_text = StaticText::builder(&panel).with_label(title).build();
+    let list = ListBox::builder(&panel).build();
+    list.set_accessibility_label(&tr("Recording Problem Times"));
+    list.set_items(&lines.iter().map(String::as_str).collect::<Vec<_>>());
+    let hint = StaticText::builder(&panel)
+        .with_label(&tr(
+            "Press Enter to play the recording from the selected time.",
+        ))
+        .build();
+    let copy = Button::builder(&panel).with_label("Copy &Details").build();
+    copy.set_accessibility_label("Copy Details");
+    let close = Button::builder(&panel).with_label("&Close").build();
+    close.set_accessibility_label("Close");
+    let play = Button::builder(&panel)
+        .with_label(&tr("Play from This Time"))
+        .build();
+    let sizer = BoxSizer::builder(Orientation::Vertical).build();
+    sizer.add(&heading_text, 0, SizerFlag::All, 12);
+    sizer.add(&list, 1, SizerFlag::Expand | SizerFlag::All, 12);
+    sizer.add(&hint, 0, SizerFlag::All, 12);
+    let buttons = BoxSizer::builder(Orientation::Horizontal).build();
+    buttons.add(&copy, 0, SizerFlag::All, 4);
+    if !rows.is_empty() {
+        buttons.add(&play, 0, SizerFlag::All, 4);
+    }
+    buttons.add(&close, 0, SizerFlag::All, 4);
+    sizer.add_sizer(&buttons, 0, SizerFlag::Expand, 0);
+    panel.set_sizer(sizer, true);
+    let answer = Rc::new(std::cell::Cell::new(None::<i64>));
+    let rows_rc = Rc::new(rows);
+    let answer_enter = Rc::clone(&answer);
+    let rows_enter = Rc::clone(&rows_rc);
+    let dialog_enter = dialog;
+    list.bind_internal(EventType::KEY_DOWN, move |event| {
+        if key_event_label(event) == Some("Enter".to_string()) {
+            let selected = usize::try_from(list.get_selection().unwrap_or(0)).unwrap_or(0);
+            if let Some(row) = rows_enter.get(selected) {
+                answer_enter.set(Some(row.position_ms));
+                dialog_enter.end_modal(ID_OK);
+            }
+            event.skip(false);
+            return;
+        }
+        event.skip(true);
+    });
+    let answer_play = Rc::clone(&answer);
+    let rows_play = Rc::clone(&rows_rc);
+    let dialog_play = dialog;
+    play.on_click(move |_| {
+        let selected = usize::try_from(list.get_selection().unwrap_or(0)).unwrap_or(0);
+        if let Some(row) = rows_play.get(selected) {
+            answer_play.set(Some(row.position_ms));
+            dialog_play.end_modal(ID_OK);
+        }
+    });
+    let dialog_copy = dialog;
+    copy.on_click(move |_| {
+        if !copy_to_clipboard(&lines.join("\n")) {
+            let _ = MessageDialog::builder(
+                &dialog_copy,
+                &tr("Could not open the clipboard."),
+                &tr("Recording Problem Times"),
+            )
+            .with_style(MessageDialogStyle::OK | MessageDialogStyle::IconError)
+            .build()
+            .show_modal_tracked();
+        }
+    });
+    let dialog_close = dialog;
+    close.on_click(move |_| {
+        dialog_close.end_modal(ID_CANCEL);
+    });
+    list.set_selection(0, true);
+    list.set_focus();
+    dialog.show_modal_tracked();
+    answer.get()
+}
+
 /// The Recording Library dialog (PR #36): every recording in
 /// the library folders, searchable and sortable, with trash
 /// and restore. Opened from the Recordings menu.
@@ -17152,6 +19450,15 @@ fn open_recording_library(wiring: &Wiring, main_status: Status) {
     let play = Button::builder(&panel)
         .with_label(&tr("Play / Resume"))
         .build();
+    let add_queue = Button::builder(&panel)
+        .with_label(&tr("Add to Playback Queue"))
+        .build();
+    let queue_editor = Button::builder(&panel)
+        .with_label(&tr("Recording Playback Queue..."))
+        .build();
+    let problems = Button::builder(&panel)
+        .with_label(&format!("{}...", tr("Recording Problem Times")))
+        .build();
     let rename = Button::builder(&panel)
         .with_label(&tr("Rename Title..."))
         .build();
@@ -17182,7 +19489,17 @@ fn open_recording_library(wiring: &Wiring, main_status: Status) {
     sizer.add(&list, 1, SizerFlag::Expand | SizerFlag::All, 4);
     sizer.add(&status_bar, 0, SizerFlag::Expand | SizerFlag::All, 4);
     let buttons = BoxSizer::builder(Orientation::Horizontal).build();
-    for button in [&play, &rename, &remove, &restore, &refresh, &close] {
+    for button in [
+        &play,
+        &add_queue,
+        &queue_editor,
+        &problems,
+        &rename,
+        &remove,
+        &restore,
+        &refresh,
+        &close,
+    ] {
         buttons.add(button, 0, SizerFlag::All, 4);
     }
     sizer.add_sizer(&buttons, 0, SizerFlag::Expand, 0);
@@ -17196,6 +19513,9 @@ fn open_recording_library(wiring: &Wiring, main_status: Status) {
         list,
         status_label: status_bar,
         play,
+        add_queue,
+        queue_editor,
+        problems,
         rename,
         remove,
         restore,
@@ -17381,6 +19701,28 @@ fn open_recording_library(wiring: &Wiring, main_status: Status) {
     let ui_p = Rc::clone(&ui);
     play.on_click(move |_| {
         library_play_selected(&wiring_p, &ui_p, &controls);
+    });
+    // Add to Playback Queue (C7, Python `queue_selected`).
+    let wiring_q = clone_wiring(wiring);
+    let ui_q = Rc::clone(&ui);
+    add_queue.on_click(move |_| {
+        library_queue_selected(&wiring_q, &ui_q, &controls);
+    });
+    // Recording Playback Queue... (C7, Python `open_queue`):
+    // a Play Queue answer closes the library, as Python's does.
+    let wiring_e2 = clone_wiring(wiring);
+    controls.queue_editor.on_click(move |_| {
+        if show_recording_queue_editor(&wiring_e2, frame, main_status) {
+            frame.hide();
+            queue_start(&wiring_e2, main_status);
+        }
+    });
+    // Recording Problem Times... in seek mode (C7, Python
+    // `show_problems`): pick a problem time, then play there.
+    let wiring_prob = clone_wiring(wiring);
+    let ui_prob = Rc::clone(&ui);
+    problems.on_click(move |_| {
+        library_show_problems(&wiring_prob, &frame, &ui_prob, &controls, main_status);
     });
     let wiring_e = clone_wiring(wiring);
     let ui_e = Rc::clone(&ui);
@@ -18031,6 +20373,568 @@ fn save_assign_value(
     request_suffix_refresh(wiring);
     dialog.hide();
     status.set_label(&tr("Programme guide assignment saved."));
+}
+
+/// The saved-search rules from config (C11, Python's
+/// `saved_programme_searches` key), normalized as Python does.
+fn saved_search_rules(wiring: &Wiring) -> Vec<iptv_core::saved_searches::Rule> {
+    let config = wiring.persist.config.borrow();
+    config
+        .value("saved_programme_searches")
+        .map_or_else(Vec::new, iptv_core::saved_searches::normalize)
+}
+
+/// Queue one saved-search scan (C11, Python `_scan_saved_searches`):
+/// a background thread opens the guide store read-only, scans,
+/// commits the seen-history, and drops the outcome for the tick.
+/// A scan already running queues nothing; the rules' signature
+/// rejects stale outcomes instead.
+fn scan_saved_searches(wiring: &Wiring) {
+    use iptv_core::saved_searches;
+    if wiring.search_pending.get() {
+        return;
+    }
+    let rules = saved_search_rules(wiring);
+    if !rules.iter().any(|rule| rule.enabled) {
+        wiring.search_results.borrow_mut().clear();
+        *wiring.search_status.borrow_mut() = tr("No enabled saved searches.");
+        return;
+    }
+    let signature = saved_searches::signature(&rules);
+    let channels = wiring.browser.borrow().all_channels();
+    let store_path = epg_store_path();
+    let seen_path = restore_targets(wiring).search_seen;
+    let outcome = Arc::clone(&wiring.search_outcome);
+    wiring.search_pending.set(true);
+    *wiring.search_status.borrow_mut() = tr("Searching programmes...");
+    std::thread::spawn(move || {
+        let work = (|| -> Result<(Vec<saved_searches::RuleResult>, usize), String> {
+            let store = iptv_core::epgstore::EpgStore::open(&store_path)?;
+            let results = saved_searches::scan(&store, &rules, &channels, now_epoch())?;
+            let now = now_seconds();
+            let seen = saved_searches::read_seen(&seen_path, now)?;
+            let (_, count) = saved_searches::commit_seen(&seen_path, &seen, &results, now)?;
+            Ok((results, count))
+        })();
+        if let Ok(mut slot) = outcome.lock() {
+            *slot = Some(ScanOutcome {
+                signature,
+                result: work,
+            });
+        }
+    });
+}
+
+/// Drain a finished scan (C11): reject outcomes made stale by a
+/// rules change, otherwise publish the results and announce the
+/// new-match count exactly as Python does.
+fn drain_saved_search(wiring: &Wiring, status: Status) {
+    let outcome = wiring
+        .search_outcome
+        .lock()
+        .map_or(None, |mut slot| slot.take());
+    let Some(outcome) = outcome else { return };
+    wiring.search_pending.set(false);
+    if outcome.signature != iptv_core::saved_searches::signature(&saved_search_rules(wiring)) {
+        scan_saved_searches(wiring);
+        return;
+    }
+    match outcome.result {
+        Ok((results, count)) => {
+            *wiring.search_results.borrow_mut() = results;
+            let text = trf(
+                "New programme matches: {count}.",
+                &[("count", &count.to_string())],
+            );
+            (*wiring.search_status.borrow_mut()).clone_from(&text);
+            status.set_label(&text);
+            let level = wiring
+                .persist
+                .config
+                .borrow()
+                .value("announcement_level")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(2);
+            if count > 0 && level >= 1 {
+                live_region::announce_with_priority(
+                    status.label,
+                    &text,
+                    live_region::Priority::Medium,
+                );
+            }
+        }
+        Err(error) => {
+            *wiring.search_status.borrow_mut() =
+                trf("The operation failed:\n{error}", &[("error", &error)]);
+            status.set_label(&trf("The operation failed:\n{error}", &[("error", &error)]));
+        }
+    }
+}
+
+/// View > Saved Programme Searches... (C11, Python
+/// `SavedSearchesDialog`): edit up to 30 saved-search rules and
+/// browse their latest scan results. Each result can create a
+/// reminder or a scheduled recording, resolving its channel keys
+/// against the current catalogue.
+#[allow(clippy::too_many_lines)] // one dialog flow, as in Python
+fn open_saved_searches_dialog(wiring: &Wiring, _frame: Frame, list: ListCtrl, status: Status) {
+    let dialog = Frame::builder()
+        .with_title(&tr("Saved Programme Searches"))
+        .with_size(Size::new(860, 650))
+        .build();
+    dialog.set_accessibility_label(&tr("Saved Programme Searches"));
+    bind_escape_hide(dialog);
+    let panel = Panel::builder(&dialog).build();
+    let rules_list = ListBox::builder(&panel).build();
+    rules_list.set_accessibility_label(&tr("Saved Programme Searches"));
+    let matches_list = ListBox::builder(&panel).build();
+    matches_list.set_accessibility_label(&tr("Search Results"));
+    let details = TextCtrl::builder(&panel)
+        .with_style(TextCtrlStyle::ReadOnly)
+        .build();
+    details.set_accessibility_label(&tr("Description"));
+    let status_label = StaticText::builder(&panel).build();
+    let new_button = Button::builder(&panel).with_label(&tr("New...")).build();
+    let edit_button = Button::builder(&panel).with_label(&tr("Edit...")).build();
+    let delete_button = Button::builder(&panel).with_label(&tr("Delete")).build();
+    let refresh_button = Button::builder(&panel).with_label(&tr("Refresh")).build();
+    let remind_button = Button::builder(&panel)
+        .with_label(&tr("Set Reminder..."))
+        .build();
+    let schedule_button = Button::builder(&panel)
+        .with_label(&tr("Schedule Recording..."))
+        .build();
+    let close_button = Button::builder(&panel).with_label(&tr("Close")).build();
+    let layout = BoxSizer::builder(Orientation::Vertical).build();
+    layout.add(&rules_list, 1, SizerFlag::Expand | SizerFlag::All, 8);
+    layout.add(&matches_list, 1, SizerFlag::Expand | SizerFlag::All, 8);
+    layout.add(&details, 0, SizerFlag::Expand | SizerFlag::All, 8);
+    layout.add(&status_label, 0, SizerFlag::All, 8);
+    let buttons = BoxSizer::builder(Orientation::Horizontal).build();
+    for button in [
+        &new_button,
+        &edit_button,
+        &delete_button,
+        &refresh_button,
+        &remind_button,
+        &schedule_button,
+        &close_button,
+    ] {
+        buttons.add(button, 0, SizerFlag::All, 4);
+    }
+    layout.add_sizer(&buttons, 0, SizerFlag::Expand, 0);
+    panel.set_sizer(layout, true);
+    bind_f1_help(&dialog, wiring, "personal-tools", status);
+    bind_f1_help(&rules_list, wiring, "personal-tools", status);
+    bind_f1_help(&matches_list, wiring, "personal-tools", status);
+    let list_wiring = clone_wiring(wiring);
+    rules_list.bind_internal(EventType::COMMAND_LISTBOX_SELECTED, move |_| {
+        render_saved_searches(
+            &list_wiring,
+            rules_list,
+            matches_list,
+            details,
+            status_label,
+        );
+    });
+    let render_wiring = clone_wiring(wiring);
+    matches_list.bind_internal(EventType::COMMAND_LISTBOX_SELECTED, move |_| {
+        render_saved_searches(
+            &render_wiring,
+            rules_list,
+            matches_list,
+            details,
+            status_label,
+        );
+    });
+    render_saved_searches(wiring, rules_list, matches_list, details, status_label);
+    let edit_wiring = clone_wiring(wiring);
+    new_button.on_click(move |_| {
+        if edit_saved_rule(&edit_wiring, dialog, None, list, status) {
+            render_saved_searches(
+                &edit_wiring,
+                rules_list,
+                matches_list,
+                details,
+                status_label,
+            );
+        }
+    });
+    let edit_wiring = clone_wiring(wiring);
+    edit_button.on_click(move |_| {
+        let Some(rule) = selected_saved_rule(&edit_wiring, rules_list) else {
+            return;
+        };
+        if edit_saved_rule(&edit_wiring, dialog, Some(rule), list, status) {
+            render_saved_searches(
+                &edit_wiring,
+                rules_list,
+                matches_list,
+                details,
+                status_label,
+            );
+        }
+    });
+    let edit_wiring = clone_wiring(wiring);
+    delete_button.on_click(move |_| {
+        let Some(rule) = selected_saved_rule(&edit_wiring, rules_list) else {
+            return;
+        };
+        if !confirm_box(
+            &dialog,
+            &trf("Delete saved search '{name}'?", &[("name", &rule.query)]),
+        ) {
+            return;
+        }
+        let rules: Vec<serde_json::Value> = saved_search_rules(&edit_wiring)
+            .iter()
+            .filter(|row| row.id != rule.id)
+            .map(iptv_core::saved_searches::Rule::to_json)
+            .collect();
+        edit_wiring
+            .persist
+            .set_and_save("saved_programme_searches", serde_json::Value::Array(rules));
+        edit_wiring.search_results.borrow_mut().clear();
+        scan_saved_searches(&edit_wiring);
+        render_saved_searches(
+            &edit_wiring,
+            rules_list,
+            matches_list,
+            details,
+            status_label,
+        );
+    });
+    let edit_wiring = clone_wiring(wiring);
+    refresh_button.on_click(move |_| {
+        scan_saved_searches(&edit_wiring);
+        render_saved_searches(
+            &edit_wiring,
+            rules_list,
+            matches_list,
+            details,
+            status_label,
+        );
+    });
+    let edit_wiring = clone_wiring(wiring);
+    remind_button.on_click(move |_| {
+        saved_search_action(
+            &edit_wiring,
+            dialog,
+            rules_list,
+            matches_list,
+            status,
+            false,
+        );
+    });
+    let edit_wiring = clone_wiring(wiring);
+    schedule_button.on_click(move |_| {
+        saved_search_action(&edit_wiring, dialog, rules_list, matches_list, status, true);
+    });
+    close_button.on_click(move |_| dialog.hide());
+    dialog.show(true);
+}
+
+/// Render the saved-search dialog's rules, results, description
+/// and status from the wiring state, keeping both selections by
+/// rule and match id across rescans.
+fn render_saved_searches(
+    wiring: &Wiring,
+    rules_list: ListBox,
+    matches_list: ListBox,
+    details: TextCtrl,
+    status_label: StaticText,
+) {
+    let old_rule = rules_list.get_selection().and_then(|index| {
+        saved_search_rules(wiring)
+            .get(usize::try_from(index).unwrap_or(usize::MAX))
+            .map(|rule| rule.id.clone())
+    });
+    let old_match = matches_list.get_selection().and_then(|index| {
+        selected_rule_matches(wiring, old_rule.as_deref())
+            .get(usize::try_from(index).unwrap_or(usize::MAX))
+            .map(|found| found.id.clone())
+    });
+    let rules = saved_search_rules(wiring);
+    let labels: Vec<String> = rules
+        .iter()
+        .map(|rule| {
+            if rule.enabled {
+                rule.query.clone()
+            } else {
+                format!("{} — {}", rule.query, tr("Disabled"))
+            }
+        })
+        .collect();
+    rules_list.set_items(&labels.iter().map(String::as_str).collect::<Vec<_>>());
+    if let Some(id) = &old_rule {
+        if let Some(index) = rules.iter().position(|rule| &rule.id == id) {
+            rules_list.set_selection(u32::try_from(index).unwrap_or(0), true);
+        }
+    }
+    let matches = selected_rule_matches(wiring, old_rule.as_deref());
+    let mut match_labels = Vec::new();
+    for found in &matches {
+        let stamp = chrono::TimeZone::timestamp_opt(&chrono::Local, found.start, 0)
+            .single()
+            .map_or_else(
+                || "Unknown time".to_string(),
+                |dt| dt.format("%Y-%m-%d %H:%M").to_string(),
+            );
+        match_labels.push(format!("{stamp} — {} — {}", found.title, found.channel));
+    }
+    matches_list.set_items(&match_labels.iter().map(String::as_str).collect::<Vec<_>>());
+    if let Some(id) = &old_match {
+        if let Some(index) = matches.iter().position(|found| &found.id == id) {
+            matches_list.set_selection(u32::try_from(index).unwrap_or(0), true);
+        }
+    }
+    let mut text = wiring.search_status.borrow().clone();
+    if matches
+        .first()
+        .is_some_and(|_| rule_truncated(wiring, old_rule.as_deref()))
+    {
+        text.push(' ');
+        text.push_str(&tr(
+            "Only the first 500 matches are shown. Narrow the search.",
+        ));
+    }
+    status_label.set_label(&text);
+    let index = matches_list.get_selection();
+    details.set_value(
+        index
+            .and_then(|index| matches.get(usize::try_from(index).unwrap_or(usize::MAX)))
+            .map_or("", |found| found.description.as_str()),
+    );
+}
+
+/// The rule editor (C11, Python `SearchRuleDialog`): the search
+/// text, whether descriptions are searched too, the Enabled
+/// switch, and the channel scope (all, the selected channel, or
+/// for an edit the previously chosen set). Returns true when a
+/// rule was saved.
+#[allow(clippy::too_many_lines)] // rule editor dialog, as in Python
+fn edit_saved_rule(
+    wiring: &Wiring,
+    parent: Frame,
+    existing: Option<iptv_core::saved_searches::Rule>,
+    list: ListCtrl,
+    status: Status,
+) -> bool {
+    use iptv_core::saved_searches;
+    if existing.is_none() && saved_search_rules(wiring).len() >= saved_searches::MAX_RULES {
+        operation_failed_box(&parent, &tr("You can save up to 30 programme searches."));
+        return false;
+    }
+    let dialog = Dialog::builder(&parent, &tr("Saved Programme Search")).build();
+    dialog.set_accessibility_label(&tr("Saved Programme Search"));
+    bind_escape_cancel(dialog);
+    let panel = Panel::builder(&dialog).build();
+    let search_label = StaticText::builder(&panel)
+        .with_label(&tr("Search"))
+        .build();
+    let search = TextCtrl::builder(&panel)
+        .with_value(existing.as_ref().map_or("", |rule| rule.query.as_str()))
+        .build();
+    search.set_accessibility_label(&tr("Search"));
+    let description = CheckBox::builder(&panel)
+        .with_label(&tr("Search descriptions too"))
+        .build();
+    description.set_accessibility_label(&tr("Search descriptions too"));
+    description.set_value(existing.as_ref().is_some_and(|rule| rule.description));
+    let enabled = CheckBox::builder(&panel).with_label(&tr("Enabled")).build();
+    enabled.set_accessibility_label(&tr("Enabled"));
+    enabled.set_value(existing.as_ref().is_none_or(|rule| rule.enabled));
+    let scope_label = StaticText::builder(&panel)
+        .with_label(&tr("Channels"))
+        .build();
+    let scope = Choice::builder(&panel).build();
+    scope.set_accessibility_label(&tr("Channels"));
+    // Scope entries: (label, channel keys). Python's new-rule
+    // dialog offers All Channels and the selected channel; an
+    // edit also offers keeping the previously chosen set.
+    let mut scopes: Vec<(String, Vec<String>)> = Vec::new();
+    if let Some(rule) = &existing {
+        scopes.push((tr("Keep chosen channels"), rule.channels.clone()));
+    }
+    scopes.push((tr("All Channels"), Vec::new()));
+    if let Some(channel) = selected_channel(wiring, list) {
+        let key = iptv_core::reminders::reminder_channel_key(&channel);
+        if !key.is_empty() {
+            scopes.push((
+                trf("Selected channel: {name}", &[("name", &channel.name)]),
+                vec![key],
+            ));
+        }
+    }
+    for (label, _) in &scopes {
+        scope.append(label);
+    }
+    scope.set_selection(0);
+    let ok = Button::builder(&panel).with_label("&OK").build();
+    let cancel = Button::builder(&panel).with_label("&Cancel").build();
+    bind_f1_help(&dialog, wiring, "personal-tools", status);
+    bind_f1_help(&search, wiring, "personal-tools", status);
+    let layout = BoxSizer::builder(Orientation::Vertical).build();
+    layout.add(&search_label, 0, SizerFlag::All, 8);
+    layout.add(&search, 0, SizerFlag::Expand | SizerFlag::All, 8);
+    layout.add(&description, 0, SizerFlag::All, 8);
+    layout.add(&enabled, 0, SizerFlag::All, 8);
+    layout.add(&scope_label, 0, SizerFlag::All, 8);
+    layout.add(&scope, 0, SizerFlag::Expand | SizerFlag::All, 8);
+    let buttons = BoxSizer::builder(Orientation::Horizontal).build();
+    buttons.add(&ok, 0, SizerFlag::All, 4);
+    buttons.add(&cancel, 0, SizerFlag::All, 4);
+    layout.add_sizer(&buttons, 0, SizerFlag::Expand, 0);
+    panel.set_sizer(layout, true);
+    let persist = wiring.persist.clone();
+    let ok_wiring = clone_wiring(wiring);
+    let dialog_ok = dialog;
+    let dialog_cancel = dialog;
+    let saved = Rc::new(std::cell::Cell::new(false));
+    let saved_ok = Rc::clone(&saved);
+    ok.on_click(move |_| {
+        let wiring = &ok_wiring;
+        let channels = scope
+            .get_selection()
+            .and_then(|index| scopes.get(usize::try_from(index).unwrap_or(usize::MAX)))
+            .map_or_else(Vec::new, |(_, keys)| keys.clone());
+        match saved_searches::new_rule(&search.get_value(), &channels, description.get_value()) {
+            Ok(mut rule) => {
+                if let Some(old) = &existing {
+                    rule.id.clone_from(&old.id);
+                }
+                rule.enabled = enabled.get_value();
+                let value: Vec<serde_json::Value> = saved_search_rules(wiring)
+                    .iter()
+                    .filter(|row| row.id != rule.id)
+                    .map(saved_searches::Rule::to_json)
+                    .chain(std::iter::once(rule.to_json()))
+                    .collect();
+                persist.set_and_save("saved_programme_searches", serde_json::Value::Array(value));
+                saved_ok.set(true);
+                dialog_ok.end_modal(ID_OK);
+            }
+            Err(error) => operation_failed_box(&dialog_ok, &tr(&error)),
+        }
+    });
+    cancel.on_click(move |_| {
+        dialog_cancel.end_modal(ID_CANCEL);
+    });
+    dialog.show_modal_tracked();
+    let done = saved.get();
+    if done {
+        wiring.search_results.borrow_mut().clear();
+        scan_saved_searches(wiring);
+    }
+    done
+}
+
+/// Set Reminder... / Schedule Recording... for one search result
+/// (C11, Python `SavedSearchesDialog._action`): resolve the
+/// match's channel keys, ask when several channels share the
+/// slot, then reuse the app's reminder/recording builders.
+fn saved_search_action(
+    wiring: &Wiring,
+    dialog: Frame,
+    rules_list: ListBox,
+    matches_list: ListBox,
+    status: Status,
+    recording: bool,
+) {
+    let Some(rule) = selected_saved_rule(wiring, rules_list) else {
+        return;
+    };
+    let matches = selected_rule_matches(wiring, Some(&rule.id));
+    let Some(index) = matches_list.get_selection() else {
+        return;
+    };
+    let Some(found) = matches
+        .get(usize::try_from(index).unwrap_or(usize::MAX))
+        .cloned()
+    else {
+        return;
+    };
+    let channels = wiring.browser.borrow().all_channels();
+    let resolved = iptv_core::saved_searches::resolve_channels(&found.channel_keys, &channels);
+    let Some(first) = resolved.first() else {
+        operation_failed_box(&dialog, &tr("Channel Not Found"));
+        return;
+    };
+    let channel = if resolved.len() > 1 {
+        let labels: Vec<String> = resolved
+            .iter()
+            .map(|channel| {
+                format!(
+                    "{} — {}",
+                    channel.name,
+                    channel
+                        .unknown_attributes
+                        .get("playlist-id")
+                        .map_or("", String::as_str)
+                )
+            })
+            .collect();
+        let picker = SingleChoiceDialog::builder(
+            &dialog,
+            &tr("Channel"),
+            &tr("Choose Channel"),
+            &labels.iter().map(String::as_str).collect::<Vec<_>>(),
+        )
+        .build();
+        if picker.show_modal_tracked() != ID_OK {
+            return;
+        }
+        match resolved.get(usize::try_from(picker.get_selection()).unwrap_or(usize::MAX)) {
+            Some(channel) => (*channel).clone(),
+            None => return,
+        }
+    } else {
+        (*first).clone()
+    };
+    let programme = found.programme();
+    if recording {
+        add_dvr_job(wiring, dialog, &channel, &programme, status, "none");
+    } else {
+        add_reminder(wiring, dialog, &channel, &programme, status);
+    }
+}
+
+/// The rule currently selected in a saved-search dialog, if any.
+fn selected_saved_rule(
+    wiring: &Wiring,
+    rules_list: ListBox,
+) -> Option<iptv_core::saved_searches::Rule> {
+    let index = usize::try_from(rules_list.get_selection()?).ok()?;
+    saved_search_rules(wiring).get(index).cloned()
+}
+
+/// The latest scan matches for one rule id.
+fn selected_rule_matches(
+    wiring: &Wiring,
+    rule_id: Option<&str>,
+) -> Vec<iptv_core::saved_searches::Match> {
+    let Some(rule_id) = rule_id else {
+        return Vec::new();
+    };
+    wiring
+        .search_results
+        .borrow()
+        .iter()
+        .find(|result| result.rule == rule_id)
+        .map_or_else(Vec::new, |result| result.matches.clone())
+}
+
+/// Whether the selected rule's matches were truncated.
+fn rule_truncated(wiring: &Wiring, rule_id: Option<&str>) -> bool {
+    let Some(rule_id) = rule_id else {
+        return false;
+    };
+    wiring
+        .search_results
+        .borrow()
+        .iter()
+        .find(|result| result.rule == rule_id)
+        .is_some_and(|result| result.truncated)
 }
 
 /// View > Assign Programme Guide... (C10, Python
@@ -19247,6 +22151,7 @@ fn schedule_by_time(wiring: &Wiring, frame: &Frame, list: ListCtrl, status: Stat
 const DVR_CTX_PADDING: i32 = 6054;
 const DVR_CTX_FIND_AIRING: i32 = 6055;
 const DVR_CTX_SKIP: i32 = 6056;
+const DVR_CTX_RECOVER: i32 = 6057;
 
 /// Python `start_operation`: run `work` off the UI thread and hand
 /// its result to `done` on the UI thread.
@@ -19440,6 +22345,119 @@ fn confirm_box_titled(parent: &dyn WxWidget, text: &str, title: &str) -> bool {
         )
         .build();
     message.show_modal_tracked() == ID_YES
+}
+
+/// Python's Catch-up Download box for recovery errors: the
+/// message in the plain text with the Catch-up Download title,
+/// information or warning icon as Python shows it.
+fn recovery_box(parent: &dyn WxWidget, text: &str, warning: bool) {
+    let style = if warning {
+        MessageDialogStyle::OK | MessageDialogStyle::IconWarning
+    } else {
+        MessageDialogStyle::OK | MessageDialogStyle::IconInformation
+    };
+    let message = MessageDialog::builder(parent, &tr(text), &tr("Catch-up Download"))
+        .with_style(style)
+        .build();
+    message.show_modal_tracked();
+}
+
+/// The account keys of the recordings and catch-up captures
+/// currently running (Python `recorder.list_active()` for
+/// `recording_limits.check_start`). Scheduled recordings
+/// resolve through their job snapshot; manual recordings keyed
+/// by channel key resolve through the channel list. Runs that
+/// cannot be attributed to an account are skipped: Python reads
+/// them from the recorder's metadata, which Rust's engine does
+/// not keep.
+fn active_account_keys(wiring: &Wiring, channels: &[Channel]) -> Vec<String> {
+    let config = config_value(wiring);
+    let keys = wiring.recordings.borrow().active_keys();
+    keys.into_iter()
+        .filter_map(|key| {
+            let channel = if let Some(job_id) = key.strip_prefix("dvr:") {
+                wiring
+                    .dvr
+                    .borrow()
+                    .get(job_id)
+                    .map(|job| channel_from_snapshot(&job.channel))
+            } else {
+                channels
+                    .iter()
+                    .find(|channel| channel_key(channel) == key)
+                    .cloned()
+            }?;
+            Some(iptv_core::recording_limits::channel_key(&channel, &config))
+        })
+        .collect()
+}
+
+/// Scheduled Recordings > Recover from Channel Archive... (Python
+/// `_recover_archive`). Runs synchronously: Python's two
+/// background legs (prepare off the GUI thread, then the
+/// download) collapse into one call, with the channel list
+/// re-resolved between the budget checks, exactly where Python
+/// re-checks the list identity in its `ready` leg.
+fn recover_selected_archive(wiring: &Wiring, frame: Frame, list: ListCtrl, dstatus: Status) {
+    let Some(job) = selected_single_job(wiring, list) else {
+        return;
+    };
+    let config = config_value(wiring);
+    let channels = wiring.browser.borrow().all_channels();
+    // Prepare leg.
+    let Some(channel) = iptv_core::archive_recovery::resolve_recovery_channel(&job, &channels)
+    else {
+        recovery_box(&frame, "Channel Not Found", false);
+        return;
+    };
+    let plan = match iptv_core::archive_recovery::recovery_show(&job, &channel, now_epoch()) {
+        Ok(plan) => plan,
+        Err(error) => {
+            recovery_box(&frame, &error, false);
+            return;
+        }
+    };
+    let active = active_account_keys(wiring, &channels);
+    if let Err(error) = iptv_core::archive_recovery::check_start(&config, &channel, &active) {
+        recovery_box(&frame, &error, false);
+        return;
+    }
+    let cast_url = cast_source_url(&wiring.cast_ui);
+    if single_stream_busy(
+        &wiring.recordings,
+        &wiring.buffers,
+        Some(&wiring.player),
+        &channel.url,
+        true,
+        cast_url.as_deref(),
+    ) {
+        recovery_box(&frame, iptv_core::catchup_direct::ONE_STREAM_REFUSAL, false);
+        return;
+    }
+    // Ready leg: the channel list must still resolve to the
+    // same channel, and the budget is re-checked.
+    let fresh = wiring.browser.borrow().all_channels();
+    if iptv_core::archive_recovery::resolve_recovery_channel(&job, &fresh) != Some(channel.clone())
+    {
+        recovery_box(&frame, "The channel list changed. Try again.", false);
+        return;
+    }
+    if let Err(error) = iptv_core::archive_recovery::check_start(
+        &config,
+        &channel,
+        &active_account_keys(wiring, &fresh),
+    ) {
+        recovery_box(&frame, &error, true);
+        return;
+    }
+    start_recovered_download(
+        wiring,
+        &channel,
+        &plan.programme,
+        plan.pre_minutes,
+        plan.post_minutes,
+        dstatus,
+    );
 }
 
 /// Scheduled Recordings > Repeat on Weekdays... (Python
@@ -20243,6 +23261,14 @@ fn open_scheduled_dialog(wiring: &Wiring, main_status: Status) {
             menu.append(DVR_CTX_DELETE, &tr("Delete\tDel"), "", ItemKind::Normal);
             // Python's single-selection items for a pending entry.
             if let Some(job) = selected_single_job(&wiring_ctx, list) {
+                if iptv_core::archive_recovery::recoverable_status(&job.status) {
+                    menu.append(
+                        DVR_CTX_RECOVER,
+                        &tr("Recover from Channel Archive..."),
+                        "",
+                        ItemKind::Normal,
+                    );
+                }
                 if job.status == iptv_core::dvr::STATUS_SCHEDULED {
                     menu.append(
                         DVR_CTX_PADDING,
@@ -20277,6 +23303,7 @@ fn open_scheduled_dialog(wiring: &Wiring, main_status: Status) {
         DVR_CTX_PADDING => padding_for_selected(&wiring_m, frame, list, dstatus),
         DVR_CTX_FIND_AIRING => find_another_airing(&wiring_m, frame, list, dstatus),
         DVR_CTX_SKIP => skip_selected_occurrence(&wiring_m, frame, list, dstatus),
+        DVR_CTX_RECOVER => recover_selected_archive(&wiring_m, frame, list, dstatus),
         _ => {}
     });
     close.on_click(move |_| frame.hide());
@@ -20454,6 +23481,7 @@ fn start_catchup_download(
                 PendingResolve::Download {
                     channel: channel.clone(),
                     programme: programme.clone(),
+                    schedule_padding: None,
                 },
                 key,
                 channel.unknown_attributes.clone(),
@@ -20473,6 +23501,71 @@ fn start_catchup_download(
                 PendingResolve::Download {
                     channel: channel.clone(),
                     programme: programme.clone(),
+                    schedule_padding: None,
+                },
+                key,
+                channel.unknown_attributes.clone(),
+                start_text,
+                duration_minutes,
+            );
+            status.set_label("Resolving the download link...");
+        }
+        Err(error) => status.set_label(&tr(&error)),
+    }
+}
+
+/// Resolve a recovered recording's archive URL and queue its
+/// download (Python `_recover_archive`'s download leg): like
+/// `start_catchup_download`, but the window widens by the
+/// recording's own padding, so the copy covers its booked span.
+fn start_recovered_download(
+    wiring: &Wiring,
+    channel: &Channel,
+    programme: &Programme,
+    pre_minutes: i64,
+    post_minutes: i64,
+    status: Status,
+) {
+    let pad = (pre_minutes, post_minutes);
+    let now = now_epoch();
+    match iptv_core::catchup::resolve_show_url(channel, programme.start, programme.stop, now) {
+        Ok(
+            iptv_core::catchup::ShowResolution::Catchup(url)
+            | iptv_core::catchup::ShowResolution::Live(url),
+        ) => {
+            begin_catchup_download_with_padding(wiring, channel, programme, url, status, Some(pad));
+        }
+        Ok(iptv_core::catchup::ShowResolution::StalkerLive) => {
+            let Some(key) = channel.unknown_attributes.get("provider-id").cloned() else {
+                status.set_label("This Stalker channel has no provider account configured.");
+                return;
+            };
+            dispatch_resolve(
+                wiring,
+                PendingResolve::Download {
+                    channel: channel.clone(),
+                    programme: programme.clone(),
+                    schedule_padding: Some(pad),
+                },
+                key,
+                channel.unknown_attributes.clone(),
+            );
+            status.set_label("Resolving the download link...");
+        }
+        Ok(iptv_core::catchup::ShowResolution::StalkerCatchup {
+            start_text,
+            duration_minutes,
+        }) => {
+            let Some(key) = channel.unknown_attributes.get("provider-id").cloned() else {
+                status.set_label("This Stalker channel has no provider account configured.");
+                return;
+            };
+            dispatch_resolve_catchup(
+                wiring,
+                PendingResolve::Download {
+                    channel: channel.clone(),
+                    programme: programme.clone(),
+                    schedule_padding: Some(pad),
                 },
                 key,
                 channel.unknown_attributes.clone(),
@@ -20516,14 +23609,29 @@ fn padding_minutes(wiring: &Wiring) -> (i64, i64) {
 }
 
 fn padded_window(wiring: &Wiring, programme: &Programme) -> (i64, i64) {
-    let (pre, post) = padding_minutes(wiring);
+    padded_window_with(wiring, programme, None)
+}
+
+/// The programme window widened by `pad` when a recovered
+/// recording carries its booked span (Python's
+/// `schedule_padding`), else by the configured padding.
+fn padded_window_with(
+    wiring: &Wiring,
+    programme: &Programme,
+    pad: Option<(i64, i64)>,
+) -> (i64, i64) {
+    let (pre, post) = pad.unwrap_or_else(|| padding_minutes(wiring));
     (programme.start - pre * 60, programme.stop + post * 60)
 }
 
 /// Total padding inside a padded window, in seconds (N13:
 /// Python's truncation expectation subtracts it back out).
 fn padding_seconds(wiring: &Wiring) -> i64 {
-    let (pre, post) = padding_minutes(wiring);
+    padding_seconds_with(wiring, None)
+}
+
+fn padding_seconds_with(wiring: &Wiring, pad: Option<(i64, i64)>) -> i64 {
+    let (pre, post) = pad.unwrap_or_else(|| padding_minutes(wiring));
     (pre + post) * 60
 }
 
@@ -20533,7 +23641,8 @@ fn padding_seconds(wiring: &Wiring) -> i64 {
 /// capture from the result. Used for the first attempt and for
 /// N15 retries, which re-run the whole probe flow like Python.
 fn stage_direct_probe(wiring: &Wiring, key: &str, mut staged: StagedDownload) {
-    let (padded_start, padded_stop) = padded_window(wiring, &staged.programme);
+    let (padded_start, padded_stop) =
+        padded_window_with(wiring, &staged.programme, staged.schedule_padding);
     let programme = staged.programme.clone();
     let url = staged.url.clone();
     let headers = iptv_core::playback::StreamHeaders::for_channel(&staged.channel);
@@ -20565,6 +23674,20 @@ fn begin_catchup_download(
     programme: &Programme,
     url: String,
     status: Status,
+) {
+    begin_catchup_download_with_padding(wiring, channel, programme, url, status, None);
+}
+
+/// `begin_catchup_download` with an explicit schedule padding
+/// (a recovered recording asks for its booked span again).
+#[allow(clippy::too_many_lines)] // R02-R05 staged download flow
+fn begin_catchup_download_with_padding(
+    wiring: &Wiring,
+    channel: &Channel,
+    programme: &Programme,
+    url: String,
+    status: Status,
+    pad: Option<(i64, i64)>,
 ) {
     // Audit R08: the destination check gates downloads too —
     // before any provider connection is opened.
@@ -20613,7 +23736,7 @@ fn begin_catchup_download(
     // Audit R04: ask the provider for the padded window,
     // falling back to the programme-exact URL the caller
     // resolved when the padded one cannot be built.
-    let (padded_start, padded_stop) = padded_window(wiring, programme);
+    let (padded_start, padded_stop) = padded_window_with(wiring, programme, pad);
     let now = now_epoch();
     let url = match iptv_core::catchup::resolve_show_url(channel, padded_start, padded_stop, now) {
         Ok(
@@ -20660,6 +23783,7 @@ fn begin_catchup_download(
                 channel: channel.clone(),
                 programme: programme.clone(),
                 url,
+                schedule_padding: pad,
                 headers: None,
                 probing: true,
                 attempts: 1,
@@ -20721,7 +23845,8 @@ fn launch_staged_capture(
         recording_format_for_channel(&wiring.persist, &wiring.media_probe.cache, &staged.channel);
     let extension = recording::format_extension(&format);
     let part = iptv_core::downloads::part_path(&staged.final_path);
-    let (padded_start, padded_stop) = padded_window(wiring, &staged.programme);
+    let (padded_start, padded_stop) =
+        padded_window_with(wiring, &staged.programme, staged.schedule_padding);
     // N15: the Downloads window's live figures read this
     // attempt's log and clock.
     staged.started_at = now_seconds();
@@ -20729,7 +23854,11 @@ fn launch_staged_capture(
         .parent()
         .map(|parent| iptv_core::recording_log::recording_log_path(parent, &part));
     staged.expected_seconds = f64::from(
-        i32::try_from(((padded_stop - padded_start) - padding_seconds(wiring)).max(1)).unwrap_or(0),
+        i32::try_from(
+            ((padded_stop - padded_start) - padding_seconds_with(wiring, staged.schedule_padding))
+                .max(1),
+        )
+        .unwrap_or(0),
     );
     staged.failure_detail = None;
     staged.retry_at = None;
@@ -22718,6 +25847,41 @@ mod tests {
         assert_eq!(pick_row(Some(2), Some(5)), Some(2));
         assert_eq!(pick_row(None, Some(5)), Some(5));
         assert_eq!(pick_row(None, None), None);
+    }
+
+    // C6: embedded-track labels drop empty parts and mark
+    // image tracks unavailable for speech.
+    #[test]
+    fn embedded_track_labels_match_python_shape() {
+        use iptv_core::recording_media::{EmbeddedTrack, FileSignature};
+        let signature = FileSignature {
+            size: 1,
+            mtime_ns: 1,
+        };
+        let text = EmbeddedTrack {
+            index: 2,
+            language: "hun".to_string(),
+            codec: "subrip".to_string(),
+            title: "Magyar".to_string(),
+            readable: true,
+            signature,
+        };
+        assert_eq!(
+            embedded_track_label(&text),
+            "Track 2 — hun — Magyar — subrip"
+        );
+        let image = EmbeddedTrack {
+            index: 3,
+            language: String::new(),
+            codec: "hdvd_subtitle".to_string(),
+            title: String::new(),
+            readable: false,
+            signature,
+        };
+        assert_eq!(
+            embedded_track_label(&image),
+            "Track 3 — hdvd_subtitle — Unavailable for speech"
+        );
     }
 
     // R10: ffmpeg probe reports become Python-shaped audio labels.

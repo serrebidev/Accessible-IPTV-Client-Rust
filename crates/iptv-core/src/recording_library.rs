@@ -876,6 +876,158 @@ pub fn playback_channel(
     Ok(channel)
 }
 
+/// Python `problem_log` (C7): the log for a library row, only
+/// when its own summary footer identifies this media file.
+/// The summary header is found by scanning backwards in
+/// blocks so an ordinary log reads one small tail block.
+/// A `.part` base falls back to the final file's log name.
+/// Legacy summaries (no `# Media signature:` line) are checked
+/// by their started/ended wall-clock window instead.
+///
+/// # Errors
+/// `No matching recording log is available for this file.`
+/// for every refusal, plus the checked-path errors.
+pub fn problem_log(
+    directory: &Path,
+    row: &LibraryRow,
+    active_paths: &[PathBuf],
+) -> Result<PathBuf, String> {
+    use std::io::Read as _;
+    use std::io::{Seek, SeekFrom};
+
+    let unavailable = || "No matching recording log is available for this file.".to_string();
+    let path = checked_path(directory, row, active_paths)?;
+    let base = if path
+        .extension()
+        .is_some_and(|ext| ext.to_string_lossy().eq_ignore_ascii_case("part"))
+    {
+        path.with_extension("")
+    } else {
+        path.clone()
+    };
+    let parent = path.parent().unwrap_or(Path::new("."));
+    let log = crate::recording_log::recording_log_path(parent, &base);
+    if fs::symlink_metadata(&log).is_ok_and(|meta| meta.file_type().is_symlink()) {
+        return Err(unavailable());
+    }
+    // Python `log.resolve() != log` (symlink rejection). The
+    // lexical absolute form is `log` itself; canonicalize
+    // follows a link, so a mismatch names a symlink.
+    let resolved = fs::canonicalize(&log).map_err(|_| unavailable())?;
+    if resolved != absolute_normalized(&log) {
+        return Err(unavailable());
+    }
+    if !log.is_file() {
+        return Err(unavailable());
+    }
+    // Find the summary header: scan backwards in blocks,
+    // keeping an overlap of marker length - 1 bytes.
+    let marker = "# ===== Recording summary =====".as_bytes();
+    let mut file = fs::File::open(&log).map_err(|_| unavailable())?;
+    let end_len = file
+        .metadata()
+        .map(|meta| meta.len())
+        .map_err(|_| unavailable())?;
+    let mut end = end_len;
+    let mut overlap: Vec<u8> = Vec::new();
+    let header: Vec<String> = loop {
+        if end == 0 {
+            return Err(unavailable());
+        }
+        let start = end.saturating_sub(65_536);
+        file.seek(SeekFrom::Start(start))
+            .map_err(|_| unavailable())?;
+        let len = usize::try_from(end - start).map_err(|_| unavailable())?;
+        let mut data = vec![0_u8; len];
+        file.read_exact(&mut data).map_err(|_| unavailable())?;
+        data.extend_from_slice(&overlap);
+        if let Some(offset) = rfind(&data, marker) {
+            file.seek(SeekFrom::Start(start + offset as u64))
+                .map_err(|_| unavailable())?;
+            let mut lines = Vec::new();
+            let mut text = String::new();
+            file.read_to_string(&mut text).map_err(|_| unavailable())?;
+            for line in text.lines().take(5) {
+                lines.push(line.trim_end().to_string());
+                if line == "# ===== End of summary =====" {
+                    break;
+                }
+            }
+            break lines;
+        }
+        let keep = marker.len() - 1;
+        overlap = data.iter().rev().take(keep).rev().copied().collect();
+        end = start;
+    };
+    if header.len() < 3 || !header[1].starts_with("# File: ") {
+        return Err(unavailable());
+    }
+    let recorded = PathBuf::from(header[1]["# File: ".len()..].trim());
+    if fs::canonicalize(&recorded).unwrap_or(recorded.clone()) != path
+        && absolute_normalized(&recorded) != absolute_normalized(&path)
+    {
+        return Err(unavailable());
+    }
+    if header[2].starts_with("# Media signature: ") {
+        let expected = format!("# Media signature: {} {}", row.size, row.modified_ns);
+        if header[2] != expected {
+            return Err(unavailable());
+        }
+        return Ok(log);
+    }
+    // Legacy: compare local wall times, including both folds
+    // of a clock change, as Python does (the earliest/latest
+    // local interpretations bracket the window).
+    let started = parse_log_stamp(&header[2]).ok_or_else(unavailable)?;
+    let ended_line = header.get(3).ok_or_else(unavailable)?;
+    let ended_text = ended_line
+        .split(" (ran for ")
+        .next()
+        .unwrap_or(ended_line.as_str());
+    let ended = parse_log_stamp(ended_text).ok_or_else(unavailable)?;
+    #[allow(clippy::cast_precision_loss)] // wall-clock window comparison, as Python's float
+    let modified = row.modified_ns as f64 / 1_000_000_000.0;
+    let earliest = started.min(ended);
+    let latest = started.max(ended);
+    let log_mtime_ns = fs::metadata(&log)
+        .map_err(|_| unavailable())?
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map_or(0, |duration| {
+            i64::try_from(duration.as_nanos()).unwrap_or(i64::MAX)
+        });
+    if !(earliest - 2.0 <= modified && modified <= latest + 2.0) || log_mtime_ns < row.modified_ns {
+        return Err(unavailable());
+    }
+    Ok(log)
+}
+
+fn rfind(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    haystack
+        .windows(needle.len())
+        .rposition(|window| window == needle)
+}
+
+/// Parse a `# Started:` / `# Ended:` line into epoch seconds
+/// (naive local, as Python's `strptime` + `timestamp`).
+fn parse_log_stamp(line: &str) -> Option<f64> {
+    use chrono::TimeZone as _;
+    let stamp = line
+        .strip_prefix("# Started: ")
+        .or_else(|| line.strip_prefix("# Ended: "))?;
+    let naive = chrono::NaiveDateTime::parse_from_str(stamp, "%Y-%m-%d %H:%M:%S").ok()?;
+    let epoch = chrono::Local
+        .from_local_datetime(&naive)
+        .earliest()?
+        .timestamp();
+    #[allow(clippy::cast_precision_loss)] // epoch seconds in a window comparison, as Python's float
+    Some(epoch as f64)
+}
+
 /// Python `resolve_resume` (worker-only): find the library row
 /// whose exact file signature matches a saved resume key.
 /// Provider items are never resolved here — the caller checks
@@ -1438,5 +1590,93 @@ mod tests {
             file_uri(Path::new("/tmp/a b/ü.ts")),
             "file:///tmp/a%20b/%C3%BC.ts"
         );
+    }
+
+    /// C7 `problem_log`: a legacy summary whose window covers
+    /// the file's mtime resolves; a different file, a replaced
+    /// file outside the window, and a missing log all refuse.
+    #[test]
+    fn problem_log_checks_the_summary_footer() {
+        let dir = temp_dir("problem-log");
+        media_file(&dir, "show.ts", b"media-bytes");
+        let row = scan_one(&dir);
+        let out_path = dir.join("show.ts");
+        let now = chrono::Local::now().timestamp();
+        let stamp = |epoch: i64| {
+            chrono::DateTime::from_timestamp(epoch, 0)
+                .unwrap()
+                .with_timezone(&chrono::Local)
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string()
+        };
+        let logs = dir.join("logs");
+        fs::create_dir_all(&logs).unwrap();
+        let log_path = logs.join("show.log");
+        let write_log = |file_line: &str, started: i64, ended: i64| {
+            std::fs::write(
+                &log_path,
+                format!(
+                    "2026-01-01 00:00:00 [error] boom\n# ===== Recording summary =====\n# File: {file_line}\n# Started: {}\n# Ended: {} (ran for 0:01:00)\n# How it ended: ok\n",
+                    stamp(started),
+                    stamp(ended)
+                ),
+            )
+            .unwrap();
+        };
+        // The row's mtime is now: a window around it resolves.
+        write_log(&out_path.to_string_lossy(), now - 60, now + 60);
+        assert_eq!(
+            absolute_normalized(&problem_log(&dir, &row, &[]).unwrap()),
+            absolute_normalized(&log_path)
+        );
+        // A summary naming another file refuses.
+        write_log("/elsewhere/other.ts", now - 60, now + 60);
+        assert!(problem_log(&dir, &row, &[]).is_err());
+        // A window the file's mtime misses (replaced file) refuses.
+        write_log(&out_path.to_string_lossy(), now - 3600, now - 3500);
+        assert!(problem_log(&dir, &row, &[]).is_err());
+        // No log at all refuses.
+        fs::remove_file(&log_path).unwrap();
+        assert_eq!(
+            problem_log(&dir, &row, &[]).unwrap_err(),
+            "No matching recording log is available for this file."
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// C7 `problem_log`: Python's `# Media signature:` line is
+    /// checked exactly when present.
+    #[test]
+    fn problem_log_checks_the_media_signature() {
+        let dir = temp_dir("problem-sig");
+        media_file(&dir, "show.ts", b"media-bytes");
+        let row = scan_one(&dir);
+        let out_path = dir.join("show.ts");
+        let logs = dir.join("logs");
+        fs::create_dir_all(&logs).unwrap();
+        let log_path = logs.join("show.log");
+        let expected = format!("# Media signature: {} {}", row.size, row.modified_ns);
+        std::fs::write(
+            &log_path,
+            format!(
+                "# ===== Recording summary =====\n# File: {}\n{expected}\n",
+                out_path.to_string_lossy()
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            absolute_normalized(&problem_log(&dir, &row, &[]).unwrap()),
+            absolute_normalized(&log_path)
+        );
+        std::fs::write(
+            &log_path,
+            format!(
+                "# ===== Recording summary =====\n# File: {}\n# Media signature: 1 2\n",
+                out_path.to_string_lossy()
+            ),
+        )
+        .unwrap();
+        assert!(problem_log(&dir, &row, &[]).is_err());
+        fs::remove_dir_all(&dir).ok();
     }
 }

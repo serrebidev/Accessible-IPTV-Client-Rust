@@ -1326,16 +1326,16 @@ Checked and not gaps: Python's start-at-100-percent volume fix (Rust never reads
 ### Open
 
 - **C1, high: recording planning engine.** **Fixed 2026-11-23 (validation 0102); Schedule by Time for new recordings was also missing and is ported there.** Review Guide Changes and its notice option, Find Another Airing, Skip This Occurrence, Repeat on Weekdays, Padding for This Recording, episode-aware rerun suppression, Partial and Stopped-by-user outcomes with later-airing rescheduling, unreadable-schedule backup. Python `dvr.py`, `recording_edits.py`, `planning_tools.py`, `recording_outcome.py`.
-- **C2, medium: Recover from Channel Archive.** Python `main.py`.
-- **C3, medium: Prevent Automatic Sleep While Recording and Wake for Scheduled Recordings.** Python `recording_power.py`.
-- **C4, medium: Recording Space Monitor.** Python `storage_monitor.py`.
-- **C5, medium: Save Recent Broadcast.** Python `buffer_clip.py`.
-- **C6, medium: Read Embedded Subtitle Track and Recording Chapters.** Python `recording_media.py`, `media_navigation_ui.py`.
-- **C7, medium: Recording Playback Queue and play from Problem Times.** Python `recording_queue.py`, `recording_library_ui.py`.
-- **C8, medium: Automatically Play the Next Episode.** Python `episode_continuation_ui.py`.
+- **C2, medium: Recover from Channel Archive.** **Fixed 2026-11-24 (validation 0107).** Python `main.py`.
+- **C3, medium: Prevent Automatic Sleep While Recording and Wake for Scheduled Recordings.** **Fixed 2026-11-24 (validation 0105).** Python `recording_power.py`.
+- **C4, medium: Recording Space Monitor.** **Fixed 2026-11-24 (validation 0106).** Python `storage_monitor.py`.
+- **C5, medium: Save Recent Broadcast.** **Fixed 2026-11-24 (validation 0110).** Python `buffer_clip.py`.
+- **C6, medium: Read Embedded Subtitle Track and Recording Chapters.** **Fixed 2026-11-24 (validation 0111).** Python `recording_media.py`, `media_navigation_ui.py`.
+- **C7, medium: Recording Playback Queue and play from Problem Times.** **Fixed 2026-11-24 (validation 0108).** Python `recording_queue.py`, `recording_library_ui.py`.
+- **C8, medium: Automatically Play the Next Episode.** **Fixed 2026-11-24 (validation 0109).** Python `episode_continuation_ui.py`.
 - **C9, high: full backup (`accessible-iptv-settings-v2`).** **Fixed 2026-11-23 (validation 0103); also moves reminders into Python's reminder file, which Rust never read.** Python `full_backup.py`.
 - **C10, medium: Assign Programme Guide.** **Fixed 2026-11-24 (validation 0104).** Python `accessible_tools_ui.py`.
-- **C11, medium: Saved Programme Searches.** Python `saved_searches.py`.
+- **C11, medium: Saved Programme Searches.** **Fixed 2026-11-24 (validation 0112).** Python `saved_searches.py`, `personal_tools_ui.py`.
 - **C12, high: guide ids scoped per guide source.** **Fixed 2026-11-24 (validation 0104, with C10).** Python's EPG import keeps a shared XMLTV id but splits it into `epg:<source_key>:<id>` when two sources collide or a source renames a shared id (`channels.xmltv_id`, `channel_sources`), and matching resolves an unscoped duplicate by one exact, number-safe display name (`choose_source_collision`). Python `playlist.py:1473`, `:2120`, `channel_identity.py`. Found by the scope sweep.
 - **M1, medium: Mute / Unmute and Remember Volume for Each Channel.** Python `channel_preferences.py`.
 - **M2, medium: on-demand seek keys, Go to Time, time announcement.** Python `media_navigation.py`.

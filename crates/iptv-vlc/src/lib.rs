@@ -49,6 +49,12 @@ type SetSpuFn = unsafe extern "C" fn(*mut c_void, c_int) -> c_int;
 type AddSlaveFn = unsafe extern "C" fn(*mut c_void, c_int, *const c_char, bool) -> c_int;
 type GetSpuDelayFn = unsafe extern "C" fn(*mut c_void) -> i64;
 type SetSpuDelayFn = unsafe extern "C" fn(*mut c_void, i64) -> c_int;
+type FullChaptersFn =
+    unsafe extern "C" fn(*mut c_void, c_int, *mut *mut *mut ChapterDescription) -> c_int;
+type ChapterReleaseFn = unsafe extern "C" fn(*mut *mut ChapterDescription, c_int);
+type SetChapterFn = unsafe extern "C" fn(*mut c_void, c_int) -> c_int;
+type GetChapterFn = unsafe extern "C" fn(*mut c_void) -> c_int;
+type IsSeekableFn = unsafe extern "C" fn(*mut c_void) -> c_int;
 
 /// `libvlc_media_stats_t` (field order per libvlc headers). libVLC
 /// writes the whole struct: a missing field overruns the stack.
@@ -85,6 +91,16 @@ struct TrackDescription {
     id: c_int,
     name: *mut c_char,
     next: *mut TrackDescription,
+}
+
+/// `libvlc_chapter_description_t`: the full chapter description
+/// libVLC hands out for the current title (C6, Python's
+/// `recording_media.chapters`).
+#[repr(C)]
+struct ChapterDescription {
+    time_offset: i64,
+    duration: i64,
+    name: *mut c_char,
 }
 
 /// libVLC player states (`libvlc_state_t`).
@@ -227,6 +243,11 @@ struct Functions {
     add_slave: Option<AddSlaveFn>,
     get_spu_delay: Option<GetSpuDelayFn>,
     set_spu_delay: Option<SetSpuDelayFn>,
+    full_chapter_descriptions: Option<FullChaptersFn>,
+    chapter_descriptions_release: ChapterReleaseFn,
+    set_chapter: Option<SetChapterFn>,
+    get_chapter: Option<GetChapterFn>,
+    is_seekable: Option<IsSeekableFn>,
 }
 
 /// The per-load media options the core's cache plan decides
@@ -471,6 +492,24 @@ impl VlcEngine {
                 .ok()
                 .map(|s| *s),
             set_spu_delay: unsafe { lib.get::<SetSpuDelayFn>(b"libvlc_video_set_spu_delay") }
+                .ok()
+                .map(|s| *s),
+            full_chapter_descriptions: unsafe {
+                lib.get::<FullChaptersFn>(b"libvlc_media_player_get_full_chapter_descriptions")
+            }
+            .ok()
+            .map(|s| *s),
+            chapter_descriptions_release: sym!(
+                b"libvlc_chapter_descriptions_release",
+                ChapterReleaseFn
+            ),
+            set_chapter: unsafe { lib.get::<SetChapterFn>(b"libvlc_media_player_set_chapter") }
+                .ok()
+                .map(|s| *s),
+            get_chapter: unsafe { lib.get::<GetChapterFn>(b"libvlc_media_player_get_chapter") }
+                .ok()
+                .map(|s| *s),
+            is_seekable: unsafe { lib.get::<IsSeekableFn>(b"libvlc_media_player_is_seekable") }
                 .ok()
                 .map(|s| *s),
         };
@@ -776,6 +815,64 @@ impl VlcEngine {
         let code = unsafe { add(self.inner.player, 0, c_uri.as_ptr(), true) };
         code == 0
     }
+
+    /// The full chapter descriptions of the current title (C6,
+    /// Python's `recording_media.chapters`): (index, start in
+    /// milliseconds, name) rows, copied before the native array
+    /// is released as libVLC requires.
+    #[must_use]
+    pub fn chapters(&self) -> Vec<(i32, i64, String)> {
+        let Some(get) = self.inner.fns.full_chapter_descriptions else {
+            return Vec::new();
+        };
+        let mut array: *mut *mut ChapterDescription = std::ptr::null_mut();
+        // -1: the current title, as Python passes.
+        let count = unsafe { get(self.inner.player, -1, &raw mut array) };
+        if count <= 0 || array.is_null() {
+            return Vec::new();
+        }
+        let mut rows = Vec::with_capacity(usize::try_from(count).unwrap_or(usize::MAX));
+        for index in 0..count {
+            let chapter = unsafe { *array.add(usize::try_from(index).unwrap_or(0)) };
+            if chapter.is_null() {
+                continue;
+            }
+            let chapter = unsafe { &*chapter };
+            rows.push((index, chapter.time_offset.max(0), unsafe {
+                c_string(chapter.name)
+            }));
+        }
+        unsafe { (self.inner.fns.chapter_descriptions_release)(array, count) };
+        rows
+    }
+
+    /// Jump to a chapter (Python's `set_chapter`).
+    pub fn set_chapter(&self, index: i32) -> bool {
+        let Some(set) = self.inner.fns.set_chapter else {
+            return false;
+        };
+        let code = unsafe { set(self.inner.player, index) };
+        code == 0
+    }
+
+    /// The current chapter index, or -1 when there is none.
+    #[must_use]
+    pub fn chapter(&self) -> i32 {
+        self.inner
+            .fns
+            .get_chapter
+            .map_or(-1, |get| unsafe { get(self.inner.player) })
+    }
+
+    /// Whether the current media can be seeked (Python's
+    /// `is_seekable` guard before a chapter jump).
+    #[must_use]
+    pub fn is_seekable(&self) -> bool {
+        self.inner
+            .fns
+            .is_seekable
+            .is_some_and(|get| unsafe { get(self.inner.player) } != 0)
+    }
 }
 
 impl Drop for EngineInner {
@@ -860,7 +957,7 @@ mod tests {
     /// stack overrun or a garbage pointer, not a wrong number.
     #[test]
     fn structs_match_the_libvlc_headers() {
-        use super::{AudioOutputDevice, MediaStats, TrackDescription};
+        use super::{AudioOutputDevice, ChapterDescription, MediaStats, TrackDescription};
         use std::mem::{offset_of, size_of};
         assert_eq!(size_of::<MediaStats>(), 15 * 4);
         assert_eq!(offset_of!(MediaStats, decoded_video), 6 * 4);
@@ -868,6 +965,13 @@ mod tests {
         assert_eq!(offset_of!(AudioOutputDevice, next), 0);
         assert_eq!(offset_of!(AudioOutputDevice, device), size_of::<usize>());
         assert_eq!(offset_of!(TrackDescription, next), 2 * size_of::<usize>());
+        // `libvlc_chapter_description_t`: two i64s then the name.
+        assert_eq!(size_of::<ChapterDescription>(), 2 * 8 + size_of::<usize>());
+        assert_eq!(offset_of!(ChapterDescription, duration), 8);
+        assert_eq!(
+            offset_of!(ChapterDescription, name),
+            size_of::<ChapterDescription>() - size_of::<usize>()
+        );
     }
 
     #[test]

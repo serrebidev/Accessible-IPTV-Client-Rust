@@ -358,6 +358,15 @@ pub struct RecordingStartMeta {
     pub channel_name: String,
 }
 
+/// One running recording, as reported to the space
+/// monitor (Python's `recorder._recordings` rows).
+#[derive(Clone, Debug)]
+pub struct ActiveRecordingInfo {
+    pub key: String,
+    pub out_path: PathBuf,
+    pub stopping: bool,
+}
+
 /// One running recording.
 struct Active {
     child: Child,
@@ -455,6 +464,26 @@ impl RecordingEngine {
     #[must_use]
     pub fn in_use_paths(&self) -> Vec<PathBuf> {
         self.active.values().map(|a| a.out_path.clone()).collect()
+    }
+
+    /// One running recording for the space-monitor snapshot:
+    /// which recording, the file it writes, and whether a
+    /// stop is already in progress.
+    #[must_use]
+    pub fn active_recordings(&mut self) -> Vec<ActiveRecordingInfo> {
+        self.active
+            .iter_mut()
+            .filter_map(|(key, active)| {
+                // Python only watches recordings whose
+                // process is still alive.
+                let exited = active.child.try_wait().ok().flatten().is_some();
+                (!exited).then(|| ActiveRecordingInfo {
+                    key: key.clone(),
+                    out_path: active.out_path.clone(),
+                    stopping: active.stopped_by_user,
+                })
+            })
+            .collect()
     }
 
     /// Spawn ffmpeg for one recording.
