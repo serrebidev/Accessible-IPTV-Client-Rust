@@ -5,6 +5,10 @@ adjacent releases were part of the same fix stream, they are combined with a
 version range such as `0.2.2-0.2.3`. Each release's section below is its
 Forgejo release note, taken from this file by the release workflow.
 
+## 0.4.38
+
+- Help, Report an issue on GitHub asks for a title and a description in accessible dialogs, then opens GitHub's new issue page with both filled in and your Accessible IPTV Client version and system added. Sign in on GitHub and press Create.
+
 ## 0.4.37
 
 - The player gains Mute/Unmute and an optional per-channel volume memory, plus Back/Forward 10 and 60 second seeks, Go to Time, and a Playback Time announcement on on-demand media.

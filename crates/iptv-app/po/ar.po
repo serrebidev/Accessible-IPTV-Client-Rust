@@ -5278,3 +5278,18 @@ msgid ""
 msgstr ""
 "تستجيب عمليات فحص البحث لتذكرة البوابة؛ وتفسح دفعات النتائج المجال للتفاعل "
 "(#108) (#114)"
+
+msgid "Report an &issue on GitHub..."
+msgstr "الإبلاغ عن &مشكلة على GitHub..."
+
+msgid "Describe a problem or an idea, then send it as a GitHub issue"
+msgstr "صف مشكلة أو فكرة، ثم أرسلها كبلاغ على GitHub"
+
+msgid "Report an issue"
+msgstr "الإبلاغ عن مشكلة"
+
+msgid "Issue title: one line saying what went wrong or what you would like"
+msgstr "العنوان: سطر واحد يوضح ما الخطأ الذي حدث أو ما تريده"
+
+msgid "Describe what you did, what happened, and what you expected.\nYour browser then opens GitHub with this filled in. Sign in and press Create."
+msgstr "صف ما فعلته، وما حدث، وما كنت تتوقعه.\nبعد ذلك يفتح المتصفح GitHub وقد مُلئت هذه البيانات. سجّل الدخول واضغط «Create»."

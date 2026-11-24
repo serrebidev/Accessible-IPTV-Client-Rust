@@ -5413,3 +5413,18 @@ msgid ""
 msgstr ""
 "Le scansioni di ricerca rispondono al ticket del cancello; i lotti di "
 "risultati lasciano spazio all'interazione (#108) (#114)"
+
+msgid "Report an &issue on GitHub..."
+msgstr "Segnala un &problema su GitHub..."
+
+msgid "Describe a problem or an idea, then send it as a GitHub issue"
+msgstr "Descrivi un problema o un'idea, poi inviala come segnalazione su GitHub"
+
+msgid "Report an issue"
+msgstr "Segnala un problema"
+
+msgid "Issue title: one line saying what went wrong or what you would like"
+msgstr "Titolo: una riga che dica cosa non ha funzionato o cosa vorresti"
+
+msgid "Describe what you did, what happened, and what you expected.\nYour browser then opens GitHub with this filled in. Sign in and press Create."
+msgstr "Descrivi cosa hai fatto, cosa è successo e cosa ti aspettavi.\nPoi il browser apre GitHub con questi dati già inseriti. Accedi e premi «Create»."

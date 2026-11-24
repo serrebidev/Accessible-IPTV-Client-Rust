@@ -7242,6 +7242,7 @@ pub const WHATS_NEW: i32 = 5191;
 pub const OPEN_LOGS: i32 = 5192;
 pub const COPY_DEBUG: i32 = 5193;
 pub const ABOUT: i32 = 5194;
+pub const REPORT_ISSUE: i32 = 5211;
 pub const READ_PREVIOUS_SUBTITLE: i32 = 5187;
 pub const REVIEW_SUBTITLES: i32 = 5188;
 pub const SUBTITLE_CAPABILITIES: i32 = 5189;
@@ -8686,6 +8687,13 @@ fn build_help_menu() -> Menu {
         "",
         ItemKind::Normal,
     );
+    menu_add(
+        &help_menu,
+        REPORT_ISSUE,
+        "Report an &issue on GitHub...",
+        "Describe a problem or an idea, then send it as a GitHub issue",
+        ItemKind::Normal,
+    );
     help_menu.append_separator();
     menu_add(&help_menu, ABOUT, "&About...", "", ItemKind::Normal);
 
@@ -9234,9 +9242,79 @@ fn bind_menu_option_actions(frame: Frame, wiring: &Wiring, controls: Controls) {
             }
             COPY_DEBUG => copy_debug_information(&wiring, status),
             ABOUT => open_about(frame),
+            REPORT_ISSUE => report_issue(frame),
             _ => {}
         }
     });
+}
+
+/// Help > Report an issue on GitHub (Python's `dialogs_misc.report_issue`):
+/// title and description asked here, where the screen reader knows the
+/// boxes, then GitHub's new-issue page opens with both filled in and the
+/// version line added. GitHub needs the user's own account, so the last
+/// step, Create, is theirs in the browser.
+fn report_issue(frame: Frame) {
+    let caption = tr("Report an issue");
+    let Some(summary) = ask_issue_text(
+        frame,
+        &tr("Issue title: one line saying what went wrong or what you would like"),
+        &caption,
+        TextEntryDialogStyle::Default,
+    )
+    .filter(|text| !text.is_empty()) else {
+        return;
+    };
+    let Some(details) = ask_issue_text(
+        frame,
+        &tr("Describe what you did, what happened, and what you expected.\nYour browser then opens GitHub with this filled in. Sign in and press Create."),
+        &caption,
+        TextEntryDialogStyle::Default | TextEntryDialogStyle::MultiLine,
+    ) else {
+        return;
+    };
+    launch_default_browser(&issue_url(&summary, &details), BrowserLaunchFlags::Default);
+}
+
+/// Trimmed text, or None on Cancel. Multiline: Enter is a new line, Tab reaches OK.
+fn ask_issue_text(
+    frame: Frame,
+    message: &str,
+    caption: &str,
+    style: TextEntryDialogStyle,
+) -> Option<String> {
+    let dialog = TextEntryDialog::builder(&frame, message, caption)
+        .with_style(style)
+        .build();
+    let value =
+        (dialog.show_modal_tracked() == ID_OK).then(|| dialog.get_value().unwrap_or_default());
+    dialog.destroy();
+    value.map(|text| text.trim().to_owned())
+}
+
+fn issue_url(summary: &str, details: &str) -> String {
+    let body = format!(
+        "{details}\n\n---\nAccessible IPTV Client {} on {} {}",
+        env!("CARGO_PKG_VERSION"),
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+    );
+    format!(
+        "https://github.com/serrebidev/Accessible-IPTV-Client-Rust/issues/new?title={}&body={}",
+        query_encode(summary),
+        query_encode(&body)
+    )
+}
+
+/// Percent-encode a query value: everything but unreserved ASCII, as UTF-8 bytes.
+fn query_encode(text: &str) -> String {
+    text.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
 }
 
 /// Help > About (audit N25, Python's `AccessibleAboutDialog`):
@@ -28570,6 +28648,15 @@ fn suffix_result_matches(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn issue_link_carries_title_body_and_version() {
+        let url = super::issue_url("Photo & video", "Line 1\nПривет");
+        assert!(url.starts_with(
+            "https://github.com/serrebidev/Accessible-IPTV-Client-Rust/issues/new?title=Photo%20%26%20video&body=Line%201%0A%D0%9F"
+        ));
+        assert!(url.contains(&super::query_encode(env!("CARGO_PKG_VERSION"))));
+        assert!(!url[url.find('?').unwrap()..].contains(['\n', ' ', '#']));
+    }
     use super::*;
     use iptv_core::{search::SearchWorker, BrowseModel};
     use std::sync::Arc;

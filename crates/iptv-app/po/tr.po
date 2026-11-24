@@ -5340,3 +5340,18 @@ msgid ""
 msgstr ""
 "Arama taramaları geçit biletine uyar; sonuç grupları etkileşime yol verir "
 "(#108) (#114)"
+
+msgid "Report an &issue on GitHub..."
+msgstr "GitHub'da &sorun bildir..."
+
+msgid "Describe a problem or an idea, then send it as a GitHub issue"
+msgstr "Bir sorunu veya fikri anlatın, ardından GitHub sorunu olarak gönderin"
+
+msgid "Report an issue"
+msgstr "Sorun bildir"
+
+msgid "Issue title: one line saying what went wrong or what you would like"
+msgstr "Başlık: neyin yanlış gittiğini veya ne istediğinizi söyleyen tek satır"
+
+msgid "Describe what you did, what happened, and what you expected.\nYour browser then opens GitHub with this filled in. Sign in and press Create."
+msgstr "Ne yaptığınızı, ne olduğunu ve ne beklediğinizi anlatın.\nArdından tarayıcınız GitHub'ı bunlar doldurulmuş olarak açar. Oturum açın ve “Create” düğmesine basın."
