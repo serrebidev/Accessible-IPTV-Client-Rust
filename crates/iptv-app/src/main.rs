@@ -6408,6 +6408,7 @@ pub const PREVIOUS_CHANNEL: i32 = 5126;
 pub const RECENT_CHANNELS: i32 = 5127;
 pub const CHANNEL_NUMBER: i32 = 5128;
 pub const SHOW_DOWNLOADS: i32 = 5129;
+pub const ASSIGN_GUIDE: i32 = 5130;
 pub const PLAYER_RADIO_BASE: i32 = 5131;
 pub const CUSTOM_PLAYER: i32 = 5163;
 pub const PREFERRED_AUDIO: i32 = 5164;
@@ -6810,6 +6811,13 @@ fn build_view_menu(keys: &std::collections::BTreeMap<String, String>) -> Menu {
         &view_menu,
         CHANNEL_NUMBER,
         &menu_label(keys, "Go to Channel &Number...", "channel_number"),
+        "",
+        ItemKind::Normal,
+    );
+    menu_add(
+        &view_menu,
+        ASSIGN_GUIDE,
+        "Assign Programme Guide...",
         "",
         ItemKind::Normal,
     );
@@ -7771,6 +7779,7 @@ fn menu_item_topic(id: i32) -> Option<&'static str> {
         IMPORT_EPG => "import-epg",
         WHATS_ON_NOW => "whats-on-now",
         CONTINUE_WATCHING => "continue-watching",
+        ASSIGN_GUIDE => "epg",
         VIEW_VOD => "video-on-demand",
         FAVORITE | GO_TO_FAVORITES | CTX_FAVORITE => "favorites",
         ACCOUNT_INFO => "account-info",
@@ -7912,6 +7921,7 @@ fn bind_menu_actions(frame: Frame, wiring: &Wiring, controls: Controls) {
                 }
             }
             CHANNEL_NUMBER => menu_go_to_channel_number(&wiring, frame, list, status),
+            ASSIGN_GUIDE => open_assign_programme_guide(&wiring, frame, list, status),
             _ => {}
         }
     });
@@ -17885,6 +17895,227 @@ fn open_recent_channels(wiring: &Wiring, status: Status) {
     });
     close.on_click(move |_| frame.hide());
     frame.show(true);
+}
+
+/// One filter pass for the Assign dialog (Python
+/// `EpgMappingDialog.filter`): case-folded substring match on
+/// name plus id, capped at 500 rows with an explicit count.
+fn render_assign_rows(
+    all_rows: &[(String, String)],
+    showing: &Rc<RefCell<Vec<(String, String)>>>,
+    guide_list: ListBox,
+    status_label: StaticText,
+    query: &str,
+) {
+    let query = query.trim().to_lowercase();
+    let matches: Vec<(String, String)> = all_rows
+        .iter()
+        .filter(|(id, name)| {
+            let haystack = format!("{name} {id}").to_lowercase();
+            query.is_empty() || haystack.contains(&query)
+        })
+        .cloned()
+        .collect();
+    let shown: Vec<(String, String)> = matches.iter().take(500).cloned().collect();
+    let labels: Vec<String> = shown
+        .iter()
+        .map(|(id, name)| format!("{name} [{id}]"))
+        .collect();
+    guide_list.set_items(&labels.iter().map(String::as_str).collect::<Vec<_>>());
+    guide_list.set_selection(0, true);
+    status_label.set_label(&trf(
+        "Showing {count} of {total} matching channels. Refine the search if needed.",
+        &[
+            ("count", &shown.len().to_string()),
+            ("total", &matches.len().to_string()),
+        ],
+    ));
+    *showing.borrow_mut() = shown;
+}
+
+/// Persist one Assign outcome (Python `_assign_programme_guide`):
+/// save the override, reload the process-wide table, and
+/// advance the guide generation so the suffix worker rebuilds
+/// its matches instead of reusing the cached ones.
+fn save_assign_value(
+    wiring: &Wiring,
+    channel: &Channel,
+    before_ptr: usize,
+    value: &str,
+    dialog: Frame,
+    status: Status,
+) {
+    if wiring.model.borrow().playlist_ptr() != before_ptr {
+        operation_failed_box(
+            &dialog,
+            &tr("The playlists changed. Select the channel again."),
+        );
+        return;
+    }
+    let full = serde_json::Value::Object(wiring.persist.config.borrow().raw().clone());
+    let overrides = iptv_core::channel_preferences::with_assignment(&full, channel, value);
+    wiring.persist.set_and_save(
+        iptv_core::channel_preferences::OVERRIDES_KEY,
+        overrides.clone(),
+    );
+    let mut raw = wiring.persist.config.borrow().raw().clone();
+    raw.insert(
+        iptv_core::channel_preferences::OVERRIDES_KEY.to_string(),
+        overrides,
+    );
+    iptv_core::channel_preferences::configure(&serde_json::Value::Object(raw));
+    wiring
+        .guide_generation
+        .set(wiring.guide_generation.get() + 1);
+    request_suffix_refresh(wiring);
+    dialog.hide();
+    status.set_label(&tr("Programme guide assignment saved."));
+}
+
+/// View > Assign Programme Guide... (C10, Python
+/// `EpgMappingDialog`): per-channel override of the guide
+/// channel, stored under `epg_channel_overrides` and honoured
+/// by `channel_preferences` in every guide lookup. Use
+/// Automatic Matching clears the override. A save busts the
+/// suffix matches by advancing the guide generation, the
+/// Rust equivalent of Python clearing its program-match and
+/// epg-match caches and forcing a now-playing refresh.
+#[allow(clippy::too_many_lines)] // one dialog flow, as in Python
+fn open_assign_programme_guide(wiring: &Wiring, parent: Frame, list: ListCtrl, status: Status) {
+    let Some(channel) = selected_channel(wiring, list) else {
+        status.set_label(&tr("Select a live channel first."));
+        return;
+    };
+    // Rust's Channel carries no movie kind, as Python's dict does;
+    // the channel list holds live channels here, so the guard above
+    // covers Python's non-live refusal.
+    let before_ptr = wiring.model.borrow().playlist_ptr();
+    let rows: Vec<(String, String)> = match (|| -> Result<Vec<(String, String)>, String> {
+        let store = iptv_core::epgstore::EpgStore::open(&epg_store_path())?;
+        let mut rows: Vec<(String, String)> = store
+            .channels()?
+            .into_iter()
+            .map(|guide| {
+                let name = if guide.display_name.trim().is_empty() {
+                    guide.id.clone()
+                } else {
+                    guide.display_name
+                };
+                (guide.id, name)
+            })
+            .collect();
+        rows.sort_by(|a, b| {
+            a.1.to_lowercase()
+                .cmp(&b.1.to_lowercase())
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        Ok(rows)
+    })() {
+        Ok(rows) => rows,
+        Err(error) => {
+            operation_failed_box(&parent, &error);
+            return;
+        }
+    };
+    let initial = iptv_core::channel_preferences::epg_id(&channel);
+    let frame = Frame::builder()
+        .with_title(&tr("Assign Programme Guide"))
+        .with_size(Size::new(670, 480))
+        .build();
+    frame.set_accessibility_label(&tr("Assign Programme Guide"));
+    bind_escape_hide(frame);
+    let panel = Panel::builder(&frame).build();
+    let channel_label = StaticText::builder(&panel)
+        .with_label(&trf("Channel: {name}", &[("name", &channel.name)]))
+        .build();
+    let search_label = StaticText::builder(&panel)
+        .with_label(&tr("Search guide channels:"))
+        .build();
+    let search = TextCtrl::builder(&panel).with_value(&initial).build();
+    search.set_accessibility_label(&tr("Search guide channels:"));
+    let guide_list = ListBox::builder(&panel).build();
+    guide_list.set_accessibility_label(&tr("Programme guide channels"));
+    let status_label = StaticText::builder(&panel)
+        .with_label(&tr("Loading guide channels..."))
+        .build();
+    let automatic = Button::builder(&panel)
+        .with_label(&tr("Use Automatic Matching"))
+        .build();
+    let ok = Button::builder(&panel).with_label("&OK").build();
+    let cancel = Button::builder(&panel).with_label("&Cancel").build();
+    let layout = BoxSizer::builder(Orientation::Vertical).build();
+    layout.add(&channel_label, 0, SizerFlag::All, 8);
+    layout.add(&search_label, 0, SizerFlag::All, 8);
+    layout.add(&search, 0, SizerFlag::Expand | SizerFlag::All, 8);
+    layout.add(&guide_list, 1, SizerFlag::Expand | SizerFlag::All, 8);
+    layout.add(&status_label, 0, SizerFlag::Expand | SizerFlag::All, 8);
+    layout.add(&automatic, 0, SizerFlag::All, 8);
+    let buttons = BoxSizer::builder(Orientation::Horizontal).build();
+    buttons.add(&ok, 0, SizerFlag::All, 4);
+    buttons.add(&cancel, 0, SizerFlag::All, 4);
+    layout.add_sizer(&buttons, 0, SizerFlag::Expand, 0);
+    panel.set_sizer(layout, true);
+    let all_rows = Rc::new(rows);
+    let showing: Rc<RefCell<Vec<(String, String)>>> = Rc::new(RefCell::new(Vec::new()));
+    render_assign_rows(&all_rows, &showing, guide_list, status_label, &initial);
+    {
+        let all_rows = Rc::clone(&all_rows);
+        let showing = Rc::clone(&showing);
+        search.bind_internal(EventType::TEXT, move |_| {
+            render_assign_rows(
+                &all_rows,
+                &showing,
+                guide_list,
+                status_label,
+                &search.get_value(),
+            );
+        });
+    }
+    {
+        let wiring = clone_wiring(wiring);
+        let channel = channel.clone();
+        let showing = Rc::clone(&showing);
+        ok.on_click(move |_| {
+            let Some(selection) = guide_list.get_selection() else {
+                status_label.set_label(&tr(
+                    "Select a programme guide channel, or choose automatic matching.",
+                ));
+                return;
+            };
+            let index = usize::try_from(selection).unwrap_or(usize::MAX);
+            if let Some((id, _)) = showing.borrow().get(index).cloned() {
+                save_assign_value(&wiring, &channel, before_ptr, &id, frame, status);
+            } else {
+                status_label.set_label(&tr(
+                    "Select a programme guide channel, or choose automatic matching.",
+                ));
+            }
+        });
+    }
+    {
+        let wiring = clone_wiring(wiring);
+        let channel = channel.clone();
+        automatic.on_click(move |_| {
+            save_assign_value(&wiring, &channel, before_ptr, "", frame, status);
+        });
+    }
+    {
+        let wiring = clone_wiring(wiring);
+        let channel = channel.clone();
+        let showing = Rc::clone(&showing);
+        guide_list.bind_internal(EventType::COMMAND_LISTBOX_DOUBLECLICKED, move |_| {
+            let Some(selection) = guide_list.get_selection() else {
+                return;
+            };
+            let index = usize::try_from(selection).unwrap_or(usize::MAX);
+            if let Some((id, _)) = showing.borrow().get(index).cloned() {
+                save_assign_value(&wiring, &channel, before_ptr, &id, frame, status);
+            }
+        });
+    }
+    cancel.on_click(move |_| frame.hide());
+    frame.show(true);
+    search.set_focus();
 }
 
 /// The Reminders dialog (audit R13): rows carry time, title,

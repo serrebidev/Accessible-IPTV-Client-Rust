@@ -1334,9 +1334,9 @@ Checked and not gaps: Python's start-at-100-percent volume fix (Rust never reads
 - **C7, medium: Recording Playback Queue and play from Problem Times.** Python `recording_queue.py`, `recording_library_ui.py`.
 - **C8, medium: Automatically Play the Next Episode.** Python `episode_continuation_ui.py`.
 - **C9, high: full backup (`accessible-iptv-settings-v2`).** **Fixed 2026-11-23 (validation 0103); also moves reminders into Python's reminder file, which Rust never read.** Python `full_backup.py`.
-- **C10, medium: Assign Programme Guide.** Python `accessible_tools_ui.py`.
+- **C10, medium: Assign Programme Guide.** **Fixed 2026-11-24 (validation 0104).** Python `accessible_tools_ui.py`.
 - **C11, medium: Saved Programme Searches.** Python `saved_searches.py`.
-- **C12, high: guide ids scoped per guide source.** Python's EPG import keeps a shared XMLTV id but splits it into `epg:<source_key>:<id>` when two sources collide or a source renames a shared id (`channels.xmltv_id`, `channel_sources`), and matching resolves an unscoped duplicate by one exact, number-safe display name (`choose_source_collision`). Python `playlist.py:1473`, `:2120`, `channel_identity.py`. Found by the scope sweep.
+- **C12, high: guide ids scoped per guide source.** **Fixed 2026-11-24 (validation 0104, with C10).** Python's EPG import keeps a shared XMLTV id but splits it into `epg:<source_key>:<id>` when two sources collide or a source renames a shared id (`channels.xmltv_id`, `channel_sources`), and matching resolves an unscoped duplicate by one exact, number-safe display name (`choose_source_collision`). Python `playlist.py:1473`, `:2120`, `channel_identity.py`. Found by the scope sweep.
 - **M1, medium: Mute / Unmute and Remember Volume for Each Channel.** Python `channel_preferences.py`.
 - **M2, medium: on-demand seek keys, Go to Time, time announcement.** Python `media_navigation.py`.
 - **M3, low: Named Bookmarks.** Python `named_bookmarks.py`.
