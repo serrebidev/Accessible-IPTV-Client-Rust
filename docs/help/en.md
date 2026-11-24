@@ -349,6 +349,8 @@ The program asks before it closes while any scheduled recordings are still waiti
 
 Recording Conflicts in Scheduled Recordings lists overlaps for one selected entry, including padding. Details include the channel, configured account alias and actual recording window. Edit Times opens the existing timing editor. A conflict confirmation also offers these details and Schedule Anyway. Known account budgets restrict the comparison to that account; unknown budgets show time overlaps without claiming a provider limit.
 
+Recordings > Recording Connection Limits sets the connections available to recordings for each provider account: 1–64, or 0 for no additional limit. Allow for playback and other devices; this setting does not discover the provider's actual limit. Scheduling checks the peak number of simultaneous recording connections for the same known account. Exceeding its budget requires confirmation; without a known budget, overlapping schedules receive the usual warning. A new recording is refused when its budget is full; existing recordings continue. A recording using the player's local buffer does not count as another provider connection. Existing single-stream protections still apply.
+
 ### Schedule padding {#schedule-padding}
 
 Programmes rarely start and end exactly on time. Recordings > Schedule Padding sets how many minutes before a programme a scheduled recording starts, and how many minutes after it ends it keeps recording. Manual recordings are not affected. Catch-up downloads use the same minutes: the archive window requested from the provider is widened by them whenever the provider can serve it, and the download is retried when the file arrives shorter than the programme.
