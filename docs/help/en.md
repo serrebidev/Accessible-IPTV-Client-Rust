@@ -418,7 +418,7 @@ The Options menu holds the program's settings. Each one is saved as soon as you 
 - Show Player on Enter: when on, playing a channel shows the built-in player window. When off, playback starts and focus stays in the channel list.
 - Show Stream URL: adds the Stream URL field after the episode description in the main window.
 - Auto-check for Updates: see Updates.
-- Automatic Announcements: choose None, Errors only, Important events or Detailed status for automatic player and channel feedback.
+- Automatic Announcements: choose None, Errors only, Important events or Detailed status for automatic player and channel feedback. The same menu switches three kinds of announcements on or off separately: Playback, Subtitles and Guide.
 - Keyboard Shortcuts: the editor lists every command for the main window and the player window with its current key combination, and you can search the list. Choose Edit on a command and type the new combination (for example Ctrl+Shift+F); a combination another command already uses is rejected with a message. Reset All restores every default. Changes save at once and apply to menus and keys right away.
 - Export Settings and Import Settings: save or restore an encrypted backup of playlists, guide sources, favorites and preferences. Keep the backup password; you need it to restore provider credentials.
 
