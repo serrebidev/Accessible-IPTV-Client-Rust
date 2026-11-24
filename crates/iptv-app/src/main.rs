@@ -694,6 +694,9 @@ struct Wiring {
     /// Minimize to System Tray must not swallow it, and the
     /// exit warnings run (audit N07, Python's `_exit_requested`).
     exit_requested: Rc<std::cell::Cell<bool>>,
+    /// A staged restore closes the app without the exit warnings
+    /// (Python's `_exit_forced`).
+    exit_forced: Rc<std::cell::Cell<bool>>,
     last_dvr_tick: Rc<std::cell::Cell<f64>>,
     scope_ids: Rc<RefCell<Vec<Option<String>>>>,
     /// N22: category-tree branch labels by scope id, filled with
@@ -1261,7 +1264,31 @@ fn bind_browser(
     epg_rows: Rc<RefCell<Vec<EpgSearchRow>>>,
 ) {
     let candidates = config::config_candidates();
-    let loaded = config::load(&candidates, &config::default_write_target());
+    let mut loaded = config::load(&candidates, &config::default_write_target());
+    // Python: a staged restore finishes before any scheduler,
+    // reminder or playlist worker can read these files.
+    let targets = iptv_core::settings_backup::RestoreTargets::new(
+        loaded.path.clone(),
+        iptv_core::dvr::schedule_path(&loaded.path),
+    );
+    match iptv_core::settings_backup::apply_pending(&targets, now_seconds()) {
+        Ok(true) => loaded = config::load(&candidates, &config::default_write_target()),
+        Ok(false) => {}
+        Err(error) => {
+            let message = MessageDialog::builder(
+                &frame,
+                &trf(
+                    "Could not finish restoring the backup. No background services were started.\n{error}",
+                    &[("error", &error)],
+                ),
+                &tr("Settings Backup"),
+            )
+            .with_style(MessageDialogStyle::OK | MessageDialogStyle::IconError)
+            .build();
+            message.show_modal_tracked();
+            std::process::exit(1);
+        }
+    }
     init_app_log(&loaded);
     if !loaded.config.bool_or("show_channel_url", true) {
         controls.stream_url.hide();
@@ -1337,6 +1364,7 @@ fn bind_browser(
         recorded: Rc::new(std::cell::Cell::new(false)),
         shutdown_attempted: Rc::new(std::cell::Cell::new(false)),
         exit_requested: Rc::new(std::cell::Cell::new(false)),
+        exit_forced: Rc::new(std::cell::Cell::new(false)),
         last_dvr_tick: Rc::new(std::cell::Cell::new(0.0)),
         scope_ids: Rc::new(RefCell::new(vec![None])),
         branch_labels: Rc::new(RefCell::new(std::collections::BTreeMap::new())),
@@ -1549,11 +1577,13 @@ fn bind_main_close(frame: Frame, wiring: &Wiring) {
     let close_reminders = Rc::clone(&wiring.reminders);
     let close_downloads = Rc::clone(&wiring.downloads);
     let close_exit_requested = Rc::clone(&wiring.exit_requested);
+    let close_exit_forced = Rc::clone(&wiring.exit_forced);
     frame.bind_internal(EventType::CLOSE_WINDOW, move |event| {
-        if close_persist
-            .config
-            .borrow()
-            .bool_or("minimize_to_tray", false)
+        if !close_exit_forced.get()
+            && close_persist
+                .config
+                .borrow()
+                .bool_or("minimize_to_tray", false)
             && !close_exit_requested.get()
         {
             // A plain close with Minimize to System Tray hides
@@ -1569,7 +1599,9 @@ fn bind_main_close(frame: Frame, wiring: &Wiring) {
         // started, and a download in flight each get Python's
         // confirmation, in Python's order; declining any of
         // them vetoes the exit.
-        let prompts = {
+        let prompts = if close_exit_forced.get() {
+            Vec::new()
+        } else {
             let dvr = close_dvr.borrow();
             #[allow(clippy::cast_possible_truncation)] // epoch seconds for reminder expiry
             let now_i64 = now_seconds() as i64;
@@ -6178,6 +6210,7 @@ fn clone_wiring(wiring: &Wiring) -> Wiring {
         recorded: Rc::clone(&wiring.recorded),
         shutdown_attempted: Rc::clone(&wiring.shutdown_attempted),
         exit_requested: Rc::clone(&wiring.exit_requested),
+        exit_forced: Rc::clone(&wiring.exit_forced),
         last_dvr_tick: Rc::clone(&wiring.last_dvr_tick),
         scope_ids: Rc::clone(&wiring.scope_ids),
         branch_labels: Rc::clone(&wiring.branch_labels),
@@ -8644,15 +8677,38 @@ fn backup_password(frame: Frame, confirm: bool) -> Option<String> {
     Some(password)
 }
 
-/// Options > Export Settings...: write the encrypted backup
-/// (Python's Fernet format, interchangeable with the Python
-/// client) after the two-entry password prompt.
+/// The settings, schedule, reminders and saved-search history a full
+/// backup carries (Python `_export_full_settings`).
+fn current_bundle(wiring: &Wiring) -> Result<serde_json::Value, String> {
+    let config = serde_json::Value::Object(wiring.persist.config.borrow().raw().clone());
+    let jobs = serde_json::to_value(wiring.dvr.borrow().jobs()).map_err(|e| e.to_string())?;
+    let reminders = serde_json::to_value(&*wiring.reminders.borrow()).map_err(|e| e.to_string())?;
+    let targets = restore_targets(wiring);
+    let search_seen = iptv_core::saved_searches::read_seen(&targets.search_seen, now_seconds())?;
+    Ok(serde_json::json!({
+        "config": config,
+        "jobs": jobs,
+        "reminders": reminders,
+        "search_seen": search_seen,
+    }))
+}
+
+fn restore_targets(wiring: &Wiring) -> iptv_core::settings_backup::RestoreTargets {
+    iptv_core::settings_backup::RestoreTargets::new(
+        wiring.persist.path.clone(),
+        iptv_core::dvr::schedule_path(&wiring.persist.path),
+    )
+}
+
+/// Options > Export Settings...: the encrypted full backup (Python's
+/// v2 format, interchangeable with the Python client) after the
+/// two-entry password prompt.
 fn menu_export_settings(wiring: &Wiring, frame: Frame, status: Status) {
     let Some(password) = backup_password(frame, true) else {
         return;
     };
     let dialog = FileDialog::builder(&frame)
-        .with_message("Export Settings")
+        .with_message(&tr("Export Settings"))
         .with_default_file("settings.aiptv")
         .with_wildcard("Accessible IPTV backup (*.aiptv)|*.aiptv|All files (*.*)|*.*")
         .with_style(FileDialogStyle::Save | FileDialogStyle::OverwritePrompt)
@@ -8663,32 +8719,21 @@ fn menu_export_settings(wiring: &Wiring, frame: Frame, status: Status) {
     let Some(path) = dialog.get_path() else {
         return;
     };
-    let config_json = {
-        let config = wiring.persist.config.borrow();
-        serde_json::to_vec(&serde_json::Value::Object(config.raw().clone())).unwrap_or_default()
-    };
-    match iptv_core::settings_backup::export_settings(&config_json, &password) {
-        Ok(bytes) => match std::fs::write(&path, bytes) {
-            Ok(()) => {
-                let _ = MessageDialog::builder(
-                    &frame,
-                    "Encrypted settings backup saved.",
-                    "Settings Backup",
-                )
-                .with_style(MessageDialogStyle::OK)
+    let written = current_bundle(wiring)
+        .and_then(|bundle| {
+            iptv_core::settings_backup::export_bundle(&bundle, &password, now_seconds())
+        })
+        .and_then(|bytes| std::fs::write(&path, bytes).map_err(|e| e.to_string()));
+    match written {
+        Ok(()) => {
+            let text = tr("Encrypted backup saved, including recording schedules, reminders and saved searches.");
+            let _ = MessageDialog::builder(&frame, &text, &tr("Settings Backup"))
+                .with_style(MessageDialogStyle::OK | MessageDialogStyle::IconInformation)
                 .build()
                 .show_modal_tracked();
-                status.set_label("Encrypted settings backup saved.");
-            }
-            Err(error) => status.set_label(&trf(
-                "Could not export settings: {error}",
-                &[("error", &error.to_string())],
-            )),
-        },
-        Err(error) => status.set_label(&trf(
-            "Could not export settings: {error}",
-            &[("error", &error)],
-        )),
+            status.set_label(&text);
+        }
+        Err(error) => operation_failed_box(&frame, &error),
     }
 }
 
@@ -8723,14 +8768,13 @@ fn make_recovery_copy(wiring: &Wiring, frame: Frame, status: Status) -> Option<S
         return None;
     }
     let recovery_path = save.get_path()?;
-    let config_json = {
-        let config = wiring.persist.config.borrow();
-        serde_json::to_vec(&serde_json::Value::Object(config.raw().clone())).unwrap_or_default()
-    };
-    let recovery = match iptv_core::settings_backup::create_verified_recovery(
-        &config_json,
-        &recovery_password,
-    ) {
+    // The copy is a full backup, so the schedule and reminders an
+    // import replaces can be restored too.
+    let bundle = current_bundle(wiring);
+    let recovery = bundle.and_then(|bundle| {
+        iptv_core::settings_backup::export_bundle(&bundle, &recovery_password, now_seconds())
+    });
+    let recovery = match recovery {
         Ok(recovery) => recovery,
         Err(error) => {
             status.set_label(&trf(
@@ -8744,9 +8788,10 @@ fn make_recovery_copy(wiring: &Wiring, frame: Frame, status: Status) -> Option<S
     // read back and decrypted blocks the import.
     let on_disk =
         std::fs::write(&recovery_path, &recovery).and_then(|()| std::fs::read(&recovery_path));
+    let config = serde_json::Value::Object(wiring.persist.config.borrow().raw().clone());
     let verified = on_disk.is_ok_and(|bytes| {
-        iptv_core::settings_backup::verify_recovery(&bytes, &recovery_password, &config_json)
-            .is_ok()
+        iptv_core::settings_backup::import_bundle(&bytes, &recovery_password, now_seconds())
+            .is_ok_and(|restored| restored["config"] == config)
     });
     if !verified {
         status.set_label(
@@ -8795,49 +8840,61 @@ fn menu_import_settings(wiring: &Wiring, frame: Frame, status: Status) {
         status.set_label("Could not import settings: cannot read that file.");
         return;
     };
-    let decrypted = match iptv_core::settings_backup::import_settings(&bytes, &password) {
-        Ok(decrypted) => decrypted,
+    let bundle = match iptv_core::settings_backup::import_bundle(&bytes, &password, now_seconds()) {
+        Ok(bundle) => bundle,
         Err(error) => {
-            status.set_label(&trf(
-                "Could not import settings: {error}",
-                &[("error", &error)],
-            ));
+            operation_failed_box(&frame, &error);
             return;
         }
     };
-    let valid =
-        serde_json::from_slice::<serde_json::Value>(&decrypted).is_ok_and(|v| v.is_object());
-    if !valid {
-        status.set_label("Could not import settings: that backup holds no settings object.");
-        return;
-    }
-    let confirm = MessageDialog::builder(
-        &frame,
-        &format!(
-            "Replace current settings with this backup? A verified recovery copy of your current settings is saved at {recovery_path}. Restart the app after importing."
+    let mut text = match (bundle.get("jobs"), bundle.get("reminders")) {
+        (Some(jobs), Some(reminders)) => trf(
+            "Replace settings, {jobs} recording entries and {reminders} reminders? Started recordings will not restart.",
+            &[
+                ("jobs", &jobs.as_array().map_or(0, Vec::len).to_string()),
+                ("reminders", &reminders.as_array().map_or(0, Vec::len).to_string()),
+            ],
         ),
-        "Import Settings",
-    )
-    .with_style(MessageDialogStyle::YesNo)
-    .build();
-    if confirm.show_modal_tracked() != ID_YES {
+        _ => tr("This older backup replaces settings only. Recording schedules and reminders will be kept."),
+    };
+    text.push_str("\n\n");
+    text.push_str(&tr(
+        "The app will close. Open it again to finish restoring the backup.",
+    ));
+    text.push_str("\n\n");
+    text.push_str(&trf(
+        "A verified recovery copy of your current settings, recordings and reminders is saved at {path}.",
+        &[("path", &recovery_path)],
+    ));
+    if !confirm_box(&frame, &text) {
         return;
     }
     // Rechecked at the moment of applying: work that started
-    // while the dialogs were open still blocks the swap.
-    if let Some(blocker) = import_blocker(wiring) {
-        status.set_label(&trf(
-            "Import canceled: {blocker}. Your settings are unchanged; the recovery copy remains saved.",
-            &[("blocker", blocker)],
-        ));
+    // while the dialogs were open still blocks the restore.
+    let live = wiring.dvr.borrow().jobs().iter().any(|job| {
+        matches!(
+            job.status.as_str(),
+            iptv_core::dvr::STATUS_RECORDING | iptv_core::dvr::STATUS_STOPPING
+        )
+    });
+    if import_blocker(wiring).is_some() || live {
+        operation_failed_box(
+            &frame,
+            "Finish recordings and downloads before restoring a backup.",
+        );
         return;
     }
-    match std::fs::write(&wiring.persist.path, decrypted) {
-        Ok(()) => status.set_label("Settings imported. Restart the app to use them."),
-        Err(error) => status.set_label(&trf(
-            "Could not import settings: {error}",
-            &[("error", &error.to_string())],
-        )),
+    match iptv_core::settings_backup::stage_restore(
+        &bundle,
+        &restore_targets(wiring),
+        now_seconds(),
+    ) {
+        Ok(()) => {
+            wiring.exit_forced.set(true);
+            wiring.exit_requested.set(true);
+            frame.close(false);
+        }
+        Err(error) => operation_failed_box(&frame, &error),
     }
 }
 

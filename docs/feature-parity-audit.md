@@ -1333,7 +1333,7 @@ Checked and not gaps: Python's start-at-100-percent volume fix (Rust never reads
 - **C6, medium: Read Embedded Subtitle Track and Recording Chapters.** Python `recording_media.py`, `media_navigation_ui.py`.
 - **C7, medium: Recording Playback Queue and play from Problem Times.** Python `recording_queue.py`, `recording_library_ui.py`.
 - **C8, medium: Automatically Play the Next Episode.** Python `episode_continuation_ui.py`.
-- **C9, high: full backup (`accessible-iptv-settings-v2`).** Python `full_backup.py`.
+- **C9, high: full backup (`accessible-iptv-settings-v2`).** **Fixed 2026-11-23 (validation 0103); also moves reminders into Python's reminder file, which Rust never read.** Python `full_backup.py`.
 - **C10, medium: Assign Programme Guide.** Python `accessible_tools_ui.py`.
 - **C11, medium: Saved Programme Searches.** Python `saved_searches.py`.
 - **C12, high: guide ids scoped per guide source.** Python's EPG import keeps a shared XMLTV id but splits it into `epg:<source_key>:<id>` when two sources collide or a source renames a shared id (`channels.xmltv_id`, `channel_sources`), and matching resolves an unscoped duplicate by one exact, number-safe display name (`choose_source_collision`). Python `playlist.py:1473`, `:2120`, `channel_identity.py`. Found by the scope sweep.
