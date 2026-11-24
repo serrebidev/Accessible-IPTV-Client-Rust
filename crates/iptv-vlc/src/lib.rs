@@ -33,6 +33,7 @@ type SetTimeFn = unsafe extern "C" fn(*mut c_void, i64);
 type GetTimeFn = unsafe extern "C" fn(*mut c_void) -> i64;
 type GetStateFn = unsafe extern "C" fn(*mut c_void) -> c_int;
 type SetVolumeFn = unsafe extern "C" fn(*mut c_void, c_int) -> c_int;
+type SetMuteFn = unsafe extern "C" fn(*mut c_void, c_int);
 type GetTrackCountFn = unsafe extern "C" fn(*mut c_void) -> c_int;
 type GetTrackDescFn = unsafe extern "C" fn(*mut c_void) -> *mut TrackDescription;
 type SetTrackFn = unsafe extern "C" fn(*mut c_void, c_int) -> c_int;
@@ -226,6 +227,7 @@ struct Functions {
     get_length: GetTimeFn,
     get_state: GetStateFn,
     set_volume: SetVolumeFn,
+    set_mute: Option<SetMuteFn>,
     get_track_count: GetTrackCountFn,
     get_track_description: GetTrackDescFn,
     set_track: SetTrackFn,
@@ -440,6 +442,9 @@ impl VlcEngine {
             get_length: sym!(b"libvlc_media_player_get_length", GetTimeFn),
             get_state: sym!(b"libvlc_media_player_get_state", GetStateFn),
             set_volume: sym!(b"libvlc_audio_set_volume", SetVolumeFn),
+            set_mute: unsafe { lib.get::<SetMuteFn>(b"libvlc_audio_set_mute") }
+                .ok()
+                .map(|s| *s),
             get_track_count: sym!(b"libvlc_audio_get_track_count", GetTrackCountFn),
             get_track_description: sym!(b"libvlc_audio_get_track_description", GetTrackDescFn),
             set_track: sym!(b"libvlc_audio_set_track", SetTrackFn),
@@ -620,6 +625,20 @@ impl VlcEngine {
     /// so quiet streams can be boosted, VLC-style).
     pub fn set_volume(&self, percent: i32) {
         unsafe { (self.inner.fns.set_volume)(self.inner.player, percent.clamp(0, 200)) };
+    }
+
+    /// Set the mute state (`libvlc_audio_set_mute`). Returns false
+    /// when the loaded libVLC has no such entry point, so the caller
+    /// can report Python's "could not change its mute state" line
+    /// instead of claiming a mute that never happened.
+    pub fn set_mute(&self, muted: bool) -> bool {
+        match self.inner.fns.set_mute {
+            Some(set_mute) => {
+                unsafe { set_mute(self.inner.player, c_int::from(muted)) };
+                true
+            }
+            None => false,
+        }
     }
 
     /// The audio tracks as (id, name) pairs.

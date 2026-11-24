@@ -1387,9 +1387,9 @@ pub fn bitrate_hint_from_url(url: &str) -> Option<f64> {
 /// The player status line (Python's `_update_status_label`
 /// format, audit N23): `{prefix} {buffer:.1}s buffer`
 /// plus ` | ~{mbps:.1} Mbps` when a bitrate is known, the
-/// always-present ` | Vol {volume}%`, and ` | Audio: {track}`
-/// when a track label is known. The whole line is stripped,
-/// like Python's.
+/// always-present ` | Vol {volume}%`, ` | Muted` when muted, and
+/// ` | Audio: {track}` when a track label is known. The whole line
+/// is stripped, like Python's.
 #[must_use]
 pub fn player_status_line(
     prefix: &str,
@@ -1397,6 +1397,7 @@ pub fn player_status_line(
     bitrate_mbps: Option<f64>,
     volume: i32,
     audio_track: &str,
+    muted: bool,
 ) -> String {
     use std::fmt::Write as _;
     let mut line = String::new();
@@ -1411,6 +1412,9 @@ pub fn player_status_line(
         }
     }
     let _ = write!(line, " | Vol {volume}%");
+    if muted {
+        line.push_str(" | Muted");
+    }
     if !audio_track.is_empty() {
         let _ = write!(line, " | Audio: {audio_track}");
     }
@@ -1988,19 +1992,25 @@ mod tests {
     #[test]
     fn status_line_matches_python_format() {
         assert_eq!(
-            player_status_line("Audio: English", 25.0, Some(8.0), 40, "English"),
+            player_status_line("Audio: English", 25.0, Some(8.0), 40, "English", false),
             "Audio: English 25.0s buffer | ~8.0 Mbps | Vol 40% | Audio: English"
         );
         // No prefix, no bitrate, no track: buffer and Vol only.
         assert_eq!(
-            player_status_line("", 0.5, None, 100, ""),
+            player_status_line("", 0.5, None, 100, "", false),
             "0.5s buffer | Vol 100%"
         );
         // A zero bitrate omits the segment, like Python's
         // truthiness check.
         assert_eq!(
-            player_status_line("Reconnecting...", 25.0, Some(0.0), 40, ""),
+            player_status_line("Reconnecting...", 25.0, Some(0.0), 40, "", false),
             "Reconnecting... 25.0s buffer | Vol 40%"
+        );
+        // Muted rides the volume segment, before the track, as in
+        // Python's `_update_status_label`.
+        assert_eq!(
+            player_status_line("", 0.5, None, 40, "English", true),
+            "0.5s buffer | Vol 40% | Muted | Audio: English"
         );
     }
 }
