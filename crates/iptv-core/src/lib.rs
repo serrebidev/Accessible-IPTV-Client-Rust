@@ -51,6 +51,7 @@ pub mod epg;
 pub mod epgstore;
 pub mod episode_continuation;
 pub mod exit_guard;
+pub mod favorite_collections;
 pub mod favorites;
 pub mod guide;
 pub mod guide_match;

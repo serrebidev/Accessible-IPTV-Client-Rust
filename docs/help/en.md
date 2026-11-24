@@ -393,6 +393,10 @@ It never fires while something is still recording or waiting in the schedule. Wh
 
 View > Notification History retains the latest 200 queued notifications for the current session. Select an entry to read its Details; Refresh updates the list, and Copy Details copies the selected text. Obvious credentials in URLs and credential lines are masked in this history and its copied text. This is not a guarantee that arbitrary messages contain no private information. Clear History asks for confirmation. The history is discarded when the application closes; existing log files are unchanged.
 
+In a named favourite list, select an unavailable channel and choose Relink Missing Channel. Search for its replacement and confirm your choice. The entry keeps its position in the list.
+
+- View > Favourite Lists manages up to 50 named lists of 2000 channels each, separate from the original favourites. Select a channel before opening the dialog to add it. Move Up/Down or Ctrl+Up/Down changes order. Missing channels remain listed and cannot play until available again.
+
 ## Casting {#casting}
 
 Casting sends a channel to a TV or speaker on your network: DLNA and UPnP renderers, Sonos speakers and Roku players. Chromecast and AirPlay are not supported in this build.

@@ -241,6 +241,19 @@ impl Config {
             let list = coerce_string_list(self.values.get(key));
             self.values.insert(key.to_string(), json!(list));
         }
+        // Named favourite lists normalize at load, as Python's
+        // options.py does for `favorite_collections`.
+        let collections =
+            crate::favorite_collections::normalize(self.values.get("favorite_collections"));
+        self.values.insert(
+            "favorite_collections".to_string(),
+            Value::Array(
+                collections
+                    .iter()
+                    .map(crate::favorite_collections::FavList::to_value)
+                    .collect(),
+            ),
+        );
         // Guide source lists are string lists in both spellings:
         // Python's `epgs` (the key its manager and backup format
         // use) and this port's legacy `epg_urls`. Normalizing both

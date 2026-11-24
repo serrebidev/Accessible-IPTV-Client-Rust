@@ -7092,6 +7092,7 @@ pub const FAVORITE: i32 = 5124;
 pub const GO_TO_FAVORITES: i32 = 5125;
 pub const PREVIOUS_CHANNEL: i32 = 5126;
 pub const RECENT_CHANNELS: i32 = 5127;
+pub const FAVOURITE_LISTS: i32 = 5471;
 pub const CHANNEL_NUMBER: i32 = 5128;
 pub const SHOW_DOWNLOADS: i32 = 5129;
 pub const ASSIGN_GUIDE: i32 = 5130;
@@ -7546,6 +7547,13 @@ fn build_view_menu(keys: &std::collections::BTreeMap<String, String>) -> Menu {
         &view_menu,
         NOTIFICATION_HISTORY_ID,
         "Notification History...",
+        "",
+        ItemKind::Normal,
+    );
+    menu_add(
+        &view_menu,
+        FAVOURITE_LISTS,
+        "Favourite Lists...",
         "",
         ItemKind::Normal,
     );
@@ -8580,7 +8588,7 @@ fn menu_item_topic(id: i32) -> Option<&'static str> {
         WHATS_ON_NOW => "whats-on-now",
         CONTINUE_WATCHING => "continue-watching",
         ASSIGN_GUIDE => "epg",
-        SAVED_SEARCHES => "personal-tools",
+        SAVED_SEARCHES | FAVOURITE_LISTS => "personal-tools",
         VIEW_VOD | AUTO_NEXT_EPISODE => "video-on-demand",
         FAVORITE | GO_TO_FAVORITES | CTX_FAVORITE => "favorites",
         ACCOUNT_INFO => "account-info",
@@ -8763,6 +8771,7 @@ fn bind_menu_actions(frame: Frame, wiring: &Wiring, controls: Controls) {
             ASSIGN_GUIDE => open_assign_programme_guide(&wiring, frame, list, status),
             SAVED_SEARCHES => open_saved_searches_dialog(&wiring, frame, list, status),
             NOTIFICATION_HISTORY_ID => show_notification_history(frame),
+            FAVOURITE_LISTS => open_favourite_lists(&wiring, frame, list, status),
             _ => {}
         }
     });
@@ -21602,6 +21611,900 @@ fn open_recent_channels(wiring: &Wiring, status: Status) {
         }
     });
     close.on_click(move |_| frame.hide());
+    frame.show(true);
+}
+
+/// Apply one favourite-list operation to the live config
+/// value (Python `FavouriteListsDialog._change`): save on
+/// success, show Python's error box on failure.
+fn favourite_apply(
+    wiring: &Wiring,
+    parent: Frame,
+    op: impl FnOnce(
+        &serde_json::Value,
+    ) -> Result<Vec<iptv_core::favorite_collections::FavList>, &'static str>,
+) -> Option<Vec<iptv_core::favorite_collections::FavList>> {
+    let current = wiring
+        .persist
+        .config
+        .borrow()
+        .raw()
+        .get("favorite_collections")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    match op(&current) {
+        Ok(rows) => {
+            wiring.persist.set_and_save(
+                "favorite_collections",
+                serde_json::Value::Array(
+                    rows.iter()
+                        .map(iptv_core::favorite_collections::FavList::to_value)
+                        .collect(),
+                ),
+            );
+            Some(rows)
+        }
+        Err(error) => {
+            operation_failed_box(&parent, error);
+            None
+        }
+    }
+}
+
+/// The list row selected in the Favourite Lists dialog.
+fn favourite_selected_list(
+    rows: &Rc<RefCell<Vec<iptv_core::favorite_collections::FavList>>>,
+    lists_box: ListBox,
+) -> Option<iptv_core::favorite_collections::FavList> {
+    let index = usize::try_from(lists_box.get_selection()?).ok()?;
+    rows.borrow().get(index).cloned()
+}
+
+/// The channel entry selected in the Favourite Lists dialog.
+fn favourite_selected_entry(
+    rows: &Rc<RefCell<Vec<iptv_core::favorite_collections::FavList>>>,
+    lists_box: ListBox,
+    entries_box: ListBox,
+) -> Option<iptv_core::favorite_collections::FavEntry> {
+    let row = favourite_selected_list(rows, lists_box)?;
+    let index = usize::try_from(entries_box.get_selection()?).ok()?;
+    row.entries.get(index).cloned()
+}
+
+/// Python `personal_tools_ui.text_entry`: a one-line prompt
+/// whose message and caption are the same text.
+fn favourite_text_entry(parent: Frame, label: &str, value: &str) -> Option<String> {
+    let dialog = TextEntryDialog::builder(&parent, &tr(label), &tr(label))
+        .with_default_value(value)
+        .build();
+    if dialog.show_modal_tracked() != ID_OK {
+        return None;
+    }
+    dialog.get_value()
+}
+
+/// The Favourite Lists dialog (Python
+/// `personal_tools_ui.FavouriteListsDialog`): up to 50 named
+/// lists, each an ordered set of channels, with portable
+/// export / import and relinking of missing channels. The
+/// channel selected in the main window when the dialog opens
+/// is the one Add Selected Channel offers. Python resolves
+/// on background threads; the Rust core calls are fast
+/// enough to run inline, so the channel snapshot is taken
+/// once at open instead of re-checking list identity.
+#[allow(clippy::too_many_lines)]
+fn open_favourite_lists(wiring: &Wiring, parent: Frame, list: ListCtrl, status: Status) {
+    use iptv_core::favorite_collections as fc;
+    let selected = selected_channel(wiring, list);
+    let channels: Rc<Vec<Channel>> = Rc::new(
+        wiring
+            .browser
+            .borrow()
+            .catalogue_model()
+            .channels()
+            .to_vec(),
+    );
+    let frame = Frame::builder()
+        .with_title(&tr("Favourite Lists"))
+        .with_size(Size::new(740, 540))
+        .build();
+    frame.set_accessibility_label(&tr("Favourite Lists"));
+    bind_escape_hide(frame);
+    let panel = Panel::builder(&frame).build();
+    let lists_label = StaticText::builder(&panel)
+        .with_label(&tr("Favourite Lists"))
+        .build();
+    let lists_box = ListBox::builder(&panel).build();
+    lists_box.set_accessibility_label(&tr("Favourite Lists"));
+    let entries_label = StaticText::builder(&panel)
+        .with_label(&tr("Channels"))
+        .build();
+    let entries_box = ListBox::builder(&panel).build();
+    entries_box.set_accessibility_label(&tr("Channels"));
+    let status_line = StaticText::builder(&panel).with_label("").build();
+    status_line.set_accessibility_label(&tr("Status"));
+    let new_button = Button::builder(&panel).with_label(&tr("New...")).build();
+    let rename_button = Button::builder(&panel).with_label(&tr("Rename...")).build();
+    let delete_button = Button::builder(&panel)
+        .with_label(&tr("Delete List"))
+        .build();
+    let add_button = Button::builder(&panel)
+        .with_label(&tr("Add Selected Channel"))
+        .build();
+    let remove_button = Button::builder(&panel)
+        .with_label(&tr("Remove Channel"))
+        .build();
+    let relink_button = Button::builder(&panel)
+        .with_label(&tr("Relink Missing Channel..."))
+        .build();
+    let export_button = Button::builder(&panel)
+        .with_label(&tr("Export Favourite List..."))
+        .build();
+    let import_button = Button::builder(&panel)
+        .with_label(&tr("Import Favourite List..."))
+        .build();
+    let up_button = Button::builder(&panel).with_label(&tr("Move Up")).build();
+    let down_button = Button::builder(&panel).with_label(&tr("Move Down")).build();
+    let play_button = Button::builder(&panel).with_label(&tr("Play")).build();
+    let close_button = Button::builder(&panel).with_label(&tr("Close")).build();
+    let layout = BoxSizer::builder(Orientation::Vertical).build();
+    layout.add(&lists_label, 0, SizerFlag::All, 8);
+    layout.add(&lists_box, 1, SizerFlag::Expand | SizerFlag::All, 8);
+    layout.add(&entries_label, 0, SizerFlag::All, 8);
+    layout.add(&entries_box, 1, SizerFlag::Expand | SizerFlag::All, 8);
+    layout.add(&status_line, 0, SizerFlag::Expand | SizerFlag::All, 8);
+    let row_one = BoxSizer::builder(Orientation::Horizontal).build();
+    for button in [
+        new_button,
+        rename_button,
+        delete_button,
+        add_button,
+        remove_button,
+        relink_button,
+    ] {
+        row_one.add(&button, 0, SizerFlag::All, 4);
+    }
+    layout.add_sizer(&row_one, 0, SizerFlag::Expand, 0);
+    let row_two = BoxSizer::builder(Orientation::Horizontal).build();
+    for button in [
+        export_button,
+        import_button,
+        up_button,
+        down_button,
+        play_button,
+        close_button,
+    ] {
+        row_two.add(&button, 0, SizerFlag::All, 4);
+    }
+    layout.add_sizer(&row_two, 0, SizerFlag::Expand, 0);
+    panel.set_sizer(layout, true);
+
+    let rows: Rc<RefCell<Vec<fc::FavList>>> = Rc::new(RefCell::new(fc::normalize(
+        wiring
+            .persist
+            .config
+            .borrow()
+            .raw()
+            .get("favorite_collections"),
+    )));
+    // Python `_entries`: fill the channel list for the
+    // selected list and say which main-window channel Add
+    // would use.
+    let render_entries: Rc<dyn Fn(Option<String>)> = {
+        let rows = Rc::clone(&rows);
+        let selected = selected.clone();
+        Rc::new(move |keep_entry: Option<String>| {
+            let row = favourite_selected_list(&rows, lists_box);
+            let entries: Vec<fc::FavEntry> = row.map_or_else(Vec::new, |r| r.entries);
+            let names: Vec<String> = entries
+                .iter()
+                .map(|e| {
+                    if e.name.is_empty() {
+                        tr("(No channel name)")
+                    } else {
+                        e.name.clone()
+                    }
+                })
+                .collect();
+            let labels = fc::variant_labels(&names, &tr("Variant {number}"));
+            entries_box.set_items(&labels.iter().map(String::as_str).collect::<Vec<_>>());
+            if !entries.is_empty() {
+                let index = keep_entry
+                    .as_ref()
+                    .and_then(|key| entries.iter().position(|e| &e.key == key))
+                    .unwrap_or(0);
+                entries_box.set_selection(u32::try_from(index).unwrap_or(0), true);
+            }
+            match &selected {
+                Some(channel) => status_line.set_label(&trf(
+                    "Selected channel: {name}",
+                    &[("name", &channel_display_name(channel))],
+                )),
+                None => status_line.set_label(&tr("No channel selected.")),
+            }
+        })
+    };
+    // Python `refresh`: reload the lists, keep the selection
+    // by id, then refill the channels.
+    let render_all: Rc<dyn Fn(Option<String>, Option<String>)> = {
+        let rows = Rc::clone(&rows);
+        let render_entries = Rc::clone(&render_entries);
+        Rc::new(move |keep_id: Option<String>, keep_entry: Option<String>| {
+            let names: Vec<String> = rows.borrow().iter().map(|r| r.name.clone()).collect();
+            lists_box.set_items(&names.iter().map(String::as_str).collect::<Vec<_>>());
+            if !names.is_empty() {
+                let index = keep_id
+                    .as_ref()
+                    .and_then(|id| rows.borrow().iter().position(|r| &r.id == id))
+                    .unwrap_or(0);
+                lists_box.set_selection(u32::try_from(index).unwrap_or(0), true);
+            }
+            render_entries(keep_entry);
+        })
+    };
+    render_all(None, None);
+    lists_box.set_focus();
+
+    {
+        let render_entries = Rc::clone(&render_entries);
+        lists_box.bind_internal(EventType::COMMAND_LISTBOX_SELECTED, move |_| {
+            render_entries(None);
+        });
+    }
+    {
+        let wiring = clone_wiring(wiring);
+        let rows = Rc::clone(&rows);
+        let render_all = Rc::clone(&render_all);
+        new_button.on_click(move |_| {
+            let Some(name) = favourite_text_entry(frame, "Favourite List Name", "") else {
+                return;
+            };
+            if let Some(new_rows) = favourite_apply(&wiring, frame, |current| {
+                fc::create(current, &name).map(|(rows, _)| rows)
+            }) {
+                let id = new_rows.last().map(|r| r.id.clone());
+                *rows.borrow_mut() = new_rows;
+                render_all(id, None);
+            }
+        });
+    }
+    {
+        let wiring = clone_wiring(wiring);
+        let rows = Rc::clone(&rows);
+        let render_all = Rc::clone(&render_all);
+        rename_button.on_click(move |_| {
+            let Some(row) = favourite_selected_list(&rows, lists_box) else {
+                return;
+            };
+            let Some(name) = favourite_text_entry(frame, "Favourite List Name", &row.name) else {
+                return;
+            };
+            let edit = fc::Edit {
+                name: Some(name),
+                ..Default::default()
+            };
+            if let Some(new_rows) =
+                favourite_apply(&wiring, frame, |current| fc::edit(current, &row.id, &edit))
+            {
+                *rows.borrow_mut() = new_rows;
+                render_all(Some(row.id), None);
+            }
+        });
+    }
+    {
+        let wiring = clone_wiring(wiring);
+        let rows = Rc::clone(&rows);
+        let render_all = Rc::clone(&render_all);
+        delete_button.on_click(move |_| {
+            let Some(row) = favourite_selected_list(&rows, lists_box) else {
+                return;
+            };
+            if !confirm_box(
+                &frame,
+                &trf("Delete favourite list '{name}'?", &[("name", &row.name)]),
+            ) {
+                return;
+            }
+            let edit = fc::Edit {
+                delete: true,
+                ..Default::default()
+            };
+            if let Some(new_rows) =
+                favourite_apply(&wiring, frame, |current| fc::edit(current, &row.id, &edit))
+            {
+                *rows.borrow_mut() = new_rows;
+                render_all(None, None);
+            }
+        });
+    }
+    {
+        let wiring = clone_wiring(wiring);
+        let rows = Rc::clone(&rows);
+        let render_all = Rc::clone(&render_all);
+        let selected = selected.clone();
+        let channels = Rc::clone(&channels);
+        add_button.on_click(move |_| {
+            let (Some(row), Some(channel)) = (favourite_selected_list(&rows, lists_box), &selected)
+            else {
+                return;
+            };
+            let entry = match fc::selected_entry(channel, Some(&channels)) {
+                Ok(entry) => entry,
+                Err(error) => {
+                    operation_failed_box(&frame, error);
+                    return;
+                }
+            };
+            let keep = entry.key.clone();
+            let edit = fc::Edit {
+                selection: Some(entry),
+                ..Default::default()
+            };
+            if let Some(new_rows) =
+                favourite_apply(&wiring, frame, |current| fc::edit(current, &row.id, &edit))
+            {
+                *rows.borrow_mut() = new_rows;
+                render_all(Some(row.id), Some(keep));
+            }
+        });
+    }
+    {
+        let wiring = clone_wiring(wiring);
+        let rows = Rc::clone(&rows);
+        let render_all = Rc::clone(&render_all);
+        remove_button.on_click(move |_| {
+            let (Some(row), Some(entry)) = (
+                favourite_selected_list(&rows, lists_box),
+                favourite_selected_entry(&rows, lists_box, entries_box),
+            ) else {
+                return;
+            };
+            if !confirm_box(
+                &frame,
+                &trf("Remove '{name}' from this list?", &[("name", &entry.name)]),
+            ) {
+                return;
+            }
+            let edit = fc::Edit {
+                remove: Some(entry.key.clone()),
+                ..Default::default()
+            };
+            if let Some(new_rows) =
+                favourite_apply(&wiring, frame, |current| fc::edit(current, &row.id, &edit))
+            {
+                *rows.borrow_mut() = new_rows;
+                render_all(Some(row.id), None);
+            }
+        });
+    }
+    let do_move: Rc<dyn Fn(i64)> = {
+        let wiring = clone_wiring(wiring);
+        let rows = Rc::clone(&rows);
+        let render_all = Rc::clone(&render_all);
+        Rc::new(move |delta: i64| {
+            let (Some(row), Some(entry)) = (
+                favourite_selected_list(&rows, lists_box),
+                favourite_selected_entry(&rows, lists_box, entries_box),
+            ) else {
+                return;
+            };
+            let edit = fc::Edit {
+                move_entry: Some((entry.key.clone(), delta)),
+                ..Default::default()
+            };
+            if let Some(new_rows) =
+                favourite_apply(&wiring, frame, |current| fc::edit(current, &row.id, &edit))
+            {
+                *rows.borrow_mut() = new_rows;
+                render_all(Some(row.id), Some(entry.key));
+                entries_box.set_focus();
+            }
+        })
+    };
+    {
+        let do_move = Rc::clone(&do_move);
+        up_button.on_click(move |_| do_move(-1));
+    }
+    {
+        let do_move = Rc::clone(&do_move);
+        down_button.on_click(move |_| do_move(1));
+    }
+    let do_play: Rc<dyn Fn()> = {
+        let wiring = clone_wiring(wiring);
+        let rows = Rc::clone(&rows);
+        let channels = Rc::clone(&channels);
+        Rc::new(move || {
+            let Some(entry) = favourite_selected_entry(&rows, lists_box, entries_box) else {
+                return;
+            };
+            match fc::resolve(&[entry], &channels)
+                .into_iter()
+                .next()
+                .and_then(|(_, channel)| channel)
+            {
+                Some(channel) => {
+                    frame.hide();
+                    play_channel(
+                        &wiring.player,
+                        &wiring.persist,
+                        &wiring.media_probe,
+                        &channel,
+                        status,
+                    );
+                }
+                None => operation_failed_box(&frame, "Channel Not Found"),
+            }
+        })
+    };
+    {
+        let do_play = Rc::clone(&do_play);
+        play_button.on_click(move |_| do_play());
+    }
+    {
+        let do_play = Rc::clone(&do_play);
+        entries_box.bind_internal(EventType::COMMAND_LISTBOX_DOUBLECLICKED, move |_| {
+            do_play();
+        });
+    }
+    {
+        let do_move = Rc::clone(&do_move);
+        let do_play = Rc::clone(&do_play);
+        entries_box.bind_internal(EventType::KEY_DOWN, move |event| {
+            // WXK_UP / WXK_DOWN / WXK_RETURN, as Python's _key.
+            match (event.control_down(), event.get_key_code()) {
+                (true, Some(315)) => {
+                    do_move(-1);
+                    event.skip(false);
+                }
+                (true, Some(317)) => {
+                    do_move(1);
+                    event.skip(false);
+                }
+                (_, Some(13 | 370)) => {
+                    do_play();
+                    event.skip(false);
+                }
+                _ => event.skip(true),
+            }
+        });
+    }
+    {
+        let rows = Rc::clone(&rows);
+        let channels = Rc::clone(&channels);
+        export_button.on_click(move |_| {
+            let Some(row) = favourite_selected_list(&rows, lists_box) else {
+                return;
+            };
+            let dialog = FileDialog::builder(&frame)
+                .with_message(&tr("Export Favourite List..."))
+                .with_wildcard("IPTV (*.aiptvfav)|*.aiptvfav")
+                .with_style(FileDialogStyle::Save | FileDialogStyle::OverwritePrompt)
+                .build();
+            if dialog.show_modal_tracked() != ID_OK {
+                return;
+            }
+            let Some(path) = dialog.get_path() else {
+                return;
+            };
+            match fc::export_list(&row, &channels)
+                .map_err(ToString::to_string)
+                .and_then(|bytes| std::fs::write(&path, bytes).map_err(|e| e.to_string()))
+            {
+                Ok(()) => status_line.set_label(&trf("Saved to {path}.", &[("path", &path)])),
+                Err(error) => operation_failed_box(&frame, &error),
+            }
+        });
+    }
+    {
+        let wiring = clone_wiring(wiring);
+        let rows = Rc::clone(&rows);
+        let render_all = Rc::clone(&render_all);
+        let channels = Rc::clone(&channels);
+        import_button.on_click(move |_| {
+            let dialog = FileDialog::builder(&frame)
+                .with_message(&tr("Import Favourite List..."))
+                .with_wildcard("IPTV (*.aiptvfav)|*.aiptvfav")
+                .with_style(FileDialogStyle::Open | FileDialogStyle::FileMustExist)
+                .build();
+            if dialog.show_modal_tracked() != ID_OK {
+                return;
+            }
+            let Some(path) = dialog.get_path() else {
+                return;
+            };
+            let data = std::fs::File::open(&path).and_then(|file| {
+                use std::io::Read as _;
+                let mut buf = Vec::new();
+                file.take((fc::TRANSFER_LIMIT + 1) as u64)
+                    .read_to_end(&mut buf)?;
+                Ok(buf)
+            });
+            let parsed = data
+                .map_err(|e| e.to_string())
+                .and_then(|bytes| fc::read_list(&bytes).map_err(str::to_string));
+            let (name, entries) = match parsed {
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    operation_failed_box(&frame, &error);
+                    return;
+                }
+            };
+            let matched = fc::match_entries(&entries, &channels);
+            let rows_cb = Rc::clone(&rows);
+            let render_cb = Rc::clone(&render_all);
+            open_favourite_import(
+                &wiring,
+                frame,
+                &name,
+                matched,
+                Rc::new(move |id: String, new_rows: Vec<fc::FavList>| {
+                    *rows_cb.borrow_mut() = new_rows;
+                    render_cb(Some(id), None);
+                    lists_box.set_focus();
+                }),
+            );
+        });
+    }
+    {
+        let wiring = clone_wiring(wiring);
+        let rows = Rc::clone(&rows);
+        let render_all = Rc::clone(&render_all);
+        let channels = Rc::clone(&channels);
+        relink_button.on_click(move |_| {
+            let (Some(row), Some(entry)) = (
+                favourite_selected_list(&rows, lists_box),
+                favourite_selected_entry(&rows, lists_box, entries_box),
+            ) else {
+                return;
+            };
+            if fc::resolve(std::slice::from_ref(&entry), &channels)
+                .into_iter()
+                .next()
+                .is_some_and(|(_, channel)| channel.is_some())
+            {
+                operation_failed_box(&frame, "This favourite is already available.");
+                return;
+            }
+            let Some(query) =
+                favourite_text_entry(frame, "Search for the replacement channel:", "")
+            else {
+                return;
+            };
+            let needle = query.trim().to_lowercase();
+            let sources = fc::source_names(&config_value(&wiring));
+            let mut found: Vec<(String, Channel)> = Vec::new();
+            for channel in channels.iter() {
+                if channel.url.is_empty()
+                    || matches!(
+                        channel.unknown_attributes.get("kind").map(String::as_str),
+                        Some("movie" | "series")
+                    )
+                {
+                    continue;
+                }
+                let scope = channel
+                    .unknown_attributes
+                    .get("playlist-id")
+                    .filter(|v| !v.is_empty())
+                    .or_else(|| channel.unknown_attributes.get("provider-id"));
+                let mut fields: Vec<String> = vec![
+                    iptv_core::reminders::safe_title(&channel_display_name(channel)),
+                    iptv_core::reminders::safe_title(&channel.group),
+                    iptv_core::reminders::safe_title(&channel.tvg_id),
+                ];
+                if let Some(label) = scope.and_then(|key| sources.get(key)) {
+                    fields.push(iptv_core::reminders::safe_title(label));
+                }
+                let mut deduped: Vec<String> = Vec::new();
+                for field in fields {
+                    if !field.is_empty() && !deduped.contains(&field) {
+                        deduped.push(field);
+                    }
+                }
+                let label = deduped.join(" – ");
+                if label.to_lowercase().contains(&needle) {
+                    found.push((label, channel.clone()));
+                    if found.len() > 200 {
+                        operation_failed_box(
+                            &frame,
+                            "Too many matches. Enter a more specific channel name.",
+                        );
+                        return;
+                    }
+                }
+            }
+            if found.is_empty() {
+                operation_failed_box(&frame, "Channel Not Found");
+                return;
+            }
+            let labels = fc::variant_labels(
+                &found
+                    .iter()
+                    .map(|(label, _)| label.clone())
+                    .collect::<Vec<_>>(),
+                &tr("Variant {number}"),
+            );
+            let dialog = SingleChoiceDialog::builder(
+                &frame,
+                &tr("Choose a replacement channel:"),
+                &tr("Favourite Lists"),
+                &labels.iter().map(String::as_str).collect::<Vec<_>>(),
+            )
+            .build();
+            if dialog.show_modal_tracked() != ID_OK {
+                return;
+            }
+            let index = usize::try_from(dialog.get_selection()).unwrap_or(usize::MAX);
+            let Some((_, candidate)) = found.get(index).cloned() else {
+                return;
+            };
+            let replacement = match fc::selected_entry(&candidate, Some(&channels)) {
+                Ok(entry) => entry,
+                Err(error) => {
+                    operation_failed_box(&frame, error);
+                    return;
+                }
+            };
+            let keep = replacement.key.clone();
+            if let Some(new_rows) = favourite_apply(&wiring, frame, |current| {
+                fc::relink(
+                    current,
+                    &row.id,
+                    &entry.key,
+                    &candidate,
+                    Some(replacement.clone()),
+                )
+            }) {
+                *rows.borrow_mut() = new_rows;
+                render_all(Some(row.id), Some(keep));
+                entries_box.set_focus();
+            }
+        });
+    }
+    close_button.on_click(move |_| frame.hide());
+    let _ = parent;
+    frame.show(true);
+}
+
+/// One option label in the import preview (Python
+/// `favourite_transfer_ui.ImportDialog.channel_label`).
+fn import_channel_label(
+    aliases: &std::collections::BTreeMap<String, String>,
+    channel: &Channel,
+    index: usize,
+    shown_name: &str,
+) -> String {
+    use iptv_core::favorite_collections as fc;
+    let alias = channel
+        .unknown_attributes
+        .get("provider-id")
+        .filter(|v| !v.is_empty())
+        .or_else(|| channel.unknown_attributes.get("playlist-id"))
+        .and_then(|key| aliases.get(key));
+    let name = fc::public_name(&channel_display_name(channel));
+    let mut parts: Vec<String> = Vec::new();
+    if name.to_lowercase() != shown_name.to_lowercase() {
+        parts.push(name.clone());
+    }
+    if let Some(alias) = alias {
+        if !alias.is_empty()
+            && alias.to_lowercase() != name.to_lowercase()
+            && alias.to_lowercase() != shown_name.to_lowercase()
+        {
+            parts.push(alias.clone());
+        }
+    }
+    parts.push(trf(
+        "Source {number}",
+        &[("number", &(index + 1).to_string())],
+    ));
+    parts
+        .into_iter()
+        .filter(|p| !p.is_empty())
+        .collect::<Vec<_>>()
+        .join(" — ")
+}
+
+/// The import preview (Python
+/// `favourite_transfer_ui.ImportDialog`): review the matches
+/// for a portable list, choose a local channel for ambiguous
+/// entries, then create the list under a cleaned name.
+#[allow(clippy::too_many_lines)] // import preview dialog, as in Python
+fn open_favourite_import(
+    wiring: &Wiring,
+    parent: Frame,
+    name: &str,
+    matched: Vec<(
+        iptv_core::favorite_collections::PortableEntry,
+        Vec<(String, Channel)>,
+    )>,
+    on_done: Rc<dyn Fn(String, Vec<iptv_core::favorite_collections::FavList>)>,
+) {
+    use iptv_core::favorite_collections as fc;
+    let frame = Frame::builder()
+        .with_title(&tr("Import Favourite List..."))
+        .with_size(Size::new(740, 540))
+        .build();
+    frame.set_accessibility_label(&tr("Import Favourite List..."));
+    bind_escape_hide(frame);
+    let panel = Panel::builder(&frame).build();
+    let name_label = StaticText::builder(&panel)
+        .with_label(&tr("List name:"))
+        .build();
+    let name_field = TextCtrl::builder(&panel).with_value(name).build();
+    name_field.set_accessibility_label(&tr("List name:"));
+    let channels_label = StaticText::builder(&panel)
+        .with_label(&tr("Channels"))
+        .build();
+    let channels_box = ListBox::builder(&panel).build();
+    channels_box.set_accessibility_label(&tr("Channels"));
+    let choose_button = Button::builder(&panel)
+        .with_label(&tr("Choose Channel..."))
+        .build();
+    let ok_button = Button::builder(&panel).with_label("&OK").build();
+    let cancel_button = Button::builder(&panel).with_label("&Cancel").build();
+    let layout = BoxSizer::builder(Orientation::Vertical).build();
+    layout.add(&name_label, 0, SizerFlag::All, 8);
+    layout.add(&name_field, 0, SizerFlag::Expand | SizerFlag::All, 8);
+    layout.add(&channels_label, 0, SizerFlag::All, 8);
+    layout.add(&channels_box, 1, SizerFlag::Expand | SizerFlag::All, 8);
+    let buttons = BoxSizer::builder(Orientation::Horizontal).build();
+    buttons.add(&choose_button, 0, SizerFlag::All, 4);
+    buttons.add(&ok_button, 0, SizerFlag::All, 4);
+    buttons.add(&cancel_button, 0, SizerFlag::All, 4);
+    layout.add_sizer(&buttons, 0, SizerFlag::Expand, 0);
+    panel.set_sizer(layout, true);
+
+    let aliases: std::collections::BTreeMap<String, String> =
+        fc::source_names(&config_value(wiring))
+            .into_iter()
+            .map(|(key, value)| (key, fc::public_name(&value)))
+            .collect();
+    let matched = Rc::new(matched);
+    let choices: Rc<RefCell<Vec<Option<usize>>>> = Rc::new(RefCell::new(
+        matched
+            .iter()
+            .map(
+                |(_, options)| {
+                    if options.len() == 1 {
+                        Some(0)
+                    } else {
+                        None
+                    }
+                },
+            )
+            .collect(),
+    ));
+    let render_rows: Rc<dyn Fn(usize)> = {
+        let matched = Rc::clone(&matched);
+        let choices = Rc::clone(&choices);
+        let aliases = aliases.clone();
+        Rc::new(move |index: usize| {
+            let labels: Vec<String> = matched
+                .iter()
+                .zip(choices.borrow().iter())
+                .map(|((item, options), choice)| {
+                    let name = if item.name.is_empty() {
+                        tr("(No channel name)")
+                    } else {
+                        item.name.clone()
+                    };
+                    let state = match choice {
+                        None if options.len() > 1 => {
+                            tr("The channel cannot be identified unambiguously.")
+                        }
+                        None if options.is_empty() => tr("Channel Not Found"),
+                        None => tr("Leave unresolved"),
+                        Some(choice) => {
+                            import_channel_label(&aliases, &options[*choice].1, *choice, &name)
+                        }
+                    };
+                    format!("{name} — {state}")
+                })
+                .collect();
+            channels_box.set_items(&labels.iter().map(String::as_str).collect::<Vec<_>>());
+            if !labels.is_empty() {
+                channels_box.set_selection(
+                    u32::try_from(index.min(labels.len() - 1)).unwrap_or(0),
+                    true,
+                );
+            }
+        })
+    };
+    render_rows(0);
+    channels_box.set_focus();
+    let do_choose: Rc<dyn Fn()> = {
+        let matched = Rc::clone(&matched);
+        let choices = Rc::clone(&choices);
+        let render_rows = Rc::clone(&render_rows);
+        let aliases = aliases.clone();
+        Rc::new(move || {
+            let Some(index) = channels_box
+                .get_selection()
+                .and_then(|i| usize::try_from(i).ok())
+            else {
+                return;
+            };
+            let Some((item, options)) = matched.get(index) else {
+                return;
+            };
+            if options.is_empty() {
+                return;
+            }
+            let shown = if item.name.is_empty() {
+                tr("(No channel name)")
+            } else {
+                item.name.clone()
+            };
+            let mut labels = vec![tr("Leave unresolved")];
+            for (n, (_, channel)) in options.iter().enumerate() {
+                labels.push(import_channel_label(&aliases, channel, n, &shown));
+            }
+            let dialog = SingleChoiceDialog::builder(
+                &frame,
+                &shown,
+                &tr("Choose Channel..."),
+                &labels.iter().map(String::as_str).collect::<Vec<_>>(),
+            )
+            .build();
+            let current = choices.borrow()[index];
+            dialog.set_selection(i32::try_from(current.map_or(0, |c| c + 1)).unwrap_or(0));
+            if dialog.show_modal_tracked() != ID_OK {
+                return;
+            }
+            let picked = dialog.get_selection();
+            choices.borrow_mut()[index] = if picked > 0 {
+                usize::try_from(picked - 1).ok()
+            } else {
+                None
+            };
+            render_rows(index);
+        })
+    };
+    {
+        let do_choose = Rc::clone(&do_choose);
+        choose_button.on_click(move |_| do_choose());
+    }
+    {
+        let do_choose = Rc::clone(&do_choose);
+        channels_box.bind_internal(EventType::COMMAND_LISTBOX_DOUBLECLICKED, move |_| {
+            do_choose();
+        });
+    }
+    {
+        let wiring = clone_wiring(wiring);
+        let matched = Rc::clone(&matched);
+        let choices = Rc::clone(&choices);
+        ok_button.on_click(move |_| {
+            let list_name = match fc::clean_name(&name_field.get_value()) {
+                Ok(name) => name,
+                Err(error) => {
+                    operation_failed_box(&frame, error);
+                    return;
+                }
+            };
+            let built = match fc::build_entries(&matched, &choices.borrow()) {
+                Ok(entries) => entries,
+                Err(error) => {
+                    operation_failed_box(&frame, error);
+                    return;
+                }
+            };
+            if let Some(new_rows) = favourite_apply(&wiring, frame, |current| {
+                let (mut rows, _) = fc::create(current, &list_name)?;
+                if let Some(last) = rows.last_mut() {
+                    last.entries = built;
+                }
+                Ok(rows)
+            }) {
+                let id = new_rows.last().map(|r| r.id.clone()).unwrap_or_default();
+                frame.hide();
+                on_done(id, new_rows);
+            }
+        });
+    }
+    cancel_button.on_click(move |_| frame.hide());
+    let _ = parent;
     frame.show(true);
 }
 
