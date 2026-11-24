@@ -506,6 +506,124 @@ pub fn display_status(reminder: &Reminder, now: i64) -> &'static str {
     }
 }
 
+/// Postpone a reminder (Python `ReminderStore.snooze`): five
+/// minutes by default, or to the programme start; the new
+/// alert must land strictly between now and the programme's
+/// end, and an expired reminder cannot be postponed.
+///
+/// # Errors
+/// Python's messages for an invalid postponement and for a
+/// target at or beyond the programme's end.
+pub fn snooze(
+    rows: &mut [Reminder],
+    id: &str,
+    minutes: i64,
+    at_start: bool,
+    now: i64,
+) -> Result<(), String> {
+    if !valid_time(now) || !(1..=120).contains(&minutes) {
+        return Err("Invalid reminder postponement.".to_string());
+    }
+    let Some(row) = rows.iter_mut().find(|row| row.id == id) else {
+        return Err("The reminder cannot be postponed beyond the programme's end.".to_string());
+    };
+    let target = if at_start {
+        row.start
+    } else {
+        now + minutes * 60
+    };
+    if row.status == ReminderStatus::Expired || !(now < target && target < row.end) {
+        return Err("The reminder cannot be postponed beyond the programme's end.".to_string());
+    }
+    row.status = ReminderStatus::Scheduled;
+    row.notify_at = Some(target);
+    Ok(())
+}
+
+/// Record the alert dialog's choice (Python
+/// `ReminderStore.save_alert_choice`): a retry keeps the
+/// originally requested time and respects subsequent edits.
+/// Only a due row changes: past its end it expires; a target
+/// already past, or at/after the end, leaves it due so the
+/// next poll can show it again; otherwise it re-arms as
+/// scheduled at the target. Python's store only ever holds
+/// due rows as `ready` (its poll promotes them); this port's
+/// poll treats scheduled rows in their window as due without
+/// promoting, so both states count as due here. Returns
+/// whether a row changed.
+pub fn save_alert_choice(rows: &mut [Reminder], id: &str, target: i64, now: i64) -> bool {
+    let Some(row) = rows.iter_mut().find(|row| row.id == id) else {
+        return false;
+    };
+    if !matches!(
+        row.status,
+        ReminderStatus::Scheduled | ReminderStatus::Ready
+    ) {
+        return false;
+    }
+    if row.end <= now {
+        row.status = ReminderStatus::Expired;
+        return true;
+    }
+    if target <= now || target >= row.end {
+        return false;
+    }
+    row.status = ReminderStatus::Scheduled;
+    row.notify_at = Some(target);
+    true
+}
+
+/// Playlist source display names (Python
+/// `programme_reminders.source_names`): each playlist's id
+/// (or provider id) mapped to its cleaned name, plus the
+/// `playlist_names` aliases keyed `m3u:<sha256>`. Used by the
+/// favourite transfer, the guide-by-time scope and recording
+/// edits; ported with M4 as the spec's scope sweep directs.
+#[must_use]
+pub fn source_names(config: &serde_json::Value) -> std::collections::BTreeMap<String, String> {
+    let mut names: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    if let Some(sources) = config
+        .get("playlists")
+        .and_then(serde_json::Value::as_array)
+    {
+        for source in sources {
+            let key = source
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.is_empty())
+                .or_else(|| {
+                    source
+                        .get("provider_id")
+                        .and_then(serde_json::Value::as_str)
+                        .filter(|value| !value.is_empty())
+                });
+            if let Some(key) = key {
+                let name = source
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                names.insert(key.to_string(), safe_title(name));
+            }
+        }
+    }
+    if let Some(aliases) = config
+        .get("playlist_names")
+        .and_then(serde_json::Value::as_object)
+    {
+        for (key, name) in aliases {
+            if key.len() == 64
+                && key
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            {
+                let name = name.as_str().unwrap_or("");
+                names.insert(format!("m3u:{key}"), safe_title(name));
+            }
+        }
+    }
+    names
+}
+
 /// Resolve a reminder's channel for Open Channel (port of Python's
 /// `programme_reminders.resolve_channel`): the channel whose
 /// reminder key matches the row's, returned only when exactly one
@@ -785,5 +903,92 @@ mod tests {
         unrelated.tvg_id = "other.example".to_string();
         assert!(find_channel_for_reminder(&row, &[unrelated]).is_none());
         assert!(find_channel_for_reminder(&row, &[]).is_none());
+    }
+
+    fn due_row(now: i64) -> Reminder {
+        Reminder {
+            id: "abc".to_string(),
+            channel_key: "def".to_string(),
+            title: "Show".to_string(),
+            channel: "Chan".to_string(),
+            start: now + 3600,
+            end: now + 7200,
+            lead: 5,
+            status: ReminderStatus::Ready,
+            notify_at: None,
+        }
+    }
+
+    #[test]
+    fn snooze_moves_the_alert_and_validates() {
+        let now = 1_000_000;
+        let mut rows = vec![due_row(now)];
+        snooze(&mut rows, "abc", 5, false, now).expect("snooze");
+        assert_eq!(rows[0].status, ReminderStatus::Scheduled);
+        assert_eq!(rows[0].notify_at, Some(now + 300));
+        // At start targets the programme start.
+        let mut rows = vec![due_row(now)];
+        snooze(&mut rows, "abc", 5, true, now).expect("at start");
+        assert_eq!(rows[0].notify_at, Some(now + 3600));
+        // Past the end and bad minutes are refused with Python's lines.
+        let mut rows = vec![due_row(now)];
+        rows[0].end = now + 120;
+        assert_eq!(
+            snooze(&mut rows, "abc", 5, false, now),
+            Err("The reminder cannot be postponed beyond the programme's end.".to_string())
+        );
+        let mut rows = vec![due_row(now)];
+        assert_eq!(
+            snooze(&mut rows, "abc", 0, false, now),
+            Err("Invalid reminder postponement.".to_string())
+        );
+        assert_eq!(
+            snooze(&mut rows, "missing", 5, false, now),
+            Err("The reminder cannot be postponed beyond the programme's end.".to_string())
+        );
+    }
+
+    #[test]
+    fn save_alert_choice_rearms_expires_or_leaves_due() {
+        let now = 1_000_000;
+        // A valid target re-arms as scheduled at the target.
+        let mut rows = vec![due_row(now)];
+        assert!(save_alert_choice(&mut rows, "abc", now + 300, now));
+        assert_eq!(rows[0].status, ReminderStatus::Scheduled);
+        assert_eq!(rows[0].notify_at, Some(now + 300));
+        // A target already past leaves the row due and unchanged.
+        let mut rows = vec![due_row(now)];
+        assert!(!save_alert_choice(&mut rows, "abc", now - 5, now));
+        assert_eq!(rows[0].status, ReminderStatus::Ready);
+        assert_eq!(rows[0].notify_at, None);
+        // Past the end, the row expires.
+        let mut rows = vec![due_row(now)];
+        assert!(save_alert_choice(&mut rows, "abc", now + 300, now + 8000));
+        assert_eq!(rows[0].status, ReminderStatus::Expired);
+        // A notified row never changes.
+        let mut rows = vec![due_row(now)];
+        rows[0].status = ReminderStatus::Notified;
+        assert!(!save_alert_choice(&mut rows, "abc", now + 300, now));
+    }
+
+    #[test]
+    fn source_names_maps_ids_and_aliases() {
+        let key = "a".repeat(64);
+        let config = serde_json::json!({
+            "playlists": [
+                {"id": "src1", "name": "  My List  "},
+                {"provider_id": "src2", "name": "https://bad.example/x"},
+                {"name": "No id"},
+            ],
+            "playlist_names": { key.clone(): "Alias Name", "short": "Skip" },
+        });
+        let names = source_names(&config);
+        assert_eq!(names.get("src1").map(String::as_str), Some("My List"));
+        assert_eq!(names.get("src2").map(String::as_str), Some(""));
+        assert_eq!(
+            names.get(&format!("m3u:{key}")).map(String::as_str),
+            Some("Alias Name")
+        );
+        assert_eq!(names.len(), 3);
     }
 }

@@ -191,6 +191,10 @@ View > Continue Watching lists programmes you stopped part-way through, newest f
 
 A reminder tells you before a programme starts. Add one from a programme in View EPG or What's on Now. Recordings > Programme Reminders lists your reminders; when one is due the program announces it. Reminders are kept between sessions, up to 500.
 
+A programme reminder offers Remind Again in 5 Minutes and, before the start, Remind at Programme Start. Postponement is saved and survives restart; it must remain before the programme ends. Close dismisses the alert. The application must remain open, and these reminders do not wake the computer.
+
+Export to Calendar on a programme’s context menu, or a selected reminder, saves an .ics file for import into a calendar. It includes title, channel and UTC start/end times, so the calendar can display its own local time. It does not create a recording, start playback or schedule a computer wake.
+
 ### Channel guide (View EPG) {#channel-epg}
 
 View EPG, on a channel's menu, lists that channel's programmes from the one on air now to as far as the guide goes. The programme on air now comes first.

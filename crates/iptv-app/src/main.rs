@@ -3008,6 +3008,23 @@ fn acknowledge_reminder(wiring: &Wiring, id: &str) {
     }
 }
 
+/// Record a Remind Again / Remind at Programme Start answer
+/// (Python's `_save_alert_choice` after its ReminderAlert):
+/// the choice re-arms the reminder at the target time, and
+/// the id leaves the seen set either way, exactly as Python's
+/// saved callback discards it, so a still-due reminder can be
+/// shown again by the next poll.
+fn apply_alert_choice(wiring: &Wiring, id: &str, target: i64) {
+    let now = now_epoch();
+    let mut rows = wiring.reminders.borrow_mut();
+    if iptv_core::reminders::save_alert_choice(&mut rows, id, target, now) {
+        let saved = rows.clone();
+        drop(rows);
+        wiring.persist.save_reminders(&saved);
+    }
+    wiring.reminder_seen.borrow_mut().remove(id);
+}
+
 /// The reminder delivery window (audit R12/R13): one reminder,
 /// with Open Channel resolving the uniquely matching channel
 /// (Python's delivery dialog).
@@ -3034,10 +3051,35 @@ fn open_reminder_window(wiring: &Wiring, status: Status, reminder: &Reminder) {
         .build();
     text.set_accessibility_label("Reminder details");
     let open_button = Button::builder(&panel).with_label("&Open Channel").build();
+    // Python's ReminderAlert offers the two postponements
+    // conditionally: Remind Again only while five more minutes
+    // still lands before the end, Remind at Programme Start
+    // only before the start.
+    let now = now_epoch();
+    let snooze_button = (now + 300 < reminder.end).then(|| {
+        let button = Button::builder(&panel)
+            .with_label("Remind &Again in 5 Minutes")
+            .build();
+        button.set_accessibility_label("Remind Again in 5 Minutes");
+        button
+    });
+    let start_button = (now < reminder.start).then(|| {
+        let button = Button::builder(&panel)
+            .with_label("Remind at &Programme Start")
+            .build();
+        button.set_accessibility_label("Remind at Programme Start");
+        button
+    });
     let close_button = Button::builder(&panel).with_label("&Close").build();
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     sizer.add(&text, 0, SizerFlag::All, 8);
     sizer.add(&open_button, 0, SizerFlag::Expand | SizerFlag::All, 4);
+    if let Some(button) = &snooze_button {
+        sizer.add(button, 0, SizerFlag::Expand | SizerFlag::All, 4);
+    }
+    if let Some(button) = &start_button {
+        sizer.add(button, 0, SizerFlag::Expand | SizerFlag::All, 4);
+    }
     sizer.add(&close_button, 0, SizerFlag::Expand | SizerFlag::All, 4);
     panel.set_sizer(sizer, true);
     let reminder_id = reminder.id.clone();
@@ -3062,6 +3104,25 @@ fn open_reminder_window(wiring: &Wiring, status: Status, reminder: &Reminder) {
             None => status.set_label("Channel not found."),
         }
     });
+    if let Some(button) = &snooze_button {
+        let wiring_s = clone_wiring(wiring);
+        let reminder_id_s = reminder.id.clone();
+        button.on_click(move |_| {
+            apply_alert_choice(&wiring_s, &reminder_id_s, now_epoch() + 300);
+            wiring_s.reminder_window_open.set(false);
+            frame.hide();
+        });
+    }
+    if let Some(button) = &start_button {
+        let wiring_t = clone_wiring(wiring);
+        let reminder_id_t = reminder.id.clone();
+        let start_at = reminder.start;
+        button.on_click(move |_| {
+            apply_alert_choice(&wiring_t, &reminder_id_t, start_at);
+            wiring_t.reminder_window_open.set(false);
+            frame.hide();
+        });
+    }
     let wiring_c = clone_wiring(wiring);
     let reminder_id_c = reminder.id.clone();
     close_button.on_click(move |_| {
@@ -18118,6 +18179,80 @@ fn open_assign_programme_guide(wiring: &Wiring, parent: Frame, list: ListCtrl, s
     search.set_focus();
 }
 
+/// Reminders > Export to Calendar... (Python's
+/// `planning_ui._export_calendar` over `planning_tools_ui.
+/// export_file`): save the selected reminder as an .ics file.
+/// Python asks for the path, appends .ics when missing (with a
+/// replace confirmation when the appended path exists), then
+/// writes atomically in the background and reports "Export
+/// saved." or the failure in a message box; the file is a few
+/// hundred bytes, so the write happens inline here.
+fn export_reminder_calendar(frame: Frame, reminder: &Reminder) {
+    let title = tr("Export to Calendar...");
+    let bytes = match iptv_core::planning_tools::programme_calendar(
+        &reminder.title,
+        &reminder.channel,
+        reminder.start,
+        reminder.end,
+        &reminder.channel_key,
+        now_epoch(),
+    ) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            let dialog = MessageDialog::builder(&frame, &tr(&error), &title)
+                .with_style(MessageDialogStyle::OK | MessageDialogStyle::IconError)
+                .build();
+            dialog.show_modal_tracked();
+            return;
+        }
+    };
+    let dialog = FileDialog::builder(&frame)
+        .with_message(&title)
+        .with_wildcard("Calendar file (*.ics)|*.ics")
+        .with_style(FileDialogStyle::Save | FileDialogStyle::OverwritePrompt)
+        .build();
+    if dialog.show_modal_tracked() != ID_OK {
+        return;
+    }
+    let Some(mut path) = dialog.get_path() else {
+        return;
+    };
+    if !path.to_lowercase().ends_with(".ics") {
+        path.push_str(".ics");
+        if std::path::Path::new(&path).exists() {
+            let confirm =
+                MessageDialog::builder(&frame, &tr("Replace the existing export file?"), &title)
+                    .with_style(
+                        MessageDialogStyle::YesNo
+                            | MessageDialogStyle::NoDefault
+                            | MessageDialogStyle::IconWarning,
+                    )
+                    .build();
+            if confirm.show_modal_tracked() != ID_YES {
+                return;
+            }
+        }
+    }
+    let (message, error) =
+        match iptv_core::planning_tools::atomic_export(std::path::Path::new(&path), &bytes) {
+            Ok(()) => (tr("Export saved."), false),
+            Err(error) => (
+                trf("The operation failed:\n{error}", &[("error", &error)]),
+                true,
+            ),
+        };
+    let mut style = MessageDialogStyle::OK;
+    style |= if error {
+        MessageDialogStyle::IconError
+    } else {
+        MessageDialogStyle::IconInformation
+    };
+    let dialog = MessageDialog::builder(&frame, &message, &title)
+        .with_style(style)
+        .build();
+    dialog.show_modal_tracked();
+}
+
 /// The Reminders dialog (audit R13): rows carry time, title,
 /// channel, delivery status and lead; the lead is editable,
 /// and Clear All / Refresh / Open Channel are offered like
@@ -18185,6 +18320,10 @@ fn open_reminders_dialog(wiring: &Wiring, main_status: Status) {
     let clear = Button::builder(&panel)
         .with_label("Clear &All Reminders")
         .build();
+    let export = Button::builder(&panel)
+        .with_label("Export to &Calendar...")
+        .build();
+    export.set_accessibility_label("Export to Calendar...");
     let refresh = Button::builder(&panel).with_label("&Refresh").build();
     let close = Button::builder(&panel).with_label("&Close").build();
     let selected_reminder = move |wiring: &Wiring| -> Option<Reminder> {
@@ -18235,6 +18374,14 @@ fn open_reminders_dialog(wiring: &Wiring, main_status: Status) {
         wiring_a.reminders.borrow_mut().clear();
         wiring_a.persist.save_reminders(&[]);
         render(&wiring_a, list, dstatus);
+    });
+    let wiring_x = clone_wiring(wiring);
+    export.on_click(move |_| {
+        let Some(reminder) = selected_reminder(&wiring_x) else {
+            dstatus.set_label("Choose a reminder to export first.");
+            return;
+        };
+        export_reminder_calendar(frame, &reminder);
     });
     let wiring_r = clone_wiring(wiring);
     refresh.on_click(move |_| render(&wiring_r, list, dstatus));
