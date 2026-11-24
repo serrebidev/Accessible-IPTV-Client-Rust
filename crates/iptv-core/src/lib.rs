@@ -59,6 +59,7 @@ pub mod instance;
 pub mod loading;
 pub mod media_type;
 pub mod navindex;
+pub mod notifications;
 pub mod playback;
 pub mod providers;
 pub mod proxy;

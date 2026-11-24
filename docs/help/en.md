@@ -359,6 +359,10 @@ Recordings > Shut Down the Computer When Recordings Finish turns the computer of
 
 It never fires while something is still recording or waiting in the schedule. When the time comes, a window counts down 60 seconds; Cancel Shutdown is focused, so pressing Enter or Escape stops it, and Shut Down Now does not wait. The option turns itself off once it has been used or canceled.
 
+## Personal tools {#personal-tools}
+
+View > Notification History retains the latest 200 queued notifications for the current session. Select an entry to read its Details; Refresh updates the list, and Copy Details copies the selected text. Obvious credentials in URLs and credential lines are masked in this history and its copied text. This is not a guarantee that arbitrary messages contain no private information. Clear History asks for confirmation. The history is discarded when the application closes; existing log files are unchanged.
+
 ## Casting {#casting}
 
 Casting sends a channel to a TV or speaker on your network: DLNA and UPnP renderers, Sonos speakers and Roku players. Chromecast and AirPlay are not supported in this build.

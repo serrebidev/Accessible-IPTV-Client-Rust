@@ -3320,6 +3320,21 @@ thread_local! {
     static MODAL_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     static DEFERRED_NOTES: RefCell<std::collections::VecDeque<DeferredNote>> =
         const { RefCell::new(std::collections::VecDeque::new()) };
+    /// The session's notification history (M5, Python's
+    /// `_notification_history`): every non-Yes/No box shown
+    /// through `show_or_queue_notification` is recorded.
+    static NOTIFICATION_HISTORY: RefCell<Vec<iptv_core::notifications::NotificationEntry>> =
+        const { RefCell::new(Vec::new()) };
+}
+
+/// Record one shown notification in the session history
+/// (Python's history append in `_show_or_queue_message_box`,
+/// which skips Yes/No questions).
+fn record_notification(caption: &str, message: &str) {
+    NOTIFICATION_HISTORY.with(|history| {
+        let mut history = history.borrow_mut();
+        *history = iptv_core::notifications::notification(&history, caption, message, now_epoch());
+    });
 }
 
 /// How many notifications may wait behind a modal box
@@ -3427,6 +3442,9 @@ fn show_or_queue_notification(
     style: MessageDialogStyle,
     on_dismiss: Option<Rc<dyn Fn()>>,
 ) {
+    if !style.contains(MessageDialogStyle::YesNo) {
+        record_notification(caption, message);
+    }
     if modal_box_is_open() {
         DEFERRED_NOTES.with(|queue| {
             let mut queue = queue.borrow_mut();
@@ -3449,6 +3467,129 @@ fn show_or_queue_notification(
     if let Some(on_dismiss) = on_dismiss {
         on_dismiss();
     }
+}
+
+/// View > Notification History... (M5, Python
+/// `session_tools_ui.NotificationsDialog`): the session's
+/// recorded notifications, newest first, as "HH:MM:SS -
+/// caption" rows with the selected message in a read-only
+/// Details field; Refresh, Copy Details and Clear History
+/// (confirmed) match Python's buttons.
+fn show_notification_history(frame: Frame) {
+    let dialog = Dialog::builder(&frame, &tr("Notification History"))
+        .with_size(720, 480)
+        .build();
+    dialog.set_accessibility_label(&tr("Notification History"));
+    bind_escape_cancel(dialog);
+    let panel = Panel::builder(&dialog).build();
+    let heading = StaticText::builder(&panel)
+        .with_label(&tr("Notifications from this session:"))
+        .build();
+    let list = ListBox::builder(&panel).build();
+    list.set_accessibility_label(&tr("Notifications from this session:"));
+    let details_label = StaticText::builder(&panel)
+        .with_label(&tr("Details"))
+        .build();
+    let details = TextCtrl::builder(&panel)
+        .with_style(TextCtrlStyle::ReadOnly | TextCtrlStyle::MultiLine)
+        .build();
+    details.set_accessibility_label(&tr("Details"));
+    let refresh_button = Button::builder(&panel).with_label(&tr("Refresh")).build();
+    refresh_button.set_accessibility_label("Refresh");
+    let copy_button = Button::builder(&panel)
+        .with_label(&tr("Copy Details"))
+        .build();
+    copy_button.set_accessibility_label("Copy Details");
+    let clear_button = Button::builder(&panel)
+        .with_label(&tr("Clear History"))
+        .build();
+    clear_button.set_accessibility_label("Clear History");
+    let close_button = Button::builder(&panel).with_label(&tr("Close")).build();
+    close_button.set_accessibility_label("Close");
+    let sizer = BoxSizer::builder(Orientation::Vertical).build();
+    sizer.add(&heading, 0, SizerFlag::All, 8);
+    sizer.add(&list, 1, SizerFlag::Expand | SizerFlag::All, 8);
+    sizer.add(&details_label, 0, SizerFlag::Left, 8);
+    sizer.add(&details, 1, SizerFlag::Expand | SizerFlag::All, 8);
+    let buttons = BoxSizer::builder(Orientation::Horizontal).build();
+    buttons.add(&refresh_button, 0, SizerFlag::All, 5);
+    buttons.add(&copy_button, 0, SizerFlag::All, 5);
+    buttons.add(&clear_button, 0, SizerFlag::All, 5);
+    buttons.add(&close_button, 0, SizerFlag::All, 5);
+    sizer.add_sizer(&buttons, 0, SizerFlag::Expand, 0);
+    panel.set_sizer(sizer, true);
+
+    let rows: Rc<RefCell<Vec<iptv_core::notifications::NotificationEntry>>> =
+        Rc::new(RefCell::new(Vec::new()));
+    let refresh = {
+        let rows = Rc::clone(&rows);
+        move || {
+            let mut current: Vec<iptv_core::notifications::NotificationEntry> =
+                NOTIFICATION_HISTORY.with(|history| history.borrow().clone());
+            current.reverse();
+            let labels: Vec<String> = current
+                .iter()
+                .map(|row| {
+                    let clock = chrono::TimeZone::timestamp_opt(&chrono::Local, row.time, 0)
+                        .single()
+                        .map(|dt| dt.format("%H:%M:%S").to_string())
+                        .unwrap_or_default();
+                    format!("{clock} — {}", row.caption)
+                })
+                .collect();
+            *rows.borrow_mut() = current;
+            list.set_items(&labels.iter().map(String::as_str).collect::<Vec<_>>());
+            if labels.is_empty() {
+                details.set_value("");
+            } else {
+                list.set_selection(0);
+                details.set_value(&rows.borrow()[0].message);
+            }
+        }
+    };
+    let refresh = Rc::new(refresh);
+    refresh();
+    list.on_selection_changed({
+        let rows = Rc::clone(&rows);
+        move |_| {
+            let Some(index) = list.get_selection() else {
+                return;
+            };
+            if let Some(row) = rows.borrow().get(index) {
+                details.set_value(&row.message);
+            }
+        }
+    });
+    refresh_button.on_click({
+        let refresh = Rc::clone(&refresh);
+        move |_| refresh()
+    });
+    copy_button.on_click(move |_| {
+        let _ = copy_to_clipboard(&details.get_value());
+    });
+    let dialog_clear = dialog;
+    clear_button.on_click({
+        let refresh = Rc::clone(&refresh);
+        move |_| {
+            let confirm = MessageDialog::builder(
+                &dialog_clear,
+                &tr("Clear the notification history for this session?"),
+                &tr("Notification History"),
+            )
+            .with_style(MessageDialogStyle::YesNo | MessageDialogStyle::NoDefault)
+            .build();
+            if confirm.show_modal_tracked() == ID_YES {
+                NOTIFICATION_HISTORY.with(|history| history.borrow_mut().clear());
+                refresh();
+            }
+        }
+    });
+    let dialog_close = dialog;
+    close_button.on_click(move |_| {
+        dialog_close.end_modal(ID_CANCEL);
+    });
+    list.set_focus();
+    dialog.show_modal_tracked();
 }
 
 /// The open Account Info window's state (audit N17, Python's
@@ -6409,6 +6550,7 @@ pub const RECENT_CHANNELS: i32 = 5127;
 pub const CHANNEL_NUMBER: i32 = 5128;
 pub const SHOW_DOWNLOADS: i32 = 5129;
 pub const ASSIGN_GUIDE: i32 = 5130;
+pub const NOTIFICATION_HISTORY_ID: i32 = 5470;
 pub const PLAYER_RADIO_BASE: i32 = 5131;
 pub const CUSTOM_PLAYER: i32 = 5163;
 pub const PREFERRED_AUDIO: i32 = 5164;
@@ -6811,6 +6953,13 @@ fn build_view_menu(keys: &std::collections::BTreeMap<String, String>) -> Menu {
         &view_menu,
         CHANNEL_NUMBER,
         &menu_label(keys, "Go to Channel &Number...", "channel_number"),
+        "",
+        ItemKind::Normal,
+    );
+    menu_add(
+        &view_menu,
+        NOTIFICATION_HISTORY_ID,
+        "Notification History...",
         "",
         ItemKind::Normal,
     );
@@ -7922,6 +8071,7 @@ fn bind_menu_actions(frame: Frame, wiring: &Wiring, controls: Controls) {
             }
             CHANNEL_NUMBER => menu_go_to_channel_number(&wiring, frame, list, status),
             ASSIGN_GUIDE => open_assign_programme_guide(&wiring, frame, list, status),
+            NOTIFICATION_HISTORY_ID => show_notification_history(frame),
             _ => {}
         }
     });
