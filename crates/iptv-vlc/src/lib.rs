@@ -29,7 +29,8 @@ type MediaReleaseFn = unsafe extern "C" fn(*mut c_void);
 type SetMediaFn = unsafe extern "C" fn(*mut c_void, *mut c_void);
 type PlayFn = unsafe extern "C" fn(*mut c_void) -> c_int;
 type VoidFn = unsafe extern "C" fn(*mut c_void);
-type SetTimeFn = unsafe extern "C" fn(*mut c_void, i64);
+type SetTimeFn = unsafe extern "C" fn(*mut c_void, i64) -> i32;
+type IsSeekableFn = unsafe extern "C" fn(*mut c_void) -> i32;
 type GetTimeFn = unsafe extern "C" fn(*mut c_void) -> i64;
 type GetStateFn = unsafe extern "C" fn(*mut c_void) -> c_int;
 type SetVolumeFn = unsafe extern "C" fn(*mut c_void, c_int) -> c_int;
@@ -55,7 +56,6 @@ type FullChaptersFn =
 type ChapterReleaseFn = unsafe extern "C" fn(*mut *mut ChapterDescription, c_int);
 type SetChapterFn = unsafe extern "C" fn(*mut c_void, c_int) -> c_int;
 type GetChapterFn = unsafe extern "C" fn(*mut c_void) -> c_int;
-type IsSeekableFn = unsafe extern "C" fn(*mut c_void) -> c_int;
 
 /// `libvlc_media_stats_t` (field order per libvlc headers). libVLC
 /// writes the whole struct: a missing field overruns the stack.
@@ -223,6 +223,7 @@ struct Functions {
     pause: VoidFn,
     stop: VoidFn,
     set_time: SetTimeFn,
+    is_seekable: Option<IsSeekableFn>,
     get_time: GetTimeFn,
     get_length: GetTimeFn,
     get_state: GetStateFn,
@@ -249,7 +250,6 @@ struct Functions {
     chapter_descriptions_release: ChapterReleaseFn,
     set_chapter: Option<SetChapterFn>,
     get_chapter: Option<GetChapterFn>,
-    is_seekable: Option<IsSeekableFn>,
 }
 
 /// The per-load media options the core's cache plan decides
@@ -438,6 +438,9 @@ impl VlcEngine {
             pause: sym!(b"libvlc_media_player_pause", VoidFn),
             stop: sym!(b"libvlc_media_player_stop", VoidFn),
             set_time: sym!(b"libvlc_media_player_set_time", SetTimeFn),
+            is_seekable: unsafe { lib.get::<IsSeekableFn>(b"libvlc_media_player_is_seekable") }
+                .ok()
+                .map(|symbol| *symbol),
             get_time: sym!(b"libvlc_media_player_get_time", GetTimeFn),
             get_length: sym!(b"libvlc_media_player_get_length", GetTimeFn),
             get_state: sym!(b"libvlc_media_player_get_state", GetStateFn),
@@ -512,9 +515,6 @@ impl VlcEngine {
                 .ok()
                 .map(|s| *s),
             get_chapter: unsafe { lib.get::<GetChapterFn>(b"libvlc_media_player_get_chapter") }
-                .ok()
-                .map(|s| *s),
-            is_seekable: unsafe { lib.get::<IsSeekableFn>(b"libvlc_media_player_is_seekable") }
                 .ok()
                 .map(|s| *s),
         };
@@ -598,9 +598,21 @@ impl VlcEngine {
         unsafe { (self.inner.fns.stop)(self.inner.player) };
     }
 
-    /// Seek to a position in milliseconds.
-    pub fn set_time(&self, ms: i64) {
-        unsafe { (self.inner.fns.set_time)(self.inner.player, ms) };
+    /// Seek to a position in milliseconds; the libVLC result
+    /// (negative when the player refused the seek).
+    pub fn set_time(&self, ms: i64) -> i32 {
+        unsafe { (self.inner.fns.set_time)(self.inner.player, ms) }
+    }
+
+    /// Whether the current media can seek (Python's
+    /// `player.is_seekable()`); a libVLC too old to answer
+    /// counts as seekable, as its `set_time` still applies.
+    #[must_use]
+    pub fn is_seekable(&self) -> bool {
+        match self.inner.fns.is_seekable {
+            Some(is_seekable) => unsafe { is_seekable(self.inner.player) != 0 },
+            None => true,
+        }
     }
 
     /// Current position in milliseconds (-1 when unknown).
@@ -881,16 +893,6 @@ impl VlcEngine {
             .fns
             .get_chapter
             .map_or(-1, |get| unsafe { get(self.inner.player) })
-    }
-
-    /// Whether the current media can be seeked (Python's
-    /// `is_seekable` guard before a chapter jump).
-    #[must_use]
-    pub fn is_seekable(&self) -> bool {
-        self.inner
-            .fns
-            .is_seekable
-            .is_some_and(|get| unsafe { get(self.inner.player) } != 0)
     }
 }
 

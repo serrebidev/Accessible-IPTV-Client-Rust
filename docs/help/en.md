@@ -123,6 +123,8 @@ Playback > Previous Episode (Ctrl+PageUp) and Next Episode (Ctrl+PageDown) switc
 
 Player > Automatically Play the Next Episode is off by default. When enabled, a series episode that finishes normally opens a 10-second countdown before the next identified episode. Play Now starts immediately; Cancel or Escape stops the continuation. A manual stop or an early playback failure does not trigger it. Changing playback or the playlist cancels an outdated continuation; if no unambiguous next episode is available, playback ends.
 
+During on-demand playback, Ctrl+Left/Right seeks 10 seconds, Ctrl+Shift+Left/Right 60 seconds, Ctrl+T opens Go to Time, and T announces elapsed, total and remaining time. Shortcuts are configurable. Seeking requires a seekable stream with known duration; live playback is unchanged.
+
 Continue Watching now has a Type choice for Video on Demand or Recordings. Local positions remain in a separate store. Checking a recording searches only the configured recording folders in the background and requires its exact path and file signature. Missing or replaced files are not played. Removing or clearing positions affects only the selected type.
 
 ## Playlist Manager {#playlist-manager}
