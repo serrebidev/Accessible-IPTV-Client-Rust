@@ -5,6 +5,14 @@ adjacent releases were part of the same fix stream, they are combined with a
 version range such as `0.2.2-0.2.3`. Each release's section below is its
 Forgejo release note, taken from this file by the release workflow.
 
+## 0.4.37
+
+- The player gains Mute/Unmute and an optional per-channel volume memory, plus Back/Forward 10 and 60 second seeks, Go to Time, and a Playback Time announcement on on-demand media.
+- You can save named positions inside a recording and jump back to them, and choose which events the announcements speak for: Playback, Subtitles and Guide.
+- Notification History lists the session's boxes with Details, Refresh, Copy and Clear. Reminders gain per-event switches, the Recording Library gains Export List to CSV, and Recordings gains a Connection Limits dialog.
+- Favourite Lists manage up to 50 named lists of 2000 channels with portable export, import and relinking of missing channels.
+- Programme Guide by Time shows what airs at any local time, with Programme Details, scheduling, reminders and calendar export. Recently Watched now resolves channels per playlist source, and Go to Channel Number understands the channels' own numbers.
+
 ## 0.4.36
 
 - Scheduled Recordings now offers Weekday repeats, skipping one occurrence, extra time before and after, finding another airing, and checking what changed in the guide. Series rules skip episodes you already have, and recordings say when they were partly recorded or stopped by you.
