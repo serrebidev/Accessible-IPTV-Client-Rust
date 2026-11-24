@@ -111,6 +111,8 @@ Favorites are stored by provider and channel, not by stream address, so they sur
 
 View > Recently Watched lists channels you have played. View > Previous Channel (Ctrl+0) switches back to the channel you watched before this one.
 
+In Favourite Lists, Export Favourite List saves one ordered list without stream addresses or account credentials. On the other computer, choose Import Favourite List. Review the matches, choose a local channel for ambiguous entries, and enter a new list name. Unresolved entries keep their places and can be linked later.
+
 ## Video on demand {#video-on-demand}
 
 View > Video on Demand (Movies && Series) switches the category list from live channels to your provider's films and series. Categories are named Movies or Series followed by the provider's category. Choosing a series lists its episodes in season and episode order. Press Enter to play a film or an episode.
@@ -358,6 +360,12 @@ Programmes rarely start and end exactly on time. Recordings > Schedule Padding s
 Recordings > Shut Down the Computer When Recordings Finish turns the computer off once every running and scheduled recording is done, which is useful for a late-night recording.
 
 It never fires while something is still recording or waiting in the schedule. When the time comes, a window counts down 60 seconds; Cancel Shutdown is focused, so pressing Enter or Escape stops it, and Shut Down Now does not wait. The option turns itself off once it has been used or canceled.
+
+## Personal tools {#personal-tools}
+
+In a named favourite list, select an unavailable channel and choose Relink Missing Channel. Search for its replacement and confirm your choice. The entry keeps its position in the list.
+
+- View > Favourite Lists manages up to 50 named lists of 2000 channels each, separate from the original favourites. Select a channel before opening the dialog to add it. Move Up/Down or Ctrl+Up/Down changes order. Missing channels remain listed and cannot play until available again.
 
 ## Casting {#casting}
 
