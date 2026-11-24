@@ -1453,6 +1453,47 @@ pub struct GuideIndexes {
     /// scored matcher (Python gathers its fuzzy rows with token `LIKE`
     /// queries over the guide's normalized names).
     token_index: HashMap<String, Vec<String>>,
+    /// The guide's own id (lower case, per-source qualifier removed)
+    /// -> every stored id carrying it, in guide order (Python
+    /// `source_ids`).
+    source_ids: HashMap<String, Vec<String>>,
+    /// Guide ids two or more sources define differently (Python's
+    /// collision cache over the known ids).
+    collisions: HashSet<String>,
+}
+
+/// Python `channel_identity.xmltv_id`: the guide's own id, without
+/// the per-source `epg:<40 hex>:` qualifier the import adds when two
+/// sources disagree about one id.
+#[must_use]
+pub fn xmltv_id(identity: &str) -> &str {
+    identity
+        .strip_prefix("epg:")
+        .and_then(|rest| rest.split_once(':'))
+        .filter(|(hex, _)| hex.len() == 40 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
+        .map_or(identity, |(_, id)| id)
+}
+
+/// Python `choose_source_collision`: among guide channels sharing one
+/// id, the single one whose name matches the playlist channel's (word
+/// numbers as digits, numbers not disagreeing), or none.
+#[must_use]
+pub fn choose_source_collision(channel: &Channel, names: &[(String, String)]) -> Option<String> {
+    let wanted: HashSet<String> = [channel.name.as_str(), channel.tvg_name.as_str()]
+        .into_iter()
+        .map(|text| canonicalize_name(&replace_word_numbers(text)))
+        .filter(|key| !key.is_empty())
+        .collect();
+    let numbers = significant_channel_numbers(&[channel.name.as_str(), channel.tvg_name.as_str()]);
+    let matches: Vec<&String> = names
+        .iter()
+        .filter(|(_, name)| {
+            wanted.contains(&canonicalize_name(&replace_word_numbers(name)))
+                && !numbers_disagree(&numbers, &significant_channel_numbers(&[name.as_str()]))
+        })
+        .map(|(id, _)| id)
+        .collect();
+    (matches.len() == 1).then(|| matches[0].clone())
 }
 
 /// Add one id to a name index bucket, keeping guide order, no duplicates.
@@ -1490,7 +1531,24 @@ impl GuideIndexes {
             name_index: HashMap::new(),
             stripped_index: HashMap::new(),
             token_index: HashMap::new(),
+            source_ids: HashMap::new(),
+            collisions: HashSet::new(),
         };
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for channel in channels {
+            let original = xmltv_id(&channel.id).to_lowercase();
+            *counts.entry(original.clone()).or_default() += 1;
+            indexes
+                .source_ids
+                .entry(original)
+                .or_default()
+                .push(channel.id.clone());
+        }
+        indexes.collisions = counts
+            .into_iter()
+            .filter(|(_, count)| *count > 1)
+            .map(|(id, _)| id)
+            .collect();
         for channel in channels {
             let display = channel.display_name.as_str();
             for token in crate::guide_match::channel_tokens(display) {
@@ -1617,12 +1675,46 @@ fn add_base_variants(value: &str, candidates: &mut Vec<String>) {
 /// `match_guide_channel`). `known_ids` holds every guide channel id in
 /// lower case, including ones with nothing on air at the moment.
 #[must_use]
+#[allow(clippy::too_many_lines)] // Python's one matcher, step by step
 pub fn match_guide_channel<S: std::hash::BuildHasher>(
     channel: &Channel,
     indexes: &GuideIndexes,
     known_ids: Option<&HashSet<String, S>>,
 ) -> Option<String> {
+    // The user's assignment wins; one whose guide id vanished stays
+    // unavailable until it is corrected (Python `channel_preferences`).
+    let assigned = crate::channel_preferences::epg_id(channel);
+    if !assigned.is_empty() {
+        return indexes
+            .display_names
+            .contains_key(&assigned)
+            .then_some(assigned);
+    }
     let raw_id = channel.tvg_id.trim();
+    // An id two sources define differently resolves by an exact,
+    // number-safe name; one only a qualified copy carries is that copy.
+    let raw_lower = raw_id.to_lowercase();
+    let scoped = indexes
+        .source_ids
+        .get(&raw_lower)
+        .map_or(&[][..], Vec::as_slice);
+    if scoped.len() > 1 || indexes.collisions.contains(&raw_lower) {
+        let names: Vec<(String, String)> = scoped
+            .iter()
+            .map(|id| {
+                (
+                    id.clone(),
+                    indexes.display_names.get(id).cloned().unwrap_or_default(),
+                )
+            })
+            .collect();
+        return choose_source_collision(channel, &names);
+    }
+    if let [only] = scoped {
+        if xmltv_id(only) != only {
+            return Some(only.clone());
+        }
+    }
     let mut candidates = expand_tvg_id_candidates(raw_id);
     candidates.push(raw_id.to_string());
     if let Some((head, _)) = raw_id.rsplit_once('.') {
@@ -2119,13 +2211,19 @@ impl EpgReadWorker {
                                 ));
                             }
                             let indexes = &indexes.as_ref().expect("indexes just built").1;
-                            if let Some(id) =
-                                match_guide_channel(&channel, indexes, Some(&indexes.known_ids))
-                            {
-                                let programmes = db.programmes_between(&id, from, to)?;
+                            let matched =
+                                match_guide_channel(&channel, indexes, Some(&indexes.known_ids));
+                            if let Some(id) = &matched {
+                                let programmes = db.programmes_between(id, from, to)?;
                                 if !programmes.is_empty() {
                                     return Ok(EpgReadValue::Programmes(programmes));
                                 }
+                            }
+                            // An assigned guide is the channel's only one.
+                            if matched.is_some()
+                                || !crate::channel_preferences::epg_id(&channel).is_empty()
+                            {
+                                return Ok(EpgReadValue::Programmes(Vec::new()));
                             }
                             let mut candidates = expand_tvg_id_candidates(channel.tvg_id.trim());
                             candidates.push(channel.tvg_id.trim().to_string());

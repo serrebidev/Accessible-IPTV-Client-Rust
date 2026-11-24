@@ -88,6 +88,7 @@ impl EpgStore {
     /// Add the columns per-source imports need to databases from
     /// older builds, backfill normalized names once, and make
     /// programme slots unique so the upsert can conflict on them.
+    #[allow(clippy::too_many_lines)] // one migration per older schema
     fn migrate(&mut self) -> Result<(), String> {
         let columns: Vec<String> = {
             let mut statement = self
@@ -116,6 +117,16 @@ impl EpgStore {
         if !columns.iter().any(|c| c == "last_seen") {
             self.conn
                 .execute("ALTER TABLE channels ADD COLUMN last_seen INTEGER", [])
+                .map_err(|e| e.to_string())?;
+        }
+        // The guide's own id beside a per-source qualified one
+        // (Python `channels.xmltv_id`).
+        if !self.column_exists("channels", "xmltv_id")? {
+            self.conn
+                .execute(
+                    "ALTER TABLE channels ADD COLUMN xmltv_id TEXT NOT NULL DEFAULT ''",
+                    [],
+                )
                 .map_err(|e| e.to_string())?;
         }
         // Python's store keeps the XMLTV episode number and
@@ -200,6 +211,19 @@ impl EpgStore {
         Ok(())
     }
 
+    /// Whether a source other than `source_key` lists `channel_id`.
+    fn listed_elsewhere(&self, channel_id: &str, source_key: &str) -> Result<bool, String> {
+        self.conn
+            .query_row(
+                "SELECT 1 FROM channel_sources WHERE channel_id = ?1 AND source_key != ?2 LIMIT 1",
+                [channel_id, source_key],
+                |_| Ok(()),
+            )
+            .optional()
+            .map(|row| row.is_some())
+            .map_err(|e| e.to_string())
+    }
+
     fn column_exists(&self, table: &str, column: &str) -> Result<bool, String> {
         let mut statement = self
             .conn
@@ -261,8 +285,6 @@ impl EpgStore {
         guide: &EpgGuide,
         now: i64,
     ) -> Result<usize, String> {
-        let keep: std::collections::HashSet<&str> =
-            guide.channels.iter().map(|c| c.id.as_str()).collect();
         let listed: Vec<String> = {
             let mut statement = self
                 .conn
@@ -283,20 +305,35 @@ impl EpgStore {
         // giant transaction over a whole guide is what made a
         // fresh import take 773 s against Python's 290 s combined
         // parse+import (audit 0067).
-        {
+        let internal = {
             let tx = self.conn.transaction().map_err(|e| e.to_string())?;
-            insert_channels(&tx, guide, Some(source_key), now)?;
+            let internal = insert_channels(&tx, guide, Some(source_key), now)?;
             tx.commit().map_err(|e| e.to_string())?;
+            internal
+        };
+        let keep: std::collections::HashSet<&str> = internal.values().map(String::as_str).collect();
+        // Programmes go to the source's own copy of their channel; a
+        // feed's programmes for a channel it never declared must not
+        // overwrite another source's guide (Python's import).
+        let mut routed: Vec<Programme> = Vec::new();
+        for (raw, programmes) in &guide.programmes {
+            let target = match internal.get(raw) {
+                Some(target) => target.clone(),
+                None if self.listed_elsewhere(raw, source_key)? => continue,
+                None => raw.clone(),
+            };
+            routed.extend(programmes.iter().map(|programme| Programme {
+                channel_id: target.clone(),
+                ..programme.clone()
+            }));
         }
         let mut count = 0_usize;
         let mut batch: Vec<&Programme> = Vec::with_capacity(IMPORT_BATCH);
-        for programmes in guide.programmes.values() {
-            for programme in programmes {
-                batch.push(programme);
-                if batch.len() == IMPORT_BATCH {
-                    count += self.flush_programme_batch(&batch)?;
-                    batch.clear();
-                }
+        for programme in &routed {
+            batch.push(programme);
+            if batch.len() == IMPORT_BATCH {
+                count += self.flush_programme_batch(&batch)?;
+                batch.clear();
             }
         }
         if !batch.is_empty() {
@@ -861,7 +898,7 @@ fn insert_guide_rows(
     source_key: Option<&str>,
     now: i64,
 ) -> Result<usize, String> {
-    insert_channels(tx, guide, source_key, now)?;
+    let _ = insert_channels(tx, guide, source_key, now)?;
     let mut count = 0_usize;
     for programmes in guide.programmes.values() {
         let refs: Vec<&Programme> = programmes.iter().collect();
@@ -870,20 +907,35 @@ fn insert_guide_rows(
     Ok(count)
 }
 
+/// Store a guide's channels; returns each guide id's stored id. With
+/// a source, an id another source already defines under a different
+/// name (or one this source already qualified) is stored as
+/// `epg:<source>:<id>` and this source's listing of the shared id is
+/// dropped (Python `insert_channel`): existing identities stay stable
+/// and only colliding ids split.
 fn insert_channels(
     tx: &rusqlite::Transaction<'_>,
     guide: &EpgGuide,
     source_key: Option<&str>,
     now: i64,
-) -> Result<(), String> {
+) -> Result<std::collections::HashMap<String, String>, String> {
+    let mut internal = std::collections::HashMap::new();
     {
         let mut read_norm = tx
             .prepare("SELECT norm_name FROM channels WHERE id = ?1")
             .map_err(|e| e.to_string())?;
         let mut insert_channel = tx
             .prepare(
-                "INSERT OR REPLACE INTO channels (id, display_name, norm_name, last_seen)
-                 VALUES (?1, ?2, ?3, ?4)",
+                "INSERT OR REPLACE INTO channels (id, display_name, norm_name, last_seen, xmltv_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+            )
+            .map_err(|e| e.to_string())?;
+        let mut read_name = tx
+            .prepare("SELECT display_name FROM channels WHERE id = ?1")
+            .map_err(|e| e.to_string())?;
+        let mut other_source = tx
+            .prepare(
+                "SELECT 1 FROM channel_sources WHERE channel_id = ?1 AND source_key != ?2 LIMIT 1",
             )
             .map_err(|e| e.to_string())?;
         let mut insert_source = tx
@@ -893,34 +945,63 @@ fn insert_channels(
             )
             .map_err(|e| e.to_string())?;
         for channel in &guide.channels {
+            let mut id = channel.id.clone();
+            if let Some(key) = source_key {
+                let qualified = format!("epg:{key}:{}", channel.id);
+                let existing = read_name
+                    .query_row([&qualified], |_| Ok(()))
+                    .optional()
+                    .map_err(|e| e.to_string())?
+                    .is_some();
+                let old_name: Option<String> = read_name
+                    .query_row([&channel.id], |row| row.get::<_, String>(0))
+                    .optional()
+                    .map_err(|e| e.to_string())?;
+                let shared = other_source
+                    .query_row([channel.id.as_str(), key], |_| Ok(()))
+                    .optional()
+                    .map_err(|e| e.to_string())?
+                    .is_some();
+                if existing || (shared && old_name.is_some_and(|name| name != channel.display_name))
+                {
+                    tx.execute(
+                        "DELETE FROM channel_sources WHERE channel_id = ?1 AND source_key = ?2",
+                        [channel.id.as_str(), key],
+                    )
+                    .map_err(|e| e.to_string())?;
+                    id = qualified;
+                }
+            }
             let new_norm = norm_name(&channel.display_name);
             let stored: Option<String> = read_norm
-                .query_row([&channel.id], |row| row.get::<_, String>(0))
+                .query_row([&id], |row| row.get::<_, String>(0))
                 .optional()
                 .map_err(|e| e.to_string())?;
             if let Some(stored) = stored {
                 if !stored.is_empty() && !new_norm.is_empty() && stored != new_norm {
-                    tx.execute("DELETE FROM programmes WHERE channel = ?1", [&channel.id])
+                    tx.execute("DELETE FROM programmes WHERE channel = ?1", [&id])
                         .map_err(|e| e.to_string())?;
                 }
             }
             let seen: Option<i64> = source_key.map(|_| now);
             insert_channel
                 .execute(rusqlite::params![
-                    channel.id,
+                    id,
                     channel.display_name,
                     new_norm,
-                    seen
+                    seen,
+                    channel.id
                 ])
                 .map_err(|e| e.to_string())?;
             if let Some(key) = source_key {
                 insert_source
-                    .execute([&channel.id, key])
+                    .execute([&id, key])
                     .map_err(|e| e.to_string())?;
             }
+            internal.insert(channel.id.clone(), id);
         }
     }
-    Ok(())
+    Ok(internal)
 }
 
 fn insert_programmes(
@@ -1568,6 +1649,110 @@ mod tests {
         );
         drop(store);
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// Python `insert_channel`: an id two sources define with
+    /// different names is split, the later source's copy qualified as
+    /// `epg:<source>:<id>`; a shared id with the same name stays one;
+    /// a feed's undeclared programmes never land on another source's
+    /// channel. Matching picks the copy by name.
+    #[test]
+    fn colliding_guide_ids_are_scoped_per_source() {
+        let (a, b) = ("a".repeat(40), "b".repeat(40));
+        let mut store = EpgStore::open(std::path::Path::new(":memory:")).unwrap();
+        store
+            .import_source(
+                &a,
+                &guide_with("news", "Hír TV", vec![prog("news", 100, 200, "A Show", "")]),
+                1_000,
+            )
+            .unwrap();
+        store
+            .import_source(
+                &b,
+                &guide_with(
+                    "news",
+                    "News 24",
+                    vec![prog("news", 100, 200, "B Show", "")],
+                ),
+                1_000,
+            )
+            .unwrap();
+        let qualified = format!("epg:{b}:news");
+        let ids: Vec<String> = store
+            .channels()
+            .unwrap()
+            .into_iter()
+            .map(|c| c.id)
+            .collect();
+        assert!(
+            ids.contains(&"news".to_string()) && ids.contains(&qualified),
+            "{ids:?}"
+        );
+        assert_eq!(
+            store.programmes_between("news", 0, 300).unwrap()[0].title,
+            "A Show"
+        );
+        assert_eq!(
+            store.programmes_between(&qualified, 0, 300).unwrap()[0].title,
+            "B Show"
+        );
+
+        // Re-importing B keeps using its qualified copy.
+        store
+            .import_source(
+                &b,
+                &guide_with(
+                    "news",
+                    "News 24",
+                    vec![prog("news", 200, 300, "B Next", "")],
+                ),
+                2_000,
+            )
+            .unwrap();
+        assert!(store
+            .programmes_between(&qualified, 150, 350)
+            .unwrap()
+            .iter()
+            .any(|p| p.title == "B Next"));
+        assert_eq!(store.programmes_between("news", 0, 300).unwrap().len(), 1);
+
+        let indexes = crate::epg::GuideIndexes::build(&store.channels().unwrap());
+        let channel = |name: &str| crate::Channel {
+            name: name.to_string(),
+            tvg_id: "news".to_string(),
+            ..crate::Channel::default()
+        };
+        let find = |c: &crate::Channel| {
+            crate::epg::match_guide_channel(c, &indexes, Some(&indexes.known_ids))
+        };
+        assert_eq!(find(&channel("News 24")), Some(qualified.clone()));
+        assert_eq!(find(&channel("Hír TV")), Some("news".to_string()));
+        assert_eq!(find(&channel("Something else")), None);
+
+        // A third source sharing the id under the same name joins it.
+        let c = "c".repeat(40);
+        store
+            .import_source(&c, &guide_with("news", "Hír TV", vec![]), 3_000)
+            .unwrap();
+        assert!(!store
+            .channels()
+            .unwrap()
+            .iter()
+            .any(|ch| ch.id == format!("epg:{c}:news")));
+
+        // An undeclared programme for an id another source owns is dropped.
+        let d = "d".repeat(40);
+        let mut stray = guide_with("other", "Other", vec![]);
+        stray.programmes.insert(
+            "news".to_string(),
+            vec![prog("news", 400, 500, "Stray", "")],
+        );
+        store.import_source(&d, &stray, 4_000).unwrap();
+        assert!(store
+            .programmes_between("news", 350, 600)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

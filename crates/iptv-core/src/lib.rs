@@ -42,6 +42,7 @@ pub mod cast;
 pub mod catchup;
 pub mod catchup_direct;
 pub mod categories;
+pub mod channel_preferences;
 pub mod config;
 pub mod downloads;
 pub mod dvr;

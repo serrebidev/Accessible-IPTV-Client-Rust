@@ -299,16 +299,7 @@ pub fn warnings(config: &Value, changes: &Changes, jobs: &Changes) -> Vec<String
     messages
 }
 
-/// Python `channel_identity.xmltv_id`: the guide's own id, without
-/// the application's per-source `epg:<40 hex>:` qualifier.
-#[must_use]
-pub fn xmltv_id(identity: &str) -> &str {
-    identity
-        .strip_prefix("epg:")
-        .and_then(|rest| rest.split_once(':'))
-        .filter(|(hex, _)| hex.len() == 40 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
-        .map_or(identity, |(_, id)| id)
-}
+pub use crate::epg::xmltv_id;
 
 /// Python `programme_reminders.media_identity`: the stream address
 /// with its request headers, so two entries for the same URL with
