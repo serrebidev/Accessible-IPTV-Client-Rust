@@ -9402,7 +9402,7 @@ fn menu_go_to_channel_number(wiring: &Wiring, frame: Frame, list: ListCtrl, stat
             let Some(channel) = model.channel(candidate) else {
                 continue;
             };
-            if own_number(&channel) == digits {
+            if own_number(channel) == digits {
                 row = Some(candidate);
                 break;
             }
@@ -9416,7 +9416,7 @@ fn menu_go_to_channel_number(wiring: &Wiring, frame: Frame, list: ListCtrl, stat
                 return None;
             }
             let channel = model.channel(position - 1)?;
-            own_number(&channel).is_empty().then_some(position - 1)
+            own_number(channel).is_empty().then_some(position - 1)
         });
         let Some(row) = row else {
             let dialog = MessageDialog::builder(
