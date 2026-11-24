@@ -1337,17 +1337,17 @@ Checked and not gaps: Python's start-at-100-percent volume fix (Rust never reads
 - **C10, medium: Assign Programme Guide.** **Fixed 2026-11-24 (validation 0104).** Python `accessible_tools_ui.py`.
 - **C11, medium: Saved Programme Searches.** **Fixed 2026-11-24 (validation 0112).** Python `saved_searches.py`, `personal_tools_ui.py`.
 - **C12, high: guide ids scoped per guide source.** **Fixed 2026-11-24 (validation 0104, with C10).** Python's EPG import keeps a shared XMLTV id but splits it into `epg:<source_key>:<id>` when two sources collide or a source renames a shared id (`channels.xmltv_id`, `channel_sources`), and matching resolves an unscoped duplicate by one exact, number-safe display name (`choose_source_collision`). Python `playlist.py:1473`, `:2120`, `channel_identity.py`. Found by the scope sweep.
-- **M1, medium: Mute / Unmute and Remember Volume for Each Channel.** Python `channel_preferences.py`.
-- **M2, medium: on-demand seek keys, Go to Time, time announcement.** Python `media_navigation.py`.
-- **M3, low: Named Bookmarks.** Python `named_bookmarks.py`.
-- **M4, low: reminder snooze and Export to Calendar.** Python `programme_reminders.py`, `planning_tools.py`.
-- **M5, low: Notification History.** Python `session_tools_ui.py`.
-- **M6, low: per-event announcement switches.** Python `main.py` (PR #118).
-- **M7, low: Recording Connection Limits dialog.** Python `recording_limits_ui.py`.
-- **M8, low: Recording Library CSV export.** Python `recording_library_ui.py`.
-- **M9, medium: Favourite Lists with export, import and relink.** Python `favorite_collections.py`, `favourite_transfer.py`.
-- **M10, low: Programme Guide by Time and Programme Details.** Python `personal_tools_ui.py`.
-- **M11, medium: Recently Watched keyed per playlist source.** Plain M3U entries use `m3u-history:<sha256(playlist-id)>:<channel key>` while favourite keys stay unchanged; lookup accepts legacy keys, refuses ambiguous matches, and labels same-named channels with their source alias. Also `playlist_index.channel_number` (canonical decimal digits, Unicode digits folded) for Go to Channel. Without the keys, Recently Watched written by Python does not resolve after the swap. Python `favorites.py` (`history_key`, `history_channels`, `history_labels`), `playlist_index.py`. Found by the scope sweep.
+- **M1, medium: Mute / Unmute and Remember Volume for Each Channel.** **Fixed 2026-11-24 (validation 0113).** Python `channel_preferences.py`.
+- **M2, medium: on-demand seek keys, Go to Time, time announcement.** **Fixed 2026-11-24 (validation 0113).** Python `media_navigation.py`.
+- **M3, low: Named Bookmarks.** **Fixed 2026-11-24 (validation 0113).** Python `named_bookmarks.py`.
+- **M4, low: reminder snooze and Export to Calendar.** **Fixed 2026-11-24 (validation 0113).** Python `programme_reminders.py`, `planning_tools.py`.
+- **M5, low: Notification History.** **Fixed 2026-11-24 (validation 0113).** Python `session_tools_ui.py`.
+- **M6, low: per-event announcement switches.** **Fixed 2026-11-24 (validation 0113).** Python `main.py` (PR #118).
+- **M7, low: Recording Connection Limits dialog.** **Fixed 2026-11-24 (validation 0113).** Python `recording_limits_ui.py`.
+- **M8, low: Recording Library CSV export.** **Fixed 2026-11-24 (validation 0113).** Python `recording_library_ui.py`.
+- **M9, medium: Favourite Lists with export, import and relink.** **Fixed 2026-11-24 (validation 0113).** Python `favorite_collections.py`, `favourite_transfer.py`.
+- **M10, low: Programme Guide by Time and Programme Details.** **Fixed 2026-11-24 (validation 0113).** Python `personal_tools_ui.py`.
+- **M11, medium: Recently Watched keyed per playlist source.** **Fixed 2026-11-24 (validation 0113).** Plain M3U entries use `m3u-history:<sha256(playlist-id)>:<channel key>` while favourite keys stay unchanged; lookup accepts legacy keys, refuses ambiguous matches, and labels same-named channels with their source alias. Also `playlist_index.channel_number` (canonical decimal digits, Unicode digits folded) for Go to Channel. Without the keys, Recently Watched written by Python does not resolve after the swap. Python `favorites.py` (`history_key`, `history_channels`, `history_labels`), `playlist_index.py`. Found by the scope sweep.
 
 Scope sweep (2026-11-23): every function added in `6afe6014..a29ad9a3` outside tests and tools was mapped to an entry above. Folded in rather than listed: series padding (`dvr.series_padding_at`) into C1; subtitle-speech history reset on seek (`subtitle_pipeline.seeked`) into M2; reminder alert choice and source names (`programme_reminders`, `planning_ui`) into M4; start-at-problem-time seek (`_choose_recording_position`, `_apply_recording_seek`) into C7.
 
