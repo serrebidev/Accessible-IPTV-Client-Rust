@@ -7145,6 +7145,7 @@ pub const REC_BY_TIME: i32 = 5226;
 pub const REC_PREVENT_SLEEP: i32 = 5227;
 pub const REC_WAKE_RECORDINGS: i32 = 5228;
 pub const REC_SPACE_MONITOR: i32 = 5229;
+pub const REC_LIMITS: i32 = 5230;
 
 /// The Recording Format submenu inside the Recordings menu
 /// (found by its label, the same fetch-by-parent pattern the
@@ -7665,6 +7666,13 @@ fn build_recordings_menu(config: &Config) -> Menu {
         &menu,
         REC_LIBRARY,
         "Recording &Library...",
+        "",
+        ItemKind::Normal,
+    );
+    menu_add(
+        &menu,
+        REC_LIMITS,
+        "Recording Connection &Limits...",
         "",
         ItemKind::Normal,
     );
@@ -8583,7 +8591,7 @@ fn menu_item_topic(id: i32) -> Option<&'static str> {
         WHATS_NEW => "updates",
         REC_START | REC_STOP | REC_STOP_ALL | REC_STORAGE | REC_MIN_FREE | REC_SET_FOLDER
         | REC_OPEN_FOLDER | REC_PROBLEM_TIMES | REC_LIBRARY | REC_PREVENT_SLEEP
-        | REC_WAKE_RECORDINGS | REC_SPACE_MONITOR | CTX_RECORD => "recordings",
+        | REC_WAKE_RECORDINGS | REC_SPACE_MONITOR | REC_LIMITS | CTX_RECORD => "recordings",
         REC_REMINDERS | CTX_REMINDER => "reminders",
         REC_SCHEDULED | CTX_SCHEDULE => "scheduled-recordings",
         REC_PADDING => "schedule-padding",
@@ -8846,6 +8854,7 @@ fn menu_recordings_action(
         REC_STORAGE => show_recording_storage(wiring, frame, status),
         REC_SPACE_MONITOR => show_space_monitor_dialog(wiring, frame, status),
         REC_LIBRARY => open_recording_library(wiring, status),
+        REC_LIMITS => open_recording_limits(wiring, frame),
         REC_MIN_FREE => prompt_min_free_space(wiring, frame, status),
         REC_PADDING => prompt_schedule_padding(wiring, frame, status),
         REC_PROBLEM_TIMES => show_recording_problem_times(wiring, frame),
@@ -25526,6 +25535,197 @@ fn cancel_selected_download(wiring: &Wiring, frame: Frame, list: ListBox, dstatu
         }
         _ => {}
     }
+}
+
+/// Recordings > Recording Connection Limits... (M7, Python
+/// `recording_limits_ui.RecordingLimitsDialog`): one row per
+/// configured or detected provider account, with a 0-64 spin
+/// for the connections recordings may use (0 = no additional
+/// limit). Accounts are discovered on a worker thread, as in
+/// Python; a dialog timer polls for the result. Save writes
+/// the selected account's budget through the core normalize
+/// (a 0 budget drops the entry) and reports in the status.
+#[allow(clippy::too_many_lines)] // connection limits dialog, as in Python
+fn open_recording_limits(wiring: &Wiring, frame: Frame) {
+    let dialog = Dialog::builder(&frame, &tr("Recording Connection Limits"))
+        .with_size(730, 430)
+        .build();
+    dialog.set_accessibility_label(&tr("Recording Connection Limits"));
+    bind_escape_cancel(dialog);
+    let panel = Panel::builder(&dialog).build();
+    let list_label = StaticText::builder(&panel)
+        .with_label(&tr("Provider accounts"))
+        .build();
+    let list = ListBox::builder(&panel).build();
+    list.set_accessibility_label(&tr("Provider accounts"));
+    let spin_label_text = tr("Connections available for recordings (0 = no additional limit):");
+    let spin_label = StaticText::builder(&panel)
+        .with_label(&spin_label_text)
+        .build();
+    let spin = SpinCtrl::builder(&panel).with_range(0, 64).build();
+    spin.set_accessibility_label(&spin_label_text);
+    let explanation = StaticText::builder(&panel)
+        .with_label(&tr("Allow for playback and other devices when setting this budget. Existing recordings are never stopped to free a connection."))
+        .build();
+    explanation.wrap(680);
+    let dstatus = StaticText::builder(&panel)
+        .with_label(&tr("Loading accounts..."))
+        .build();
+    dstatus.set_accessibility_label("Status");
+    let save_button = Button::builder(&panel).with_label(&tr("Save")).build();
+    save_button.set_accessibility_label("Save");
+    save_button.enable(false);
+    let close_button = Button::builder(&panel).with_label(&tr("Close")).build();
+    close_button.set_accessibility_label("Close");
+    let sizer = BoxSizer::builder(Orientation::Vertical).build();
+    sizer.add(&list_label, 0, SizerFlag::All, 8);
+    sizer.add(&list, 1, SizerFlag::Expand | SizerFlag::All, 8);
+    sizer.add(&spin_label, 0, SizerFlag::All, 8);
+    sizer.add(&spin, 0, SizerFlag::All, 8);
+    sizer.add(&explanation, 0, SizerFlag::Expand | SizerFlag::All, 8);
+    sizer.add(&dstatus, 0, SizerFlag::All, 8);
+    let buttons = BoxSizer::builder(Orientation::Horizontal).build();
+    buttons.add(&save_button, 0, SizerFlag::All, 8);
+    buttons.add(&close_button, 0, SizerFlag::All, 8);
+    sizer.add_sizer(&buttons, 0, SizerFlag::Expand, 0);
+    panel.set_sizer(sizer, true);
+
+    let accounts: Rc<RefCell<Vec<iptv_core::account_info::Account>>> =
+        Rc::new(RefCell::new(Vec::new()));
+    let apply_selection = {
+        let accounts = Rc::clone(&accounts);
+        let persist = wiring.persist.clone();
+        move || {
+            let Some(index) = list.get_selection().and_then(|i| usize::try_from(i).ok()) else {
+                return;
+            };
+            if let Some(account) = accounts.borrow().get(index) {
+                let key = iptv_core::recording_limits::account_key(account);
+                let limits = iptv_core::recording_limits::normalize(
+                    persist.config.borrow().value("recording_connection_limits"),
+                );
+                spin.set_value(i32::try_from(limits.get(&key).copied().unwrap_or(0)).unwrap_or(0));
+            }
+        }
+    };
+    let apply_selection = Rc::new(apply_selection);
+    list.on_selection_changed({
+        let apply_selection = Rc::clone(&apply_selection);
+        move |_| apply_selection()
+    });
+    save_button.on_click({
+        let accounts = Rc::clone(&accounts);
+        let persist = wiring.persist.clone();
+        move |_| {
+            let Some(index) = list.get_selection().and_then(|i| usize::try_from(i).ok()) else {
+                return;
+            };
+            let key = {
+                let rows = accounts.borrow();
+                let Some(account) = rows.get(index) else {
+                    return;
+                };
+                iptv_core::recording_limits::account_key(account)
+            };
+            let value = i64::from(spin.value());
+            // Python's commit: normalize, set, normalize again
+            // (a 0 budget therefore removes the entry).
+            let mut limits = iptv_core::recording_limits::normalize(
+                persist.config.borrow().value("recording_connection_limits"),
+            );
+            limits.insert(key, value);
+            let staged: serde_json::Map<String, serde_json::Value> = limits
+                .into_iter()
+                .map(|(k, v)| (k, serde_json::json!(v)))
+                .collect();
+            let limits: serde_json::Map<String, serde_json::Value> =
+                iptv_core::recording_limits::normalize(Some(&serde_json::Value::Object(staged)))
+                    .into_iter()
+                    .map(|(k, v)| (k, serde_json::json!(v)))
+                    .collect();
+            persist.set_and_save(
+                "recording_connection_limits",
+                serde_json::Value::Object(limits),
+            );
+            dstatus.set_label(&tr("Recording connection limit saved."));
+        }
+    });
+    let dialog_close = dialog;
+    close_button.on_click(move |_| {
+        dialog_close.end_modal(ID_CANCEL);
+    });
+
+    // Discovery on a worker, polled by a dialog timer (Python
+    // threads it and posts back with CallAfter).
+    let sources: Vec<serde_json::Value> =
+        match wiring.persist.config.borrow().value("playlists").cloned() {
+            Some(serde_json::Value::Array(entries)) => entries,
+            Some(serde_json::Value::String(_)) => wiring
+                .persist
+                .config
+                .borrow()
+                .string_list("playlists")
+                .into_iter()
+                .map(serde_json::Value::String)
+                .collect(),
+            _ => Vec::new(),
+        };
+    let channels: Vec<Channel> = wiring
+        .browser
+        .borrow()
+        .catalogue_model()
+        .channels()
+        .to_vec();
+    let (sender, receiver) =
+        std::sync::mpsc::channel::<Result<Vec<iptv_core::account_info::Account>, String>>();
+    std::thread::spawn(move || {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            iptv_core::account_info::discover_accounts(&sources, &channels)
+        }))
+        .map_err(|_| "the account scan failed".to_string());
+        let _ = sender.send(result);
+    });
+    let timer = Timer::new(&dialog);
+    timer.on_tick({
+        let accounts = Rc::clone(&accounts);
+        let persist = wiring.persist.clone();
+        move |_| {
+            let Ok(result) = receiver.try_recv() else {
+                return;
+            };
+            match result {
+                Ok(found) => {
+                    let labels: Vec<String> = found.iter().map(|a| tr(&a.label())).collect();
+                    let empty = found.is_empty();
+                    *accounts.borrow_mut() = found;
+                    list.set_items(&labels.iter().map(String::as_str).collect::<Vec<_>>());
+                    if empty {
+                        dstatus.set_label(&tr("No provider accounts found."));
+                    } else {
+                        dstatus.set_label("");
+                    }
+                    save_button.enable(!empty);
+                    if !empty {
+                        list.set_selection(0, true);
+                        let key = iptv_core::recording_limits::account_key(&accounts.borrow()[0]);
+                        let limits = iptv_core::recording_limits::normalize(
+                            persist.config.borrow().value("recording_connection_limits"),
+                        );
+                        spin.set_value(
+                            i32::try_from(limits.get(&key).copied().unwrap_or(0)).unwrap_or(0),
+                        );
+                    }
+                }
+                Err(error) => {
+                    dstatus.set_label(&error);
+                }
+            }
+        }
+    });
+    let _ = timer.start(100, false);
+    list.set_focus();
+    dialog.show_modal_tracked();
+    timer.stop();
 }
 
 /// File > Account Info (audit N17): discovery runs on a
