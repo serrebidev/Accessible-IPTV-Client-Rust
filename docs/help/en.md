@@ -262,6 +262,8 @@ With the local live buffer active, Playback > Save Recent Broadcast saves the la
 
 Mute / Unmute silences the built-in player without pausing playback or recording. The default shortcut is Ctrl+Shift+M in the main window and M in the player; both can be changed in Keyboard Shortcuts. Muting survives channel changes and reconnects. Player > Remember Volume for Each Channel is optional and off by default: it recalls your chosen volume separately for each playlist or provider. Channels without a saved value use the ordinary player volume. Neither feature changes screen-reader volume.
 
+In the built-in player's Playback menu, Add Named Bookmark saves the current position in on-demand media or a local recording. Seeking and a known duration are required. Named Bookmarks lists the current item's bookmarks: Enter or Go to Bookmark jumps to a position; Rename and Delete manage the selected entry. Names must be unique within that item. Up to 1000 bookmarks can be saved in total. These bookmarks are separate from the automatic resume position.
+
 ### Audio tracks {#audio-tracks}
 
 Channels can carry several audio tracks, such as other languages or audio description. Press A to move to the next track, use Playback > Audio Track, or Tab to Choose Audio Track, which always names the track that is playing.

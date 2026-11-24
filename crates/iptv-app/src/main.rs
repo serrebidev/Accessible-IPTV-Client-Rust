@@ -11819,6 +11819,8 @@ const PM_SEEK_BACK_60: i32 = 5462;
 const PM_SEEK_FORWARD_60: i32 = 5463;
 const PM_GO_TO_TIME: i32 = 5464;
 const PM_MEDIA_TIME: i32 = 5465;
+const PM_ADD_BOOKMARK: i32 = 5466;
+const PM_BOOKMARKS: i32 = 5467;
 const PM_TRACK_BASE: i32 = 5340;
 const PM_SUB_BASE: i32 = 5400;
 
@@ -11943,6 +11945,20 @@ fn build_playback_menu(
         &menu,
         PM_MEDIA_TIME,
         &menu_label(&keys, "Playback &Time", "media_time"),
+        "",
+        ItemKind::Normal,
+    );
+    menu_add(
+        &menu,
+        PM_ADD_BOOKMARK,
+        "Add Named &Bookmark...",
+        "",
+        ItemKind::Normal,
+    );
+    menu_add(
+        &menu,
+        PM_BOOKMARKS,
+        "Named &Bookmarks...",
         "",
         ItemKind::Normal,
     );
@@ -12197,6 +12213,8 @@ fn dispatch_player_menu(
         PM_SEEK_FORWARD_60 => player_seek_media(player, status, Some(60_000), None),
         PM_GO_TO_TIME => prompt_go_to_time(player, win.frame, status),
         PM_MEDIA_TIME => player_announce_media_time(player, status),
+        PM_ADD_BOOKMARK => add_named_bookmark(player, win.frame, persist, status),
+        PM_BOOKMARKS => show_named_bookmarks(player, win.frame, persist, status),
         PM_CAST => {
             let state = player.borrow();
             if let Some(shared) = &state.shared {
@@ -14466,6 +14484,360 @@ fn prompt_go_to_time(player: &Rc<RefCell<PlayerState>>, frame: Frame, status: St
                     .with_style(MessageDialogStyle::OK | MessageDialogStyle::IconWarning)
                     .build();
                 warning.show_modal_tracked();
+            }
+        }
+    }
+}
+
+/// HH:MM:SS for a millisecond position (Python
+/// `media_navigation.clock_text`; a local copy until M2's
+/// core module lands, then this call switches to it).
+fn bookmark_clock(milliseconds: i64) -> String {
+    let seconds = milliseconds.max(0) / 1000;
+    format!(
+        "{:02}:{:02}:{:02}",
+        seconds / 3600,
+        (seconds % 3600) / 60,
+        seconds % 60
+    )
+}
+
+/// The shared bookmark context (Python `session_tools_ui.
+/// _context`): the on-demand clock, the current item's resume
+/// key and a seekable engine, or Python's error for whichever
+/// is missing.
+fn bookmark_context(player: &Rc<RefCell<PlayerState>>) -> Result<(String, i64, i64, u64), String> {
+    let state = player.borrow();
+    let on_demand = match state.session.current() {
+        Some(request) => {
+            !request.live
+                || state.current_channel.as_ref().is_some_and(|channel| {
+                    channel.unknown_attributes.contains_key("local-recording")
+                })
+        }
+        None => false,
+    };
+    if !on_demand {
+        return Err(tr("This command is available during on-demand playback."));
+    }
+    let (position, length) = position_length(&state);
+    if position < 0 {
+        return Err(tr("The playback position is not available yet."));
+    }
+    if length <= 0 {
+        return Err(tr("The media duration is not available yet."));
+    }
+    if state.resume_key.is_empty() {
+        return Err(tr("This stream does not support seeking."));
+    }
+    Ok((
+        state.resume_key.clone(),
+        position,
+        length,
+        state.session.generation(),
+    ))
+}
+
+/// Python `session_tools_ui._error`: a plain error box.
+fn bookmark_error(parent: &dyn WxWidget, error: &str) {
+    let dialog = MessageDialog::builder(parent, error, &tr("Error"))
+        .with_style(MessageDialogStyle::OK | MessageDialogStyle::IconError)
+        .build();
+    dialog.show_modal_tracked();
+}
+
+fn bookmark_store(persist: &Persist) -> serde_json::Value {
+    persist
+        .config
+        .borrow()
+        .value("named_playback_bookmarks")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null)
+}
+
+/// Player > Add Named Bookmark... (Python
+/// `session_tools_ui.add_bookmark`): the name entry starts at
+/// the current position's clock text, a save error is shown
+/// and the entry reopens with what was typed, and a stream
+/// change behind the dialog aborts it.
+fn add_named_bookmark(
+    player: &Rc<RefCell<PlayerState>>,
+    frame: Frame,
+    persist: &Persist,
+    status: Status,
+) {
+    let (key, position, length, generation) = match bookmark_context(player) {
+        Ok(context) => context,
+        Err(error) => {
+            bookmark_error(&frame, &error);
+            return;
+        }
+    };
+    if position >= length {
+        bookmark_error(
+            &frame,
+            &tr("Choose a position before the end of the media."),
+        );
+        return;
+    }
+    let mut entry = bookmark_clock(position);
+    loop {
+        let dialog =
+            TextEntryDialog::builder(&frame, &tr("Bookmark name:"), &tr("Add Named Bookmark"))
+                .with_default_value(&entry)
+                .build();
+        if dialog.show_modal_tracked() != ID_OK {
+            return;
+        }
+        if player.borrow().session.generation() != generation {
+            return;
+        }
+        let Some(value) = dialog.get_value() else {
+            return;
+        };
+        entry.clone_from(&value);
+        match iptv_core::named_bookmarks::put(
+            &bookmark_store(persist),
+            &key,
+            &value,
+            position,
+            None,
+        ) {
+            Ok(store) => {
+                persist.set_and_save("named_playback_bookmarks", store);
+                status.set_label("Bookmark saved.");
+                return;
+            }
+            Err(error) => bookmark_error(&frame, &tr(&error)),
+        }
+    }
+}
+
+/// Player > Named Bookmarks... (Python
+/// `session_tools_ui.show_bookmarks` + `BookmarksDialog`):
+/// the current item's rows as "name — HH:MM:SS", with Go to
+/// Bookmark (Enter or double-click too), Rename... and
+/// Delete; Go hands the position back for a seek.
+#[allow(clippy::too_many_lines)] // bookmark list dialog, as in Python
+#[allow(clippy::collapsible_if)] // edition 2021: let chains unavailable
+fn show_named_bookmarks(
+    player: &Rc<RefCell<PlayerState>>,
+    frame: Frame,
+    persist: &Persist,
+    _status: Status,
+) {
+    let (key, _position, length, generation) = match bookmark_context(player) {
+        Ok(context) => context,
+        Err(error) => {
+            bookmark_error(&frame, &error);
+            return;
+        }
+    };
+    let rows: Rc<RefCell<Vec<iptv_core::named_bookmarks::NamedBookmark>>> = Rc::new(RefCell::new(
+        iptv_core::named_bookmarks::rows_for(&bookmark_store(persist), &key),
+    ));
+    let target: Rc<RefCell<Option<i64>>> = Rc::new(RefCell::new(None));
+    let dialog = Dialog::builder(&frame, &tr("Named Bookmarks"))
+        .with_size(620, 400)
+        .build();
+    dialog.set_accessibility_label(&tr("Named Bookmarks"));
+    bind_escape_cancel(dialog);
+    let panel = Panel::builder(&dialog).build();
+    let heading = StaticText::builder(&panel)
+        .with_label(&tr("Bookmarks for the current item:"))
+        .build();
+    let list = ListBox::builder(&panel).build();
+    list.set_accessibility_label(&tr("Bookmarks for the current item:"));
+    let go_button = Button::builder(&panel)
+        .with_label(&tr("Go to Bookmark"))
+        .build();
+    go_button.set_accessibility_label("Go to Bookmark");
+    let rename_button = Button::builder(&panel).with_label(&tr("Rename...")).build();
+    rename_button.set_accessibility_label("Rename...");
+    let delete_button = Button::builder(&panel).with_label(&tr("Delete")).build();
+    delete_button.set_accessibility_label("Delete");
+    let close_button = Button::builder(&panel).with_label(&tr("Close")).build();
+    close_button.set_accessibility_label("Close");
+    let sizer = BoxSizer::builder(Orientation::Vertical).build();
+    sizer.add(&heading, 0, SizerFlag::All, 8);
+    sizer.add(&list, 1, SizerFlag::Expand | SizerFlag::All, 8);
+    let buttons = BoxSizer::builder(Orientation::Horizontal).build();
+    buttons.add(&go_button, 0, SizerFlag::All, 5);
+    buttons.add(&rename_button, 0, SizerFlag::All, 5);
+    buttons.add(&delete_button, 0, SizerFlag::All, 5);
+    buttons.add(&close_button, 0, SizerFlag::All, 5);
+    sizer.add_sizer(&buttons, 0, SizerFlag::Expand, 0);
+    panel.set_sizer(sizer, true);
+
+    let refresh = {
+        let rows = Rc::clone(&rows);
+        let persist = persist.clone();
+        let key = key.clone();
+        move || {
+            let previous = list.get_selection();
+            *rows.borrow_mut() =
+                iptv_core::named_bookmarks::rows_for(&bookmark_store(&persist), &key);
+            let labels: Vec<String> = rows
+                .borrow()
+                .iter()
+                .map(|row| format!("{} — {}", row.name, bookmark_clock(row.position_ms)))
+                .collect();
+            list.set_items(&labels.iter().map(String::as_str).collect::<Vec<_>>());
+            if !labels.is_empty() {
+                let keep = previous
+                    .unwrap_or(0)
+                    .min(u32::try_from(labels.len().saturating_sub(1)).unwrap_or(0));
+                list.set_selection(keep, true);
+            }
+        }
+    };
+    let refresh = Rc::new(refresh);
+    refresh();
+
+    let selected = {
+        let rows = Rc::clone(&rows);
+        move || -> Option<iptv_core::named_bookmarks::NamedBookmark> {
+            let index = usize::try_from(list.get_selection()?).ok()?;
+            rows.borrow().get(index).cloned()
+        }
+    };
+    let selected = Rc::new(selected);
+
+    let go = {
+        let selected = Rc::clone(&selected);
+        let target = Rc::clone(&target);
+        let player = Rc::clone(player);
+        let dialog_frame = frame;
+        move || {
+            let Some(row) = selected() else {
+                return false;
+            };
+            if player.borrow().session.generation() != generation {
+                bookmark_error(
+                    &dialog_frame,
+                    &tr("Playback changed. Reopen the bookmark list."),
+                );
+                return false;
+            }
+            if row.position_ms >= length {
+                bookmark_error(
+                    &dialog_frame,
+                    &tr("Choose a position before the end of the media."),
+                );
+                return false;
+            }
+            *target.borrow_mut() = Some(row.position_ms);
+            true
+        }
+    };
+    let go = Rc::new(go);
+    let dialog_go = dialog;
+    go_button.on_click({
+        let go = Rc::clone(&go);
+        move |_| {
+            if go() {
+                dialog_go.end_modal(ID_OK);
+            }
+        }
+    });
+    let dialog_dclick = dialog;
+    list.on_item_double_clicked({
+        let go = Rc::clone(&go);
+        move |_| {
+            if go() {
+                dialog_dclick.end_modal(ID_OK);
+            }
+        }
+    });
+    // Python binds Enter on the list to Go (its char hook).
+    let dialog_enter = dialog;
+    list.bind_internal(EventType::KEY_DOWN, {
+        let go = Rc::clone(&go);
+        move |event| {
+            match event.get_key_code() {
+                // WXK_RETURN / WXK_NUMPAD_ENTER.
+                Some(13 | 370) => {
+                    if go() {
+                        dialog_enter.end_modal(ID_OK);
+                    }
+                    event.skip(false);
+                }
+                _ => event.skip(true),
+            }
+        }
+    });
+    let dialog_rename = dialog;
+    rename_button.on_click({
+        let selected = Rc::clone(&selected);
+        let refresh = Rc::clone(&refresh);
+        let persist = persist.clone();
+        let key = key.clone();
+        move |_| {
+            let Some(row) = selected() else {
+                return;
+            };
+            let entry_dialog =
+                TextEntryDialog::builder(&dialog_rename, &tr("Bookmark name:"), &tr("Rename..."))
+                    .with_default_value(&row.name)
+                    .build();
+            if entry_dialog.show_modal_tracked() != ID_OK {
+                return;
+            }
+            let Some(value) = entry_dialog.get_value() else {
+                return;
+            };
+            match iptv_core::named_bookmarks::put(
+                &bookmark_store(&persist),
+                &key,
+                &value,
+                row.position_ms,
+                Some(&row.id),
+            ) {
+                Ok(store) => {
+                    persist.set_and_save("named_playback_bookmarks", store);
+                    refresh();
+                }
+                Err(error) => bookmark_error(&dialog_rename, &tr(&error)),
+            }
+        }
+    });
+    let dialog_delete = dialog;
+    delete_button.on_click({
+        let selected = Rc::clone(&selected);
+        let refresh = Rc::clone(&refresh);
+        let persist = persist.clone();
+        let key = key.clone();
+        move |_| {
+            let Some(row) = selected() else {
+                return;
+            };
+            let confirm = MessageDialog::builder(
+                &dialog_delete,
+                &trf("Delete bookmark '{name}'?", &[("name", &row.name)]),
+                &tr("Named Bookmarks"),
+            )
+            .with_style(MessageDialogStyle::YesNo | MessageDialogStyle::NoDefault)
+            .build();
+            if confirm.show_modal_tracked() != ID_YES {
+                return;
+            }
+            let store =
+                iptv_core::named_bookmarks::remove(&bookmark_store(&persist), &key, &row.id);
+            persist.set_and_save("named_playback_bookmarks", store);
+            refresh();
+        }
+    });
+    let dialog_close = dialog;
+    close_button.on_click(move |_| {
+        dialog_close.end_modal(ID_CANCEL);
+    });
+    list.set_focus();
+    if dialog.show_modal_tracked() == ID_OK {
+        if player.borrow().session.generation() == generation {
+            if let Some(target) = *target.borrow() {
+                // Python seeks through _seek_media; until M2
+                // lands this uses the same engine seek it wraps.
+                player_seek_to(player, target);
             }
         }
     }
