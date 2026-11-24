@@ -4003,3 +4003,57 @@ msgstr "Visiter le site des projets, projects.serrebiradio.com"
 
 msgid "Read the full credits"
 msgstr "Lire les crédits complets"
+
+msgid "Enter a bookmark name of 1 to 120 characters."
+msgstr "Saisissez un nom de signet de 1 à 120 caractères."
+
+msgid "The bookmark is no longer available. Reopen the list."
+msgstr "Ce signet n’est plus disponible. Rouvrez la liste."
+
+msgid "A bookmark with this name already exists for this item."
+msgstr "Un signet portant ce nom existe déjà pour ce contenu."
+
+msgid "The bookmark limit has been reached. Delete an unused bookmark first."
+msgstr "Le nombre maximal de signets est atteint. Supprimez d’abord un signet inutilisé."
+
+msgid "Bookmark name:"
+msgstr "Nom du signet :"
+
+msgid "Add Named Bookmark"
+msgstr "Ajouter un signet nommé"
+
+msgid "Named Bookmarks"
+msgstr "Signets nommés"
+
+msgid "Bookmarks for the current item:"
+msgstr "Signets du contenu actuel :"
+
+msgid "Go to Bookmark"
+msgstr "Aller au signet"
+
+msgid "Rename..."
+msgstr "Renommer..."
+
+msgid "Delete bookmark '{name}'?"
+msgstr "Supprimer le signet « {name} » ?"
+
+msgid "Bookmark saved."
+msgstr "Signet enregistré."
+
+msgid "Playback changed. Reopen the bookmark list."
+msgstr "La lecture a changé. Rouvrez la liste des signets."
+
+msgid "This command is available during on-demand playback."
+msgstr "Cette commande est disponible pendant la lecture à la demande."
+
+msgid "This stream does not support seeking."
+msgstr "Ce flux ne permet pas de changer de position."
+
+msgid "The playback position is not available yet."
+msgstr "La position de lecture n'est pas encore disponible."
+
+msgid "The media duration is not available yet."
+msgstr "La durée du média n'est pas encore disponible."
+
+msgid "Choose a position before the end of the media."
+msgstr "Choisissez une position avant la fin du média."

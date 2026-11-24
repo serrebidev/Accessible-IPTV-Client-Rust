@@ -3939,3 +3939,57 @@ msgstr "プロジェクト サイト projects.serrebiradio.com を開く"
 
 msgid "Read the full credits"
 msgstr "全クレジットを読む"
+
+msgid "Enter a bookmark name of 1 to 120 characters."
+msgstr "1～120文字のブックマーク名を入力してください。"
+
+msgid "The bookmark is no longer available. Reopen the list."
+msgstr "このブックマークは利用できなくなりました。一覧を開き直してください。"
+
+msgid "A bookmark with this name already exists for this item."
+msgstr "このコンテンツには同じ名前のブックマークが既にあります。"
+
+msgid "The bookmark limit has been reached. Delete an unused bookmark first."
+msgstr "ブックマーク数が上限に達しました。先に不要なブックマークを削除してください。"
+
+msgid "Bookmark name:"
+msgstr "ブックマーク名："
+
+msgid "Add Named Bookmark"
+msgstr "名前付きブックマークを追加"
+
+msgid "Named Bookmarks"
+msgstr "名前付きブックマーク"
+
+msgid "Bookmarks for the current item:"
+msgstr "現在のコンテンツのブックマーク："
+
+msgid "Go to Bookmark"
+msgstr "ブックマークへ移動"
+
+msgid "Rename..."
+msgstr "名前を変更..."
+
+msgid "Delete bookmark '{name}'?"
+msgstr "ブックマーク「{name}」を削除しますか？"
+
+msgid "Bookmark saved."
+msgstr "ブックマークを保存しました。"
+
+msgid "Playback changed. Reopen the bookmark list."
+msgstr "再生内容が変わりました。ブックマーク一覧を開き直してください。"
+
+msgid "This command is available during on-demand playback."
+msgstr "このコマンドはオンデマンド再生中に使用できます。"
+
+msgid "This stream does not support seeking."
+msgstr "このストリームはシークに対応していません。"
+
+msgid "The playback position is not available yet."
+msgstr "再生位置はまだ取得できません。"
+
+msgid "The media duration is not available yet."
+msgstr "メディアの長さはまだ取得できません。"
+
+msgid "Choose a position before the end of the media."
+msgstr "メディアの終了前の位置を選んでください。"

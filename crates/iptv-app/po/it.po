@@ -3979,3 +3979,57 @@ msgstr "Visita il sito dei progetti, projects.serrebiradio.com"
 
 msgid "Read the full credits"
 msgstr "Leggi i riconoscimenti completi"
+
+msgid "Enter a bookmark name of 1 to 120 characters."
+msgstr "Inserisci un nome per il segnalibro da 1 a 120 caratteri."
+
+msgid "The bookmark is no longer available. Reopen the list."
+msgstr "Il segnalibro non è più disponibile. Riapri l’elenco."
+
+msgid "A bookmark with this name already exists for this item."
+msgstr "Esiste già un segnalibro con questo nome per questo contenuto."
+
+msgid "The bookmark limit has been reached. Delete an unused bookmark first."
+msgstr "È stato raggiunto il limite di segnalibri. Elimina prima un segnalibro inutilizzato."
+
+msgid "Bookmark name:"
+msgstr "Nome del segnalibro:"
+
+msgid "Add Named Bookmark"
+msgstr "Aggiungi segnalibro con nome"
+
+msgid "Named Bookmarks"
+msgstr "Segnalibri con nome"
+
+msgid "Bookmarks for the current item:"
+msgstr "Segnalibri del contenuto corrente:"
+
+msgid "Go to Bookmark"
+msgstr "Vai al segnalibro"
+
+msgid "Rename..."
+msgstr "Rinomina..."
+
+msgid "Delete bookmark '{name}'?"
+msgstr "Eliminare il segnalibro «{name}»?"
+
+msgid "Bookmark saved."
+msgstr "Segnalibro salvato."
+
+msgid "Playback changed. Reopen the bookmark list."
+msgstr "La riproduzione è cambiata. Riapri l’elenco dei segnalibri."
+
+msgid "This command is available during on-demand playback."
+msgstr "Questo comando è disponibile durante la riproduzione su richiesta."
+
+msgid "This stream does not support seeking."
+msgstr "Questo flusso non consente di cambiare posizione."
+
+msgid "The playback position is not available yet."
+msgstr "La posizione di riproduzione non è ancora disponibile."
+
+msgid "The media duration is not available yet."
+msgstr "La durata del contenuto non è ancora disponibile."
+
+msgid "Choose a position before the end of the media."
+msgstr "Scegli una posizione precedente alla fine del contenuto."

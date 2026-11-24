@@ -3897,3 +3897,57 @@ msgstr "प्रोजेक्ट साइट projects.serrebiradio.com प�
 
 msgid "Read the full credits"
 msgstr "पूरा श्रेय पढ़ें"
+
+msgid "Enter a bookmark name of 1 to 120 characters."
+msgstr "बुकमार्क के लिए 1 से 120 वर्णों का नाम दर्ज करें।"
+
+msgid "The bookmark is no longer available. Reopen the list."
+msgstr "यह बुकमार्क अब उपलब्ध नहीं है। सूची दोबारा खोलें।"
+
+msgid "A bookmark with this name already exists for this item."
+msgstr "इस सामग्री के लिए इस नाम का बुकमार्क पहले से मौजूद है।"
+
+msgid "The bookmark limit has been reached. Delete an unused bookmark first."
+msgstr "बुकमार्क की अधिकतम संख्या पूरी हो गई है। पहले कोई अनुपयोगी बुकमार्क हटाएँ।"
+
+msgid "Bookmark name:"
+msgstr "बुकमार्क का नाम:"
+
+msgid "Add Named Bookmark"
+msgstr "नाम वाला बुकमार्क जोड़ें"
+
+msgid "Named Bookmarks"
+msgstr "नाम वाले बुकमार्क"
+
+msgid "Bookmarks for the current item:"
+msgstr "वर्तमान सामग्री के बुकमार्क:"
+
+msgid "Go to Bookmark"
+msgstr "बुकमार्क पर जाएँ"
+
+msgid "Rename..."
+msgstr "नाम बदलें..."
+
+msgid "Delete bookmark '{name}'?"
+msgstr "क्या '{name}' बुकमार्क हटाना है?"
+
+msgid "Bookmark saved."
+msgstr "बुकमार्क सहेजा गया।"
+
+msgid "Playback changed. Reopen the bookmark list."
+msgstr "चल रही सामग्री बदल गई है। बुकमार्क सूची दोबारा खोलें।"
+
+msgid "This command is available during on-demand playback."
+msgstr "यह आदेश ऑन-डिमांड प्लेबैक के दौरान उपलब्ध है।"
+
+msgid "This stream does not support seeking."
+msgstr "इस स्ट्रीम में समय बदलकर आगे-पीछे जाना समर्थित नहीं है।"
+
+msgid "The playback position is not available yet."
+msgstr "प्लेबैक का स्थान अभी उपलब्ध नहीं है।"
+
+msgid "The media duration is not available yet."
+msgstr "मीडिया की अवधि अभी उपलब्ध नहीं है।"
+
+msgid "Choose a position before the end of the media."
+msgstr "मीडिया के अंत से पहले का स्थान चुनें।"

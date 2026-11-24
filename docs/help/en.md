@@ -250,6 +250,8 @@ Keys in the player:
 
 The same commands are on the player's Playback menu. The player reconnects on its own when a live stream drops, and keeps the audio track you chose.
 
+In the built-in player's Playback menu, Add Named Bookmark saves the current position in on-demand media or a local recording. Seeking and a known duration are required. Named Bookmarks lists the current item's bookmarks: Enter or Go to Bookmark jumps to a position; Rename and Delete manage the selected entry. Names must be unique within that item. Up to 1000 bookmarks can be saved in total. These bookmarks are separate from the automatic resume position.
+
 ### Audio tracks {#audio-tracks}
 
 Channels can carry several audio tracks, such as other languages or audio description. Press A to move to the next track, use Playback > Audio Track, or Tab to Choose Audio Track, which always names the track that is playing.

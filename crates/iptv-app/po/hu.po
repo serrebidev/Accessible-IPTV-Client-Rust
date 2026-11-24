@@ -4003,3 +4003,57 @@ msgstr "A projektek oldalának megnyitása: projects.serrebiradio.com"
 
 msgid "Read the full credits"
 msgstr "A teljes köszönetnyilvánítás elolvasása"
+
+msgid "Enter a bookmark name of 1 to 120 characters."
+msgstr "Adja meg a könyvjelző nevét; hossza 1–120 karakter lehet."
+
+msgid "The bookmark is no longer available. Reopen the list."
+msgstr "A könyvjelző már nem érhető el. Nyissa meg újra a listát."
+
+msgid "A bookmark with this name already exists for this item."
+msgstr "Ehhez a tartalomhoz már tartozik ilyen nevű könyvjelző."
+
+msgid "The bookmark limit has been reached. Delete an unused bookmark first."
+msgstr "Elérte a menthető könyvjelzők számának felső határát. Előbb töröljön egy már nem használt bejegyzést."
+
+msgid "Bookmark name:"
+msgstr "A könyvjelző neve:"
+
+msgid "Add Named Bookmark"
+msgstr "Könyvjelző hozzáadása"
+
+msgid "Named Bookmarks"
+msgstr "Könyvjelzők"
+
+msgid "Bookmarks for the current item:"
+msgstr "Az aktuális tartalom könyvjelzői:"
+
+msgid "Go to Bookmark"
+msgstr "Ugrás a könyvjelzőhöz"
+
+msgid "Rename..."
+msgstr "Átnevezés…"
+
+msgid "Delete bookmark '{name}'?"
+msgstr "Törli a következő könyvjelzőt: „{name}”?"
+
+msgid "Bookmark saved."
+msgstr "A könyvjelző mentése sikerült."
+
+msgid "Playback changed. Reopen the bookmark list."
+msgstr "Időközben megváltozott a lejátszott tartalom. Nyissa meg újra a könyvjelzők listáját."
+
+msgid "This command is available during on-demand playback."
+msgstr "Ez a parancs igény szerinti tartalom vagy helyi felvétel lejátszásakor használható."
+
+msgid "This stream does not support seeking."
+msgstr "Ennél a műsornál nem lehet másik időpontra ugrani."
+
+msgid "The playback position is not available yet."
+msgstr "A lejátszási pozíció még nem érhető el."
+
+msgid "The media duration is not available yet."
+msgstr "A műsor teljes időtartama még nem érhető el."
+
+msgid "Choose a position before the end of the media."
+msgstr "A műsor vége előtti időpontot adjon meg."

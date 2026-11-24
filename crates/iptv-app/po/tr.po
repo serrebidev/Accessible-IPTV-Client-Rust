@@ -3940,3 +3940,57 @@ msgstr "Projeler sitesini ziyaret et, projects.serrebiradio.com"
 
 msgid "Read the full credits"
 msgstr "Tüm teşekkürleri oku"
+
+msgid "Enter a bookmark name of 1 to 120 characters."
+msgstr "1 ile 120 karakter arasında bir yer işareti adı girin."
+
+msgid "The bookmark is no longer available. Reopen the list."
+msgstr "Yer işareti artık kullanılamıyor. Listeyi yeniden açın."
+
+msgid "A bookmark with this name already exists for this item."
+msgstr "Bu içerik için aynı adda bir yer işareti zaten var."
+
+msgid "The bookmark limit has been reached. Delete an unused bookmark first."
+msgstr "Yer işareti sınırına ulaşıldı. Önce kullanılmayan bir yer işaretini silin."
+
+msgid "Bookmark name:"
+msgstr "Yer işareti adı:"
+
+msgid "Add Named Bookmark"
+msgstr "Adlandırılmış Yer İşareti Ekle"
+
+msgid "Named Bookmarks"
+msgstr "Adlandırılmış Yer İşaretleri"
+
+msgid "Bookmarks for the current item:"
+msgstr "Geçerli içeriğin yer işaretleri:"
+
+msgid "Go to Bookmark"
+msgstr "Yer İşaretine Git"
+
+msgid "Rename..."
+msgstr "Yeniden Adlandır..."
+
+msgid "Delete bookmark '{name}'?"
+msgstr "'{name}' yer işareti silinsin mi?"
+
+msgid "Bookmark saved."
+msgstr "Yer işareti kaydedildi."
+
+msgid "Playback changed. Reopen the bookmark list."
+msgstr "Oynatılan içerik değişti. Yer işareti listesini yeniden açın."
+
+msgid "This command is available during on-demand playback."
+msgstr "Bu komut isteğe bağlı içerik oynatılırken kullanılabilir."
+
+msgid "This stream does not support seeking."
+msgstr "Bu akış konum değiştirmeyi desteklemiyor."
+
+msgid "The playback position is not available yet."
+msgstr "Oynatma konumu henüz kullanılamıyor."
+
+msgid "The media duration is not available yet."
+msgstr "Medya süresi henüz kullanılamıyor."
+
+msgid "Choose a position before the end of the media."
+msgstr "Medyanın bitişinden önce bir konum seçin."

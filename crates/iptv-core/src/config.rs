@@ -251,6 +251,18 @@ impl Config {
             "internal_player_variant_max_mbps".to_string(),
             json!(settings.variant_max_mbps),
         );
+        // Python's options load normalizes the named-bookmark
+        // store in place (M3), so a hand-edited or Python-written
+        // store is validated identically in both programs.
+        let bookmarks = crate::named_bookmarks::normalize(
+            self.values
+                .get("named_playback_bookmarks")
+                .unwrap_or(&Value::Null),
+        );
+        self.values.insert(
+            "named_playback_bookmarks".to_string(),
+            crate::named_bookmarks::to_value(&bookmarks),
+        );
     }
 
     /// Python `_apply_internal_player_bounds`, including the legacy

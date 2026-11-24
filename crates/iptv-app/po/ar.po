@@ -3895,3 +3895,57 @@ msgstr "زيارة موقع المشاريع، projects.serrebiradio.com"
 
 msgid "Read the full credits"
 msgstr "قراءة قائمة الشكر الكاملة"
+
+msgid "Enter a bookmark name of 1 to 120 characters."
+msgstr "أدخل اسمًا للعلامة المرجعية يتراوح طوله بين حرف واحد و120 حرفًا."
+
+msgid "The bookmark is no longer available. Reopen the list."
+msgstr "لم تعد العلامة المرجعية متاحة. افتح القائمة من جديد."
+
+msgid "A bookmark with this name already exists for this item."
+msgstr "توجد بالفعل علامة مرجعية بهذا الاسم لهذا المحتوى."
+
+msgid "The bookmark limit has been reached. Delete an unused bookmark first."
+msgstr "تم بلوغ الحد الأقصى للعلامات المرجعية. احذف أولًا علامة لم تعد تستخدمها."
+
+msgid "Bookmark name:"
+msgstr "اسم العلامة المرجعية:"
+
+msgid "Add Named Bookmark"
+msgstr "إضافة علامة مرجعية باسم"
+
+msgid "Named Bookmarks"
+msgstr "العلامات المرجعية المسماة"
+
+msgid "Bookmarks for the current item:"
+msgstr "العلامات المرجعية للمحتوى الحالي:"
+
+msgid "Go to Bookmark"
+msgstr "الانتقال إلى العلامة المرجعية"
+
+msgid "Rename..."
+msgstr "إعادة تسمية..."
+
+msgid "Delete bookmark '{name}'?"
+msgstr "هل تريد حذف العلامة المرجعية «{name}»؟"
+
+msgid "Bookmark saved."
+msgstr "تم حفظ العلامة المرجعية."
+
+msgid "Playback changed. Reopen the bookmark list."
+msgstr "تغيّر المحتوى الجاري تشغيله. افتح قائمة العلامات المرجعية من جديد."
+
+msgid "This command is available during on-demand playback."
+msgstr "يتاح هذا الأمر أثناء التشغيل حسب الطلب."
+
+msgid "This stream does not support seeking."
+msgstr "هذا البث لا يدعم الانتقال إلى موضع زمني."
+
+msgid "The playback position is not available yet."
+msgstr "موضع التشغيل غير متاح بعد."
+
+msgid "The media duration is not available yet."
+msgstr "مدة الوسائط غير متاحة بعد."
+
+msgid "Choose a position before the end of the media."
+msgstr "اختر موضعًا قبل نهاية الوسائط."

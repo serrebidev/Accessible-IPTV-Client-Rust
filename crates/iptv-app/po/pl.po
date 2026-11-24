@@ -3955,3 +3955,57 @@ msgstr "Odwiedź stronę projektów, projects.serrebiradio.com"
 
 msgid "Read the full credits"
 msgstr "Przeczytaj pełną listę podziękowań"
+
+msgid "Enter a bookmark name of 1 to 120 characters."
+msgstr "Wpisz nazwę zakładki o długości od 1 do 120 znaków."
+
+msgid "The bookmark is no longer available. Reopen the list."
+msgstr "Zakładka nie jest już dostępna. Otwórz ponownie listę."
+
+msgid "A bookmark with this name already exists for this item."
+msgstr "Dla tego materiału istnieje już zakładka o tej nazwie."
+
+msgid "The bookmark limit has been reached. Delete an unused bookmark first."
+msgstr "Osiągnięto limit zakładek. Najpierw usuń nieużywaną zakładkę."
+
+msgid "Bookmark name:"
+msgstr "Nazwa zakładki:"
+
+msgid "Add Named Bookmark"
+msgstr "Dodaj nazwaną zakładkę"
+
+msgid "Named Bookmarks"
+msgstr "Nazwane zakładki"
+
+msgid "Bookmarks for the current item:"
+msgstr "Zakładki bieżącego materiału:"
+
+msgid "Go to Bookmark"
+msgstr "Przejdź do zakładki"
+
+msgid "Rename..."
+msgstr "Zmień nazwę..."
+
+msgid "Delete bookmark '{name}'?"
+msgstr "Usunąć zakładkę „{name}”?"
+
+msgid "Bookmark saved."
+msgstr "Zakładka zapisana."
+
+msgid "Playback changed. Reopen the bookmark list."
+msgstr "Odtwarzany materiał się zmienił. Otwórz ponownie listę zakładek."
+
+msgid "This command is available during on-demand playback."
+msgstr "To polecenie jest dostępne podczas odtwarzania na żądanie."
+
+msgid "This stream does not support seeking."
+msgstr "Ten strumień nie obsługuje zmiany pozycji."
+
+msgid "The playback position is not available yet."
+msgstr "Pozycja odtwarzania nie jest jeszcze dostępna."
+
+msgid "The media duration is not available yet."
+msgstr "Czas trwania materiału nie jest jeszcze dostępny."
+
+msgid "Choose a position before the end of the media."
+msgstr "Wybierz pozycję przed końcem materiału."

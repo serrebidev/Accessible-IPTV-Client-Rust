@@ -3969,3 +3969,57 @@ msgstr "Visitar o site de projetos, projects.serrebiradio.com"
 
 msgid "Read the full credits"
 msgstr "Ler os créditos completos"
+
+msgid "Enter a bookmark name of 1 to 120 characters."
+msgstr "Digite um nome de marcador com 1 a 120 caracteres."
+
+msgid "The bookmark is no longer available. Reopen the list."
+msgstr "O marcador não está mais disponível. Abra a lista novamente."
+
+msgid "A bookmark with this name already exists for this item."
+msgstr "Já existe um marcador com este nome para este conteúdo."
+
+msgid "The bookmark limit has been reached. Delete an unused bookmark first."
+msgstr "O limite de marcadores foi atingido. Exclua primeiro um marcador que não usa mais."
+
+msgid "Bookmark name:"
+msgstr "Nome do marcador:"
+
+msgid "Add Named Bookmark"
+msgstr "Adicionar marcador com nome"
+
+msgid "Named Bookmarks"
+msgstr "Marcadores com nome"
+
+msgid "Bookmarks for the current item:"
+msgstr "Marcadores do conteúdo atual:"
+
+msgid "Go to Bookmark"
+msgstr "Ir para o marcador"
+
+msgid "Rename..."
+msgstr "Mudar nome..."
+
+msgid "Delete bookmark '{name}'?"
+msgstr "Excluir o marcador '{name}'?"
+
+msgid "Bookmark saved."
+msgstr "Marcador salvo."
+
+msgid "Playback changed. Reopen the bookmark list."
+msgstr "A reprodução mudou. Abra a lista de marcadores novamente."
+
+msgid "This command is available during on-demand playback."
+msgstr "Este comando está disponível durante a reprodução a pedido."
+
+msgid "This stream does not support seeking."
+msgstr "Este fluxo não permite mudar de posição."
+
+msgid "The playback position is not available yet."
+msgstr "A posição de reprodução ainda não está disponível."
+
+msgid "The media duration is not available yet."
+msgstr "A duração do conteúdo ainda não está disponível."
+
+msgid "Choose a position before the end of the media."
+msgstr "Escolha uma posição anterior ao fim do conteúdo."

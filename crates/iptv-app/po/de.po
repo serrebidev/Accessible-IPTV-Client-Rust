@@ -3991,3 +3991,57 @@ msgstr "Die Projektseite projects.serrebiradio.com besuchen"
 
 msgid "Read the full credits"
 msgstr "Die vollständigen Danksagungen lesen"
+
+msgid "Enter a bookmark name of 1 to 120 characters."
+msgstr "Geben Sie einen Lesezeichennamen mit 1 bis 120 Zeichen ein."
+
+msgid "The bookmark is no longer available. Reopen the list."
+msgstr "Das Lesezeichen ist nicht mehr verfügbar. Öffnen Sie die Liste erneut."
+
+msgid "A bookmark with this name already exists for this item."
+msgstr "Für diesen Eintrag gibt es bereits ein Lesezeichen mit diesem Namen."
+
+msgid "The bookmark limit has been reached. Delete an unused bookmark first."
+msgstr "Die maximale Anzahl an Lesezeichen ist erreicht. Löschen Sie zunächst ein nicht mehr benötigtes Lesezeichen."
+
+msgid "Bookmark name:"
+msgstr "Name des Lesezeichens:"
+
+msgid "Add Named Bookmark"
+msgstr "Benanntes Lesezeichen hinzufügen"
+
+msgid "Named Bookmarks"
+msgstr "Benannte Lesezeichen"
+
+msgid "Bookmarks for the current item:"
+msgstr "Lesezeichen für den aktuellen Eintrag:"
+
+msgid "Go to Bookmark"
+msgstr "Zum Lesezeichen springen"
+
+msgid "Rename..."
+msgstr "Umbenennen..."
+
+msgid "Delete bookmark '{name}'?"
+msgstr "Lesezeichen „{name}“ löschen?"
+
+msgid "Bookmark saved."
+msgstr "Lesezeichen gespeichert."
+
+msgid "Playback changed. Reopen the bookmark list."
+msgstr "Die Wiedergabe hat sich geändert. Öffnen Sie die Lesezeichenliste erneut."
+
+msgid "This command is available during on-demand playback."
+msgstr "Dieser Befehl ist bei der Wiedergabe von Abrufvideos verfügbar."
+
+msgid "This stream does not support seeking."
+msgstr "Dieser Stream unterstützt keine Zeitsprünge."
+
+msgid "The playback position is not available yet."
+msgstr "Die Wiedergabeposition ist noch nicht verfügbar."
+
+msgid "The media duration is not available yet."
+msgstr "Die Mediendauer ist noch nicht verfügbar."
+
+msgid "Choose a position before the end of the media."
+msgstr "Wählen Sie eine Position vor dem Ende des Mediums."

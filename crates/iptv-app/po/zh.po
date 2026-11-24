@@ -3847,3 +3847,57 @@ msgstr "访问项目网站 projects.serrebiradio.com"
 
 msgid "Read the full credits"
 msgstr "阅读完整致谢"
+
+msgid "Enter a bookmark name of 1 to 120 characters."
+msgstr "请输入 1 到 120 个字符的书签名称。"
+
+msgid "The bookmark is no longer available. Reopen the list."
+msgstr "此书签已不可用。请重新打开列表。"
+
+msgid "A bookmark with this name already exists for this item."
+msgstr "此内容已有同名书签。"
+
+msgid "The bookmark limit has been reached. Delete an unused bookmark first."
+msgstr "已达到书签数量上限。请先删除不再使用的书签。"
+
+msgid "Bookmark name:"
+msgstr "书签名称："
+
+msgid "Add Named Bookmark"
+msgstr "添加命名书签"
+
+msgid "Named Bookmarks"
+msgstr "命名书签"
+
+msgid "Bookmarks for the current item:"
+msgstr "当前内容的书签："
+
+msgid "Go to Bookmark"
+msgstr "跳转到书签"
+
+msgid "Rename..."
+msgstr "重命名..."
+
+msgid "Delete bookmark '{name}'?"
+msgstr "删除书签“{name}”？"
+
+msgid "Bookmark saved."
+msgstr "书签已保存。"
+
+msgid "Playback changed. Reopen the bookmark list."
+msgstr "播放内容已更改。请重新打开书签列表。"
+
+msgid "This command is available during on-demand playback."
+msgstr "此命令可在点播播放期间使用。"
+
+msgid "This stream does not support seeking."
+msgstr "此流不支持时间跳转。"
+
+msgid "The playback position is not available yet."
+msgstr "播放位置暂不可用。"
+
+msgid "The media duration is not available yet."
+msgstr "媒体时长暂不可用。"
+
+msgid "Choose a position before the end of the media."
+msgstr "请选择媒体结束之前的位置。"

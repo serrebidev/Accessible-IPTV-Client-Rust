@@ -3950,3 +3950,57 @@ msgstr "Открыть сайт проектов, projects.serrebiradio.com"
 
 msgid "Read the full credits"
 msgstr "Прочитать полный список благодарностей"
+
+msgid "Enter a bookmark name of 1 to 120 characters."
+msgstr "Введите имя закладки длиной от 1 до 120 символов."
+
+msgid "The bookmark is no longer available. Reopen the list."
+msgstr "Закладка больше недоступна. Откройте список заново."
+
+msgid "A bookmark with this name already exists for this item."
+msgstr "Для этого материала уже есть закладка с таким именем."
+
+msgid "The bookmark limit has been reached. Delete an unused bookmark first."
+msgstr "Достигнуто максимальное количество закладок. Сначала удалите ненужную закладку."
+
+msgid "Bookmark name:"
+msgstr "Имя закладки:"
+
+msgid "Add Named Bookmark"
+msgstr "Добавить именованную закладку"
+
+msgid "Named Bookmarks"
+msgstr "Именованные закладки"
+
+msgid "Bookmarks for the current item:"
+msgstr "Закладки текущего материала:"
+
+msgid "Go to Bookmark"
+msgstr "Перейти к закладке"
+
+msgid "Rename..."
+msgstr "Переименовать..."
+
+msgid "Delete bookmark '{name}'?"
+msgstr "Удалить закладку «{name}»?"
+
+msgid "Bookmark saved."
+msgstr "Закладка сохранена."
+
+msgid "Playback changed. Reopen the bookmark list."
+msgstr "Воспроизводимый материал изменился. Откройте список закладок заново."
+
+msgid "This command is available during on-demand playback."
+msgstr "Эта команда доступна при воспроизведении по запросу."
+
+msgid "This stream does not support seeking."
+msgstr "Этот поток не поддерживает переход по времени."
+
+msgid "The playback position is not available yet."
+msgstr "Позиция воспроизведения пока недоступна."
+
+msgid "The media duration is not available yet."
+msgstr "Длительность материала пока недоступна."
+
+msgid "Choose a position before the end of the media."
+msgstr "Выберите позицию до конца материала."

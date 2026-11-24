@@ -57,6 +57,7 @@ pub mod i18n;
 pub mod instance;
 pub mod loading;
 pub mod media_type;
+pub mod named_bookmarks;
 pub mod navindex;
 pub mod playback;
 pub mod providers;
