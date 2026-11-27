@@ -79,6 +79,12 @@ impl RecordingQueue {
         self.opening.as_ref()
     }
 
+    /// Replace the pending rows wholesale (Python's saved
+    /// queue load: `queue.pending[:] = queues[name]`).
+    pub fn replace_pending(&mut self, rows: Vec<LibraryRow>) {
+        self.pending = rows;
+    }
+
     /// Add rows, skipping paths already queued (Python `add`:
     /// `os.path.normcase` dedupe). Returns the new count.
     pub fn add(&mut self, rows: impl IntoIterator<Item = LibraryRow>) -> usize {

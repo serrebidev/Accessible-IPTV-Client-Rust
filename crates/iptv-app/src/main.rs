@@ -1584,6 +1584,7 @@ fn bind_browser(
         proxy: Rc::clone(&wiring.proxy),
         cast_worker: Rc::clone(&wiring.cast_worker),
         cast_pending: Rc::clone(&wiring.cast_pending),
+        recording_queue: Rc::clone(&wiring.recording_queue),
         timer: Rc::clone(&wiring.timer),
         guide_ui: Rc::clone(&wiring.guide_ui),
         i18n: Rc::clone(&wiring.i18n),
@@ -12422,6 +12423,10 @@ struct PlayerShared {
     proxy: Rc<RefCell<Option<iptv_core::proxy::ProxyServer>>>,
     cast_worker: Rc<CastWorker>,
     cast_pending: Rc<std::cell::Cell<bool>>,
+    /// PR #46: the recording playback queue, so the player
+    /// polls can confirm a started item and fail an errored
+    /// one (Python's queue lives beside its player).
+    recording_queue: Rc<RefCell<QueueInner>>,
     timer: Rc<Timer<Frame>>,
     /// Guide window + language, so F1 in the player reaches its
     /// own topic without the full wiring (S10).
@@ -15872,6 +15877,24 @@ fn rollover_action(state: &mut PlayerState) -> Option<EngineAction> {
 /// track setup, and end/error transitions into the session
 /// machine (with its reconnect handling).
 #[allow(clippy::too_many_lines)] // engine poll legs, as in Python
+/// PR #46: confirm the recording queue's opening row now
+/// that the player reports this generation playing (Python's
+/// `started`): only then is the head consumed, so a start
+/// that never plays leaves the row queued.
+fn queue_confirm_started(state: &PlayerState) {
+    let Some(shared) = &state.shared else {
+        return;
+    };
+    let Some(ticket) = state.queue_ticket else {
+        return;
+    };
+    shared.recording_queue.borrow_mut().queue.started(
+        ticket,
+        state.queue_generation,
+        state.session.generation(),
+    );
+}
+
 fn poll_vlc_state(player: &Rc<RefCell<PlayerState>>, persist: &Persist, status: Status) {
     let mut setup_tracks = false;
     let mut confirm_history = false;
@@ -15899,6 +15922,7 @@ fn poll_vlc_state(player: &Rc<RefCell<PlayerState>>, persist: &Persist, status: 
                     player_status(status, persist, &state.session.announcement(), 3);
                     confirm_history = true;
                 }
+                queue_confirm_started(&state);
                 if let Some(ms) = state.pending_resume_ms.take() {
                     engine.set_time(ms);
                 }
@@ -15970,6 +15994,41 @@ fn poll_vlc_state(player: &Rc<RefCell<PlayerState>>, persist: &Persist, status: 
             }
             iptv_vlc::VlcState::Ended | iptv_vlc::VlcState::Error => {
                 let ended = engine.state() == iptv_vlc::VlcState::Ended;
+                // PR #46: an engine error on the queue's
+                // opening item fails the queue at that title
+                // before any restart recovery (Python's
+                // failed()); the row stays queued for a retry.
+                if !ended {
+                    let failed_title = state.shared.as_ref().and_then(|shared| {
+                        let mut inner = shared.recording_queue.borrow_mut();
+                        if state.queue_ticket != Some(inner.queue.ticket()) {
+                            return None;
+                        }
+                        let title = inner.queue.opening()?.title.clone();
+                        inner.queue.stop();
+                        Some(title)
+                    });
+                    if let Some(title) = failed_title {
+                        state.queue_ticket = None;
+                        state.vlc_active = false;
+                        let parent = state.window.as_ref().map(|win| win.frame);
+                        drop(state);
+                        player_stop(player, persist, status);
+                        let message =
+                            iptv_core::recording_queue::stopped_at(&title, "Playback Error");
+                        match parent {
+                            Some(frame) => show_or_queue_notification(
+                                frame,
+                                &message,
+                                &tr("Recording Playback Queue"),
+                                MessageDialogStyle::OK | MessageDialogStyle::IconInformation,
+                                None,
+                            ),
+                            None => status.set_label(&message),
+                        }
+                        return;
+                    }
+                }
                 // An expected TS segment ending refreshes on
                 // the rollover path (P04), never the failure
                 // budget.
@@ -16042,6 +16101,7 @@ fn poll_fallback_state(player: &Rc<RefCell<PlayerState>>, persist: &Persist, sta
                     Act::None
                 } else {
                     state.session.on_event(EngineEvent::Started, now_ms());
+                    queue_confirm_started(&state);
                     if let Some(ms) = state.pending_resume_ms.take() {
                         win.media.seek(ms, SeekMode::FromStart);
                     }
@@ -21041,7 +21101,7 @@ fn queue_poll(wiring: &Wiring, status: Status) {
 /// ticket, the Ended session state separates a natural
 /// finish from a manual stop (which leaves the session Idle).
 fn queue_maybe_advance(wiring: &Wiring, status: Status) {
-    let (_ticket, _generation, should) = {
+    let (queue_ticket, queue_generation, current, should) = {
         let inner = wiring.recording_queue.borrow();
         let state = wiring.player.borrow();
         let (queue_ticket, queue_generation) = (state.queue_ticket, state.queue_generation);
@@ -21051,7 +21111,8 @@ fn queue_maybe_advance(wiring: &Wiring, status: Status) {
             iptv_core::playback::SessionState::Ended
         );
         (
-            inner.queue.ticket(),
+            queue_ticket,
+            queue_generation,
             current,
             ended
                 && inner.queue.should_advance(
@@ -21064,6 +21125,16 @@ fn queue_maybe_advance(wiring: &Wiring, status: Status) {
         )
     };
     if should {
+        // Python `ended` confirms the opening row first
+        // (PR #46): a start the Playing poll somehow missed
+        // is still consumed before the next hand-off.
+        if let Some(ticket) = queue_ticket {
+            wiring
+                .recording_queue
+                .borrow_mut()
+                .queue
+                .started(ticket, queue_generation, current);
+        }
         queue_next(wiring, status);
     }
 }
@@ -21643,6 +21714,16 @@ fn show_recording_queue_editor(wiring: &Wiring, parent: Frame, status: Status) -
     let halt = Button::builder(&panel)
         .with_label(&tr("Stop after Current Recording"))
         .build();
+    // PR #46: named saved queues.
+    let save_queue = Button::builder(&panel)
+        .with_label(&tr("Save Queue..."))
+        .build();
+    let load_queue = Button::builder(&panel)
+        .with_label(&tr("Load Saved Queue..."))
+        .build();
+    let delete_queue = Button::builder(&panel)
+        .with_label(&tr("Delete Saved Queue..."))
+        .build();
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     sizer.add(&list, 1, SizerFlag::Expand | SizerFlag::All, 12);
     let controls_row = BoxSizer::builder(Orientation::Horizontal).build();
@@ -21653,6 +21734,9 @@ fn show_recording_queue_editor(wiring: &Wiring, parent: Frame, status: Status) -
     let buttons = BoxSizer::builder(Orientation::Horizontal).build();
     buttons.add(&play, 0, SizerFlag::All, 4);
     buttons.add(&halt, 0, SizerFlag::All, 4);
+    buttons.add(&save_queue, 0, SizerFlag::All, 4);
+    buttons.add(&load_queue, 0, SizerFlag::All, 4);
+    buttons.add(&delete_queue, 0, SizerFlag::All, 4);
     sizer.add_sizer(&buttons, 0, SizerFlag::Expand, 0);
     panel.set_sizer(sizer, true);
     let wiring_refresh = clone_wiring(wiring);
@@ -21678,6 +21762,16 @@ fn show_recording_queue_editor(wiring: &Wiring, parent: Frame, status: Status) -
         remove.enable(count > 0);
         play.enable(count > 0 && !inner.queue.playing());
         halt.enable(inner.queue.playing());
+        // PR #46: saved-queue buttons follow Python's
+        // enablement (never while the queue is playing).
+        let empty = serde_json::Value::Null;
+        let config = wiring_refresh.persist.config.borrow();
+        let saved = iptv_core::recording_queue::saved_queues(
+            config.value("saved_recording_queues").unwrap_or(&empty),
+        );
+        save_queue.enable(count > 0 && !inner.queue.playing());
+        load_queue.enable(!saved.is_empty() && !inner.queue.playing());
+        delete_queue.enable(!saved.is_empty() && !inner.queue.playing());
     });
     refresh(None);
     let wiring_edit = clone_wiring(wiring);
@@ -21735,6 +21829,22 @@ fn show_recording_queue_editor(wiring: &Wiring, parent: Frame, status: Status) -
         queue_ref.borrow_mut().queue.stop();
         halt_refresh(None);
     });
+    // PR #46: the saved-queue buttons run Python's manage()
+    // and always refresh afterwards.
+    let manage = Rc::new({
+        let wiring_m = clone_wiring(wiring);
+        let refresh_m = Rc::clone(&refresh);
+        move |mode: &'static str| {
+            manage_saved_queue(&wiring_m, &dialog, mode);
+            refresh_m(None);
+        }
+    });
+    let manage_save = Rc::clone(&manage);
+    save_queue.on_click(move |_| manage_save("save"));
+    let manage_load = Rc::clone(&manage);
+    load_queue.on_click(move |_| manage_load("load"));
+    let manage_delete = Rc::clone(&manage);
+    delete_queue.on_click(move |_| manage_delete("delete"));
     let play_answer = Rc::new(std::cell::Cell::new(false));
     let play_flag = Rc::clone(&play_answer);
     let dialog_play = dialog;
@@ -21745,6 +21855,108 @@ fn show_recording_queue_editor(wiring: &Wiring, parent: Frame, status: Status) -
     list.set_focus();
     dialog.show_modal_tracked();
     play_answer.get()
+}
+
+/// PR #46: Save / Load / Delete a named recording playback
+/// queue (Python's editor `manage`): save asks a name and
+/// confirms replacing a case-insensitive clash, load and
+/// delete pick from the saved names sorted case-insensitively
+/// and confirm first, and core validation errors show in a
+/// box titled "Saved Playback Queues". Persistence is the
+/// `saved_recording_queues` config value, the same JSON shape
+/// Python writes.
+fn manage_saved_queue(wiring: &Wiring, parent: &dyn WxWidget, mode: &str) {
+    let caption = tr("Saved Playback Queues");
+    let empty = serde_json::Value::Null;
+    let current = {
+        let config = wiring.persist.config.borrow();
+        config
+            .value("saved_recording_queues")
+            .unwrap_or(&empty)
+            .clone()
+    };
+    let queues = iptv_core::recording_queue::saved_queues(&current);
+    let fail = |error: &str| {
+        let dialog = MessageDialog::builder(parent, error, &caption)
+            .with_style(MessageDialogStyle::OK | MessageDialogStyle::IconError)
+            .build();
+        dialog.show_modal_tracked();
+    };
+    let confirm = |message: &str| {
+        MessageDialog::builder(parent, message, &caption)
+            .with_style(MessageDialogStyle::YesNo | MessageDialogStyle::NoDefault)
+            .build()
+            .show_modal_tracked()
+            == ID_YES
+    };
+    if mode == "save" {
+        let entry =
+            TextEntryDialog::builder(parent, &tr("Name for this queue:"), &caption).build();
+        if entry.show_modal_tracked() != ID_OK {
+            return;
+        }
+        let name = entry.get_value().unwrap_or_default().trim().to_string();
+        let replace = queues
+            .iter()
+            .any(|(existing, _)| existing.to_lowercase() == name.to_lowercase());
+        if replace && !confirm(&tr("Replace the saved queue with this name?")) {
+            return;
+        }
+        let rows = wiring.recording_queue.borrow().queue.pending().to_vec();
+        match iptv_core::recording_queue::save_named(&current, &name, &rows, replace) {
+            Ok(saved) => wiring.persist.set_and_save(
+                "saved_recording_queues",
+                iptv_core::recording_queue::saved_queues_json(&saved),
+            ),
+            Err(error) => fail(&error),
+        }
+        return;
+    }
+    let mut names: Vec<String> = queues.iter().map(|(name, _)| name.clone()).collect();
+    names.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
+    if names.is_empty() {
+        return;
+    }
+    let choice = SingleChoiceDialog::builder(
+        parent,
+        &tr("Choose a saved queue:"),
+        &caption,
+        &names.iter().map(String::as_str).collect::<Vec<_>>(),
+    )
+    .build();
+    if choice.show_modal_tracked() != ID_OK {
+        return;
+    }
+    let selection = usize::try_from(choice.get_selection()).unwrap_or(usize::MAX);
+    let Some(name) = names.get(selection).cloned() else {
+        return;
+    };
+    if mode == "delete" {
+        if !confirm(&tr("Delete this saved queue?")) {
+            return;
+        }
+        let kept: Vec<(String, Vec<iptv_core::recording_library::LibraryRow>)> =
+            queues.into_iter().filter(|(n, _)| *n != name).collect();
+        wiring.persist.set_and_save(
+            "saved_recording_queues",
+            iptv_core::recording_queue::saved_queues_json(&kept),
+        );
+        return;
+    }
+    // Load: a non-empty current queue confirms replacement.
+    if !wiring.recording_queue.borrow().queue.is_empty()
+        && !confirm(&tr("Replace the current playback queue?"))
+    {
+        return;
+    }
+    if let Some((_, rows)) = queues.iter().find(|(n, _)| *n == name) {
+        let rows = rows.clone();
+        wiring
+            .recording_queue
+            .borrow_mut()
+            .queue
+            .replace_pending(rows);
+    }
 }
 
 /// Choose a problem time to start from (C7, Python
