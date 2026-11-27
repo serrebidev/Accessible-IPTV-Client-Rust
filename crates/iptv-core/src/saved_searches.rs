@@ -251,6 +251,13 @@ pub fn scan(
     let guides = store.channels()?;
     let indexes = GuideIndexes::build(&guides);
     let enabled: Vec<&Rule> = rules.iter().filter(|r| r.enabled).collect();
+    // Every scope key any enabled rule asks for: a Stalker channel
+    // is indexed under its station key, and under its legacy
+    // channel key too when a stored rule still names it (PR #44).
+    let requested: HashSet<&str> = enabled
+        .iter()
+        .flat_map(|rule| rule.channels.iter().map(String::as_str))
+        .collect();
     // Guide id -> playlist channel keys (and display names).
     let mut mapped: HashMap<String, HashMap<String, String>> = HashMap::new();
     for channel in channels {
@@ -259,12 +266,27 @@ pub fn scan(
         else {
             continue;
         };
-        let key = crate::reminders::reminder_channel_key(channel);
-        if key.is_empty() {
-            continue;
+        let stable = crate::reminders::station_key(channel);
+        let legacy = if channel
+            .unknown_attributes
+            .get("provider-type")
+            .is_some_and(|kind| kind == "stalker")
+        {
+            crate::reminders::reminder_channel_key(channel)
+        } else {
+            stable.clone()
+        };
+        let mut keys = vec![stable];
+        if requested.contains(legacy.as_str()) && !keys.contains(&legacy) {
+            keys.push(legacy);
         }
-        let entry = mapped.entry(guide_id).or_default();
-        entry.insert(key, crate::reminders::safe_title(&channel.name));
+        for key in keys {
+            if key.is_empty() {
+                continue;
+            }
+            let entry = mapped.entry(guide_id.clone()).or_default();
+            entry.insert(key, crate::reminders::safe_title(&channel.name));
+        }
     }
     let from = now;
     let to = now + SCAN_DAYS * 86_400;

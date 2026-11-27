@@ -77,6 +77,23 @@ pub fn exit_prompts(
     download_active: bool,
     now: i64,
 ) -> Vec<ExitPrompt> {
+    exit_prompts_with_active(reminders, jobs, recording_active, download_active, now, &[])
+}
+
+/// [`exit_prompts`] with the titles of the recordings an exit
+/// would stop (PR #44): Python asks about them by name, in
+/// their own box, between the reminders and the scheduled
+/// recordings. Catch-up downloads are not recordings for this
+/// box; the caller leaves them out.
+#[must_use]
+pub fn exit_prompts_with_active(
+    reminders: &[Reminder],
+    jobs: &[DvrJob],
+    recording_active: bool,
+    download_active: bool,
+    now: i64,
+    active_titles: &[String],
+) -> Vec<ExitPrompt> {
     let mut prompts = Vec::new();
     let pending = pending_reminder_count(reminders, now);
     if pending > 0 {
@@ -84,6 +101,16 @@ pub fn exit_prompts(
             title: "Programme Reminders",
             message: format!(
                 "Pending programme reminders: {pending}.\n\nNotifications require the application to remain running. Exit anyway?"
+            ),
+            no_default: true,
+        });
+    }
+    if !active_titles.is_empty() {
+        prompts.push(ExitPrompt {
+            title: "Recordings in progress",
+            message: format!(
+                "Exiting will stop these recordings:\n{}\n\nExit anyway?",
+                active_titles.join("\n")
             ),
             no_default: true,
         });
@@ -136,6 +163,21 @@ mod tests {
     use super::*;
     use crate::reminders::ReminderStatus;
 
+    #[test]
+    fn active_recordings_get_their_own_prompt_between_reminders_and_jobs() {
+        let titles = vec!["News at Six".to_string(), "Film".to_string()];
+        let prompts = exit_prompts_with_active(&[], &[], true, false, 100, &titles);
+        assert_eq!(prompts.len(), 1);
+        assert_eq!(prompts[0].title, "Recordings in progress");
+        assert_eq!(
+            prompts[0].message,
+            "Exiting will stop these recordings:\nNews at Six\nFilm\n\nExit anyway?"
+        );
+        assert!(prompts[0].no_default);
+        // No active recordings: no box (the plain entry point agrees).
+        assert!(exit_prompts(&[], &[], true, false, 100).is_empty());
+    }
+
     fn reminder(status: ReminderStatus, end: i64) -> Reminder {
         Reminder {
             id: "r".to_string(),
@@ -147,6 +189,8 @@ mod tests {
             lead: 300,
             status,
             notify_at: None,
+            guide_fingerprint: None,
+            episode_fingerprint: None,
         }
     }
 

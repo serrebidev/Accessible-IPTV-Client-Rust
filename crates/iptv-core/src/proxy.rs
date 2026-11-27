@@ -31,14 +31,39 @@ type SegmentCache = Arc<Mutex<HashMap<String, (String, Vec<u8>)>>>;
 /// anything. Loopback and unspecified results do not count.
 #[must_use]
 pub fn lan_ip() -> Option<std::net::IpAddr> {
+    lan_ip_excluding(None)
+}
+
+/// Python `_address_available` (PR #44): a UDP bind probe —
+/// the address is only usable for casting while it is still
+/// assigned to a local adapter.
+#[must_use]
+pub fn address_available(address: &str) -> bool {
+    let Ok(ip) = address.parse::<std::net::IpAddr>() else {
+        return false;
+    };
+    std::net::UdpSocket::bind((ip, 0)).is_ok()
+}
+
+/// `lan_ip` with one address excluded and the bind probe
+/// applied (Python `_get_local_ip(exclude=...)`): a hostname or
+/// route may still name an adapter that has gone away, so the
+/// routed address only counts while it can be bound.
+#[must_use]
+pub fn lan_ip_excluding(exclude: Option<&str>) -> Option<std::net::IpAddr> {
     let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
     socket.connect("8.8.8.8:80").ok()?;
     let addr = socket.local_addr().ok()?.ip();
     if addr.is_loopback() || addr.is_unspecified() {
-        None
-    } else {
-        Some(addr)
+        return None;
     }
+    if exclude.is_some_and(|gone| gone == addr.to_string()) {
+        return None;
+    }
+    if !address_available(&addr.to_string()) {
+        return None;
+    }
+    Some(addr)
 }
 
 /// The host the proxy binds and advertises: the LAN address when
@@ -130,7 +155,32 @@ impl ProxyServer {
     /// # Errors
     /// Returns the OS error text when the listener cannot bind.
     pub fn start_on(host: &str) -> Result<Self, String> {
-        let listener = TcpListener::bind((host, 0)).map_err(|e| e.to_string())?;
+        let listener = match TcpListener::bind((host, 0)) {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::AddrNotAvailable => {
+                // Python `_start_server` (PR #44): the recorded
+                // address is gone — pick a replacement once, and
+                // say so plainly when only loopback remains.
+                let replacement = advertised_host(lan_ip_excluding(Some(host)));
+                let host_is_lan = host != "127.0.0.1" && !host.starts_with("127.");
+                if replacement.starts_with("127.") && host_is_lan {
+                    return Err("No local network address is available for casting. Reconnect and try again.".to_string());
+                }
+                match TcpListener::bind((replacement.as_str(), 0)) {
+                    Ok(listener) => return Self::serve(listener, &replacement),
+                    Err(retry) if retry.kind() == std::io::ErrorKind::AddrNotAvailable => {
+                        return Err("No local network address is available for casting. Reconnect and try again.".to_string());
+                    }
+                    Err(retry) => return Err(retry.to_string()),
+                }
+            }
+            Err(error) => return Err(error.to_string()),
+        };
+        Self::serve(listener, host)
+    }
+
+    /// The serving half of `start_on`, once the listener is bound.
+    fn serve(listener: TcpListener, host: &str) -> Result<Self, String> {
         listener.set_nonblocking(true).map_err(|e| e.to_string())?;
         let port = listener.local_addr().map_err(|e| e.to_string())?.port();
         let routes: Routes = Arc::new(Mutex::new(HashMap::new()));

@@ -301,13 +301,10 @@ pub fn warnings(config: &Value, changes: &Changes, jobs: &Changes) -> Vec<String
 
 pub use crate::epg::xmltv_id;
 
-/// Python `programme_reminders.media_identity`: the stream address
-/// with its request headers, so two entries for the same URL with
-/// different headers stay distinct.
-fn media_identity(channel: &Channel) -> (String, Vec<(String, String)>) {
-    let mut headers = crate::downloads::channel_headers(channel);
-    headers.sort();
-    (channel.url.clone(), headers)
+/// Python `programme_reminders.media_identity` (the canonical
+/// portal-aware identity in `reminders`).
+fn media_identity(channel: &Channel) -> crate::reminders::MediaIdentity {
+    crate::reminders::media_identity(channel)
 }
 
 fn fold(text: &str) -> String {
@@ -372,6 +369,16 @@ pub fn changed_guide_times(
         if !booked_id.is_empty() && booked_id != cid {
             continue;
         }
+        if let Some(fingerprint) = job
+            .extra
+            .get("guide_fingerprint")
+            .and_then(Value::as_str)
+            .filter(|fp| !fp.is_empty())
+        {
+            if crate::reminders::identity_digest(&cid) != fingerprint {
+                continue;
+            }
+        }
         let declared = channel.tvg_id.trim();
         if !declared.is_empty()
             && !assigned
@@ -386,22 +393,40 @@ pub fn changed_guide_times(
                 .and_then(Value::as_str)
                 .unwrap_or(&job.title),
         );
-        let identity = dvr::program_episode_key(&job.program);
+        let identity = job
+            .extra
+            .get("episode_fingerprint")
+            .and_then(Value::as_str)
+            .filter(|fp| !fp.is_empty())
+            .map_or_else(
+                || {
+                    crate::reminders::identity_digest(
+                        dvr::program_episode_key(&job.program)
+                            .as_deref()
+                            .unwrap_or(""),
+                    )
+                },
+                str::to_string,
+            );
         let near = 6 * 3600;
         let mut candidates = Vec::new();
         for row in store.programmes_starting(&cid, start - near, start + near)? {
             if fold(&row.title) != title {
                 continue;
             }
-            let matched = dvr::program_episode_key(&programme_value(&row));
-            if identity.is_some() && matched.is_some() && identity != matched {
+            let matched = crate::reminders::identity_digest(
+                dvr::program_episode_key(&programme_value(&row))
+                    .as_deref()
+                    .unwrap_or(""),
+            );
+            if !identity.is_empty() && !matched.is_empty() && identity != matched {
                 continue;
             }
             if (row.start, row.stop) == (start, end) {
                 candidates.clear();
                 break; // unchanged broadcast, even when a later repeat also matches
             }
-            let exact = identity.is_some() && matched == identity;
+            let exact = !identity.is_empty() && matched == identity;
             if row.start >= row.stop || secs(row.start - job.pre_padding_minutes * 60) <= now {
                 continue;
             }
@@ -416,7 +441,7 @@ pub fn changed_guide_times(
 
 /// A playlist channel under its guide channel, keyed as Python's
 /// `(channel_key, media_identity)`.
-type GuideEntry = (String, (String, Vec<(String, String)>), Channel);
+type GuideEntry = (String, crate::reminders::MediaIdentity, Channel);
 
 /// One other airing: the playlist channel, the programme, and whether
 /// the episode number matches exactly.
@@ -497,7 +522,7 @@ pub fn other_airings(
             .unknown_attributes
             .get("kind")
             .map_or("", String::as_str);
-        if channel.url.is_empty() || matches!(kind, "series" | "movie") {
+        if !crate::reminders::playable(channel) || matches!(kind, "series" | "movie") {
             continue;
         }
         if let Some((gid, _)) = guide_for(channel) {
@@ -561,7 +586,7 @@ pub fn other_airings(
                 {
                     continue;
                 }
-                if !original_channel.url.is_empty()
+                if crate::reminders::playable(&original_channel)
                     && media_identity(channel) == media_identity(&original_channel)
                 {
                     continue;
