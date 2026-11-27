@@ -25209,10 +25209,22 @@ fn open_conflict_dialog(wiring: &Wiring, job: &iptv_core::dvr::DvrJob, main_stat
     frame.show(true);
 }
 
+/// The Scheduled Recordings dialog's filter state (PR #46,
+/// Python's `schedule_filter` / `schedule_view`): the query
+/// and view the list is filtered by, plus the job ids the
+/// last render actually showed, in row order — selection
+/// maps through the shown rows, never the full job list.
+#[derive(Clone, Default)]
+struct ScheduledUi {
+    query: Rc<RefCell<String>>,
+    view: Rc<RefCell<String>>,
+    shown: Rc<RefCell<Vec<String>>>,
+}
+
 /// The job ids behind the Scheduled Recordings list's
 /// selected rows, in row order.
-fn selected_job_ids(wiring: &Wiring, list: ListCtrl) -> Vec<String> {
-    let dvr = wiring.dvr.borrow();
+fn selected_job_ids(ui: &ScheduledUi, list: ListCtrl) -> Vec<String> {
+    let shown = ui.shown.borrow();
     let mut ids = Vec::new();
     let mut item: i64 = -1;
     loop {
@@ -25220,8 +25232,8 @@ fn selected_job_ids(wiring: &Wiring, list: ListCtrl) -> Vec<String> {
         if next < 0 {
             break;
         }
-        if let Some(job) = dvr.jobs().get(usize::try_from(next).unwrap_or(usize::MAX)) {
-            ids.push(job.id.clone());
+        if let Some(id) = shown.get(usize::try_from(next).unwrap_or(usize::MAX)) {
+            ids.push(id.clone());
         }
         item = i64::from(next);
     }
@@ -25234,9 +25246,18 @@ fn selected_job_ids(wiring: &Wiring, list: ListCtrl) -> Vec<String> {
 /// the rebuild (waiting jobs carry their conflict reason in
 /// the status column).
 #[allow(clippy::cast_possible_truncation)] // epoch seconds to i64 for local stamps
-fn render_scheduled_jobs(wiring: &Wiring, list: ListCtrl, dstatus: Status) {
-    let selected = selected_job_ids(wiring, list);
+fn render_scheduled_jobs(ui: &ScheduledUi, wiring: &Wiring, list: ListCtrl, dstatus: Status) {
+    let selected = selected_job_ids(ui, list);
     let dvr = wiring.dvr.borrow();
+    // PR #46: the list shows the filtered jobs (Python's
+    // refresh applies filter_recording_schedule).
+    let jobs = iptv_core::planning_tools::filter_recording_schedule(
+        dvr.jobs(),
+        &ui.query.borrow(),
+        &ui.view.borrow(),
+        now_seconds(),
+    );
+    *ui.shown.borrow_mut() = jobs.iter().map(|job| job.id.clone()).collect();
     list.delete_all_items();
     let stamp = |ts: f64| {
         chrono::TimeZone::timestamp_opt(&chrono::Local, ts as i64, 0)
@@ -25244,7 +25265,7 @@ fn render_scheduled_jobs(wiring: &Wiring, list: ListCtrl, dstatus: Status) {
             .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
             .unwrap_or_default()
     };
-    for (index, job) in dvr.jobs().iter().enumerate() {
+    for (index, job) in jobs.iter().enumerate() {
         let row = i64::try_from(index).unwrap_or(0);
         let window = format!("{} - {}", stamp(job.start_ts), stamp(job.stop_ts));
         list.insert_item(row, &window, None);
@@ -25282,7 +25303,7 @@ fn render_scheduled_jobs(wiring: &Wiring, list: ListCtrl, dstatus: Status) {
     }
     dstatus.set_label(&trf(
         "{count} scheduled recordings.",
-        &[("count", &dvr.jobs().len().to_string())],
+        &[("count", &jobs.len().to_string())],
     ));
 }
 
@@ -25291,8 +25312,8 @@ fn render_scheduled_jobs(wiring: &Wiring, list: ListCtrl, dstatus: Status) {
 /// also stops the capture: a canceled job leaves the Recording
 /// state, so the scheduler will never emit its Stop action
 /// (issue #130).
-fn cancel_first_selected_job(wiring: &Wiring, list: ListCtrl, dstatus: Status) {
-    let Some(id) = selected_job_ids(wiring, list).into_iter().next() else {
+fn cancel_first_selected_job(ui: &ScheduledUi, wiring: &Wiring, list: ListCtrl, dstatus: Status) {
+    let Some(id) = selected_job_ids(ui, list).into_iter().next() else {
         dstatus.set_label("Choose a recording to cancel first.");
         return;
     };
@@ -25311,14 +25332,14 @@ fn cancel_first_selected_job(wiring: &Wiring, list: ListCtrl, dstatus: Status) {
             .pending_resolves
             .borrow_mut()
             .retain(|_, pending| !matches!(pending, PendingResolve::Dvr(job) if job == &id));
-        render_scheduled_jobs(wiring, list, dstatus);
+        render_scheduled_jobs(ui, wiring, list, dstatus);
     }
 }
 
 /// Delete every selected finished job (the Delete button and
 /// the Delete key share this; audit R19).
-fn delete_selected_finished_jobs(wiring: &Wiring, list: ListCtrl, dstatus: Status) {
-    let ids = selected_job_ids(wiring, list);
+fn delete_selected_finished_jobs(ui: &ScheduledUi, wiring: &Wiring, list: ListCtrl, dstatus: Status) {
+    let ids = selected_job_ids(ui, list);
     if ids.is_empty() {
         dstatus.set_label("Choose a finished recording to delete first.");
         return;
@@ -25341,7 +25362,7 @@ fn delete_selected_finished_jobs(wiring: &Wiring, list: ListCtrl, dstatus: Statu
     if removed == 0 {
         dstatus.set_label("Only finished recordings can be deleted.");
     }
-    render_scheduled_jobs(wiring, list, dstatus);
+    render_scheduled_jobs(ui, wiring, list, dstatus);
 }
 
 /// DVR jobs projected for budget/conflict math (PR #36):
@@ -26043,8 +26064,8 @@ fn programme_window_label(start: i64, stop: i64) -> String {
     format!("{} – {}", local(start), local(stop))
 }
 
-fn selected_single_job(wiring: &Wiring, list: ListCtrl) -> Option<iptv_core::dvr::DvrJob> {
-    let ids = selected_job_ids(wiring, list);
+fn selected_single_job(ui: &ScheduledUi, wiring: &Wiring, list: ListCtrl) -> Option<iptv_core::dvr::DvrJob> {
+    let ids = selected_job_ids(ui, list);
     (ids.len() == 1)
         .then(|| wiring.dvr.borrow().get(&ids[0]).cloned())
         .flatten()
@@ -26052,9 +26073,9 @@ fn selected_single_job(wiring: &Wiring, list: ListCtrl) -> Option<iptv_core::dvr
 
 /// The selected jobs themselves, in row order (PR #44's menu
 /// conditions and exports work on the jobs, not just their ids).
-fn selected_jobs(wiring: &Wiring, list: ListCtrl) -> Vec<iptv_core::dvr::DvrJob> {
+fn selected_jobs(ui: &ScheduledUi, wiring: &Wiring, list: ListCtrl) -> Vec<iptv_core::dvr::DvrJob> {
     let dvr = wiring.dvr.borrow();
-    selected_job_ids(wiring, list)
+    selected_job_ids(ui, list)
         .iter()
         .filter_map(|id| dvr.get(id).cloned())
         .collect()
@@ -26116,8 +26137,8 @@ fn publish_reviewed_edit(
 }
 
 /// Scheduled Recordings > Skip This Occurrence (Python `_skip_occurrence`).
-fn skip_selected_occurrence(wiring: &Wiring, frame: Frame, list: ListCtrl, dstatus: Status) {
-    let Some(job) = selected_single_job(wiring, list) else {
+fn skip_selected_occurrence(ui: &ScheduledUi, wiring: &Wiring, frame: Frame, list: ListCtrl, dstatus: Status) {
+    let Some(job) = selected_single_job(ui, wiring, list) else {
         return;
     };
     let title = if job.display_title.is_empty() {
@@ -26136,7 +26157,7 @@ fn skip_selected_occurrence(wiring: &Wiring, frame: Frame, list: ListCtrl, dstat
         .dvr
         .borrow_mut()
         .skip_occurrence(&job.id, job.start_ts, now_seconds());
-    render_scheduled_jobs(wiring, list, dstatus);
+    render_scheduled_jobs(ui, wiring, list, dstatus);
     let (text, style) = match result {
         Ok(next) => (
             trf(
@@ -26218,8 +26239,8 @@ fn active_account_keys(wiring: &Wiring, channels: &[Channel]) -> Vec<String> {
 /// download) collapse into one call, with the channel list
 /// re-resolved between the budget checks, exactly where Python
 /// re-checks the list identity in its `ready` leg.
-fn recover_selected_archive(wiring: &Wiring, frame: Frame, list: ListCtrl, dstatus: Status) {
-    let Some(job) = selected_single_job(wiring, list) else {
+fn recover_selected_archive(ui: &ScheduledUi, wiring: &Wiring, frame: Frame, list: ListCtrl, dstatus: Status) {
+    let Some(job) = selected_single_job(ui, wiring, list) else {
         return;
     };
     let config = config_value(wiring);
@@ -26282,8 +26303,8 @@ fn recover_selected_archive(wiring: &Wiring, frame: Frame, list: ListCtrl, dstat
 
 /// Scheduled Recordings > Repeat on Weekdays... (Python
 /// `planning_tools_ui.weekdays` + `_edit_weekdays`).
-fn edit_selected_weekdays(wiring: &Wiring, frame: Frame, list: ListCtrl, dstatus: Status) {
-    let Some(job) = selected_single_job(wiring, list) else {
+fn edit_selected_weekdays(ui: &ScheduledUi, wiring: &Wiring, frame: Frame, list: ListCtrl, dstatus: Status) {
+    let Some(job) = selected_single_job(ui, wiring, list) else {
         dstatus.set_label(&tr(
             "Select one pending recording that is not a series rule.",
         ));
@@ -26328,7 +26349,7 @@ fn edit_selected_weekdays(wiring: &Wiring, frame: Frame, list: ListCtrl, dstatus
         .filter_map(|day| u8::try_from(day).ok())
         .collect();
     let result = wiring.dvr.borrow_mut().set_weekdays(&job.id, &days);
-    render_scheduled_jobs(wiring, list, dstatus);
+    render_scheduled_jobs(ui, wiring, list, dstatus);
     if let Err(error) = result {
         operation_failed_box(&frame, &error);
     }
@@ -26336,8 +26357,8 @@ fn edit_selected_weekdays(wiring: &Wiring, frame: Frame, list: ListCtrl, dstatus
 
 /// Scheduled Recordings > Padding for This Recording... (Python
 /// `RecordingPaddingDialog(job=)` + `padding_dialog`).
-fn padding_for_selected(wiring: &Wiring, frame: Frame, list: ListCtrl, dstatus: Status) {
-    let Some(job) = selected_single_job(wiring, list) else {
+fn padding_for_selected(ui: &ScheduledUi, wiring: &Wiring, frame: Frame, list: ListCtrl, dstatus: Status) {
+    let Some(job) = selected_single_job(ui, wiring, list) else {
         return;
     };
     let caption = tr("Padding for This Recording...");
@@ -26412,7 +26433,7 @@ fn padding_for_selected(wiring: &Wiring, frame: Frame, list: ListCtrl, dstatus: 
         }
         Err(error) => operation_failed_box(&frame, &error),
     }
-    render_scheduled_jobs(wiring, list, dstatus);
+    render_scheduled_jobs(ui, wiring, list, dstatus);
 }
 
 /// The automatic guide matcher over a store; C10's guide assignment
@@ -26450,7 +26471,7 @@ fn pending_jobs(wiring: &Wiring) -> Vec<iptv_core::dvr::DvrJob> {
 fn review_guide_changes(
     wiring: &Wiring,
     frame: Frame,
-    refresh: Option<(ListCtrl, Status)>,
+    refresh: Option<(ScheduledUi, ListCtrl, Status)>,
     notify_only: bool,
 ) {
     let jobs = pending_jobs(wiring);
@@ -26606,8 +26627,8 @@ fn review_guide_changes(
                 Some(future_start),
                 Some(&still_current),
             );
-            if let Some((list, dstatus)) = refresh {
-                render_scheduled_jobs(wiring, list, dstatus);
+            if let Some((ui, list, dstatus)) = refresh {
+                render_scheduled_jobs(&ui, wiring, list, dstatus);
             }
         },
     );
@@ -26615,8 +26636,10 @@ fn review_guide_changes(
 
 /// Scheduled Recordings > Find Another Airing... (Python `find_airing`).
 #[allow(clippy::too_many_lines)] // one dialog flow, as in Python
-fn find_another_airing(wiring: &Wiring, frame: Frame, list: ListCtrl, dstatus: Status) {
-    let Some(job) = selected_single_job(wiring, list) else {
+fn find_another_airing(ui: &ScheduledUi, wiring: &Wiring, frame: Frame, list: ListCtrl, dstatus: Status) {
+    // Owned: the background completion renders through it.
+    let ui = ui.clone();
+    let Some(job) = selected_single_job(&ui, wiring, list) else {
         return;
     };
     let model = wiring.browser.borrow().catalogue_model();
@@ -26890,7 +26913,7 @@ fn find_another_airing(wiring: &Wiring, frame: Frame, list: ListCtrl, dstatus: S
                 Some(future_start),
                 Some(&validate),
             );
-            render_scheduled_jobs(wiring, list, dstatus);
+            render_scheduled_jobs(&ui, wiring, list, dstatus);
         },
     );
 }
@@ -26899,9 +26922,9 @@ fn find_another_airing(wiring: &Wiring, frame: Frame, list: ListCtrl, dstatus: S
 /// Calendar... (Python `planning_tools_ui.export_recordings`):
 /// the save dialog first, then the selection is re-read and
 /// must still equal the snapshot the menu was built from.
-fn export_selected_recordings(wiring: &Wiring, frame: Frame, list: ListCtrl, dstatus: Status) {
+fn export_selected_recordings(ui: &ScheduledUi, wiring: &Wiring, frame: Frame, list: ListCtrl, dstatus: Status) {
     let title = tr("Export Selected Recordings to Calendar...");
-    let snapshot = selected_jobs(wiring, list);
+    let snapshot = selected_jobs(ui, wiring, list);
     if snapshot.is_empty() {
         return;
     }
@@ -26985,9 +27008,9 @@ fn export_selected_recordings(wiring: &Wiring, frame: Frame, list: ListCtrl, dst
 /// remove option; a new pause is confirmed with the first
 /// skipped and next following recording times before it saves.
 #[allow(clippy::too_many_lines)] // one dialog flow, as in Python
-fn pause_recording_rule(wiring: &Wiring, frame: Frame, list: ListCtrl, dstatus: Status) {
+fn pause_recording_rule(ui: &ScheduledUi, wiring: &Wiring, frame: Frame, list: ListCtrl, dstatus: Status) {
     let title = tr("Pause Recording Rule...");
-    let Some(job) = selected_single_job(wiring, list) else {
+    let Some(job) = selected_single_job(ui, wiring, list) else {
         return;
     };
     let rule_id = job.series_source.clone().unwrap_or_else(|| job.id.clone());
@@ -27071,7 +27094,7 @@ fn pause_recording_rule(wiring: &Wiring, frame: Frame, list: ListCtrl, dstatus: 
         Ok(())
     };
     let finish = |wiring: &Wiring, result: Result<(), String>| match result {
-        Ok(()) => render_scheduled_jobs(wiring, list, dstatus),
+        Ok(()) => render_scheduled_jobs(ui, wiring, list, dstatus),
         Err(error) => {
             let dialog = MessageDialog::builder(&frame, &tr(&error), &title)
                 .with_style(MessageDialogStyle::OK | MessageDialogStyle::IconError)
@@ -27153,6 +27176,23 @@ fn open_scheduled_dialog(wiring: &Wiring, main_status: Status) {
     frame.set_accessibility_label("Scheduled Recordings");
     bind_escape_hide(frame);
     let panel = Panel::builder(&frame).build();
+    let ui = ScheduledUi::default();
+    *ui.view.borrow_mut() = "all".to_string();
+    // PR #46: the filter row above the list (Python's
+    // schedule_filter / schedule_view): a title/channel
+    // search and the view choice.
+    let filter_label = StaticText::builder(&panel)
+        .with_label(&tr("Filter by title or channel"))
+        .build();
+    let _ = filter_label;
+    let filter_text = TextCtrl::builder(&panel).build();
+    filter_text.set_accessibility_label(&tr("Filter by title or channel"));
+    let view_choice = Choice::builder(&panel).build();
+    view_choice.set_accessibility_label(&tr("Schedule view"));
+    for label in ["All", "Next 7 Days", "Failed and Partial", "Paused Recording Rules"] {
+        view_choice.append(&tr(label));
+    }
+    view_choice.set_selection(0);
     let list = ListCtrl::builder(&panel)
         .with_style(ListCtrlStyle::Report)
         .build();
@@ -27198,10 +27238,38 @@ fn open_scheduled_dialog(wiring: &Wiring, main_status: Status) {
         bar: None,
     };
     let render = render_scheduled_jobs;
-    render(wiring, list, dstatus);
+    render(&ui, wiring, list, dstatus);
     if wiring.dvr.borrow().jobs().is_empty() {
         main_status.set_label("No scheduled recordings.");
     }
+    // PR #46: typing in the filter re-renders after a
+    // 130 ms debounce (Python's CallLater); the view choice
+    // re-renders at once. The timer is retained by the text
+    // handler below — dropping it would destroy it.
+    let search_timer = Rc::new(Timer::new(&frame));
+    {
+        let wiring_s = clone_wiring(wiring);
+        let ui_s = ui.clone();
+        search_timer.on_tick(move |_| {
+            render_scheduled_jobs(&ui_s, &wiring_s, list, dstatus);
+        });
+    }
+    let ui_f = ui.clone();
+    let timer_f = Rc::clone(&search_timer);
+    filter_text.bind_internal(EventType::TEXT, move |_| {
+        *ui_f.query.borrow_mut() = filter_text.get_value();
+        let _ = timer_f.start(130, true);
+    });
+    let ui_ch = ui.clone();
+    let wiring_ch = clone_wiring(wiring);
+    view_choice.bind_internal(EventType::COMMAND_CHOICE_SELECTED, move |_| {
+        let index = usize::try_from(view_choice.get_selection().unwrap_or(0)).unwrap_or(0);
+        *ui_ch.view.borrow_mut() = ["all", "week", "problems", "paused"]
+            .get(index)
+            .unwrap_or(&"all")
+            .to_string();
+        render_scheduled_jobs(&ui_ch, &wiring_ch, list, dstatus);
+    });
     let cancel_job = Button::builder(&panel)
         .with_label("&Cancel Recording")
         .build();
@@ -27228,21 +27296,25 @@ fn open_scheduled_dialog(wiring: &Wiring, main_status: Status) {
         .build();
     review.set_accessibility_label(&tr("Review Guide Changes..."));
     let wiring_w = clone_wiring(wiring);
+    let ui_w = ui.clone();
     repeat_weekdays.on_click(move |_| {
-        edit_selected_weekdays(&wiring_w, frame, list, dstatus);
+        edit_selected_weekdays(&ui_w, &wiring_w, frame, list, dstatus);
     });
     let wiring_g = clone_wiring(wiring);
+    let ui_g = ui.clone();
     review.on_click(move |_| {
-        review_guide_changes(&wiring_g, frame, Some((list, dstatus)), false);
+        review_guide_changes(&wiring_g, frame, Some((ui_g.clone(), list, dstatus)), false);
     });
     let close = Button::builder(&panel).with_label("&Close").build();
     let wiring_c = clone_wiring(wiring);
+    let ui_c = ui.clone();
     cancel_job.on_click(move |_| {
-        cancel_first_selected_job(&wiring_c, list, dstatus);
+        cancel_first_selected_job(&ui_c, &wiring_c, list, dstatus);
     });
     let wiring_x = clone_wiring(wiring);
+    let ui_x = ui.clone();
     resolve_conflict.on_click(move |_| {
-        let Some(id) = selected_job_ids(&wiring_x, list).into_iter().next() else {
+        let Some(id) = selected_job_ids(&ui_x, list).into_iter().next() else {
             dstatus.set_label("Choose a waiting recording first.");
             return;
         };
@@ -27250,25 +27322,27 @@ fn open_scheduled_dialog(wiring: &Wiring, main_status: Status) {
         match job {
             Some(job) if job.status == iptv_core::dvr::STATUS_WAITING => {
                 open_conflict_dialog(&wiring_x, &job, main_status);
-                render(&wiring_x, list, dstatus);
+                render(&ui_x, &wiring_x, list, dstatus);
             }
             Some(_) => dstatus.set_label("That recording is not waiting on a conflict."),
             None => dstatus.set_label("Choose a waiting recording first."),
         }
     });
     let wiring_t = clone_wiring(wiring);
+    let ui_t = ui.clone();
     edit_times.on_click(move |_| {
-        let ids = selected_job_ids(&wiring_t, list);
+        let ids = selected_job_ids(&ui_t, list);
         if ids.len() == 1 {
             edit_job_times(&wiring_t, &frame, &ids[0], dstatus);
-            render(&wiring_t, list, dstatus);
+            render(&ui_t, &wiring_t, list, dstatus);
         } else {
             dstatus.set_label("Select a scheduled recording first.");
         }
     });
     let wiring_v = clone_wiring(wiring);
+    let ui_v = ui.clone();
     view_conflicts.on_click(move |_| {
-        let ids = selected_job_ids(&wiring_v, list);
+        let ids = selected_job_ids(&ui_v, list);
         let job = (ids.len() == 1)
             .then(|| wiring_v.dvr.borrow().get(&ids[0]).cloned())
             .flatten();
@@ -27286,19 +27360,31 @@ fn open_scheduled_dialog(wiring: &Wiring, main_status: Status) {
         }
     });
     let wiring_d = clone_wiring(wiring);
+    let ui_d = ui.clone();
     delete_job.on_click(move |_| {
-        delete_selected_finished_jobs(&wiring_d, list, dstatus);
+        delete_selected_finished_jobs(&ui_d, &wiring_d, list, dstatus);
     });
     let wiring_r = clone_wiring(wiring);
+    let ui_r = ui.clone();
     refresh.on_click(move |_| {
-        render(&wiring_r, list, dstatus);
+        render(&ui_r, &wiring_r, list, dstatus);
     });
     // Keyboard batch operations (Python's list keys): Ctrl+A
     // selects every row; Delete removes the selected finished
     // jobs. Matched keys are consumed.
     let wiring_k = clone_wiring(wiring);
+    let ui_k = ui.clone();
     let wiring_ctx = clone_wiring(wiring);
+    let ui_ctx = ui.clone();
     list.bind_internal(EventType::KEY_DOWN, move |event| {
+        if key_event_label(event) == Some("Ctrl+F".to_string()) {
+            // PR #46: Ctrl+F jumps to the filter with its
+            // text selected (Python's char hook).
+            filter_text.set_focus();
+            filter_text.select_all();
+            event.skip(false);
+            return;
+        }
         if key_event_label(event) == Some("Ctrl+A".to_string()) {
             let count = list.get_item_count();
             for row in 0..i64::from(count) {
@@ -27308,7 +27394,7 @@ fn open_scheduled_dialog(wiring: &Wiring, main_status: Status) {
             return;
         }
         if event.get_key_code() == Some(127) {
-            delete_selected_finished_jobs(&wiring_k, list, dstatus);
+            delete_selected_finished_jobs(&ui_k, &wiring_k, list, dstatus);
             event.skip(false);
             return;
         }
@@ -27327,7 +27413,7 @@ fn open_scheduled_dialog(wiring: &Wiring, main_status: Status) {
             menu.append(DVR_CTX_DELETE, &tr("Delete\tDel"), "", ItemKind::Normal);
             // PR #44: export the selection when every selected
             // job is an unpaused future booking.
-            let selected = selected_jobs(&wiring_ctx, list);
+            let selected = selected_jobs(&ui_ctx, &wiring_ctx, list);
             let now = now_seconds();
             if !selected.is_empty()
                 && selected.iter().all(|job| {
@@ -27344,7 +27430,7 @@ fn open_scheduled_dialog(wiring: &Wiring, main_status: Status) {
                 );
             }
             // Python's single-selection items for a pending entry.
-            if let Some(job) = selected_single_job(&wiring_ctx, list) {
+            if let Some(job) = selected_single_job(&ui_ctx, &wiring_ctx, list) {
                 if iptv_core::archive_recovery::recoverable_status(&job.status) {
                     menu.append(
                         DVR_CTX_RECOVER,
@@ -27400,20 +27486,24 @@ fn open_scheduled_dialog(wiring: &Wiring, main_status: Status) {
         list.popup_menu(&mut menu, None);
     });
     let wiring_m = clone_wiring(wiring);
+    let ui_m = ui.clone();
     frame.on_menu(move |event| match event.get_id() {
-        DVR_CTX_REFRESH => render_scheduled_jobs(&wiring_m, list, dstatus),
-        DVR_CTX_CANCEL => cancel_first_selected_job(&wiring_m, list, dstatus),
-        DVR_CTX_DELETE => delete_selected_finished_jobs(&wiring_m, list, dstatus),
-        DVR_CTX_PADDING => padding_for_selected(&wiring_m, frame, list, dstatus),
-        DVR_CTX_FIND_AIRING => find_another_airing(&wiring_m, frame, list, dstatus),
-        DVR_CTX_SKIP => skip_selected_occurrence(&wiring_m, frame, list, dstatus),
-        DVR_CTX_EXPORT_CAL => export_selected_recordings(&wiring_m, frame, list, dstatus),
-        DVR_CTX_PAUSE => pause_recording_rule(&wiring_m, frame, list, dstatus),
-        DVR_CTX_RECOVER => recover_selected_archive(&wiring_m, frame, list, dstatus),
+        DVR_CTX_REFRESH => render_scheduled_jobs(&ui_m, &wiring_m, list, dstatus),
+        DVR_CTX_CANCEL => cancel_first_selected_job(&ui_m, &wiring_m, list, dstatus),
+        DVR_CTX_DELETE => delete_selected_finished_jobs(&ui_m, &wiring_m, list, dstatus),
+        DVR_CTX_PADDING => padding_for_selected(&ui_m, &wiring_m, frame, list, dstatus),
+        DVR_CTX_FIND_AIRING => find_another_airing(&ui_m, &wiring_m, frame, list, dstatus),
+        DVR_CTX_SKIP => skip_selected_occurrence(&ui_m, &wiring_m, frame, list, dstatus),
+        DVR_CTX_EXPORT_CAL => export_selected_recordings(&ui_m, &wiring_m, frame, list, dstatus),
+        DVR_CTX_PAUSE => pause_recording_rule(&ui_m, &wiring_m, frame, list, dstatus),
+        DVR_CTX_RECOVER => recover_selected_archive(&ui_m, &wiring_m, frame, list, dstatus),
         _ => {}
     });
     close.on_click(move |_| frame.hide());
     frame.show(true);
+    // PR #46: the list takes the focus when the dialog
+    // opens, as in Python.
+    list.set_focus();
 }
 
 /// The Catch-up dialog for one channel: past programmes with Play
