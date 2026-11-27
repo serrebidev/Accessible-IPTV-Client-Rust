@@ -55,7 +55,12 @@ bullet).
 
 ## Gate
 
-Local gate (fmt --check, clippy --locked -D warnings, cargo test
---locked --workspace, playlist parity against Python v1.151.6
-a29ad9a3): recorded with the release. No code changed in this port —
-catalogue and help text only.
+Local gate, all green: fmt --check clean; clippy --locked
+--workspace --all-targets -D warnings exit 0; cargo test --locked
+--workspace 555 passed / 0 failed; playlist parity PASS against
+Python v1.151.6 (a29ad9a3); git diff --check clean. One environment
+note: the first test run failed at link time (libgtk-3 /
+libgstplayer dev symlinks gone — the VM had been replaced again);
+~/workspace/bin/vm-dev-deps.sh restored them and the rerun passed in
+full. No code changed in this port — catalogue and help text only,
+plus the release version bump.
