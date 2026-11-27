@@ -15,7 +15,13 @@ use crate::Channel;
 
 /// One stream's identity: its address plus its sorted
 /// request headers (Python `media_identity`).
-type MediaIdentity = (String, Vec<(String, String)>);
+type MediaIdentity = crate::reminders::MediaIdentity;
+
+/// Python `programme_reminders.media_identity` (the canonical
+/// portal-aware identity in `reminders`).
+fn media_identity(channel: &Channel) -> MediaIdentity {
+    crate::reminders::media_identity(channel)
+}
 
 pub const MAX_LISTS: usize = 50;
 pub const MAX_CHANNELS: usize = 2000;
@@ -291,35 +297,23 @@ pub fn variant_labels(labels: &[String], variant_template: &str) -> Vec<String> 
         .collect()
 }
 
-/// Python `media_identity`: the stream address with its
-/// request headers, so two entries for one URL with
-/// different headers stay distinct.
-fn media_identity(channel: &Channel) -> MediaIdentity {
-    let mut headers = crate::downloads::channel_headers(channel);
-    headers.sort();
-    (channel.url.clone(), headers)
-}
-
 /// Python `variant_key`: sha256 of the JSON dump of the
 /// media identity pair.
 #[must_use]
 pub fn variant_key(channel: &Channel) -> String {
-    let (url, headers) = media_identity(channel);
-    let mut map: BTreeMap<String, String> = BTreeMap::new();
-    for (name, value) in headers {
-        map.insert(name, value);
-    }
-    let inner = map
-        .iter()
-        .map(|(k, v)| format!("{}: {}", py_json_string(k), py_json_string(v)))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let headers_json = format!("{{{inner}}}");
-    let identity = format!(
-        "[{}, {}]",
-        py_json_string(&url),
-        py_json_string(&headers_json)
-    );
+    let identity = match crate::reminders::media_identity(channel) {
+        crate::reminders::MediaIdentity::Portal(parts) => {
+            let parts: Vec<String> = parts.iter().map(|v| py_json_string(v)).collect();
+            format!("[{}]", parts.join(", "))
+        }
+        crate::reminders::MediaIdentity::Stream(url, headers_json) => {
+            format!(
+                "[{}, {}]",
+                py_json_string(&url),
+                py_json_string(&headers_json)
+            )
+        }
+    };
     sha256_hex(identity.as_bytes())
 }
 
@@ -334,8 +328,8 @@ pub fn selected_entry(
     channel: &Channel,
     channels: Option<&[Channel]>,
 ) -> Result<FavEntry, &'static str> {
-    let key = reminder_channel_key(channel);
-    if key.is_empty() || channel.url.is_empty() {
+    let key = crate::reminders::station_key(channel);
+    if key.is_empty() || !crate::reminders::playable(channel) {
         return Err("Channel Not Found");
     }
     let mut entry = FavEntry {
@@ -346,12 +340,12 @@ pub fn selected_entry(
         variant: None,
     };
     if let Some(channels) = channels {
-        let chosen = media_identity(channel);
+        let chosen = crate::reminders::media_identity(channel);
         let mut found = false;
         let mut ambiguous = false;
         for other in channels {
-            if !other.url.is_empty() && reminder_channel_key(other) == key {
-                if media_identity(other) == chosen {
+            if crate::reminders::playable(other) && crate::reminders::station_key(other) == key {
+                if crate::reminders::media_identity(other) == chosen {
                     found = true;
                 } else {
                     ambiguous = true;
@@ -500,13 +494,13 @@ pub fn relink(
 /// Python `resolve_channel` over pre-matched channels: the
 /// single distinct stream, or None when zero or several.
 fn resolve_one(matches: &[Channel]) -> Option<Channel> {
-    let mut distinct: Vec<MediaIdentity> = Vec::new();
+    let mut distinct: Vec<crate::reminders::MediaIdentity> = Vec::new();
     let mut chosen: Option<Channel> = None;
     for channel in matches {
-        if channel.url.is_empty() {
+        if !crate::reminders::playable(channel) {
             continue;
         }
-        let identity = media_identity(channel);
+        let identity = crate::reminders::media_identity(channel);
         if !distinct.contains(&identity) {
             distinct.push(identity);
             chosen = Some(channel.clone());
@@ -531,8 +525,18 @@ pub fn resolve(entries: &[FavEntry], channels: &[Channel]) -> Vec<(FavEntry, Opt
     let mut index: HashMap<String, Vec<Channel>> = HashMap::new();
     for channel in channels {
         let key = reminder_channel_key(channel);
-        if wanted.contains(&key) {
-            index.entry(key).or_default().push(channel.clone());
+        let mut keys = vec![key];
+        if channel
+            .unknown_attributes
+            .get("provider-type")
+            .is_some_and(|kind| kind == "stalker")
+        {
+            keys.push(crate::reminders::station_key(channel));
+        }
+        for key in keys {
+            if wanted.contains(&key) {
+                index.entry(key).or_default().push(channel.clone());
+            }
         }
     }
     entries
@@ -544,7 +548,7 @@ pub fn resolve(entries: &[FavEntry], channels: &[Channel]) -> Vec<(FavEntry, Opt
             let filtered: Vec<Channel> = match &entry.variant {
                 Some(variant) => matches
                     .iter()
-                    .filter(|ch| !ch.url.is_empty() && &variant_key(ch) == variant)
+                    .filter(|ch| crate::reminders::playable(ch) && &variant_key(ch) == variant)
                     .cloned()
                     .collect(),
                 None => matches.clone(),
@@ -786,7 +790,7 @@ pub fn match_entries(
     let mut by_guide: HashMap<String, BTreeSet<String>> = HashMap::new();
     let mut by_name: HashMap<String, BTreeSet<String>> = HashMap::new();
     for channel in channels {
-        if channel.url.is_empty()
+        if !crate::reminders::playable(channel)
             || matches!(
                 channel.unknown_attributes.get("kind").map(String::as_str),
                 Some("movie" | "series")
@@ -794,7 +798,7 @@ pub fn match_entries(
         {
             continue;
         }
-        let key = reminder_channel_key(channel);
+        let key = crate::reminders::station_key(channel);
         let guide = guide_key(channel);
         let name = public_name(&channel.name).to_lowercase();
         if !key.is_empty()

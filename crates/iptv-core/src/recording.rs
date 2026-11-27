@@ -22,7 +22,7 @@ pub const RECORDING_FORMATS: &[(&str, &str, &str, &str)] = &[
     ),
     (
         "provider_mp4",
-        "Provider quality (copy, MP4)",
+        "MP4 (original video, AAC audio)",
         "mp4",
         "video",
     ),
@@ -30,7 +30,7 @@ pub const RECORDING_FORMATS: &[(&str, &str, &str, &str)] = &[
     ("x264_mp4", "x264 re-encode (MP4)", "mp4", "video"),
     (
         "provider_mka",
-        "Provider quality (stream copy, MKA)",
+        "MKA (all audio tracks, original encoding)",
         "mka",
         "audio",
     ),
@@ -365,6 +365,9 @@ pub struct ActiveRecordingInfo {
     pub key: String,
     pub out_path: PathBuf,
     pub stopping: bool,
+    /// The recording's display title (Python `Recording.title`),
+    /// for the exit prompt's list.
+    pub title: String,
 }
 
 /// One running recording.
@@ -436,6 +439,9 @@ pub struct RecordingFinished {
 #[derive(Default)]
 pub struct RecordingEngine {
     active: BTreeMap<String, Active>,
+    /// Python `RecordingManager._closing` (PR #44): set by
+    /// `begin_shutdown`; new recordings are refused from then on.
+    closing: bool,
 }
 
 impl RecordingEngine {
@@ -481,6 +487,7 @@ impl RecordingEngine {
                     key: key.clone(),
                     out_path: active.out_path.clone(),
                     stopping: active.stopped_by_user,
+                    title: active.meta.title.clone(),
                 })
             })
             .collect()
@@ -529,6 +536,9 @@ impl RecordingEngine {
         shared_stdout: bool,
         meta: RecordingStartMeta,
     ) -> Result<Option<std::process::ChildStdout>, String> {
+        if self.closing {
+            return Err("The application is closing.".to_string());
+        }
         if self.active.contains_key(key) {
             return Err("That recording is already running.".to_string());
         }
@@ -706,6 +716,38 @@ impl RecordingEngine {
         };
         let active = self.active.remove(key)?;
         Some(build_finished(key, active, exit_code, success))
+    }
+
+    /// Whether the engine is closing (Python `_closing`).
+    #[must_use]
+    pub fn is_closing(&self) -> bool {
+        self.closing
+    }
+
+    /// Begin an application shutdown (Python
+    /// `RecordingManager.begin_shutdown`): refuse new recordings
+    /// and ask every active capture to finish with the `exit`
+    /// stop reason, so its outcome reads as stopped by the exit
+    /// rather than discarded. The caller keeps polling
+    /// [`RecordingEngine::poll_finished`] until the engine drains;
+    /// that polling is this port's watcher join. Returns false
+    /// when nothing was active.
+    pub fn begin_shutdown(&mut self) -> bool {
+        self.closing = true;
+        if self.active.is_empty() {
+            return false;
+        }
+        let keys: Vec<String> = self.active.keys().cloned().collect();
+        for key in keys {
+            let needs_exit = self
+                .active
+                .get(&key)
+                .is_some_and(|active| !active.stopped_by_user);
+            if needs_exit {
+                self.stop_for(&key, "exit");
+            }
+        }
+        true
     }
 
     /// Stop every active recording with escalation (R07), returning a

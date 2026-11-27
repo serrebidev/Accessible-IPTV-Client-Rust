@@ -5293,3 +5293,105 @@ msgstr "العنوان: سطر واحد يوضح ما الخطأ الذي حدث
 
 msgid "Describe what you did, what happened, and what you expected.\nYour browser then opens GitHub with this filled in. Sign in and press Create."
 msgstr "صف ما فعلته، وما حدث، وما كنت تتوقعه.\nبعد ذلك يفتح المتصفح GitHub وقد مُلئت هذه البيانات. سجّل الدخول واضغط «Create»."
+
+msgid "Finishing recordings before exit…"
+msgstr "جارٍ إنهاء التسجيلات قبل الخروج…"
+
+msgid "Try Again"
+msgstr "إعادة المحاولة"
+
+msgid "Copy Report"
+msgstr "نسخ البلاغ"
+
+msgid "Could not copy the text. Your report is still available."
+msgstr "تعذّر نسخ النص. لا يزال بلاغك متاحًا."
+
+msgid "The browser could not open the report. You can try again or copy your text."
+msgstr "تعذّر فتح البلاغ في المتصفح. يمكنك إعادة المحاولة أو نسخ النص."
+
+msgid "Normal speed"
+msgstr "السرعة العادية"
+
+msgid "Choose the playback speed:"
+msgstr "اختر سرعة التشغيل:"
+
+msgid "Recording Playback Speed..."
+msgstr "سرعة تشغيل التسجيل…"
+
+msgid "Find Text in Recording Subtitles..."
+msgstr "البحث عن نص في ترجمة التسجيل…"
+
+msgid "Text to find:"
+msgstr "النص المطلوب البحث عنه:"
+
+msgid "Subtitle matches"
+msgstr "نتائج البحث في الترجمة"
+
+msgid "Open a seekable local recording first."
+msgstr "افتح أولًا تسجيلًا محليًا يتيح التقديم والترجيع."
+
+msgid "The playback speed could not be changed."
+msgstr "تعذّر تغيير سرعة التشغيل."
+
+msgid "Load a text subtitle file or select an embedded text track first."
+msgstr "حمّل أولًا ملف ترجمة نصيًا أو اختر مسار ترجمة نصيًا مضمّنًا."
+
+msgid "No matching subtitles."
+msgstr "لا توجد نتائج مطابقة في الترجمة."
+
+msgid "Reminder times have changed. Open Programme Reminders and choose Review Guide Changes."
+msgstr "تغيّرت مواعيد التذكيرات. افتح تذكيرات البرامج واختر مراجعة تغييرات الدليل."
+
+msgid "No changes were found to upcoming reminder times."
+msgstr "لم تتغير مواعيد التذكيرات القادمة."
+
+msgid "Use the new time for this reminder?"
+msgstr "هل تريد استخدام الموعد الجديد لهذا التذكير؟"
+
+msgid "Keep the postponement relative to the new start time? Choose No to use the usual lead time."
+msgstr "هل تريد إبقاء التأجيل متناسبًا مع وقت البدء الجديد؟ اختر «لا» لاستخدام مهلة التنبيه المعتادة."
+
+msgid "{title}, {channel}. Previous: {old}. New: {new}."
+msgstr "{title}، {channel}. الموعد السابق: {old}. الموعد الجديد: {new}."
+
+msgid "Notify me of reminder time changes after guide updates"
+msgstr "تنبيهي عند تغيّر مواعيد التذكيرات بعد تحديث دليل البرامج"
+
+msgid "Export Selected Recordings to Calendar..."
+msgstr "تصدير التسجيلات المحددة إلى التقويم…"
+
+msgid "Pause Recording Rule..."
+msgstr "إيقاف قاعدة التسجيل مؤقتًا…"
+
+msgid "First day of the pause"
+msgstr "أول أيام الإيقاف المؤقت"
+
+msgid "Last day of the pause"
+msgstr "آخر أيام الإيقاف المؤقت"
+
+msgid "Remove the pause"
+msgstr "إنهاء الإيقاف المؤقت"
+
+msgid "Choose a valid pause ending today or later."
+msgstr "اختر فترة صالحة تنتهي اليوم أو بعده."
+
+msgid "Pause from {first} through {last}, inclusive?"
+msgstr "هل تريد الإيقاف المؤقت من {first} إلى {last} بما في ذلك اليومان؟"
+
+msgid "First skipped recording: {time}"
+msgstr "موعد أول تسجيل سيتخطاه التطبيق: {time}"
+
+msgid "Next recording after the pause: {time}"
+msgstr "أول تسجيل بعد فترة الإيقاف: {time}"
+
+msgid "Connecting to {channel}…"
+msgstr "جارٍ الاتصال بالقناة {channel}…"
+
+msgid "Enter a valid start date and an end date on or after it."
+msgstr "أدخل تاريخ بدء صالحًا وتاريخ انتهاء يوافقه أو يأتي بعده."
+
+msgid "Select upcoming recordings outside the pause period."
+msgstr "اختر تسجيلات قادمة تقع خارج فترة الإيقاف المؤقت."
+
+msgid "Stopped because the app exited."
+msgstr "توقّف التسجيل عند إغلاق التطبيق."

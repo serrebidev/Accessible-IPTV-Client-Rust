@@ -57,6 +57,47 @@ fn stamp(epoch: i64) -> String {
 ///
 /// # Errors
 /// Python's message when the end is not after the start.
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = sha2::Sha256::digest(bytes);
+    let mut key = String::with_capacity(64);
+    for byte in digest {
+        use std::fmt::Write;
+        let _ = write!(key, "{byte:02x}");
+    }
+    key
+}
+
+/// Python `_calendar`: one VCALENDAR holding every event, each
+/// validated as a finite, forward window.
+fn calendar(events: &[(String, String, String, i64, i64)], now: i64) -> Result<Vec<u8>, String> {
+    let mut lines = vec![
+        "BEGIN:VCALENDAR".to_string(),
+        "VERSION:2.0".to_string(),
+        "PRODID:-//Accessible IPTV Client//Programme//EN".to_string(),
+        "CALSCALE:GREGORIAN".to_string(),
+    ];
+    for (key, title, channel, start, end) in events {
+        if *end <= *start {
+            return Err("Invalid programme times.".to_string());
+        }
+        lines.extend([
+            "BEGIN:VEVENT".to_string(),
+            format!("UID:{key}@accessible-iptv-client"),
+            format!("DTSTAMP:{}", stamp(now)),
+            format!("DTSTART:{}", stamp(*start)),
+            format!("DTEND:{}", stamp(*end)),
+            format!("SUMMARY:{}", ical_text(title)),
+            format!("DESCRIPTION:{}", ical_text(channel)),
+            "END:VEVENT".to_string(),
+        ]);
+    }
+    lines.push("END:VCALENDAR".to_string());
+    let folded: Vec<String> = lines.iter().map(|line| fold_ical(line)).collect();
+    Ok((folded.join("\r\n") + "\r\n").into_bytes())
+}
+
+/// # Errors
+/// Returns "Invalid programme times." when the window is empty.
 pub fn programme_calendar(
     title: &str,
     channel: &str,
@@ -68,30 +109,106 @@ pub fn programme_calendar(
     if end <= start {
         return Err("Invalid programme times.".to_string());
     }
-    let key_bytes = format!("{identity}\0{title}\0{channel}\0{start}");
-    let digest = sha2::Sha256::digest(key_bytes.as_bytes());
-    let mut key = String::with_capacity(64);
-    for byte in digest {
-        use std::fmt::Write;
-        let _ = write!(key, "{byte:02x}");
+    let key = sha256_hex(format!("{identity}\0{title}\0{channel}\0{start}").as_bytes());
+    calendar(
+        &[(key, title.to_string(), channel.to_string(), start, end)],
+        now,
+    )
+}
+
+/// Python `recording_calendar`: the selected upcoming bookings
+/// as one calendar. Every job must be scheduled, unpaused and
+/// still in the future; the UID derives from the booking id
+/// alone, so an edited booking keeps its UID (and no provider
+/// locator or secret enters the export).
+///
+/// # Errors
+/// Python's messages for an ineligible selection and for an
+/// invalid window.
+#[allow(clippy::cast_possible_truncation)] // schedule times are whole seconds
+pub fn recording_calendar(jobs: &[crate::dvr::DvrJob], now: f64) -> Result<Vec<u8>, String> {
+    let mut events: Vec<(String, String, String, i64, i64)> = Vec::new();
+    for job in jobs {
+        if job.status != crate::dvr::STATUS_SCHEDULED
+            || crate::dvr::paused_occurrence(job)
+            || job.id.is_empty()
+            || job.start_ts <= now
+        {
+            return Err("Select upcoming recordings outside the pause period.".to_string());
+        }
+        let key = sha256_hex(format!("booking:{}", job.id).as_bytes());
+        let mut title = crate::reminders::safe_title(&job.title);
+        if title.is_empty() {
+            title = "Scheduled Recording".to_string();
+        }
+        let channel = crate::reminders::safe_title(&job.channel_name);
+        events.push((key, title, channel, job.start_ts as i64, job.stop_ts as i64));
     }
-    let lines = [
-        "BEGIN:VCALENDAR".to_string(),
-        "VERSION:2.0".to_string(),
-        "PRODID:-//Accessible IPTV Client//Programme//EN".to_string(),
-        "CALSCALE:GREGORIAN".to_string(),
-        "BEGIN:VEVENT".to_string(),
-        format!("UID:{key}@accessible-iptv-client"),
-        format!("DTSTAMP:{}", stamp(now)),
-        format!("DTSTART:{}", stamp(start)),
-        format!("DTEND:{}", stamp(end)),
-        format!("SUMMARY:{}", ical_text(title)),
-        format!("DESCRIPTION:{}", ical_text(channel)),
-        "END:VEVENT".to_string(),
-        "END:VCALENDAR".to_string(),
-    ];
-    let folded: Vec<String> = lines.iter().map(|line| fold_ical(line)).collect();
-    Ok((folded.join("\r\n") + "\r\n").into_bytes())
+    if events.is_empty() {
+        return Err("Select upcoming recordings outside the pause period.".to_string());
+    }
+    events.sort_by(|a, b| a.3.cmp(&b.3).then_with(|| a.0.cmp(&b.0)));
+    calendar(&events, now as i64)
+}
+
+/// Python `pause_preview`: the first programme start a pause
+/// would suppress, and the first eligible start after it, as
+/// local wall times. Either is `None` when there is none.
+#[must_use]
+pub fn pause_preview(
+    rule: &crate::dvr::DvrJob,
+    period: &[String; 2],
+    bookings: &[crate::dvr::DvrJob],
+    now: f64,
+) -> (Option<chrono::NaiveDateTime>, Option<chrono::NaiveDateTime>) {
+    let (Ok(first), Ok(last)) = (
+        chrono::NaiveDate::parse_from_str(&period[0], "%Y-%m-%d"),
+        chrono::NaiveDate::parse_from_str(&period[1], "%Y-%m-%d"),
+    ) else {
+        return (None, None);
+    };
+    let start_of = |job: &crate::dvr::DvrJob| {
+        crate::dvr::programme_local_start(job.start_ts, job.pre_padding_minutes)
+    };
+    if rule.repeat == "series" {
+        let mut starts: Vec<chrono::NaiveDateTime> = bookings
+            .iter()
+            .filter(|job| {
+                (job.id == rule.id || job.series_source.as_deref() == Some(rule.id.as_str()))
+                    && job.status == crate::dvr::STATUS_SCHEDULED
+                    && job.start_ts > now
+            })
+            .filter_map(start_of)
+            .collect();
+        starts.sort();
+        let skipped = starts
+            .iter()
+            .find(|t| first <= t.date() && t.date() <= last)
+            .copied();
+        let following = starts.iter().find(|t| t.date() > last).copied();
+        return (skipped, following);
+    }
+    let occurrence = |day: chrono::NaiveDate| -> Option<chrono::NaiveDateTime> {
+        if rule.status == crate::dvr::STATUS_SCHEDULED && rule.start_ts > now {
+            if let Some(start) = start_of(rule) {
+                if start.date() >= day {
+                    return Some(start);
+                }
+            }
+        }
+        crate::dvr::next_time_occurrence_from(rule, now, &chrono::Local, true, Some(day))
+            .ok()
+            .and_then(|next| {
+                crate::dvr::programme_local_start(next.start_ts, next.pre_padding_minutes)
+            })
+    };
+    let skipped = occurrence(first).filter(|t| t.date() <= last);
+    let following = if last < chrono::NaiveDate::MAX {
+        occurrence(last + chrono::TimeDelta::days(1))
+    } else {
+        None
+    };
+    (skipped, following)
 }
 
 /// Replace a file only with a complete export (Python
@@ -173,6 +290,94 @@ mod tests {
             programme_calendar("T", "C", 100, 100, "", 0),
             Err("Invalid programme times.".to_string())
         );
+    }
+
+    fn booking(id: &str, start: f64, stop: f64) -> crate::dvr::DvrJob {
+        let mut job = crate::dvr::DvrJob {
+            id: id.to_string(),
+            status: crate::dvr::STATUS_SCHEDULED.to_string(),
+            title: "Show".to_string(),
+            channel_name: "News".to_string(),
+            start_ts: start,
+            stop_ts: stop,
+            ..crate::dvr::DvrJob::default()
+        };
+        job.program = serde_json::json!({"title": "Show"});
+        job
+    }
+
+    #[test]
+    fn recording_calendar_groups_bookings_and_keeps_uids() {
+        let jobs = vec![
+            booking("a", 1_850_000_000.0, 1_850_003_600.0),
+            booking("b", 1_850_007_200.0, 1_850_010_800.0),
+        ];
+        let text = String::from_utf8(recording_calendar(&jobs, 1_849_000_000.0).expect("ics"))
+            .expect("utf8");
+        assert_eq!(text.matches("BEGIN:VEVENT").count(), 2);
+        assert_eq!(text.matches("BEGIN:VCALENDAR").count(), 1);
+        let uids = |text: &str| {
+            text.replace("\r\n ", "")
+                .lines()
+                .filter(|line| line.starts_with("UID:"))
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        };
+        let edited: Vec<_> = jobs
+            .iter()
+            .map(|job| {
+                let mut job = job.clone();
+                job.start_ts += 30.0;
+                job
+            })
+            .collect();
+        let edited_text =
+            String::from_utf8(recording_calendar(&edited, 1_849_000_000.0).expect("ics"))
+                .expect("utf8");
+        assert_eq!(uids(&text), uids(&edited_text));
+        let mut done = jobs.clone();
+        done[0].status = crate::dvr::STATUS_FAILED.to_string();
+        assert!(recording_calendar(&done, 1_849_000_000.0).is_err());
+        assert!(recording_calendar(&[], 1_849_000_000.0).is_err());
+    }
+
+    #[test]
+    fn pause_preview_reports_skipped_and_following_starts() {
+        // A daily rule starting at a fixed local wall time: build
+        // it through the DVR builder so the times are real.
+        let channel = crate::Channel {
+            name: "News".to_string(),
+            group: String::new(),
+            url: "http://example.com/s".to_string(),
+            tvg_id: String::new(),
+            tvg_name: String::new(),
+            tvg_logo: String::new(),
+            unknown_attributes: std::collections::BTreeMap::new(),
+        };
+        let spec = crate::dvr::NewJob {
+            channel: &channel,
+            programme_title: "Daily",
+            programme_start: 1_850_000_000,
+            programme_stop: 1_850_003_600,
+            format: "provider_mkv",
+            pre_padding_minutes: 0,
+            post_padding_minutes: 0,
+            repeat: "daily",
+            episode: "",
+            subtitle: "",
+            description: "",
+        };
+        let rule = crate::dvr::build_job(&spec, 0.0).expect("rule");
+        let date = crate::dvr::programme_local_date(&rule)
+            .expect("date")
+            .format("%Y-%m-%d")
+            .to_string();
+        let period = [date.clone(), date];
+        let (skipped, following) = pause_preview(&rule, &period, &[], 1_849_000_000.0);
+        let skipped = skipped.expect("skipped");
+        assert_eq!(skipped.date().format("%Y-%m-%d").to_string(), period[0]);
+        let following = following.expect("following");
+        assert!(following.date().format("%Y-%m-%d").to_string() > period[1]);
     }
 
     #[test]

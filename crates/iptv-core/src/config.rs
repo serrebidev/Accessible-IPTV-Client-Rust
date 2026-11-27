@@ -69,6 +69,7 @@ fn defaults() -> Map<String, Value> {
     put("prevent_sleep_while_recording", json!(true));
     put("wake_for_recordings", json!(false));
     put("auto_next_episode", json!(false));
+    put("notify_reminder_guide_changes", json!(false));
     put("favorites", json!([]));
     put("recent_channels", json!([]));
     put("live_buffer_enabled", json!(false));
@@ -280,6 +281,12 @@ impl Config {
         let flag = coerce_bool(self.values.get("auto_next_episode"), false);
         self.values
             .insert("auto_next_episode".to_string(), json!(flag));
+        // Python `options.normalize_config` (PR #44): telling the
+        // user when the guide moves a reminded programme is off
+        // by default.
+        let flag = coerce_bool(self.values.get("notify_reminder_guide_changes"), false);
+        self.values
+            .insert("notify_reminder_guide_changes".to_string(), json!(flag));
         // Truncation is the Python int() behavior; clamped to 0..=3 below.
         #[allow(clippy::cast_possible_truncation)]
         let level = coerce_f64(self.values.get("announcement_level")).map_or(2, |n| n as i64);

@@ -98,6 +98,31 @@ fn absolute_normalized(path: &Path) -> PathBuf {
     out
 }
 
+/// Make a path absolute and resolve `.`/`..` lexically,
+/// without touching the filesystem.
+fn lexical_absolute(path: &Path) -> PathBuf {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        match std::env::current_dir() {
+            Ok(cwd) => cwd.join(path),
+            Err(_) => path.to_path_buf(),
+        }
+    };
+    let mut out = PathBuf::new();
+    for part in absolute.components() {
+        use std::path::Component;
+        match part {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
 fn norm_key(path: &Path) -> String {
     let text = path.to_string_lossy().into_owned();
     if cfg!(windows) {
@@ -823,6 +848,42 @@ pub fn folders(config: &Value, primary: &str) -> Vec<String> {
     result
 }
 
+/// Python `folders(display_only=True)`: the same list, but
+/// deduplicated by the lexical absolute path instead of the
+/// resolved real path, so showing the list never touches the
+/// filesystem (an offline share cannot block the dialog).
+#[must_use]
+pub fn folders_display(config: &Value, primary: &str) -> Vec<String> {
+    let mut values = vec![primary.to_string()];
+    if let Some(extra) = config
+        .get("recording_library_folders")
+        .and_then(Value::as_array)
+    {
+        values.extend(
+            extra
+                .iter()
+                .filter_map(Value::as_str)
+                .filter(|path| !path.contains('\0'))
+                .map(str::to_string),
+        );
+    }
+    let mut result = Vec::new();
+    let mut seen = Vec::new();
+    for path in values {
+        if path.trim().is_empty() {
+            continue;
+        }
+        let absolute = lexical_absolute(Path::new(&path));
+        let key = norm_key(&absolute);
+        if !seen.contains(&key) {
+            seen.push(key);
+            result.push(absolute.to_string_lossy().into_owned());
+        }
+    }
+    result.truncate(MAX_FOLDERS);
+    result
+}
+
 /// A `file://` URI for an absolute path (Python `Path.as_uri`).
 #[must_use]
 pub fn file_uri(path: &Path) -> String {
@@ -1141,7 +1202,20 @@ pub fn classify_outcome(outcome: &Outcome<'_>) -> &'static str {
     if !outcome.produced {
         return "failed";
     }
-    if outcome.interrupted || outcome.stop_reason == "storage" {
+    if outcome.interrupted {
+        return "partial";
+    }
+    // PR #44: a capture stopped because the app exited keeps
+    // its real outcome — "stopped" when ffmpeg finished the
+    // file cleanly, "partial" when it did not.
+    if outcome.stop_reason == "exit" {
+        return if outcome.exit_code == 0 {
+            "stopped"
+        } else {
+            "partial"
+        };
+    }
+    if outcome.stop_reason == "storage" {
         return "partial";
     }
     if outcome.stopped_by_user && outcome.stop_reason != "scheduled" {
@@ -1624,6 +1698,11 @@ mod tests {
         assert_eq!(c(false, true, "user", true, 0, None, None), "failed");
         assert_eq!(c(true, true, "", false, 0, None, None), "partial");
         assert_eq!(c(true, false, "storage", true, 0, None, None), "partial");
+        // PR #44: an exit stop keeps its real outcome.
+        assert_eq!(c(true, false, "exit", true, 0, None, None), "stopped");
+        assert_eq!(c(true, false, "exit", true, 1, None, None), "partial");
+        // A capture that had to be killed stays partial even on exit.
+        assert_eq!(c(true, true, "exit", true, 0, None, None), "partial");
         assert_eq!(c(true, false, "user", true, 1, None, None), "stopped");
         // The scheduler's own end-of-window stop is not a user stop.
         assert_eq!(

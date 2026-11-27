@@ -5450,3 +5450,105 @@ msgstr "Titel: eine Zeile, die sagt, was schiefging oder was Sie sich wünschen"
 
 msgid "Describe what you did, what happened, and what you expected.\nYour browser then opens GitHub with this filled in. Sign in and press Create."
 msgstr "Beschreiben Sie, was Sie getan haben, was passiert ist und was Sie erwartet haben.\nDanach öffnet Ihr Browser GitHub mit diesen Angaben. Melden Sie sich an und drücken Sie „Create“."
+
+msgid "Finishing recordings before exit…"
+msgstr "Aufnahmen werden vor dem Beenden abgeschlossen…"
+
+msgid "Try Again"
+msgstr "Erneut versuchen"
+
+msgid "Copy Report"
+msgstr "Bericht kopieren"
+
+msgid "Could not copy the text. Your report is still available."
+msgstr "Der Text konnte nicht kopiert werden. Ihr Bericht ist weiterhin verfügbar."
+
+msgid "The browser could not open the report. You can try again or copy your text."
+msgstr "Der Bericht konnte im Browser nicht geöffnet werden. Versuchen Sie es erneut oder kopieren Sie Ihren Text."
+
+msgid "Normal speed"
+msgstr "Normale Geschwindigkeit"
+
+msgid "Choose the playback speed:"
+msgstr "Wiedergabegeschwindigkeit wählen:"
+
+msgid "Recording Playback Speed..."
+msgstr "Wiedergabegeschwindigkeit für Aufnahmen…"
+
+msgid "Find Text in Recording Subtitles..."
+msgstr "Text in Aufnahmeuntertiteln suchen…"
+
+msgid "Text to find:"
+msgstr "Suchtext:"
+
+msgid "Subtitle matches"
+msgstr "Untertiteltreffer"
+
+msgid "Open a seekable local recording first."
+msgstr "Öffnen Sie zuerst eine lokale Aufnahme, in der Sie springen können."
+
+msgid "The playback speed could not be changed."
+msgstr "Die Wiedergabegeschwindigkeit konnte nicht geändert werden."
+
+msgid "Load a text subtitle file or select an embedded text track first."
+msgstr "Laden Sie zunächst eine Textuntertiteldatei oder wählen Sie eine eingebettete Textuntertitelspur."
+
+msgid "No matching subtitles."
+msgstr "Keine passenden Untertitel gefunden."
+
+msgid "Reminder times have changed. Open Programme Reminders and choose Review Guide Changes."
+msgstr "Erinnerungszeiten haben sich geändert. Öffnen Sie die Programmerinnerungen und prüfen Sie dort die Änderungen im Programm."
+
+msgid "No changes were found to upcoming reminder times."
+msgstr "Die Zeiten der anstehenden Erinnerungen haben sich nicht geändert."
+
+msgid "Use the new time for this reminder?"
+msgstr "Die neue Zeit für diese Erinnerung übernehmen?"
+
+msgid "Keep the postponement relative to the new start time? Choose No to use the usual lead time."
+msgstr "Soll der Aufschub an die neue Startzeit angepasst werden? Mit Nein gilt wieder die übliche Vorlaufzeit."
+
+msgid "{title}, {channel}. Previous: {old}. New: {new}."
+msgstr "{title}, {channel}. Bisher: {old}. Neu: {new}."
+
+msgid "Notify me of reminder time changes after guide updates"
+msgstr "Nach Programmaktualisierungen auf geänderte Erinnerungszeiten hinweisen"
+
+msgid "Export Selected Recordings to Calendar..."
+msgstr "Ausgewählte Aufnahmen in den Kalender exportieren…"
+
+msgid "Pause Recording Rule..."
+msgstr "Aufnahmeregel pausieren…"
+
+msgid "First day of the pause"
+msgstr "Erster Tag der Pause"
+
+msgid "Last day of the pause"
+msgstr "Letzter Tag der Pause"
+
+msgid "Remove the pause"
+msgstr "Pause aufheben"
+
+msgid "Choose a valid pause ending today or later."
+msgstr "Wählen Sie einen gültigen Zeitraum, der heute oder später endet."
+
+msgid "Pause from {first} through {last}, inclusive?"
+msgstr "Vom {first} bis einschließlich {last} pausieren?"
+
+msgid "First skipped recording: {time}"
+msgstr "Erste ausgesetzte Aufnahme: {time}"
+
+msgid "Next recording after the pause: {time}"
+msgstr "Erste Aufnahme nach der Pause: {time}"
+
+msgid "Connecting to {channel}…"
+msgstr "Verbindung mit {channel} wird hergestellt…"
+
+msgid "Enter a valid start date and an end date on or after it."
+msgstr "Geben Sie ein gültiges Anfangsdatum ein. Das Enddatum darf nicht davor liegen."
+
+msgid "Select upcoming recordings outside the pause period."
+msgstr "Wählen Sie anstehende Aufnahmen außerhalb des Pausenzeitraums."
+
+msgid "Stopped because the app exited."
+msgstr "Die Aufnahme wurde beim Beenden der Anwendung gestoppt."

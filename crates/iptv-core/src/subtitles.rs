@@ -109,6 +109,10 @@ fn strip_markup(text: &str) -> String {
         match rest.find(closer) {
             Some(end) => {
                 parts.push(text[offset..start].to_string());
+                if closer == '>' && is_br_tag(&text[start..=scan + end]) {
+                    // Python: a line break becomes a space, not nothing.
+                    parts.push(" ".to_string());
+                }
                 offset = scan + end + 1;
                 scan = offset;
             }
@@ -119,6 +123,17 @@ fn strip_markup(text: &str) -> String {
     }
     parts.push(text[offset..].to_string());
     parts.concat()
+}
+
+/// Python's `<br\\s*/?\\s*>` check, case-insensitive.
+fn is_br_tag(tag: &str) -> bool {
+    let inner = tag
+        .strip_prefix('<')
+        .and_then(|t| t.strip_suffix('>'))
+        .unwrap_or("");
+    let inner = inner.trim_end();
+    let inner = inner.strip_suffix('/').unwrap_or(inner).trim_end();
+    inner.trim().eq_ignore_ascii_case("br")
 }
 
 /// The common HTML entities plus numeric references (the spoken-text

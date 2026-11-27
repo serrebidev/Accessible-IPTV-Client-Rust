@@ -113,6 +113,17 @@ impl LatestTask {
         true
     }
 
+    /// Drop the pending item and supersede a running one
+    /// (Python `LatestTask.cancel`): its completion, if it ever
+    /// arrives, is dropped by the version check in `poll`.
+    /// # Panics
+    /// Panics if the task's shared state lock is poisoned.
+    pub fn cancel(&self) {
+        let mut state = self.shared.state.lock().unwrap();
+        state.version += 1;
+        state.pending = None;
+    }
+
     /// Run every due completion on the calling thread. A queued
     /// completion whose version has been superseded, or that
     /// arrives after [`LatestTask::close`], is dropped silently.

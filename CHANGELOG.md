@@ -5,6 +5,17 @@ adjacent releases were part of the same fix stream, they are combined with a
 version range such as `0.2.2-0.2.3`. Each release's section below is its
 Forgejo release note, taken from this file by the release workflow.
 
+## 0.4.39
+
+- Recording rules can pause: Scheduled Recordings gains Pause Recording Rule..., with a first and last day, a Paused label while a rule sits in its pause, and Export Selected Recordings to Calendar... for upcoming recordings. Paused recordings no longer count against connection limits or conflicts, and the wake-up planner looks past the pause.
+- Reminders follow the guide: Programme Reminders gains Review Guide Changes... and an opt-in notice after guide updates when a reminder's programme moved, with the same fingerprint matching recordings use. Favourites, saved searches and other airings now match Stalker channels by their portal identity, so a changed stream address no longer loses them.
+- Exiting with recordings in progress names them and asks first, then lets them finish before the app closes instead of cutting them off; a recording stopped by exiting says so. The app no longer starts new recordings while it is closing.
+- Stalker channels connect in the background: pressing play no longer waits on the portal, a failed connection shows a Playback Error box, and stopping or starting something else cancels a connection still in flight.
+- The Recording Library scans each folder on its own worker, so switching folders answers straight away, and Play always plays a finished recording inside the app at its saved position instead of handing the file to an external player.
+- The built-in player gains Recording Playback Speed... (0.75x to 2x) and Find Text in Recording Subtitles... for local recordings, in the Playback menu.
+- Recording formats are named for what they contain: MP4 (original video, AAC audio) and MKA (all audio tracks, original encoding).
+- If the browser cannot open a bug report, you can try again or copy the report text instead of losing it. Casting retries once when the network address it needs is not ready yet, and subtitle files read line breaks inside a cue as spaces.
+
 ## 0.4.38
 
 - Help, Report an issue on GitHub asks for a title and a description in accessible dialogs, then opens GitHub's new issue page with both filled in and your Accessible IPTV Client version and system added. Sign in on GitHub and press Create.
