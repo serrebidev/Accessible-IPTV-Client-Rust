@@ -22,6 +22,65 @@ pub fn ical_text(value: &str) -> String {
         .replace(',', "\\,")
 }
 
+/// The Scheduled Recordings filter (Python PR #46
+/// `filter_recording_schedule`): a title/channel word match
+/// plus one of four views — `all`, `week` (unpaused bookings
+/// starting within the next seven days), `problems` (failed,
+/// missed and partial) and `paused` (bookings inside a pause
+/// window, plus series rules whose pause is current or upcoming
+/// even when the rule itself already completed). Rust's
+/// `waiting` status counts as Python's `scheduled` here: it is
+/// a scheduled booking held by a conflict or a limit.
+#[must_use]
+pub fn filter_recording_schedule(
+    jobs: &[crate::dvr::DvrJob],
+    query: &str,
+    view: &str,
+    now: f64,
+) -> Vec<crate::dvr::DvrJob> {
+    use crate::dvr::{
+        paused_occurrence, STATUS_CANCELED, STATUS_FAILED, STATUS_MISSED, STATUS_PARTIAL,
+        STATUS_SCHEDULED, STATUS_WAITING,
+    };
+    let words: Vec<String> = query.to_lowercase().split_whitespace().map(str::to_string).collect();
+    let local_now = chrono::DateTime::from_timestamp(now as i64, 0)
+        .map(|utc| utc.with_timezone(&chrono::Local))
+        .unwrap_or_else(chrono::Local::now);
+    let week_end = (local_now + chrono::Duration::days(7)).timestamp() as f64;
+    let today = local_now.format("%Y-%m-%d").to_string();
+    let mut rows = Vec::new();
+    for job in jobs {
+        let scheduled = job.status == STATUS_SCHEDULED || job.status == STATUS_WAITING;
+        let paused = scheduled && paused_occurrence(job);
+        if view == "week"
+            && !(scheduled && !paused && now <= job.start_ts && job.start_ts < week_end)
+        {
+            continue;
+        }
+        if view == "problems"
+            && ![STATUS_FAILED, STATUS_MISSED, STATUS_PARTIAL].contains(&job.status.as_str())
+        {
+            continue;
+        }
+        if view == "paused" {
+            let is_rule = job.repeat == "series" && job.status != STATUS_CANCELED;
+            let in_window = job
+                .pause_dates
+                .as_ref()
+                .is_some_and(|dates| dates[1] >= today);
+            if !(in_window && (scheduled || is_rule)) {
+                continue;
+            }
+        }
+        let text = format!("{} {} {}", job.title, job.display_title, job.channel_name)
+            .to_lowercase();
+        if words.iter().all(|word| text.contains(word.as_str())) {
+            rows.push(job.clone());
+        }
+    }
+    rows
+}
+
 /// Fold one content line to 75 octets per physical line
 /// (Python `fold_ical`), never splitting a UTF-8 character;
 /// continuation lines start with one space.
@@ -290,6 +349,70 @@ mod tests {
             programme_calendar("T", "C", 100, 100, "", 0),
             Err("Invalid programme times.".to_string())
         );
+    }
+
+    #[test]
+    fn schedule_filter_views_and_words() {
+        // Python test_schedule_filters_exclude_paused_items_from_the_week.
+        let now = 1_800_000_000.0;
+        let today = chrono::DateTime::from_timestamp(now as i64, 0)
+            .map(|utc| utc.with_timezone(&chrono::Local))
+            .unwrap_or_else(chrono::Local::now)
+            .format("%Y-%m-%d")
+            .to_string();
+        let mut active = booking("active", now + 60.0, now + 3600.0);
+        active.title = "Hírek".to_string();
+        active.channel_name = "Rádió".to_string();
+        let mut paused = booking("paused", now + 60.0, now + 3600.0);
+        paused.title = "Zene".to_string();
+        paused.pause_dates = Some([today.clone(), today]);
+        let mut partial = booking("partial", now - 3600.0, now - 60.0);
+        partial.status = crate::dvr::STATUS_PARTIAL.to_string();
+        partial.title = "Zene".to_string();
+        let rows = vec![active, paused, partial];
+        let ids = |view: &str, query: &str| {
+            filter_recording_schedule(&rows, query, view, now)
+                .iter()
+                .map(|job| job.id.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids("week", "HÍREK rádió"), ["active"]);
+        assert_eq!(ids("week", ""), ["active"]);
+        assert_eq!(ids("problems", ""), ["partial"]);
+        assert_eq!(ids("paused", ""), ["paused"]);
+        assert_eq!(ids("all", "zene"), ["paused", "partial"]);
+    }
+
+    #[test]
+    fn schedule_filter_paused_view_keeps_a_completed_series_rule() {
+        // Python test_pause_filter_includes_existing_series_rule_after_its_first_recording.
+        let now = 1_800_000_000.0;
+        let local = chrono::DateTime::from_timestamp(now as i64, 0)
+            .map(|utc| utc.with_timezone(&chrono::Local))
+            .unwrap_or_else(chrono::Local::now);
+        let today = local.format("%Y-%m-%d").to_string();
+        let later = (local + chrono::Duration::days(2))
+            .format("%Y-%m-%d")
+            .to_string();
+        let mut series = booking("series", now - 3600.0, now - 60.0);
+        series.status = crate::dvr::STATUS_COMPLETED.to_string();
+        series.repeat = "series".to_string();
+        series.pause_dates = Some([today, later]);
+        let mut canceled = series.clone();
+        canceled.id = "canceled".to_string();
+        canceled.status = crate::dvr::STATUS_CANCELED.to_string();
+        let mut ordinary = series.clone();
+        ordinary.id = "ordinary".to_string();
+        ordinary.repeat = "weekly".to_string();
+        let mut expired = series.clone();
+        expired.id = "expired".to_string();
+        expired.pause_dates = Some(["2000-01-01".to_string(), "2000-01-02".to_string()]);
+        let rows = vec![series, canceled, ordinary, expired];
+        let kept: Vec<String> = filter_recording_schedule(&rows, "", "paused", now)
+            .iter()
+            .map(|job| job.id.clone())
+            .collect();
+        assert_eq!(kept, ["series"]);
     }
 
     fn booking(id: &str, start: f64, stop: f64) -> crate::dvr::DvrJob {

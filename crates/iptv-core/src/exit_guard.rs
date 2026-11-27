@@ -38,13 +38,58 @@ pub fn pending_reminder_count(reminders: &[Reminder], now: i64) -> usize {
 /// earliest first. Python filters to `scheduled`; the Rust-only
 /// `waiting` state (a job held by a connection conflict, issue
 /// #134) is in the same position — not started, gone on exit —
-/// so it is included.
+/// so it is included. PR #46: a paused time-repeat booking is
+/// listed by its next eligible occurrence after the pause, not
+/// by the occurrence the pause swallows; paused series rules
+/// and one-off bookings drop out (their next start is a guide
+/// matter, not a clock one).
 #[must_use]
-pub fn upcoming_recording_jobs(jobs: &[DvrJob]) -> Vec<&DvrJob> {
-    let mut upcoming: Vec<&DvrJob> = jobs
-        .iter()
-        .filter(|job| job.status == STATUS_SCHEDULED || job.status == STATUS_WAITING)
-        .collect();
+pub fn upcoming_recording_jobs(jobs: &[DvrJob], now: f64) -> Vec<DvrJob> {
+    let mut upcoming: Vec<DvrJob> = Vec::new();
+    let mut seen: Vec<String> = Vec::new();
+    for job in jobs {
+        if job.status != STATUS_SCHEDULED && job.status != STATUS_WAITING {
+            continue;
+        }
+        let shown = if crate::dvr::paused_occurrence(job) {
+            if !crate::dvr::TIME_REPEATS.contains(&job.repeat.as_str()) {
+                continue;
+            }
+            let Some(dates) = &job.pause_dates else {
+                continue;
+            };
+            let Some(last) =
+                chrono::NaiveDate::parse_from_str(&dates[1], "%Y-%m-%d").ok()
+            else {
+                continue;
+            };
+            if last > chrono::NaiveDate::MAX - chrono::Duration::days(8) {
+                continue;
+            }
+            let earliest = last + chrono::Duration::days(1);
+            let Ok(next) = crate::dvr::next_time_occurrence_from(
+                job,
+                now,
+                &chrono::Local,
+                true,
+                Some(earliest),
+            ) else {
+                continue;
+            };
+            if crate::dvr::paused_occurrence(&next) {
+                continue;
+            }
+            next
+        } else {
+            job.clone()
+        };
+        // Python keys the list by the source job's id: one row
+        // per booking even if the store somehow lists it twice.
+        if !seen.contains(&job.id) {
+            seen.push(job.id.clone());
+            upcoming.push(shown);
+        }
+    }
     upcoming.sort_by(|a, b| a.start_ts.total_cmp(&b.start_ts));
     upcoming
 }
@@ -115,7 +160,7 @@ pub fn exit_prompts_with_active(
             no_default: true,
         });
     }
-    let upcoming = upcoming_recording_jobs(jobs);
+    let upcoming = upcoming_recording_jobs(jobs, now as f64);
     if !upcoming.is_empty() {
         let names = upcoming
             .iter()
@@ -271,6 +316,43 @@ mod tests {
         assert!(prompts[0]
             .message
             .starts_with("A recording is in progress and 1 recording is still scheduled."));
+    }
+
+    #[test]
+    fn leaving_lists_the_next_unpaused_recurrence() {
+        // Python test_leaving_lists_next_unpaused_recurrence_instead_of_paused_occurrence.
+        use chrono::TimeZone as _;
+        let now = 1_800_000_000.0;
+        let local_now = chrono::Local
+            .timestamp_opt(now as i64, 0)
+            .single()
+            .expect("local now");
+        let future_date = local_now.date_naive() + chrono::Duration::days(2);
+        let noon = future_date
+            .and_hms_opt(12, 0, 0)
+            .expect("noon")
+            .and_local_timezone(chrono::Local)
+            .single()
+            .expect("local noon");
+        let start = noon.timestamp() as f64;
+        let mut row = job(STATUS_SCHEDULED, "News", start);
+        row.repeat = "daily".to_string();
+        row.stop_ts = start + 600.0;
+        let date_text = future_date.format("%Y-%m-%d").to_string();
+        row.pause_dates = Some([date_text.clone(), date_text]);
+        let mut one_off = row.clone();
+        one_off.id = "one-off".to_string();
+        one_off.repeat = String::new();
+        let original_start = row.start_ts;
+        let upcoming = upcoming_recording_jobs(&[row, one_off], now);
+        assert_eq!(upcoming.len(), 1);
+        let shown_date = chrono::Local
+            .timestamp_opt(upcoming[0].start_ts as i64, 0)
+            .single()
+            .expect("shown")
+            .date_naive();
+        assert_eq!(shown_date, future_date + chrono::Duration::days(1));
+        assert_eq!(original_start, start, "the stored job is not moved");
     }
 
     #[test]

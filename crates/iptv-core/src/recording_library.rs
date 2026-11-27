@@ -1190,6 +1190,16 @@ pub struct Outcome<'a> {
     pub exit_code: i32,
     pub written_seconds: Option<f64>,
     pub planned_seconds: Option<f64>,
+    /// When the capture actually started (Python `started_at`):
+    /// the written-length fallback and the PR #46 late-start
+    /// check read it.
+    pub started_at: Option<f64>,
+    /// When the capture ended (Python `ended_at`).
+    pub ended_at: Option<f64>,
+    /// The scheduled window's start (Python PR #46
+    /// `scheduled_start`): a capture that began more than five
+    /// seconds after it is partial, however much media it wrote.
+    pub scheduled_start: Option<f64>,
 }
 
 /// Python `recording_outcome.classify`: nothing produced is
@@ -1224,7 +1234,25 @@ pub fn classify_outcome(outcome: &Outcome<'_>) -> &'static str {
     if outcome.exit_code != 0 {
         return "partial";
     }
-    if let (Some(expected), Some(written)) = (outcome.planned_seconds, outcome.written_seconds) {
+    // PR #46: a capture that started more than five seconds
+    // after its scheduled start missed the beginning of the
+    // window — partial even when the media it wrote looks long
+    // enough (the written seconds are measured from the late
+    // start, so they can appear to cover the window).
+    if let (Some(scheduled), Some(started)) = (outcome.scheduled_start, outcome.started_at) {
+        if started - scheduled > 5.0 {
+            return "partial";
+        }
+    }
+    // Python: without a media-written figure, the written
+    // length is the capture's own wall-clock span.
+    let written = outcome.written_seconds.or_else(|| {
+        match (outcome.started_at, outcome.ended_at) {
+            (Some(started), Some(ended)) => Some((ended - started).max(0.0)),
+            _ => None,
+        }
+    });
+    if let (Some(expected), Some(written)) = (outcome.planned_seconds, written) {
         if expected.is_finite() && written.is_finite() && expected > 0.0 {
             let slack = (expected * 0.02).clamp(5.0, 30.0);
             if written + slack < expected {
@@ -1280,6 +1308,9 @@ pub fn remember(input: &RememberInput) -> Result<(), String> {
             exit_code: input.exit_code,
             written_seconds: seconds,
             planned_seconds: input.planned_seconds,
+            started_at: None,
+            ended_at: None,
+            scheduled_start: None,
         })
         .to_string()
     });
@@ -1693,8 +1724,41 @@ mod tests {
                 exit_code: rc,
                 written_seconds: written,
                 planned_seconds: planned,
+                started_at: None,
+                ended_at: None,
+                scheduled_start: None,
             })
         };
+        // PR #46: a start more than five seconds after the
+        // scheduled start is partial even when the written
+        // seconds appear to cover the window (Python
+        // test_late_start_is_partial_even_if_media_time_appears_to_cover_the_window).
+        let late = classify_outcome(&Outcome {
+            produced: true,
+            interrupted: false,
+            stop_reason: "",
+            stopped_by_user: false,
+            exit_code: 0,
+            written_seconds: Some(60.0),
+            planned_seconds: Some(60.0),
+            started_at: Some(1020.0),
+            ended_at: Some(1060.0),
+            scheduled_start: Some(1000.0),
+        });
+        assert_eq!(late, "partial");
+        let on_time = classify_outcome(&Outcome {
+            produced: true,
+            interrupted: false,
+            stop_reason: "",
+            stopped_by_user: false,
+            exit_code: 0,
+            written_seconds: Some(60.0),
+            planned_seconds: Some(60.0),
+            started_at: Some(1020.0),
+            ended_at: Some(1060.0),
+            scheduled_start: Some(1017.0),
+        });
+        assert_eq!(on_time, "completed");
         assert_eq!(c(false, true, "user", true, 0, None, None), "failed");
         assert_eq!(c(true, true, "", false, 0, None, None), "partial");
         assert_eq!(c(true, false, "storage", true, 0, None, None), "partial");

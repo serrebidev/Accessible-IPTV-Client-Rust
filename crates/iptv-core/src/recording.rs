@@ -429,6 +429,10 @@ pub struct RecordingFinished {
     /// Seconds the capture was meant to run, when it had a
     /// planned length (from the start meta).
     pub planned_seconds: Option<f64>,
+    /// When the capture actually started, epoch seconds
+    /// (Python `started_at`): the outcome classifier's
+    /// late-start check reads it (PR #46).
+    pub started_at: f64,
     /// The recorded channel's name (from the start meta).
     pub channel_name: String,
 }
@@ -884,6 +888,7 @@ fn build_finished(key: &str, active: Active, exit_code: i32, success: bool) -> R
         problem_counts,
         media_written_seconds,
         planned_seconds: meta.planned_seconds,
+        started_at: started_epoch,
         channel_name: meta.channel_name.clone(),
     }
 }
@@ -987,6 +992,60 @@ pub fn check_destination(dir: &Path, reserve_mib: Option<i64>) -> Result<Storage
         free_bytes: free,
         reserve_mib: reserve,
     })
+}
+
+/// Publish a staged file under a new name without ever
+/// replacing an existing file (Python `recording_storage.
+/// publish_new_file`, shared by the buffer clip save and the
+/// recording excerpt export since PR #46): on Windows a plain
+/// rename (which refuses an existing target); elsewhere a hard
+/// link, falling back on filesystems without links to an
+/// exclusive creation followed by a replace of the empty
+/// placeholder. The caller guarantees the destination is new
+/// and removes the staged file afterwards.
+///
+/// # Errors
+///
+/// Returns the OS error text when the publish fails.
+pub fn publish_new_file(temporary: &Path, destination: &Path) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        return std::fs::rename(temporary, destination).map_err(|e| e.to_string());
+    }
+    #[cfg(not(windows))]
+    {
+        match std::fs::hard_link(temporary, destination) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                let unsupported = matches!(
+                    error.raw_os_error(),
+                    Some(code) if code == libc::EPERM || code == libc::EOPNOTSUPP || code == libc::ENOSYS
+                );
+                if !unsupported {
+                    return Err(error.to_string());
+                }
+                // Filesystems without links still need exclusive
+                // creation at publication.
+                let placeholder = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(destination);
+                match placeholder {
+                    Ok(file) => {
+                        drop(file);
+                        match std::fs::rename(temporary, destination) {
+                            Ok(()) => Ok(()),
+                            Err(error) => {
+                                let _ = std::fs::remove_file(destination);
+                                Err(error.to_string())
+                            }
+                        }
+                    }
+                    Err(error) => Err(error.to_string()),
+                }
+            }
+        }
+    }
 }
 
 /// True only when `path` is an existing file with bytes in it (R09):
