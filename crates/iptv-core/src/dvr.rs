@@ -97,6 +97,12 @@ pub struct DvrJob {
     /// The series rule that booked this episode.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub series_source: Option<String>,
+    /// A recording rule's pause window (Python `pause_dates`):
+    /// two ISO local dates, first through last inclusive.
+    /// Occurrences whose programme date falls inside are skipped,
+    /// never recorded and never counted as conflicts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pause_dates: Option<[String; 2]>,
     /// Scheduled by time, not from the guide.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub manual: Option<bool>,
@@ -435,6 +441,57 @@ pub fn program_episode_key(program: &serde_json::Value) -> Option<String> {
     None
 }
 
+/// Python `dvr.valid_pause_period`: a two-item list of ISO
+/// dates, first on or before last, each spelled exactly as
+/// `date.isoformat()` writes it.
+#[must_use]
+pub fn valid_pause_period(period: &[String; 2]) -> bool {
+    let parse = |text: &str| {
+        chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d")
+            .ok()
+            .filter(|date| date.format("%Y-%m-%d").to_string() == text)
+    };
+    match (parse(&period[0]), parse(&period[1])) {
+        (Some(first), Some(last)) => first <= last,
+        _ => false,
+    }
+}
+
+/// The local calendar date a job's programme starts on: the
+/// padded record start shifted back by the pre-padding, so a
+/// programme late in the evening keeps its own date even when
+/// the padding starts the evening before (Python
+/// `paused_occurrence`).
+#[must_use]
+pub fn programme_local_date(job: &DvrJob) -> Option<chrono::NaiveDate> {
+    use chrono::TimeZone as _;
+    let start = (job.start_ts + ts_f64(job.pre_padding_minutes * 60)).floor() as i64;
+    chrono::Local
+        .timestamp_opt(start, 0)
+        .single()
+        .map(|dt| dt.date_naive())
+}
+
+/// Whether `job`'s programme date falls inside `period`
+/// (Python `paused_occurrence` with an explicit period).
+#[must_use]
+pub fn paused_occurrence_in(job: &DvrJob, period: &[String; 2]) -> bool {
+    let Some(date) = programme_local_date(job) else {
+        return false;
+    };
+    let date = date.format("%Y-%m-%d").to_string();
+    period[0].as_str() <= date.as_str() && date.as_str() <= period[1].as_str()
+}
+
+/// Whether a job is paused for its own occurrence (Python
+/// `paused_occurrence`).
+#[must_use]
+pub fn paused_occurrence(job: &DvrJob) -> bool {
+    job.pause_dates
+        .as_ref()
+        .is_some_and(|period| paused_occurrence_in(job, period))
+}
+
 /// Python `dvr.taken_episode_keys`: the episodes a series rule
 /// already has. Active and successfully completed jobs count;
 /// failed, missed, partial, stopped and canceled ones do not.
@@ -444,6 +501,7 @@ pub fn taken_episode_keys(jobs: &[DvrJob], rule_id: &str) -> std::collections::H
         .filter(|job| {
             (ACTIVE_STATUSES.contains(&job.status.as_str()) || job.status == STATUS_COMPLETED)
                 && (job.id == rule_id || job.series_source.as_deref() == Some(rule_id))
+                && !(job.status == STATUS_SCHEDULED && paused_occurrence(job))
         })
         .filter_map(|job| program_episode_key(&job.program))
         .collect()
@@ -652,6 +710,21 @@ fn valid_stored_job(job: &serde_json::Value) -> bool {
         .is_some_and(|v| !valid_series_padding(v))
     {
         return false;
+    }
+    if let Some(pause) = map.get("pause_dates") {
+        let period = pause.as_array().and_then(|row| {
+            if row.len() == 2 {
+                Some([row[0].as_str()?.to_string(), row[1].as_str()?.to_string()])
+            } else {
+                None
+            }
+        });
+        let start = number_or(map.get("start_ts"), -1.0);
+        if period.as_ref().is_none_or(|p| !valid_pause_period(p))
+            || !(0.0..=253_402_300_799.0).contains(&start)
+        {
+            return false;
+        }
     }
     let repeat = match map.get("repeat") {
         None | Some(serde_json::Value::Null) => "",
@@ -1165,6 +1238,13 @@ impl DvrSchedule {
         let mut episodes = taken_episode_keys(&self.jobs, &parent.id);
         let mut added = Vec::new();
         for mut job in candidates {
+            if parent
+                .pause_dates
+                .as_ref()
+                .is_some_and(|period| paused_occurrence_in(&job, period))
+            {
+                continue;
+            }
             let episode = program_episode_key(&job.program);
             if slots.contains(&job.start_at)
                 || job.stop_ts <= now
@@ -1377,7 +1457,12 @@ impl DvrSchedule {
                         continue;
                     }
                     if job.stop_ts > 0.0 && now >= job.stop_ts {
-                        if job.status == STATUS_WAITING && !job.wait_reason.is_empty() {
+                        if paused_occurrence(&job) {
+                            if let Some(job) = self.jobs.iter_mut().find(|j| j.id == id) {
+                                job.status = STATUS_SKIPPED.to_string();
+                                job.message = String::new();
+                            }
+                        } else if job.status == STATUS_WAITING && !job.wait_reason.is_empty() {
                             let message = format!(
                                 "Missed while waiting for a connection: {}",
                                 job.wait_reason
@@ -1389,7 +1474,14 @@ impl DvrSchedule {
                         self.schedule_next_occurrence(&job, now);
                         changed = true;
                     } else if now >= job.start_ts {
-                        if let Some(reason) = gate(&job) {
+                        if paused_occurrence(&job) {
+                            if let Some(job) = self.jobs.iter_mut().find(|j| j.id == id) {
+                                job.status = STATUS_SKIPPED.to_string();
+                                job.message = String::new();
+                            }
+                            self.schedule_next_occurrence(&job, now);
+                            changed = true;
+                        } else if let Some(reason) = gate(&job) {
                             if job.status != STATUS_WAITING {
                                 if let Some(job) = self.jobs.iter_mut().find(|j| j.id == id) {
                                     job.status = STATUS_WAITING.to_string();
@@ -1586,6 +1678,53 @@ impl DvrSchedule {
         })
     }
 
+    /// Python `set_pause_period`: set or clear a recording
+    /// rule's pause window in one durable edit. The rule itself
+    /// always carries the window; its still-scheduled episodes
+    /// are updated to match. A snapshot that no longer matches
+    /// the stored rule, or a rule that is no longer pausable, is
+    /// refused with Python's message.
+    ///
+    /// # Errors
+    /// Returns Python's messages for an invalid period, a stale
+    /// snapshot or an unpausable rule, and write errors.
+    pub fn set_pause_period(
+        &mut self,
+        snapshot: &DvrJob,
+        period: Option<[String; 2]>,
+    ) -> Result<(), String> {
+        if let Some(period) = &period {
+            if !valid_pause_period(period) {
+                return Err("Enter a valid start date and an end date on or after it.".to_string());
+            }
+        }
+        let rule_id = snapshot.id.clone();
+        self.transaction(|jobs| {
+            let Some(rule) = jobs.iter().find(|j| j.id == rule_id).cloned() else {
+                return Err(
+                    "The recording schedule changed. Check the times and try again.".to_string(),
+                );
+            };
+            let pausable = rule.repeat == "series"
+                || (TIME_REPEATS.contains(&rule.repeat.as_str())
+                    && ACTIVE_STATUSES.contains(&rule.status.as_str()));
+            if rule != *snapshot || rule.status == STATUS_CANCELED || !pausable {
+                return Err(
+                    "The recording schedule changed. Check the times and try again.".to_string(),
+                );
+            }
+            for row in jobs.iter_mut() {
+                let is_episode = row.id != rule_id
+                    && row.series_source.as_deref() == Some(rule_id.as_str())
+                    && row.status == STATUS_SCHEDULED;
+                if row.id == rule_id || is_episode {
+                    row.pause_dates = period.clone();
+                }
+            }
+            Ok(())
+        })
+    }
+
     /// Python `set_weekdays`: repeat one pending recording that is
     /// not a series rule on the given weekdays; no days makes it a
     /// single recording again.
@@ -1663,6 +1802,24 @@ pub fn next_weekday_job<Tz: chrono::TimeZone>(
     future_only: bool,
     tz: &Tz,
 ) -> Result<Option<DvrJob>, String> {
+    next_weekday_job_from(job, now, weekdays, future_only, None, tz)
+}
+
+/// [`next_weekday_job`] with Python's `earliest_date`: the
+/// search starts no earlier than that local date (a pause
+/// preview asks when recording resumes after the pause).
+///
+/// # Errors
+/// As [`next_weekday_job`].
+#[allow(clippy::too_many_arguments)] // mirrors the Python signature
+pub fn next_weekday_job_from<Tz: chrono::TimeZone>(
+    job: &DvrJob,
+    now: f64,
+    weekdays: &[u8],
+    future_only: bool,
+    earliest_date: Option<chrono::NaiveDate>,
+    tz: &Tz,
+) -> Result<Option<DvrJob>, String> {
     use chrono::{Datelike as _, Timelike as _};
     let days = checked_weekdays(&serde_json::json!(weekdays))?;
     if days.is_empty() {
@@ -1679,10 +1836,13 @@ pub fn next_weekday_job<Tz: chrono::TimeZone>(
     let (pre, post) = (pre_minutes * 60, post_minutes * 60);
     let offset = (end.date() - original.date()).num_days();
     let (today, _) = local_wall(tz, now).ok_or_else(invalid)?;
-    let first = std::cmp::max(
+    let mut first = std::cmp::max(
         original.date() + chrono::TimeDelta::days(1),
         today.date() - chrono::TimeDelta::days(offset.max(1)),
     );
+    if let Some(earliest) = earliest_date {
+        first = std::cmp::max(first, earliest);
+    }
     let minute = |date: chrono::NaiveDate, time: chrono::NaiveDateTime| {
         date.and_hms_opt(time.hour(), time.minute(), 0)
     };
@@ -1769,6 +1929,22 @@ pub fn next_time_occurrence_after<Tz: chrono::TimeZone>(
     tz: &Tz,
     future_only: bool,
 ) -> Result<DvrJob, String> {
+    next_time_occurrence_from(job, now, tz, future_only, None)
+}
+
+/// [`next_time_occurrence_after`] with Python's `earliest_date`
+/// for `next_time_occurrence`.
+///
+/// # Errors
+/// As [`next_time_occurrence_after`].
+#[allow(clippy::cast_possible_truncation)] // padding minutes are whole numbers
+pub fn next_time_occurrence_from<Tz: chrono::TimeZone>(
+    job: &DvrJob,
+    now: f64,
+    tz: &Tz,
+    future_only: bool,
+    earliest_date: Option<chrono::NaiveDate>,
+) -> Result<DvrJob, String> {
     use chrono::Datelike as _;
     let invalid = || "The recording times are invalid. Check the recording schedule.".to_string();
     let days: Vec<u8> = match job.repeat.as_str() {
@@ -1781,7 +1957,8 @@ pub fn next_time_occurrence_after<Tz: chrono::TimeZone>(
         "weekdays" => job.weekdays.clone().unwrap_or_default(),
         _ => return Err(invalid()),
     };
-    let mut successor = next_weekday_job(job, now, &days, future_only, tz)?.ok_or_else(invalid)?;
+    let mut successor = next_weekday_job_from(job, now, &days, future_only, earliest_date, tz)?
+        .ok_or_else(invalid)?;
     successor.id = uuid::Uuid::new_v5(
         &uuid::Uuid::NAMESPACE_URL,
         format!("iptv-dvr:{}", job.id).as_bytes(),
@@ -2601,6 +2778,170 @@ mod tests {
         assert_eq!(stop_actions, vec![DvrAction::Stop(due_id.clone())]);
         schedule.mark_finished(&due_id, true, "/tmp/x.mkv", "", 260.0);
         assert_eq!(schedule.get(&due_id).expect("due").status, STATUS_COMPLETED);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn pause_period_for(job: &DvrJob) -> [String; 2] {
+        let date = programme_local_date(job)
+            .expect("date")
+            .format("%Y-%m-%d")
+            .to_string();
+        [date.clone(), date]
+    }
+
+    #[test]
+    fn pause_period_validation_matches_python() {
+        assert!(valid_pause_period(&[
+            "2026-11-05".into(),
+            "2026-11-05".into()
+        ]));
+        assert!(valid_pause_period(&[
+            "2026-11-05".into(),
+            "2026-11-09".into()
+        ]));
+        assert!(!valid_pause_period(&[
+            "2026-11-09".into(),
+            "2026-11-05".into()
+        ]));
+        assert!(!valid_pause_period(&[
+            "2026-11-5".into(),
+            "2026-11-05".into()
+        ]));
+        assert!(!valid_pause_period(&[
+            "2026-02-30".into(),
+            "2026-03-01".into()
+        ]));
+        assert!(!valid_pause_period(&["soon".into(), "2026-03-01".into()]));
+    }
+
+    #[test]
+    fn paused_occurrence_uses_the_programme_local_date() {
+        let chan = channel();
+        let mut job = build_job(
+            &spec(&chan, "Show", 1_850_000_000, 1_850_003_600, 0, 0),
+            0.0,
+        )
+        .expect("job");
+        assert!(!paused_occurrence(&job));
+        job.pause_dates = Some(pause_period_for(&job));
+        assert!(paused_occurrence(&job));
+        job.pause_dates = Some(["2000-01-01".into(), "2000-01-02".into()]);
+        assert!(!paused_occurrence(&job));
+        // A stored job with a backwards pause window is invalid.
+        let mut stored = python_job();
+        stored["pause_dates"] = serde_json::json!(["2026-11-09", "2026-11-05"]);
+        assert!(!valid_stored_job(&stored));
+        stored["pause_dates"] = serde_json::json!(["2026-11-05", "2026-11-09"]);
+        assert!(valid_stored_job(&stored));
+    }
+
+    #[test]
+    fn tick_skips_a_paused_occurrence_and_queues_the_next() {
+        let dir = temp_dir("pause-tick");
+        let path = dir.join("scheduled_recordings.json");
+        let mut schedule = DvrSchedule::load(path, 0.0);
+        let chan = channel();
+        let mut spec = spec(&chan, "Daily", 100, 200, 0, 0);
+        spec.repeat = "daily";
+        let mut job = build_job(&spec, 0.0).expect("job");
+        job.pause_dates = Some(pause_period_for(&job));
+        let id = job.id.clone();
+        schedule.add_job(job).unwrap();
+        let actions = schedule.tick(150.0);
+        assert!(actions.is_empty());
+        assert_eq!(schedule.get(&id).expect("job").status, STATUS_SKIPPED);
+        let successor = schedule
+            .jobs()
+            .iter()
+            .find(|j| j.id != id)
+            .expect("successor queued");
+        assert_eq!(successor.status, STATUS_SCHEDULED);
+        assert!(!paused_occurrence(successor));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn set_pause_period_applies_to_rule_and_episodes_and_clears() {
+        let dir = temp_dir("pause-set");
+        let path = dir.join("scheduled_recordings.json");
+        let mut schedule = DvrSchedule::load(path, 0.0);
+        let chan = channel();
+        let mut rule_spec = spec(&chan, "Series", 1000, 2000, 0, 0);
+        rule_spec.repeat = "series";
+        let rule = build_job(&rule_spec, 0.0).expect("rule");
+        let rule_id = rule.id.clone();
+        let mut episode = build_job(&spec(&chan, "Episode", 3000, 4000, 0, 0), 0.0).expect("ep");
+        episode.series_source = Some(rule_id.clone());
+        let episode_id = episode.id.clone();
+        schedule.add_job(rule).unwrap();
+        schedule.add_job(episode).unwrap();
+        let period = ["2030-01-01".to_string(), "2030-01-31".to_string()];
+        let snapshot = schedule.get(&rule_id).expect("rule").clone();
+        schedule
+            .set_pause_period(&snapshot, Some(period.clone()))
+            .unwrap();
+        assert_eq!(
+            schedule.get(&rule_id).expect("rule").pause_dates,
+            Some(period.clone())
+        );
+        assert_eq!(
+            schedule.get(&episode_id).expect("ep").pause_dates,
+            Some(period)
+        );
+        // A stale snapshot is refused, as is an invalid period.
+        let mut stale = schedule.get(&rule_id).expect("rule").clone();
+        stale.title = "Changed".to_string();
+        assert!(schedule.set_pause_period(&stale, None).is_err());
+        let snapshot = schedule.get(&rule_id).expect("rule").clone();
+        assert_eq!(
+            schedule.set_pause_period(&snapshot, Some(["2030-02-01".into(), "2030-01-01".into()])),
+            Err("Enter a valid start date and an end date on or after it.".to_string())
+        );
+        schedule.set_pause_period(&snapshot, None).unwrap();
+        assert_eq!(schedule.get(&rule_id).expect("rule").pause_dates, None);
+        assert_eq!(schedule.get(&episode_id).expect("ep").pause_dates, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn taken_episode_keys_releases_a_paused_episode() {
+        let chan = channel();
+        let mut rule_spec = spec(&chan, "Series", 1000, 2000, 0, 0);
+        rule_spec.repeat = "series";
+        let rule = build_job(&rule_spec, 0.0).expect("rule");
+        // The rule's own programme carries no episode identity;
+        // the booked episode does (as in Python's scan flow).
+        let mut episode_spec = spec(&chan, "Series", 3000, 4000, 0, 0);
+        episode_spec.episode = "0.4.";
+        let mut episode = build_job(&episode_spec, 0.0).expect("episode");
+        episode.series_source = Some(rule.id.clone());
+        episode.status = STATUS_SCHEDULED.to_string();
+        let jobs = vec![rule.clone(), episode.clone()];
+        assert_eq!(taken_episode_keys(&jobs, &rule.id).len(), 1);
+        let mut paused = episode;
+        paused.pause_dates = Some(pause_period_for(&paused));
+        let jobs = vec![rule, paused];
+        assert!(taken_episode_keys(&jobs, &jobs[0].id).is_empty());
+    }
+
+    #[test]
+    fn series_scan_does_not_book_a_paused_candidate() {
+        let dir = temp_dir("pause-scan");
+        let path = dir.join("scheduled_recordings.json");
+        let mut schedule = DvrSchedule::load(path, 0.0);
+        let chan = channel();
+        let mut rule_spec = spec(&chan, "Series", 1000, 2000, 0, 0);
+        rule_spec.repeat = "series";
+        let mut rule = build_job(&rule_spec, 0.0).expect("rule");
+        let candidate = build_job(&spec(&chan, "Episode", 3000, 4000, 0, 0), 0.0).expect("cand");
+        rule.pause_dates = Some(pause_period_for(&candidate));
+        let rule_snapshot = rule.clone();
+        schedule.add_job(rule).unwrap();
+        let added = schedule
+            .add_series_episodes(&rule_snapshot, vec![candidate], 0.0)
+            .unwrap();
+        assert!(!added);
+        assert_eq!(schedule.jobs().len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
