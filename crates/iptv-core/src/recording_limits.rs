@@ -138,7 +138,19 @@ pub struct JobView {
     pub stop_ts: f64,
     pub pre_padding_minutes: i64,
     pub post_padding_minutes: i64,
+    /// The job's pause window, when it carries one (PR #44).
+    pub pause_dates: Option<[String; 2]>,
     pub channel: Channel,
+}
+
+/// Whether this view's occurrence is paused (Python
+/// `dvr.paused_occurrence` on the job dict).
+#[must_use]
+pub fn view_paused(job: &JobView) -> bool {
+    job.status == "scheduled"
+        && job.pause_dates.as_ref().is_some_and(|period| {
+            crate::dvr::paused_in(period, job.start_ts, job.pre_padding_minutes)
+        })
 }
 
 impl JobView {
@@ -158,6 +170,7 @@ impl JobView {
             stop_ts: job.stop_ts,
             pre_padding_minutes: job.pre_padding_minutes,
             post_padding_minutes: job.post_padding_minutes,
+            pause_dates: job.pause_dates.clone(),
             channel: crate::dvr::channel_from_snapshot(&job.channel),
         }
     }
@@ -204,6 +217,9 @@ pub fn peak_demand(
     }
     let mut events: Vec<(f64, i64)> = vec![(start, 1), (end, -1)];
     for job in jobs {
+        if view_paused(job) {
+            continue;
+        }
         if Some(job.id.as_str()) == exclude || !job_active(job) {
             continue;
         }
@@ -254,7 +270,10 @@ pub fn warning(
             let overlaps = jobs
                 .iter()
                 .filter(|job| {
-                    Some(job.id.as_str()) != exclude && job.start_ts < end && job.stop_ts > start
+                    !view_paused(job)
+                        && Some(job.id.as_str()) != exclude
+                        && job.start_ts < end
+                        && job.stop_ts > start
                 })
                 .count();
             if overlaps > 0 {
@@ -333,6 +352,9 @@ pub fn conflict_rows(
         if Some(job.id.as_str()) == exclude || !job_active(job) {
             continue;
         }
+        if view_paused(job) {
+            continue;
+        }
         if !(job.start_ts < end && job.stop_ts > start) {
             continue;
         }
@@ -399,6 +421,7 @@ mod tests {
             stop_ts: stop,
             pre_padding_minutes: pre,
             post_padding_minutes: 0,
+            pause_dates: None,
             channel,
         }
     }
@@ -533,6 +556,35 @@ mod tests {
             "This overlaps 1 recording(s). Continue?"
         );
         assert_eq!(warning(&bare, &target, 500.0, 600.0, &jobs, None), "");
+    }
+
+    #[test]
+    fn paused_jobs_do_not_count_toward_peak_or_conflicts() {
+        let (config, _key) = config_with_limits(1);
+        let target = channel_with("pA", "", "http://a.example/live/1");
+        let mut paused = job(
+            "a-paused",
+            "scheduled",
+            100.0,
+            200.0,
+            channel_with("pA", "", "http://a.example/live/2"),
+            0,
+        );
+        // The job's programme date in local time, paused for that day.
+        let date = crate::dvr::programme_local_start(paused.start_ts, 0)
+            .expect("start")
+            .date()
+            .format("%Y-%m-%d")
+            .to_string();
+        paused.pause_dates = Some([date.clone(), date]);
+        let jobs = vec![paused];
+        // Only the target window itself counts: peak stays at the limit.
+        assert_eq!(
+            peak_demand(&config, &target, 150.0, 250.0, &jobs, None),
+            Some((1, 1))
+        );
+        assert_eq!(warning(&config, &target, 150.0, 250.0, &jobs, None), "");
+        assert!(conflict_rows(&config, &target, 150.0, 250.0, &jobs, None, &|| false).is_empty());
     }
 
     #[test]

@@ -40,10 +40,43 @@ pub fn desired_state(
     now: f64,
 ) -> (bool, Option<f64>) {
     let wake = strict_true(config, "wake_for_recordings", false);
-    let starts: Vec<f64> = jobs
-        .iter()
-        .filter(|job| job.status == STATUS_SCHEDULED)
-        .map(|job| job.start_ts)
+    // PR #44: a paused occurrence does not wake the machine. A
+    // paused time repeat wakes for its first occurrence after
+    // the pause instead (the wake timer only schedules the
+    // coming year, so a pause ending beyond it is ignored).
+    let mut starts: Vec<f64> = Vec::new();
+    for job in jobs.iter().filter(|job| job.status == STATUS_SCHEDULED) {
+        if wake && crate::dvr::paused_occurrence(job) {
+            if !crate::dvr::TIME_REPEATS.contains(&job.repeat.as_str()) {
+                continue;
+            }
+            let Some(last) = job
+                .pause_dates
+                .as_ref()
+                .and_then(|period| chrono::NaiveDate::parse_from_str(&period[1], "%Y-%m-%d").ok())
+            else {
+                continue;
+            };
+            let horizon =
+                crate::dvr::programme_local_start(now + 366.0 * 86_400.0, 0).map(|dt| dt.date());
+            if horizon.is_some_and(|date| last > date) {
+                continue;
+            }
+            if let Ok(next) = crate::dvr::next_time_occurrence_from(
+                job,
+                now,
+                &chrono::Local,
+                false,
+                Some(last + chrono::TimeDelta::days(1)),
+            ) {
+                starts.push(next.start_ts);
+            }
+            continue;
+        }
+        starts.push(job.start_ts);
+    }
+    let starts: Vec<f64> = starts
+        .into_iter()
         .filter(|value| now - 15.0 <= *value && *value <= now + 366.0 * 86_400.0)
         .collect();
     let next_start = if wake {
@@ -449,6 +482,36 @@ mod tests {
                 100.0,
             ),
             (false, None)
+        );
+    }
+
+    #[test]
+    fn desired_state_skips_paused_occurrences() {
+        let wake = config(json!({"wake_for_recordings": true}));
+        // A paused series rule never wakes for the paused start.
+        let mut series = job(STATUS_SCHEDULED, 1_850_000_000.0);
+        series.repeat = "series".to_string();
+        let date = crate::dvr::programme_local_date(&series)
+            .expect("date")
+            .format("%Y-%m-%d")
+            .to_string();
+        series.pause_dates = Some([date.clone(), date.clone()]);
+        assert_eq!(
+            desired_state(&wake, false, std::slice::from_ref(&series), 1_849_000_000.0),
+            (false, None)
+        );
+        // A paused daily rule wakes for the day after the pause:
+        // its alarm is a minute before that start.
+        let mut daily = job(STATUS_SCHEDULED, 1_850_000_000.0);
+        daily.stop_ts = 1_850_003_600.0;
+        daily.repeat = "daily".to_string();
+        daily.pause_dates = Some([date.clone(), date]);
+        let (_keep, alarm) =
+            desired_state(&wake, false, std::slice::from_ref(&daily), 1_849_000_000.0);
+        let alarm = alarm.expect("alarm for the resumed occurrence");
+        assert!(
+            alarm > 1_850_000_000.0,
+            "alarm {alarm} must be after the paused start"
         );
     }
 

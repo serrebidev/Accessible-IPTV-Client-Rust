@@ -457,30 +457,48 @@ pub fn valid_pause_period(period: &[String; 2]) -> bool {
     }
 }
 
-/// The local calendar date a job's programme starts on: the
-/// padded record start shifted back by the pre-padding, so a
+/// The local wall-clock start of a programme: the padded
+/// record start shifted back by the pre-padding (Python
+/// `paused_occurrence`'s `programme_start`).
+#[must_use]
+pub fn programme_local_start(
+    start_ts: f64,
+    pre_padding_minutes: i64,
+) -> Option<chrono::NaiveDateTime> {
+    use chrono::TimeZone as _;
+    let start = (start_ts + ts_f64(pre_padding_minutes * 60)).floor() as i64;
+    chrono::Local
+        .timestamp_opt(start, 0)
+        .single()
+        .map(|dt| dt.naive_local())
+}
+
+/// The local calendar date a job's programme starts on, so a
 /// programme late in the evening keeps its own date even when
 /// the padding starts the evening before (Python
 /// `paused_occurrence`).
 #[must_use]
 pub fn programme_local_date(job: &DvrJob) -> Option<chrono::NaiveDate> {
-    use chrono::TimeZone as _;
-    let start = (job.start_ts + ts_f64(job.pre_padding_minutes * 60)).floor() as i64;
-    chrono::Local
-        .timestamp_opt(start, 0)
-        .single()
-        .map(|dt| dt.date_naive())
+    programme_local_start(job.start_ts, job.pre_padding_minutes).map(|dt| dt.date())
+}
+
+/// Whether a window starting at `start_ts` (with that
+/// pre-padding) falls inside `period`.
+#[must_use]
+pub fn paused_in(period: &[String; 2], start_ts: f64, pre_padding_minutes: i64) -> bool {
+    let Some(date) = programme_local_start(start_ts, pre_padding_minutes).map(|dt| dt.date())
+    else {
+        return false;
+    };
+    let date = date.format("%Y-%m-%d").to_string();
+    period[0].as_str() <= date.as_str() && date.as_str() <= period[1].as_str()
 }
 
 /// Whether `job`'s programme date falls inside `period`
 /// (Python `paused_occurrence` with an explicit period).
 #[must_use]
 pub fn paused_occurrence_in(job: &DvrJob, period: &[String; 2]) -> bool {
-    let Some(date) = programme_local_date(job) else {
-        return false;
-    };
-    let date = date.format("%Y-%m-%d").to_string();
-    period[0].as_str() <= date.as_str() && date.as_str() <= period[1].as_str()
+    paused_in(period, job.start_ts, job.pre_padding_minutes)
 }
 
 /// Whether a job is paused for its own occurrence (Python
