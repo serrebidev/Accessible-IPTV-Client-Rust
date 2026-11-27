@@ -10,11 +10,20 @@
 
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use crate::config::Config;
 
 /// One mebibyte in bytes.
 pub const MIB: u64 = 1024 * 1024;
+
+/// Seconds between free-space probes of one destination
+/// (Python `POLL_SECONDS`).
+pub const POLL_SECONDS: u64 = 5;
+
+/// Most destinations probed at once (Python `MAX_PROBES`).
+pub const MAX_PROBES: usize = 64;
 
 /// Smallest accepted threshold value, MiB (Python's spin range).
 pub const MIN_MIB: i64 = 16;
@@ -82,8 +91,24 @@ pub fn settings(config: &Config) -> Preferences {
     }
 }
 
-type DriveKey = (Option<u64>, String);
-type Group<'a> = (DriveKey, PathBuf, Vec<&'a SpaceRecording>);
+/// A destination's drive identity: `(st_dev, drive)`, with
+/// `None` and the directory itself when it cannot be stat'ed.
+pub type DriveKey = (Option<u64>, String);
+/// One drive's rows with the free-space figure measured for
+/// it (`None` when the filesystem could not be queried).
+type Group<'a> = (DriveKey, PathBuf, Option<u64>, Vec<&'a SpaceRecording>);
+
+/// One destination measurement (Python `_measure`): the
+/// drive key and the free bytes, `None` when the filesystem
+/// cannot be queried.
+pub type Measure = dyn Fn(&Path) -> (DriveKey, Option<u64>) + Send + Sync;
+
+/// The default measurement: stat the directory for its
+/// drive key and ask the filesystem for its free space.
+#[must_use]
+pub fn measure_directory(dir: &Path) -> (DriveKey, Option<u64>) {
+    (drive_key(dir), crate::recording::free_space_bytes(dir).ok())
+}
 
 /// One active recording for the check: its id, the file it
 /// is writing, and whether a stop is already in progress.
@@ -135,11 +160,24 @@ fn parent_dir(path: &Path) -> PathBuf {
         .map_or_else(|| PathBuf::from("."), PathBuf::from)
 }
 
+/// One destination's probe state for the background check
+/// (Python's `_pending` markers): a probe thread is running,
+/// or its measurement is on hand.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Probe {
+    InFlight,
+    Ready,
+}
+
 /// The stateful monitor: remembers what each drive was last
 /// told, so a drive warns once (Python `SpaceMonitor`).
 #[derive(Clone, Default)]
 pub struct SpaceMonitor {
     notified: HashMap<(Option<u64>, String), SpaceState>,
+    probes: HashMap<PathBuf, Probe>,
+    measured: HashMap<PathBuf, (DriveKey, Option<u64>)>,
+    next_probe: HashMap<PathBuf, Instant>,
+    probe_results: Arc<Mutex<HashMap<PathBuf, (DriveKey, Option<u64>)>>>,
 }
 
 impl SpaceMonitor {
@@ -150,9 +188,18 @@ impl SpaceMonitor {
 
     /// Forget every drive's last report (Python clears
     /// `notified` when monitoring is off or no recording is
-    /// left).
+    /// left). Probe state goes too: a probe that lands later
+    /// for a forgotten destination is pruned by the next
+    /// background check.
     pub fn clear(&mut self) {
         self.notified.clear();
+        self.probes.clear();
+        self.measured.clear();
+        self.next_probe.clear();
+        self.probe_results
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
     }
 
     /// Check every drive holding an active recording once.
@@ -179,15 +226,155 @@ impl SpaceMonitor {
         for rec in recordings {
             let dir = parent_dir(&rec.path);
             let key = drive_key(&dir);
-            match groups.iter_mut().find(|(existing, _, _)| *existing == key) {
-                Some((_, _, rows)) => rows.push(rec),
-                None => groups.push((key, dir, vec![rec])),
+            match groups.iter_mut().find(|(existing, _, _, _)| *existing == key) {
+                Some((_, _, _, rows)) => rows.push(rec),
+                None => {
+                    let free = free_bytes(&dir);
+                    groups.push((key, dir, free, vec![rec]));
+                }
             }
         }
-        self.notified
-            .retain(|key, _| groups.iter().any(|(existing, _, _)| existing == key));
-        for (key, dir, rows) in &groups {
-            let Some(free) = free_bytes(dir) else {
+        self.apply_groups(&groups, prefs, true, notify, stop);
+    }
+
+    /// The background check (Python PR #46 `check(background=
+    /// True)`): free-space probes run on their own threads, so
+    /// a destination on an offline share cannot stall the
+    /// healthy drives' warnings or stops. A completed
+    /// measurement is used until its next probe falls due
+    /// (every [`POLL_SECONDS`] seconds, plus one interval of
+    /// grace); drives with no measurement yet simply wait for
+    /// the next round. `measure` runs on the probe threads.
+    pub fn check_background(
+        &mut self,
+        recordings: &[SpaceRecording],
+        prefs: &Preferences,
+        measure: &Arc<Measure>,
+        notify: &mut impl FnMut(SpaceState, &Path, u64, usize),
+        stop: &mut impl FnMut(&str),
+    ) {
+        if !prefs.enabled {
+            self.notified.clear();
+            return;
+        }
+        let now = Instant::now();
+        let mut destinations: Vec<(PathBuf, Vec<&SpaceRecording>)> = Vec::new();
+        for rec in recordings {
+            let dir = parent_dir(&rec.path);
+            match destinations.iter_mut().find(|(existing, _)| *existing == dir) {
+                Some((_, rows)) => rows.push(rec),
+                None => destinations.push((dir, vec![rec])),
+            }
+        }
+        // Collect finished probes.
+        {
+            let mut results = self
+                .probe_results
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for (dir, result) in results.drain() {
+                self.measured.insert(dir.clone(), result);
+                self.probes.insert(dir, Probe::Ready);
+            }
+        }
+        // Forget destinations no recording uses any more
+        // (only once their probe has landed, as in Python).
+        let stale: Vec<PathBuf> = self
+            .probes
+            .iter()
+            .filter(|(dir, probe)| {
+                **probe == Probe::Ready
+                    && !destinations.iter().any(|(existing, _)| existing == *dir)
+            })
+            .map(|(dir, _)| dir.clone())
+            .collect();
+        for dir in stale {
+            self.probes.remove(&dir);
+            self.measured.remove(&dir);
+            self.next_probe.remove(&dir);
+        }
+        // Use fresh measurements; start probes that are due.
+        let mut measurements: Vec<(PathBuf, DriveKey, Option<u64>)> = Vec::new();
+        for (dir, _) in &destinations {
+            let deadline = self.next_probe.get(dir).copied();
+            if self.probes.get(dir) == Some(&Probe::Ready) {
+                if let (Some(result), Some(deadline)) = (self.measured.get(dir), deadline) {
+                    if now <= deadline + Duration::from_secs(POLL_SECONDS) {
+                        measurements.push((dir.clone(), result.0.clone(), result.1));
+                    }
+                }
+            }
+            let due = match self.probes.get(dir) {
+                None => self.probes.len() < MAX_PROBES,
+                Some(Probe::Ready) => deadline.is_some_and(|due| now >= due),
+                Some(Probe::InFlight) => false,
+            };
+            if due {
+                self.next_probe
+                    .insert(dir.clone(), now + Duration::from_secs(POLL_SECONDS));
+                self.probes.insert(dir.clone(), Probe::InFlight);
+                let results = Arc::clone(&self.probe_results);
+                let measure = Arc::clone(measure);
+                let probe_dir = dir.clone();
+                std::thread::spawn(move || {
+                    let result = measure(&probe_dir);
+                    results
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .insert(probe_dir, result);
+                });
+            }
+        }
+        // Python forgets drives that vanished only on a
+        // complete round: every destination measured.
+        let complete = measurements.len() == destinations.len();
+        // Merge destinations sharing a drive, keeping the
+        // smallest free figure (and its directory), as Python.
+        let mut groups: Vec<Group<'_>> = Vec::new();
+        for (dir, key, free) in measurements {
+            let rows = &destinations
+                .iter()
+                .find(|(existing, _)| *existing == dir)
+                .expect("measured destination")
+                .1;
+            match groups
+                .iter_mut()
+                .find(|(existing, _, _, _)| *existing == key)
+            {
+                Some((_, group_dir, group_free, group_rows)) => {
+                    if group_free.is_none()
+                        || (free.is_some()
+                            && group_free.is_some_and(|prev| free.expect("some") < prev))
+                    {
+                        *group_dir = dir;
+                        *group_free = free;
+                    }
+                    group_rows.extend(rows.iter().copied());
+                }
+                None => groups.push((key, dir, free, rows.clone())),
+            }
+        }
+        self.apply_groups(&groups, prefs, complete, notify, stop);
+    }
+
+    /// The shared tail of both checks: forget drives that are
+    /// gone (only when `retain` — the background check retains
+    /// only on a complete round), then warn or stop per drive.
+    fn apply_groups(
+        &mut self,
+        groups: &[Group<'_>],
+        prefs: &Preferences,
+        retain: bool,
+        notify: &mut impl FnMut(SpaceState, &Path, u64, usize),
+        stop: &mut impl FnMut(&str),
+    ) {
+        if retain {
+            self.notified.retain(|key, _| {
+                groups.iter().any(|(existing, _, _, _)| existing == key)
+            });
+        }
+        for (key, dir, free, rows) in groups {
+            let Some(free) = *free else {
                 if self.notified.get(key) != Some(&SpaceState::Unavailable) {
                     self.notified.insert(key.clone(), SpaceState::Unavailable);
                     notify(SpaceState::Unavailable, dir, 0, rows.len());
@@ -438,6 +625,72 @@ mod tests {
             vec![(SpaceState::Warning, 512, 2)],
             "warns again after recovering from unavailable"
         );
+    }
+
+    #[test]
+    fn background_probe_cannot_block_a_healthy_drive() {
+        // Python test_storage_monitor_notifies_healthy_probe_when_another_is_blocked.
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let slow_entered = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        let measure: Arc<Measure> = {
+            let slow_entered = Arc::clone(&slow_entered);
+            let release = Arc::clone(&release);
+            Arc::new(move |dir: &Path| {
+                if dir.ends_with("slow") {
+                    slow_entered.store(true, Ordering::SeqCst);
+                    let start = Instant::now();
+                    while !release.load(Ordering::SeqCst)
+                        && start.elapsed() < Duration::from_secs(5)
+                    {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                }
+                ((None, dir.to_string_lossy().into_owned()), Some(1))
+            })
+        };
+        let recordings = vec![
+            SpaceRecording {
+                id: "0".to_string(),
+                path: PathBuf::from("/iptv-test/slow/a.mkv"),
+                stopping: false,
+            },
+            SpaceRecording {
+                id: "1".to_string(),
+                path: PathBuf::from("/iptv-test/fast/a.mkv"),
+                stopping: false,
+            },
+        ];
+        let mut monitor = SpaceMonitor::new();
+        let mut stopped: Vec<String> = Vec::new();
+        let mut notify = |_state: SpaceState, _dir: &Path, _free: u64, _count: usize| {};
+        monitor.check_background(
+            &recordings,
+            &prefs(),
+            &measure,
+            &mut notify,
+            &mut |id: &str| stopped.push(id.to_string()),
+        );
+        // Wait for the slow probe to be running, then poll
+        // until the fast drive's measurement lands and stops
+        // its recording — all while the slow probe is blocked.
+        let start = Instant::now();
+        while !slow_entered.load(Ordering::SeqCst) && start.elapsed() < Duration::from_secs(2) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(slow_entered.load(Ordering::SeqCst), "slow probe started");
+        while stopped.is_empty() && start.elapsed() < Duration::from_secs(2) {
+            monitor.check_background(
+                &recordings,
+                &prefs(),
+                &measure,
+                &mut notify,
+                &mut |id: &str| stopped.push(id.to_string()),
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        release.store(true, Ordering::SeqCst);
+        assert_eq!(stopped, vec!["1".to_string()]);
     }
 
     #[cfg(windows)]
