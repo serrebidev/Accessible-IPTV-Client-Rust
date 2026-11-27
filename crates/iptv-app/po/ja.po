@@ -5349,3 +5349,105 @@ msgstr "タイトル: 何がうまくいかなかったか、または何をし�
 
 msgid "Describe what you did, what happened, and what you expected.\nYour browser then opens GitHub with this filled in. Sign in and press Create."
 msgstr "何をしたか、何が起きたか、何を期待していたかを書いてください。\nその後、ブラウザーで GitHub が開き、この内容が入力されています。サインインして「Create」を押してください。"
+
+msgid "Finishing recordings before exit…"
+msgstr "終了する前に録画ファイルを保存しています…"
+
+msgid "Try Again"
+msgstr "再試行"
+
+msgid "Copy Report"
+msgstr "報告内容をコピー"
+
+msgid "Could not copy the text. Your report is still available."
+msgstr "テキストをコピーできませんでした。報告内容は保持されています。"
+
+msgid "The browser could not open the report. You can try again or copy your text."
+msgstr "ブラウザーで報告を開けませんでした。再試行するか、テキストをコピーしてください。"
+
+msgid "Normal speed"
+msgstr "標準速度"
+
+msgid "Choose the playback speed:"
+msgstr "再生速度を選択してください："
+
+msgid "Recording Playback Speed..."
+msgstr "録画の再生速度…"
+
+msgid "Find Text in Recording Subtitles..."
+msgstr "録画の字幕内を検索…"
+
+msgid "Text to find:"
+msgstr "検索するテキスト："
+
+msgid "Subtitle matches"
+msgstr "字幕の検索結果"
+
+msgid "Open a seekable local recording first."
+msgstr "先に再生位置を変更できるローカル録画を開いてください。"
+
+msgid "The playback speed could not be changed."
+msgstr "再生速度を変更できませんでした。"
+
+msgid "Load a text subtitle file or select an embedded text track first."
+msgstr "先にテキスト字幕ファイルを読み込むか、埋め込みのテキスト字幕トラックを選択してください。"
+
+msgid "No matching subtitles."
+msgstr "字幕内に一致する箇所はありません。"
+
+msgid "Reminder times have changed. Open Programme Reminders and choose Review Guide Changes."
+msgstr "リマインダーの時刻が変わりました。番組リマインダーを開き、番組表の変更を確認してください。"
+
+msgid "No changes were found to upcoming reminder times."
+msgstr "今後のリマインダーの時刻に変更はありません。"
+
+msgid "Use the new time for this reminder?"
+msgstr "このリマインダーに新しい時刻を適用しますか？"
+
+msgid "Keep the postponement relative to the new start time? Choose No to use the usual lead time."
+msgstr "新しい開始時刻に合わせて通知の延期幅を維持しますか？ 通常の事前通知に戻すには「いいえ」を選んでください。"
+
+msgid "{title}, {channel}. Previous: {old}. New: {new}."
+msgstr "{title}、{channel}。変更前：{old}。変更後：{new}。"
+
+msgid "Notify me of reminder time changes after guide updates"
+msgstr "番組表の更新でリマインダーの時刻が変わったら通知する"
+
+msgid "Export Selected Recordings to Calendar..."
+msgstr "選択した録画予定をカレンダーにエクスポート…"
+
+msgid "Pause Recording Rule..."
+msgstr "録画ルールを一時休止…"
+
+msgid "First day of the pause"
+msgstr "休止開始日"
+
+msgid "Last day of the pause"
+msgstr "休止終了日"
+
+msgid "Remove the pause"
+msgstr "休止を解除"
+
+msgid "Choose a valid pause ending today or later."
+msgstr "今日以降に終了する有効な休止期間を選択してください。"
+
+msgid "Pause from {first} through {last}, inclusive?"
+msgstr "{first} から {last} まで、両日を含めて休止しますか？"
+
+msgid "First skipped recording: {time}"
+msgstr "休止期間中の最初の録画予定：{time}"
+
+msgid "Next recording after the pause: {time}"
+msgstr "休止後の最初の録画：{time}"
+
+msgid "Connecting to {channel}…"
+msgstr "{channel} に接続しています…"
+
+msgid "Enter a valid start date and an end date on or after it."
+msgstr "有効な開始日を入力してください。終了日には開始日以降の日付を指定してください。"
+
+msgid "Select upcoming recordings outside the pause period."
+msgstr "休止期間外の今後の録画予定を選択してください。"
+
+msgid "Stopped because the app exited."
+msgstr "アプリの終了に伴い録画を停止しました。"

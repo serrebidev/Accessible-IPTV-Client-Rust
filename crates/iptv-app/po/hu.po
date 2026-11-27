@@ -5487,3 +5487,105 @@ msgstr "Cím: egy sor arról, mi romlott el, vagy mit szeretne"
 
 msgid "Describe what you did, what happened, and what you expected.\nYour browser then opens GitHub with this filled in. Sign in and press Create."
 msgstr "Írja le, mit csinált, mi történt, és mire számított.\nEzután a böngésző megnyitja a GitHubot kitöltve. Jelentkezzen be, és nyomja meg a „Create” gombot."
+
+msgid "Finishing recordings before exit…"
+msgstr "Kilépés előtt a program lezárja a felvételeket…"
+
+msgid "Try Again"
+msgstr "Újrapróbálkozás"
+
+msgid "Copy Report"
+msgstr "Bejelentés másolása"
+
+msgid "Could not copy the text. Your report is still available."
+msgstr "A vágólapra másolás nem sikerült. A bejelentés szövege megmaradt."
+
+msgid "The browser could not open the report. You can try again or copy your text."
+msgstr "Nem sikerült megnyitni a hibabejelentő űrlapot a böngészőben. Megpróbálhatja újra, vagy a vágólapra másolhatja a beírt szöveget."
+
+msgid "Normal speed"
+msgstr "Normál sebesség"
+
+msgid "Choose the playback speed:"
+msgstr "Válasszon lejátszási sebességet:"
+
+msgid "Recording Playback Speed..."
+msgstr "Felvétel lejátszási sebessége…"
+
+msgid "Find Text in Recording Subtitles..."
+msgstr "Keresés a felvétel feliratában…"
+
+msgid "Text to find:"
+msgstr "Keresett szöveg:"
+
+msgid "Subtitle matches"
+msgstr "Találatok a feliratban"
+
+msgid "Open a seekable local recording first."
+msgstr "Nyisson meg olyan helyi felvételt, amelyben előre és hátra is ugorhat."
+
+msgid "The playback speed could not be changed."
+msgstr "Nem sikerült módosítani a lejátszási sebességet."
+
+msgid "Load a text subtitle file or select an embedded text track first."
+msgstr "A kereséshez szöveges felirat szükséges. Töltsön be egy külső fájlt, vagy válasszon sávot a „Beágyazott feliratsáv felolvasása…” paranccsal."
+
+msgid "No matching subtitles."
+msgstr "A feliratban nincs találat."
+
+msgid "Reminder times have changed. Open Programme Reminders and choose Review Guide Changes."
+msgstr "Változhatott az értesítésre kijelölt műsorok adásideje. Az „Értesítések műsorkezdés előtt” ablakban válassza az „Időpontváltozások áttekintése…” gombot."
+
+msgid "No changes were found to upcoming reminder times."
+msgstr "A program nem talált időpontváltozást az értesítésre kijelölt műsoroknál."
+
+msgid "Use the new time for this reminder?"
+msgstr "Az új adásidőhöz igazítja az értesítést?"
+
+msgid "Keep the postponement relative to the new start time? Choose No to use the usual lead time."
+msgstr "Az elhalasztott értesítés időpontja is ugyanannyival változzon, mint a műsor kezdete? Ha a Nem gombot választja, ismét az eredeti értesítési beállítás lesz érvényben."
+
+msgid "{title}, {channel}. Previous: {old}. New: {new}."
+msgstr "{title} ({channel}). Korábbi adásidő: {old}. Új adásidő: {new}."
+
+msgid "Notify me of reminder time changes after guide updates"
+msgstr "Jelzés a műsorújság frissítése után, ha megváltozott egy értesítésre kijelölt műsor adásideje"
+
+msgid "Export Selected Recordings to Calendar..."
+msgstr "Kijelölt felvételek időpontjainak exportálása naptárba…"
+
+msgid "Pause Recording Rule..."
+msgstr "Felvételi szabály szüneteltetése…"
+
+msgid "First day of the pause"
+msgstr "A szünet első napja"
+
+msgid "Last day of the pause"
+msgstr "A szünet utolsó napja"
+
+msgid "Remove the pause"
+msgstr "Szüneteltetés megszüntetése"
+
+msgid "Choose a valid pause ending today or later."
+msgstr "Ellenőrizze a szünet dátumait. A zárónap nem előzheti meg sem a kezdőnapot, sem a mai napot."
+
+msgid "Pause from {first} through {last}, inclusive?"
+msgstr "Szünetelteti a kijelölt felvételi szabályt {first} és {last} között, a két határnapot is beleértve?"
+
+msgid "First skipped recording: {time}"
+msgstr "Az első kimaradó felvétel időpontja: {time}"
+
+msgid "Next recording after the pause: {time}"
+msgstr "A szünet utáni első felvétel: {time}"
+
+msgid "Connecting to {channel}…"
+msgstr "Kapcsolódás a csatornához: {channel}…"
+
+msgid "Enter a valid start date and an end date on or after it."
+msgstr "Adjon meg érvényes dátumokat. A zárónap nem előzheti meg a kezdőnapot."
+
+msgid "Select upcoming recordings outside the pause period."
+msgstr "Olyan közelgő felvételeket jelöljön ki, amelyek nem esnek a szünet idejére."
+
+msgid "Stopped because the app exited."
+msgstr "A rögzítés az alkalmazás bezárása miatt állt le."

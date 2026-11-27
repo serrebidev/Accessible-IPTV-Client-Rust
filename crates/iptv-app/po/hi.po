@@ -5292,3 +5292,105 @@ msgstr "शीर्षक: एक पंक्ति में बताएँ 
 
 msgid "Describe what you did, what happened, and what you expected.\nYour browser then opens GitHub with this filled in. Sign in and press Create."
 msgstr "बताएँ कि आपने क्या किया, क्या हुआ, और आपको क्या अपेक्षा थी।\nइसके बाद आपका ब्राउज़र GitHub खोलेगा जिसमें यह भरा होगा। साइन इन करें और ‘Create’ दबाएँ।"
+
+msgid "Finishing recordings before exit…"
+msgstr "बाहर निकलने से पहले रिकॉर्डिंग फ़ाइलें पूरी की जा रही हैं…"
+
+msgid "Try Again"
+msgstr "फिर से कोशिश करें"
+
+msgid "Copy Report"
+msgstr "रिपोर्ट कॉपी करें"
+
+msgid "Could not copy the text. Your report is still available."
+msgstr "टेक्स्ट कॉपी नहीं हो सका। आपकी रिपोर्ट अभी भी उपलब्ध है।"
+
+msgid "The browser could not open the report. You can try again or copy your text."
+msgstr "ब्राउज़र में रिपोर्ट नहीं खुल सकी। आप फिर से कोशिश कर सकते हैं या टेक्स्ट कॉपी कर सकते हैं।"
+
+msgid "Normal speed"
+msgstr "सामान्य गति"
+
+msgid "Choose the playback speed:"
+msgstr "प्लेबैक की गति चुनें:"
+
+msgid "Recording Playback Speed..."
+msgstr "रिकॉर्डिंग की प्लेबैक गति…"
+
+msgid "Find Text in Recording Subtitles..."
+msgstr "रिकॉर्डिंग के उपशीर्षकों में टेक्स्ट खोजें…"
+
+msgid "Text to find:"
+msgstr "खोजने का टेक्स्ट:"
+
+msgid "Subtitle matches"
+msgstr "उपशीर्षकों में मिले परिणाम"
+
+msgid "Open a seekable local recording first."
+msgstr "पहले ऐसी स्थानीय रिकॉर्डिंग खोलें जिसमें आगे और पीछे जा सकें।"
+
+msgid "The playback speed could not be changed."
+msgstr "प्लेबैक की गति नहीं बदली जा सकी।"
+
+msgid "Load a text subtitle file or select an embedded text track first."
+msgstr "पहले टेक्स्ट उपशीर्षक फ़ाइल लोड करें या कोई अंतर्निहित टेक्स्ट ट्रैक चुनें।"
+
+msgid "No matching subtitles."
+msgstr "उपशीर्षकों में कोई मिलान नहीं मिला।"
+
+msgid "Reminder times have changed. Open Programme Reminders and choose Review Guide Changes."
+msgstr "अनुस्मारकों के समय बदल गए हैं। कार्यक्रम अनुस्मारक खोलें और गाइड में हुए बदलावों की समीक्षा करें।"
+
+msgid "No changes were found to upcoming reminder times."
+msgstr "आगामी अनुस्मारकों के समय में कोई बदलाव नहीं मिला।"
+
+msgid "Use the new time for this reminder?"
+msgstr "क्या इस अनुस्मारक के लिए नया समय इस्तेमाल करना है?"
+
+msgid "Keep the postponement relative to the new start time? Choose No to use the usual lead time."
+msgstr "क्या अनुस्मारक को नए प्रारंभ समय के सापेक्ष उतना ही टालना है? सामान्य अग्रिम सूचना के लिए ‘नहीं’ चुनें।"
+
+msgid "{title}, {channel}. Previous: {old}. New: {new}."
+msgstr "{title}, {channel}। पिछला समय: {old}। नया समय: {new}।"
+
+msgid "Notify me of reminder time changes after guide updates"
+msgstr "कार्यक्रम गाइड अपडेट होने पर अनुस्मारक के समय में बदलाव की सूचना दें"
+
+msgid "Export Selected Recordings to Calendar..."
+msgstr "चुनी गई रिकॉर्डिंग कैलेंडर में निर्यात करें…"
+
+msgid "Pause Recording Rule..."
+msgstr "रिकॉर्डिंग नियम को कुछ समय के लिए रोकें…"
+
+msgid "First day of the pause"
+msgstr "विराम का पहला दिन"
+
+msgid "Last day of the pause"
+msgstr "विराम का अंतिम दिन"
+
+msgid "Remove the pause"
+msgstr "विराम हटाएँ"
+
+msgid "Choose a valid pause ending today or later."
+msgstr "मान्य अवधि चुनें जो आज या इसके बाद समाप्त हो।"
+
+msgid "Pause from {first} through {last}, inclusive?"
+msgstr "क्या {first} से {last} तक, दोनों तारीखों सहित, रिकॉर्डिंग रोकें?"
+
+msgid "First skipped recording: {time}"
+msgstr "रोक के दौरान पहली छूटने वाली रिकॉर्डिंग: {time}"
+
+msgid "Next recording after the pause: {time}"
+msgstr "विराम के बाद पहली रिकॉर्डिंग: {time}"
+
+msgid "Connecting to {channel}…"
+msgstr "{channel} से कनेक्ट किया जा रहा है…"
+
+msgid "Enter a valid start date and an end date on or after it."
+msgstr "शुरू होने की मान्य तारीख दर्ज करें। समाप्ति की तारीख उससे पहले की नहीं हो सकती।"
+
+msgid "Select upcoming recordings outside the pause period."
+msgstr "विराम की अवधि से बाहर की आगामी रिकॉर्डिंग चुनें।"
+
+msgid "Stopped because the app exited."
+msgstr "ऐप बंद होने के कारण रिकॉर्डिंग रुक गई।"

@@ -5375,3 +5375,105 @@ msgstr "Tytuł: jedna linia o tym, co poszło nie tak lub czego chcesz"
 
 msgid "Describe what you did, what happened, and what you expected.\nYour browser then opens GitHub with this filled in. Sign in and press Create."
 msgstr "Opisz, co zrobiłeś, co się stało i czego oczekiwałeś.\nPotem przeglądarka otworzy GitHuba z wypełnionymi polami. Zaloguj się i naciśnij „Create”."
+
+msgid "Finishing recordings before exit…"
+msgstr "Kończenie zapisu nagrań przed zamknięciem…"
+
+msgid "Try Again"
+msgstr "Spróbuj ponownie"
+
+msgid "Copy Report"
+msgstr "Kopiuj zgłoszenie"
+
+msgid "Could not copy the text. Your report is still available."
+msgstr "Nie udało się skopiować tekstu. Zgłoszenie jest nadal dostępne."
+
+msgid "The browser could not open the report. You can try again or copy your text."
+msgstr "Nie udało się otworzyć zgłoszenia w przeglądarce. Możesz spróbować ponownie lub skopiować tekst."
+
+msgid "Normal speed"
+msgstr "Normalna prędkość"
+
+msgid "Choose the playback speed:"
+msgstr "Wybierz prędkość odtwarzania:"
+
+msgid "Recording Playback Speed..."
+msgstr "Prędkość odtwarzania nagrania…"
+
+msgid "Find Text in Recording Subtitles..."
+msgstr "Znajdź tekst w napisach nagrania…"
+
+msgid "Text to find:"
+msgstr "Szukany tekst:"
+
+msgid "Subtitle matches"
+msgstr "Wyniki wyszukiwania w napisach"
+
+msgid "Open a seekable local recording first."
+msgstr "Najpierw otwórz lokalne nagranie z możliwością przewijania."
+
+msgid "The playback speed could not be changed."
+msgstr "Nie udało się zmienić prędkości odtwarzania."
+
+msgid "Load a text subtitle file or select an embedded text track first."
+msgstr "Najpierw wczytaj plik napisów tekstowych lub wybierz osadzoną ścieżkę tekstową."
+
+msgid "No matching subtitles."
+msgstr "Brak pasujących napisów."
+
+msgid "Reminder times have changed. Open Programme Reminders and choose Review Guide Changes."
+msgstr "Godziny przypomnień uległy zmianie. Otwórz przypomnienia o audycjach i przejrzyj zmiany w programie."
+
+msgid "No changes were found to upcoming reminder times."
+msgstr "Godziny nadchodzących przypomnień nie zmieniły się."
+
+msgid "Use the new time for this reminder?"
+msgstr "Czy zastosować nową godzinę do tego przypomnienia?"
+
+msgid "Keep the postponement relative to the new start time? Choose No to use the usual lead time."
+msgstr "Zachować odroczenie względem nowej godziny rozpoczęcia? Wybierz Nie, aby przywrócić zwykłe wyprzedzenie."
+
+msgid "{title}, {channel}. Previous: {old}. New: {new}."
+msgstr "{title}, {channel}. Poprzednio: {old}. Teraz: {new}."
+
+msgid "Notify me of reminder time changes after guide updates"
+msgstr "Powiadamiaj o zmianach godzin przypomnień po aktualizacji programu telewizyjnego"
+
+msgid "Export Selected Recordings to Calendar..."
+msgstr "Eksportuj wybrane nagrania do kalendarza…"
+
+msgid "Pause Recording Rule..."
+msgstr "Wstrzymaj regułę nagrywania…"
+
+msgid "First day of the pause"
+msgstr "Pierwszy dzień przerwy"
+
+msgid "Last day of the pause"
+msgstr "Ostatni dzień przerwy"
+
+msgid "Remove the pause"
+msgstr "Usuń przerwę"
+
+msgid "Choose a valid pause ending today or later."
+msgstr "Wybierz prawidłowy okres kończący się dzisiaj lub później."
+
+msgid "Pause from {first} through {last}, inclusive?"
+msgstr "Wstrzymać nagrywanie od {first} do {last} włącznie?"
+
+msgid "First skipped recording: {time}"
+msgstr "Pierwsze pominięte nagranie: {time}"
+
+msgid "Next recording after the pause: {time}"
+msgstr "Pierwsze nagranie po przerwie: {time}"
+
+msgid "Connecting to {channel}…"
+msgstr "Łączenie z kanałem {channel}…"
+
+msgid "Enter a valid start date and an end date on or after it."
+msgstr "Podaj prawidłową datę początkową. Data końcowa nie może jej poprzedzać."
+
+msgid "Select upcoming recordings outside the pause period."
+msgstr "Wybierz nadchodzące nagrania przypadające poza okresem przerwy."
+
+msgid "Stopped because the app exited."
+msgstr "Nagrywanie przerwano po zamknięciu aplikacji."

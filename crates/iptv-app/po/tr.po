@@ -5355,3 +5355,105 @@ msgstr "Başlık: neyin yanlış gittiğini veya ne istediğinizi söyleyen tek 
 
 msgid "Describe what you did, what happened, and what you expected.\nYour browser then opens GitHub with this filled in. Sign in and press Create."
 msgstr "Ne yaptığınızı, ne olduğunu ve ne beklediğinizi anlatın.\nArdından tarayıcınız GitHub'ı bunlar doldurulmuş olarak açar. Oturum açın ve “Create” düğmesine basın."
+
+msgid "Finishing recordings before exit…"
+msgstr "Çıkmadan önce kayıtlar sonlandırılıyor…"
+
+msgid "Try Again"
+msgstr "Yeniden dene"
+
+msgid "Copy Report"
+msgstr "Bildirimi kopyala"
+
+msgid "Could not copy the text. Your report is still available."
+msgstr "Metin kopyalanamadı. Bildiriminize hâlâ erişebilirsiniz."
+
+msgid "The browser could not open the report. You can try again or copy your text."
+msgstr "Bildirim tarayıcıda açılamadı. Yeniden deneyebilir veya metni kopyalayabilirsiniz."
+
+msgid "Normal speed"
+msgstr "Normal hız"
+
+msgid "Choose the playback speed:"
+msgstr "Oynatma hızını seçin:"
+
+msgid "Recording Playback Speed..."
+msgstr "Kayıt oynatma hızı…"
+
+msgid "Find Text in Recording Subtitles..."
+msgstr "Kaydın altyazılarında metin ara…"
+
+msgid "Text to find:"
+msgstr "Aranacak metin:"
+
+msgid "Subtitle matches"
+msgstr "Altyazı eşleşmeleri"
+
+msgid "Open a seekable local recording first."
+msgstr "Önce ileri ve geri sarılabilen yerel bir kayıt açın."
+
+msgid "The playback speed could not be changed."
+msgstr "Oynatma hızı değiştirilemedi."
+
+msgid "Load a text subtitle file or select an embedded text track first."
+msgstr "Önce metin tabanlı bir altyazı dosyası yükleyin veya gömülü bir metin altyazı izi seçin."
+
+msgid "No matching subtitles."
+msgstr "Altyazılarda eşleşme bulunamadı."
+
+msgid "Reminder times have changed. Open Programme Reminders and choose Review Guide Changes."
+msgstr "Hatırlatma saatleri değişti. Program Hatırlatmaları'nı açıp rehber değişikliklerini inceleyin."
+
+msgid "No changes were found to upcoming reminder times."
+msgstr "Yaklaşan hatırlatmaların saatleri değişmedi."
+
+msgid "Use the new time for this reminder?"
+msgstr "Bu hatırlatma için yeni saat kullanılsın mı?"
+
+msgid "Keep the postponement relative to the new start time? Choose No to use the usual lead time."
+msgstr "Erteleme süresi yeni başlangıç saatine göre korunsun mu? Alışılmış ön bildirim süresini kullanmak için Hayır'ı seçin."
+
+msgid "{title}, {channel}. Previous: {old}. New: {new}."
+msgstr "{title}, {channel}. Önceki saat: {old}. Yeni saat: {new}."
+
+msgid "Notify me of reminder time changes after guide updates"
+msgstr "Rehber güncellendiğinde hatırlatma saatlerindeki değişiklikleri bildir"
+
+msgid "Export Selected Recordings to Calendar..."
+msgstr "Seçili kayıtları takvime aktar…"
+
+msgid "Pause Recording Rule..."
+msgstr "Kayıt kuralını duraklat…"
+
+msgid "First day of the pause"
+msgstr "Aranın ilk günü"
+
+msgid "Last day of the pause"
+msgstr "Aranın son günü"
+
+msgid "Remove the pause"
+msgstr "Arayı kaldır"
+
+msgid "Choose a valid pause ending today or later."
+msgstr "Bugün veya daha sonra sona eren geçerli bir aralık seçin."
+
+msgid "Pause from {first} through {last}, inclusive?"
+msgstr "{first} ile {last} arasında, her iki gün dahil, ara verilsin mi?"
+
+msgid "First skipped recording: {time}"
+msgstr "Atlanacak ilk kayıt: {time}"
+
+msgid "Next recording after the pause: {time}"
+msgstr "Aradan sonraki ilk kayıt: {time}"
+
+msgid "Connecting to {channel}…"
+msgstr "{channel} kanalına bağlanılıyor…"
+
+msgid "Enter a valid start date and an end date on or after it."
+msgstr "Geçerli bir başlangıç tarihi girin. Bitiş tarihi başlangıç tarihinden önce olamaz."
+
+msgid "Select upcoming recordings outside the pause period."
+msgstr "Ara dışında kalan yaklaşan kayıtları seçin."
+
+msgid "Stopped because the app exited."
+msgstr "Uygulamadan çıkıldığı için kayıt durduruldu."
