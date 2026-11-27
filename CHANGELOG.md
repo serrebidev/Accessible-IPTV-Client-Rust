@@ -5,6 +5,11 @@ adjacent releases were part of the same fix stream, they are combined with a
 version range such as `0.2.2-0.2.3`. Each release's section below is its
 Forgejo release note, taken from this file by the release workflow.
 
+## 0.4.40
+
+- Hungarian localization polished to match the Python client (Python PR #45, shipped there as v1.152.3): 17 corrected message translations, including the pause-rule, reminder and exit messages.
+- The user guide gains the recording help passages that arrived with the Python PR #44 changes in all 14 languages: Review Guide Changes, Find Text in Recording Subtitles and Recording Playback Speed, Pause Recording Rule and calendar export, the MP4/MKA format wording, and the report-issue Try Again / Copy Report note. The Hungarian guide carries the PR #45 polish on top.
+
 ## 0.4.39
 
 - Recording rules can pause: Scheduled Recordings gains Pause Recording Rule..., with a first and last day, a Paused label while a rule sits in its pause, and Export Selected Recordings to Calendar... for upcoming recordings. Paused recordings no longer count against connection limits or conflicts, and the wake-up planner looks past the pause.
