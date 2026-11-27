@@ -6,7 +6,7 @@
 //! exactly like the reference (server URL credentials stripped, MAC
 //! masked, secret payload fields never echoed).
 
-use std::cell::RefCell;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::collections::BTreeMap;
 
 use serde_json::Value;
@@ -467,7 +467,10 @@ pub struct StalkerClient {
     cfg: StalkerConfig,
     base: String,
     endpoint: String,
-    token: RefCell<Option<(String, i64)>>,
+    /// The portal token, behind a mutex (not a `RefCell`) so
+    /// the client can be shared with the PR #46 resolve
+    /// lanes: two lookups may be in flight at once.
+    token: std::sync::Mutex<Option<(String, i64)>>,
 }
 
 impl StalkerClient {
@@ -484,8 +487,22 @@ impl StalkerClient {
             cfg,
             base,
             endpoint,
-            token: RefCell::new(None),
+            token: std::sync::Mutex::new(None),
         }
+    }
+
+    fn token_get(&self) -> Option<(String, i64)> {
+        self.token
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn token_set(&self, value: Option<(String, i64)>) {
+        *self
+            .token
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = value;
     }
 
     #[must_use]
@@ -511,7 +528,7 @@ impl StalkerClient {
                 ),
             );
         if include_token {
-            if let Some((token, _)) = self.token.borrow().as_ref() {
+            if let Some((token, _)) = self.token_get() {
                 request = request.header("Authorization", &format!("Bearer {token}"));
             }
         }
@@ -519,7 +536,7 @@ impl StalkerClient {
             if matches!(e, ureq::Error::StatusCode(401 | 403)) {
                 // The portal dropped the token; forgetting it costs one
                 // handshake, keeping it fails every later call for 25 min.
-                *self.token.borrow_mut() = None;
+                self.token_set(None);
             }
             format!("Could not reach the portal: {e}")
         })?;
@@ -534,8 +551,8 @@ impl StalkerClient {
     }
 
     fn ensure_token(&self, now: i64) -> ProviderResult<()> {
-        if let Some((_, issued)) = self.token.borrow().as_ref() {
-            if now - *issued < 60 * 25 {
+        if let Some((_, issued)) = self.token_get() {
+            if now - issued < 60 * 25 {
                 return Ok(());
             }
         }
@@ -551,7 +568,7 @@ impl StalkerClient {
         )?;
         let token = portal_token(&data)
             .ok_or_else(|| "Portal handshake failed: no token returned".to_string())?;
-        *self.token.borrow_mut() = Some((token.to_string(), now));
+        self.token_set(Some((token.to_string(), now)));
         if !self.cfg.username.is_empty() || !self.cfg.password.is_empty() {
             let auth = self.portal_call(
                 &[
@@ -564,7 +581,7 @@ impl StalkerClient {
                 true,
             )?;
             if let Some(new_token) = portal_token(&auth) {
-                *self.token.borrow_mut() = Some((new_token.to_string(), now));
+                self.token_set(Some((new_token.to_string(), now)));
             }
         }
         Ok(())
@@ -1052,20 +1069,29 @@ enum ProviderJob {
         /// Bypass the fresh provider cache (B13 forced refresh).
         force: bool,
     },
-    Resolve {
+    Account {
+        provider_id: String,
+    },
+}
+
+/// One stream-link lookup for the resolve lanes (PR #46):
+/// play lookups run beside the load worker, at most two in
+/// flight, and a play lookup a newer selection has already
+/// superseded never reaches the portal. Catch-up lookups
+/// share the lanes but are never superseded — a recording
+/// depends on each one.
+enum ResolveJob {
+    Play {
         request: u64,
         provider_id: String,
         data: BTreeMap<String, String>,
     },
-    ResolveCatchup {
+    Catchup {
         request: u64,
         provider_id: String,
         data: BTreeMap<String, String>,
         start_text: String,
         duration_minutes: i64,
-    },
-    Account {
-        provider_id: String,
     },
 }
 
@@ -1101,9 +1127,14 @@ enum Client {
 }
 
 /// Background worker owning the provider clients (Stalker tokens live
-/// here), mirroring the other workers' shape.
+/// here), mirroring the other workers' shape. Loads and account
+/// reads run on the main thread; stream-link lookups run on two
+/// resolve lanes beside it (PR #46), so one stalled portal
+/// lookup cannot hold up the next selection.
 pub struct ProviderWorker {
     jobs: std::sync::mpsc::Sender<ProviderJob>,
+    resolve_jobs: std::sync::mpsc::Sender<ResolveJob>,
+    newest_play: std::sync::Arc<AtomicU64>,
     events: std::sync::Mutex<std::sync::mpsc::Receiver<ProviderEvent>>,
 }
 
@@ -1113,20 +1144,25 @@ impl Default for ProviderWorker {
     }
 }
 
-/// Run one provider load job against the worker's client table.
+/// Run one provider load job. The clients it builds are
+/// returned beside the event and published into the shared
+/// table by the caller, so the (slow) fetches never hold
+/// the table's lock against the resolve lanes.
 /// Cached provider data stays fresh for six hours; a stale copy
 /// still serves when a fetch fails.
 const CACHE_TTL: std::time::Duration = std::time::Duration::from_hours(6);
 
+type ClientTable = BTreeMap<String, (ProviderAccount, std::sync::Arc<Client>)>;
+
 fn handle_load(
     accounts: Vec<ProviderAccount>,
-    clients: &mut BTreeMap<String, (ProviderAccount, Client)>,
     cache_dir: Option<&std::path::Path>,
     force: bool,
-) -> ProviderEvent {
+) -> (ProviderEvent, Vec<(String, ProviderAccount, std::sync::Arc<Client>)>) {
     let mut channels = Vec::new();
     let mut epg_urls = Vec::new();
     let mut failures = Vec::new();
+    let mut built = Vec::new();
     for account in accounts {
         let now = now_epoch();
         let key = account.provider_id().unwrap_or_else(|| account.describe());
@@ -1137,7 +1173,7 @@ fn handle_load(
                 channels.extend(found);
                 epg_urls.extend(urls);
                 failures.extend(fails);
-                clients.insert(key, (account, Client::Xtream(client)));
+                built.push((key, account, std::sync::Arc::new(Client::Xtream(client))));
             }
             ProviderAccount::Stalker(cfg) => {
                 let client = StalkerClient::new(cfg.clone());
@@ -1146,15 +1182,18 @@ fn handle_load(
                 channels.extend(found);
                 epg_urls.extend(urls);
                 failures.extend(fails);
-                clients.insert(key, (account, Client::Stalker(client)));
+                built.push((key, account, std::sync::Arc::new(Client::Stalker(client))));
             }
         }
     }
-    ProviderEvent::Loaded {
-        channels,
-        epg_urls,
-        failures,
-    }
+    (
+        ProviderEvent::Loaded {
+            channels,
+            epg_urls,
+            failures,
+        },
+        built,
+    )
 }
 
 /// Tag parsed channels with their provider identity.
@@ -1309,86 +1348,149 @@ fn load_stalker_account(
     }
 }
 
+/// Run one resolve-lane job against the shared client
+/// table. A play lookup a newer selection superseded while
+/// it waited is dropped without a portal call (its result
+/// is never delivered by the app, which tracks the newest
+/// request itself).
+fn handle_resolve(
+    job: &ResolveJob,
+    clients: &std::sync::Mutex<ClientTable>,
+    newest_play: &AtomicU64,
+) -> ProviderEvent {
+    let (request, provider_id) = match job {
+        ResolveJob::Play {
+            request,
+            provider_id,
+            ..
+        }
+        | ResolveJob::Catchup {
+            request,
+            provider_id,
+            ..
+        } => (*request, provider_id),
+    };
+    if matches!(job, ResolveJob::Play { .. }) && request < newest_play.load(Ordering::SeqCst) {
+        return ProviderEvent::Resolved {
+            request,
+            result: Err("The stream lookup was superseded by a newer selection.".to_string()),
+        };
+    }
+    let client = clients
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(provider_id)
+        .map(|(_, client)| std::sync::Arc::clone(client));
+    let result = match client.as_deref() {
+        Some(Client::Stalker(client)) => match job {
+            ResolveJob::Play { data, .. } => client.resolve_stream(data, now_epoch()),
+            ResolveJob::Catchup {
+                data,
+                start_text,
+                duration_minutes,
+                ..
+            } => client.resolve_catchup(data, start_text, *duration_minutes, now_epoch()),
+        },
+        _ => Err("No Stalker portal for this channel".to_string()),
+    };
+    ProviderEvent::Resolved { request, result }
+}
+
 impl ProviderWorker {
     #[must_use]
     pub fn new() -> Self {
         let (job_sender, job_receiver) = std::sync::mpsc::channel::<ProviderJob>();
         let (event_sender, event_receiver) = std::sync::mpsc::channel::<ProviderEvent>();
-        std::thread::spawn(move || {
-            let mut clients: BTreeMap<String, (ProviderAccount, Client)> = BTreeMap::new();
-            let mut cache_dir: Option<std::path::PathBuf> = None;
-            while let Ok(job) = job_receiver.recv() {
-                if let ProviderJob::SetCacheDir(dir) = job {
-                    cache_dir = Some(dir);
-                    continue;
-                }
-                let event = match job {
-                    ProviderJob::Load { accounts, force } => {
-                        handle_load(accounts, &mut clients, cache_dir.as_deref(), force)
-                    }
-                    ProviderJob::SetCacheDir(_) => unreachable!(),
-                    ProviderJob::Resolve {
-                        request,
-                        provider_id,
-                        data,
-                    } => {
-                        let result = match clients.get(&provider_id) {
-                            Some((_, Client::Stalker(client))) => {
-                                client.resolve_stream(&data, now_epoch())
-                            }
-                            _ => Err("No Stalker portal for this channel".to_string()),
-                        };
-                        ProviderEvent::Resolved { request, result }
-                    }
-                    ProviderJob::ResolveCatchup {
-                        request,
-                        provider_id,
-                        data,
-                        start_text,
-                        duration_minutes,
-                    } => {
-                        let result = match clients.get(&provider_id) {
-                            Some((_, Client::Stalker(client))) => client.resolve_catchup(
-                                &data,
-                                &start_text,
-                                duration_minutes,
-                                now_epoch(),
-                            ),
-                            _ => Err("No Stalker portal for this channel".to_string()),
-                        };
-                        ProviderEvent::Resolved { request, result }
-                    }
-                    ProviderJob::Account { provider_id } => {
-                        let (report, max_connections) = match clients.get(&provider_id) {
-                            Some((account, client)) => {
-                                let payload = match client {
-                                    Client::Xtream(c) => c.account_info(),
-                                    Client::Stalker(c) => c.account_info(now_epoch()),
-                                };
-                                match payload {
-                                    Ok(p) => (
-                                        Ok(format_account_report(account, &p, now_epoch())),
-                                        max_connections_in(&p),
-                                    ),
-                                    Err(e) => (Err(e), None),
-                                }
-                            }
-                            None => (Err("Unknown provider account".to_string()), None),
-                        };
-                        ProviderEvent::Account {
-                            report,
-                            max_connections,
-                            provider_id,
-                        }
-                    }
+        let clients: std::sync::Arc<std::sync::Mutex<ClientTable>> =
+            std::sync::Arc::new(std::sync::Mutex::new(BTreeMap::new()));
+        let newest_play = std::sync::Arc::new(AtomicU64::new(0));
+        // The two resolve lanes (PR #46): one shared queue,
+        // each lane holding the queue lock only while it
+        // waits for the next lookup, never while one runs.
+        let (resolve_sender, resolve_receiver) = std::sync::mpsc::channel::<ResolveJob>();
+        let resolve_queue = std::sync::Arc::new(std::sync::Mutex::new(resolve_receiver));
+        for _ in 0..2 {
+            let queue = std::sync::Arc::clone(&resolve_queue);
+            let clients = std::sync::Arc::clone(&clients);
+            let newest_play = std::sync::Arc::clone(&newest_play);
+            let events = event_sender.clone();
+            std::thread::spawn(move || loop {
+                let job = {
+                    let receiver = queue
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    receiver.recv()
                 };
-                if event_sender.send(event).is_err() {
+                let Ok(job) = job else { break };
+                let event = handle_resolve(&job, &clients, &newest_play);
+                if events.send(event).is_err() {
                     break;
                 }
-            }
-        });
+            });
+        }
+        {
+            let clients = std::sync::Arc::clone(&clients);
+            std::thread::spawn(move || {
+                let mut cache_dir: Option<std::path::PathBuf> = None;
+                while let Ok(job) = job_receiver.recv() {
+                    if let ProviderJob::SetCacheDir(dir) = job {
+                        cache_dir = Some(dir);
+                        continue;
+                    }
+                    let event = match job {
+                        ProviderJob::Load { accounts, force } => {
+                            let (event, built) =
+                                handle_load(accounts, cache_dir.as_deref(), force);
+                            let mut table = clients
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            for (key, account, client) in built {
+                                table.insert(key, (account, client));
+                            }
+                            event
+                        }
+                        ProviderJob::SetCacheDir(_) => unreachable!(),
+                        ProviderJob::Account { provider_id } => {
+                            let found = clients
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .get(&provider_id)
+                                .map(|(account, client)| {
+                                    (account.clone(), std::sync::Arc::clone(client))
+                                });
+                            let (report, max_connections) = match &found {
+                                Some((account, client)) => {
+                                    let payload = match &**client {
+                                        Client::Xtream(c) => c.account_info(),
+                                        Client::Stalker(c) => c.account_info(now_epoch()),
+                                    };
+                                    match payload {
+                                        Ok(p) => (
+                                            Ok(format_account_report(account, &p, now_epoch())),
+                                            max_connections_in(&p),
+                                        ),
+                                        Err(e) => (Err(e), None),
+                                    }
+                                }
+                                None => (Err("Unknown provider account".to_string()), None),
+                            };
+                            ProviderEvent::Account {
+                                report,
+                                max_connections,
+                                provider_id,
+                            }
+                        }
+                    };
+                    if event_sender.send(event).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
         Self {
             jobs: job_sender,
+            resolve_jobs: resolve_sender,
+            newest_play,
             events: std::sync::Mutex::new(event_receiver),
         }
     }
@@ -1422,7 +1524,7 @@ impl ProviderWorker {
         start_text: String,
         duration_minutes: i64,
     ) {
-        let _ = self.jobs.send(ProviderJob::ResolveCatchup {
+        let _ = self.resolve_jobs.send(ResolveJob::Catchup {
             request,
             provider_id,
             data,
@@ -1431,8 +1533,13 @@ impl ProviderWorker {
         });
     }
 
+    /// Queue a play lookup on the resolve lanes. Submitting
+    /// marks `request` as the newest selection: any older
+    /// play lookup still waiting for a lane is dropped
+    /// without a portal call (PR #46).
     pub fn resolve(&self, request: u64, provider_id: String, data: BTreeMap<String, String>) {
-        let _ = self.jobs.send(ProviderJob::Resolve {
+        self.newest_play.fetch_max(request, Ordering::SeqCst);
+        let _ = self.resolve_jobs.send(ResolveJob::Play {
             request,
             provider_id,
             data,
