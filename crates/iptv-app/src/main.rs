@@ -2068,10 +2068,17 @@ fn poll_space_monitor(frame: Frame, wiring: &Wiring) {
             None,
         );
     };
-    wiring.space_monitor.borrow_mut().check(
+    // PR #46: probes run on the monitor's own threads, so
+    // a destination on an offline share cannot stall the
+    // healthy drives' warnings (Python's background check).
+    let measure: std::sync::Arc<iptv_core::storage_monitor::Measure> =
+        std::sync::Arc::new(|dir: &std::path::Path| {
+            iptv_core::storage_monitor::measure_directory(dir)
+        });
+    wiring.space_monitor.borrow_mut().check_background(
         &rows,
         &prefs,
-        |dir| recording::free_space_bytes(dir).ok(),
+        &measure,
         &mut notify,
         &mut stop,
     );
@@ -5151,10 +5158,33 @@ fn toggle_recording(
                     &[("fmt", format_label), ("path", &path_text)],
                 )
             };
-            let _ = MessageDialog::builder(parent, &message, &tr("Recording"))
-                .with_style(MessageDialogStyle::OK | MessageDialogStyle::IconInformation)
-                .build()
-                .show_modal_tracked();
+            // PR #46: in speech/history mode the start is
+            // reported through the success preference,
+            // spoken as "Recording: {name}"; the dialog
+            // mode keeps Python's plain box here.
+            let mode = persist
+                .config
+                .borrow()
+                .value("recording_success_notification")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("dialog")
+                .to_string();
+            if mode == "speech" || mode == "history" {
+                let spoken = format!("{}: {}", tr("Recording"), channel.name);
+                report_recording_success(
+                    None,
+                    status,
+                    persist,
+                    &message,
+                    &tr("Recording"),
+                    &spoken,
+                );
+            } else {
+                let _ = MessageDialog::builder(parent, &message, &tr("Recording"))
+                    .with_style(MessageDialogStyle::OK | MessageDialogStyle::IconInformation)
+                    .build()
+                    .show_modal_tracked();
+            }
         }
         Err(error) => status.set_label(&tr(&error)),
     }
@@ -5519,7 +5549,30 @@ fn record_dvr_channel(
         // N12: the job's span is the capture's planned length.
         Some((job.stop_ts - job.start_ts).max(0.0)),
     ) {
-        Ok(_) => status.set_label(&trf("Recording {display}.", &[("display", &display)])),
+        Ok(_) => {
+            status.set_label(&trf("Recording {display}.", &[("display", &display)]));
+            // PR #46: a scheduled start reports through the
+            // success-notification preference (Python shows
+            // this box via _show_or_queue_message_box; the
+            // Rust port previously only set the status line).
+            let title = if job.display_title.is_empty() {
+                job.title.clone()
+            } else {
+                job.display_title.clone()
+            };
+            let message = trf(
+                "Scheduled recording started:\n{title}",
+                &[("title", &title)],
+            );
+            report_recording_success(
+                status.bar,
+                status,
+                &wiring.persist,
+                &message,
+                &tr("Scheduled Recording"),
+                &message.clone(),
+            );
+        }
         Err(error) => {
             wiring
                 .dvr
@@ -5860,7 +5913,21 @@ fn poll_recordings(wiring: &Wiring, frame: Frame, status: Status) {
         let produced = recording::output_has_media(&finished.out_path);
         let success = finished.success && produced;
         // Python `recording_outcome.classify`, shared by the library
-        // index and the scheduled job's status.
+        // index and the scheduled job's status. PR #46: a DVR
+        // capture is classified against its scheduled window —
+        // the job supplies the planned length and the scheduled
+        // start, so a late start is partial however much media
+        // it wrote.
+        let dvr_job = finished
+            .key
+            .strip_prefix("dvr:")
+            .and_then(|job_id| wiring.dvr.borrow().get(job_id).cloned());
+        let (planned_seconds, scheduled_start) = match &dvr_job {
+            Some(job) if job.stop_ts > job.start_ts => {
+                (Some(job.stop_ts - job.start_ts), Some(job.start_ts))
+            }
+            _ => (finished.planned_seconds, None),
+        };
         let outcome = iptv_core::recording_library::classify_outcome(
             &iptv_core::recording_library::Outcome {
                 produced,
@@ -5869,7 +5936,10 @@ fn poll_recordings(wiring: &Wiring, frame: Frame, status: Status) {
                 stopped_by_user: finished.stopped_by_user,
                 exit_code: finished.exit_code,
                 written_seconds: finished.media_written_seconds,
-                planned_seconds: finished.planned_seconds,
+                planned_seconds,
+                started_at: Some(finished.started_at),
+                ended_at: Some(now),
+                scheduled_start,
             },
         );
         // PR #36: every finished recording joins the recording
@@ -5936,6 +6006,10 @@ fn poll_recordings(wiring: &Wiring, frame: Frame, status: Status) {
                     .cloned()
                     .collect::<Vec<_>>()
                     .join("\n")
+            } else if outcome == "partial" && produced {
+                // PR #46: a clean-exit capture that missed
+                // part of its window says so on the job.
+                "The recording did not cover the full scheduled time.".to_string()
             } else if !produced {
                 "Nothing was recorded: the stream ended before it wrote anything.".to_string()
             } else {
@@ -5954,7 +6028,7 @@ fn poll_recordings(wiring: &Wiring, frame: Frame, status: Status) {
         // four-way wording) for every recording the downloads
         // window does not already report on.
         if !wiring.closing_application.get() {
-            report_recording_finished(frame, &finished, produced);
+            report_recording_finished(frame, status, &wiring.persist, &finished, produced);
         }
         if success {
             let size = std::fs::metadata(&finished.out_path).map_or(0, |m| m.len());
@@ -6044,11 +6118,96 @@ fn recording_failure_detail(finished: &recording::RecordingFinished) -> String {
     lines.join("\n")
 }
 
+/// How successful recording starts and finishes are
+/// reported (PR #46, Python `_report_recording_success`):
+/// the `recording_success_notification` preference chooses
+/// a dialog (the default), speech with a history entry, or
+/// history only. `message`, `caption` and `spoken` arrive
+/// translated.
+fn report_recording_success(
+    parent: Option<Frame>,
+    status: Status,
+    persist: &Persist,
+    message: &str,
+    caption: &str,
+    spoken: &str,
+) {
+    let mode = persist
+        .config
+        .borrow()
+        .value("recording_success_notification")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("dialog")
+        .to_string();
+    match mode.as_str() {
+        "speech" | "history" => {
+            record_notification(caption, message);
+            if mode == "speech" {
+                live_region::announce_with_priority(
+                    status.label,
+                    spoken,
+                    live_region::Priority::Medium,
+                );
+            }
+        }
+        _ => match parent {
+            Some(frame) => show_or_queue_notification(
+                frame,
+                message,
+                caption,
+                MessageDialogStyle::OK | MessageDialogStyle::IconInformation,
+                None,
+            ),
+            None => record_notification(caption, message),
+        },
+    }
+}
+
+/// Recordings > Recording Notifications... (PR #46, Python
+/// `_configure_recording_notices`): choose how successful
+/// recording starts and finishes are reported.
+fn configure_recording_notifications(wiring: &Wiring, frame: Frame) {
+    const KEYS: [&str; 3] = ["dialog", "speech", "history"];
+    let labels = [
+        tr("Show a dialog"),
+        tr("Announce and save in history"),
+        tr("Save in history only"),
+    ];
+    let current = wiring
+        .persist
+        .config
+        .borrow()
+        .value("recording_success_notification")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("dialog")
+        .to_string();
+    let dialog = SingleChoiceDialog::builder(
+        &frame,
+        &tr("When a recording starts or finishes successfully:"),
+        &tr("Recording Notifications..."),
+        &labels.iter().map(String::as_str).collect::<Vec<_>>(),
+    )
+    .build();
+    let position = KEYS.iter().position(|key| *key == current).unwrap_or(0);
+    dialog.set_selection(i32::try_from(position).unwrap_or(0));
+    if dialog.show_modal_tracked() != ID_OK {
+        return;
+    }
+    let selection = usize::try_from(dialog.get_selection()).unwrap_or(usize::MAX);
+    if let Some(choice) = KEYS.get(selection) {
+        wiring
+            .persist
+            .set_and_save("recording_success_notification", serde_json::json!(choice));
+    }
+}
+
 /// Python's recording outcome report (N12; `client_recording.py`):
 /// saved, nothing recorded, stopped-by-user warning, or error,
 /// each a dialog in Python's wording.
 fn report_recording_finished(
     frame: Frame,
+    status: Status,
+    persist: &Persist,
     finished: &recording::RecordingFinished,
     produced: bool,
 ) {
@@ -6061,10 +6220,16 @@ fn report_recording_finished(
         show_or_queue_notification(frame, &message, &tr(title), style, None);
     };
     if rc == 0 && produced {
-        show(
-            trf("Recording saved:\n{path}", &[("path", &path)]),
-            "Recording Complete",
-            MessageDialogStyle::OK | MessageDialogStyle::IconInformation,
+        // PR #46: a saved recording reports through the
+        // success-notification preference, spoken as
+        // "Recording saved: {title}".
+        report_recording_success(
+            Some(frame),
+            status,
+            persist,
+            &trf("Recording saved:\n{path}", &[("path", &path)]),
+            &tr("Recording Complete"),
+            &trf("Recording saved: {title}", &[("title", &finished.title)]),
         );
     } else if rc == 0 && !finished.stopped_by_user {
         show(
@@ -7364,6 +7529,7 @@ pub const REC_PREVENT_SLEEP: i32 = 5227;
 pub const REC_WAKE_RECORDINGS: i32 = 5228;
 pub const REC_SPACE_MONITOR: i32 = 5229;
 pub const REC_LIMITS: i32 = 5230;
+pub const REC_NOTIFICATIONS: i32 = 5231;
 
 /// The Recording Format submenu inside the Recordings menu
 /// (found by its label, the same fetch-by-parent pattern the
@@ -7891,6 +8057,13 @@ fn build_recordings_menu(config: &Config) -> Menu {
         &menu,
         REC_SPACE_MONITOR,
         "Recording Space Monitor...",
+        "",
+        ItemKind::Normal,
+    );
+    menu_add(
+        &menu,
+        REC_NOTIFICATIONS,
+        "Recording Notifications...",
         "",
         ItemKind::Normal,
     );
@@ -8831,7 +9004,7 @@ fn menu_item_topic(id: i32) -> Option<&'static str> {
         WHATS_NEW => "updates",
         REC_START | REC_STOP | REC_STOP_ALL | REC_STORAGE | REC_MIN_FREE | REC_SET_FOLDER
         | REC_OPEN_FOLDER | REC_PROBLEM_TIMES | REC_LIBRARY | REC_PREVENT_SLEEP
-        | REC_WAKE_RECORDINGS | REC_SPACE_MONITOR | REC_LIMITS | CTX_RECORD => "recordings",
+        | REC_WAKE_RECORDINGS | REC_SPACE_MONITOR | REC_NOTIFICATIONS | REC_LIMITS | CTX_RECORD => "recordings",
         REC_REMINDERS | CTX_REMINDER => "reminders",
         REC_SCHEDULED | CTX_SCHEDULE => "scheduled-recordings",
         REC_PADDING => "schedule-padding",
@@ -9094,6 +9267,7 @@ fn menu_recordings_action(
         REC_BY_TIME => schedule_by_time(wiring, &frame, list, status),
         REC_STORAGE => show_recording_storage(wiring, frame, status),
         REC_SPACE_MONITOR => show_space_monitor_dialog(wiring, frame, status),
+        REC_NOTIFICATIONS => configure_recording_notifications(wiring, frame),
         REC_LIBRARY => open_recording_library(wiring, status),
         REC_LIMITS => open_recording_limits(wiring, frame),
         REC_MIN_FREE => prompt_min_free_space(wiring, frame, status),
