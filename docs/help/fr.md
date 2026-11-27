@@ -180,6 +180,8 @@ Afficher l'EPG…, dans le menu d'une chaîne, liste les émissions de cette cha
 - La touche Applications ou Shift+F10 sur une émission propose Programmer l'enregistrement.
 - Échap ferme la fenêtre.
 
+Dans les rappels d’émissions, consultez les changements du guide pour comparer l’ancien horaire au nouveau, puis confirmez votre choix. Si le rappel a été reporté, vous pouvez conserver le décalage par rapport à la nouvelle heure de début ou rétablir le délai habituel. Cochez la case de notification pour être averti après les mises à jour du guide.
+
 ## Rattrapage {#catch-up}
 
 Les chaînes qui tiennent une archive permettent de regarder des émissions déjà diffusées. Ces chaînes ont Rattrapage dans leur menu de la liste des chaînes. Il ouvre la fenêtre de rattrapage de la chaîne, qui liste ses émissions passées avec date et heure.
@@ -245,6 +247,8 @@ Lecture > Lire le sous-titre actuel (C) lit le sous-titre à l'écran, ou le der
 
 Lecture > Synchronisation des sous-titres (Ctrl+Maj+T) règle un décalage maximal de dix minutes dans chaque sens, en millisecondes par pas de 500 ms. Une valeur positive retarde l’affichage et la lecture vocale des fichiers de sous-titres. Réinitialiser règle zéro ; Annuler conserve la valeur précédente. Un nouveau média réinitialise le réglage. La vitesse du média et du lecteur d’écran reste inchangée.
 
+Pendant la lecture d’un enregistrement local, le menu Lecture permet de rechercher du texte dans un fichier de sous-titres chargé ou dans une piste de texte intégrée. Sélectionnez un résultat et appuyez sur Entrée pour y accéder. La vitesse de lecture est réglable de 0,75× à 2×. Choisissez « Vitesse normale » pour revenir à 1×.
+
 ### Périphérique de sortie audio {#audio-output-device}
 
 Lecture > Périphérique de sortie audio… (D) choisit les haut-parleurs ou le casque que le lecteur utilise, par exemple pour éloigner le son du téléviseur de votre lecteur d'écran. Par défaut du système suit le périphérique par défaut de Windows. Le choix est mémorisé.
@@ -304,7 +308,7 @@ Tous les dossiers d’enregistrements réunit les dossiers configurés. Filtrez 
 Enregistrements > Format d'enregistrement choisit comment les enregistrements sont sauvegardés :
 
 - Qualité du fournisseur (copie, MKV) : le flux exactement tel que diffusé, avec toutes les pistes audio et de sous-titres. Garde tout ce que le fournisseur envoie.
-- Qualité du fournisseur (copie, MP4) : la même image et le même son dans un fichier MP4, que plus d'appareils lisent, sans sous-titres ni télétexte.
+- Le format MP4 conserve la vidéo et encode toutes les pistes audio en AAC avec un débit cible de 192 kbit/s par piste. Les sous-titres et le télétexte sont exclus. Le format MKA conserve toutes les pistes audio dans leur encodage d’origine.
 - Réencodage x264 (MKV ou MP4) : un fichier réencodé plus petit. Utilise beaucoup plus de temps processeur.
 - Audio seulement (MP3 V0, FLAC, WAV, AAC M4A ou Opus) : le son seul, utile pour la radio.
 
@@ -327,6 +331,8 @@ Lorsqu'un nouvel enregistrement chevauche un autre enregistrement programmé, le
 Le programme demande confirmation avant de se fermer si des enregistrements programmés attendent encore de démarrer, car ils ne peuvent démarrer que pendant que le programme tourne. Si vous le fermez quand même, ces enregistrements ne démarreront pas.
 
 Conflits d’enregistrement, dans Enregistrements programmés, présente les chevauchements de l’entrée sélectionnée, marges comprises. Les détails indiquent la chaîne, l’alias du compte et la période réelle. Modifier les horaires ouvre l’éditeur existant. La confirmation propose ces détails et Programmer quand même. Un budget connu limite la comparaison au même compte ; sinon, les chevauchements ne prétendent pas représenter une limite du fournisseur.
+
+Dans le menu contextuel des enregistrements programmés, vous pouvez suspendre une règle récurrente ou une série entre deux dates incluses. L’enregistrement reprend à la prochaine diffusion prévue. Vous pouvez lever la suspension plus tôt. Sélectionnez plusieurs enregistrements à venir pour les exporter dans un seul fichier .ics avec leurs marges. À la fermeture, l’application demande confirmation avant d’arrêter un enregistrement en cours et termine l’écriture des fichiers. Avant de confirmer, vous pouvez consulter les horaires du premier enregistrement suspendu et du premier enregistrement après la pause, s’ils sont connus.
 
 ### Marge de programmation {#schedule-padding}
 
@@ -459,3 +465,5 @@ Questions, rapports de bogues et nouvelles des versions :
 - Rapports de bogues et suggestions sur Forgejo : https://git.serrebiradio.com/serrebi/Accessible-IPTV-Client/issues
 
 Aide > À propos… montre la version en cours d'exécution et lie les deux. Quand vous signalez un problème, Aide > Copier le journal et les informations de débogage donne les détails nécessaires pour le retrouver.
+
+Si le navigateur ne s’ouvre pas, choisissez « Réessayer » ou « Copier le signalement » pour conserver le titre et la description.

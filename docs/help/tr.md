@@ -179,6 +179,8 @@ Bir kanalın menüsündeki EPG'yi görüntüle..., o kanalın programlarını ya
 - Bir programda Uygulamalar tuşu ya da Shift+F10 Kayıt zamanla sunar.
 - Escape pencereyi kapatır.
 
+Program hatırlatmalarında rehber değişikliklerini inceleyerek eski ve yeni yayın saatlerini karşılaştırın ve istediğiniz değişikliği onaylayın. Ertelenmiş bir uyarının yeni başlangıç saatine göre erteleme süresini koruyabilir veya alışılmış ön bildirim süresine dönebilirsiniz. Rehber güncellemelerinden sonra haberdar olmak için bildirim kutusunu işaretleyin.
+
 ## Geri izleme {#catch-up}
 
 Arşiv tutan kanallar, çoktan yayınlanmış programları izlemenizi sağlar. Bu kanalların kanal listesindeki menüsünde Geri izleme bulunur. Kanalın geri izleme penceresini açar; geçmiş programlarını tarih ve saatleriyle listeler.
@@ -244,6 +246,8 @@ Oynatma > Geçerli altyazıyı oku (C), ekrandaki altyazıyı, ekranda altyazı 
 
 Oynatma > Altyazı Zamanlaması (Ctrl+Shift+T), her iki yönde en çok on dakikalık kaydırmayı 500 ms adımlarla milisaniye cinsinden ayarlar. Pozitif değerler altyazı dosyalarının gösterimini ve okunmasını geciktirir. Sıfırla sıfır değerini ayarlar; İptal önceki değeri korur. Yeni medya ayarı sıfırlar. Medya ve ekran okuyucu hızı değişmez.
 
+Yerel kayıt oynatılırken oynatma menüsünden yüklenmiş altyazı dosyasında veya gömülü metin izinde sözcük arayabilirsiniz. Bir sonucu seçip Enter tuşuna basarak o konuma gidin. Kayıt oynatma hızını 0,75× ile 2× arasında ayarlayabilirsiniz. 1× hızına dönmek için normal hızı seçin.
+
 ### Ses çıkış cihazı {#audio-output-device}
 
 Oynatma > Ses çıkış cihazı... (D), oynatıcının hangi hoparlörleri ya da kulaklıkları kullanacağını seçer; örneğin TV sesini ekran okuyucunuzdan uzak tutmak için. Sistem varsayılanı, Windows'un varsayılan cihazını izler. Seçim hatırlanır.
@@ -303,7 +307,7 @@ Tüm Kayıt Klasörleri yapılandırılan klasörleri birleştirir. Duruma göre
 Kayıtlar > Kayıt biçimi, kayıtların nasıl saklanacağını seçer:
 
 - Sağlayıcı kalitesi (kopya, MKV): akış, yayımlandığı gibi, tüm ses ve altyazı parçalarıyla. Sağlayıcının gönderdiği her şeyi tutar.
-- Sağlayıcı kalitesi (kopya, MP4): aynı görüntü ve ses, daha çok cihazın oynattığı bir MP4 dosyasında; altyazı ve teletext olmadan.
+- MP4 özgün videoyu kopyalar ve her ses izini 192 kbit/sn hedef bit hızıyla AAC olarak kodlar. Altyazılar ve teletekst eklenmez. MKA tüm ses izlerini özgün kodlamalarıyla kopyalar.
 - x264 yeniden kodlama (MKV ya da MP4): daha küçük, yeniden kodlanmış dosya. Çok daha fazla işlemci zamanı kullanır.
 - Yalnızca ses (MP3 V0, FLAC, WAV, AAC M4A ya da Opus): yalnızca ses; radyo için kullanışlı.
 
@@ -326,6 +330,8 @@ Yeni bir kayıt, planlanmış başka bir kayıtla çakıştığında program, on
 Başlamayı bekleyen zamanlanmış kayıtlar varken program kapanmadan önce sorar, çünkü bu kayıtlar yalnızca program çalışırken başlayabilir. Yine de kapatırsanız bekleyen kayıtlar başlamaz.
 
 Zamanlanmış Kayıtlar içindeki Kayıt Çakışmaları, seçilen kaydın zaman payları dahil çakışmalarını listeler. Ayrıntılarda kanal, hesap takma adı ve gerçek kayıt aralığı bulunur. Zamanları Düzenle mevcut düzenleyiciyi açar. Onay penceresi bu ayrıntıları ve Yine de Zamanla seçeneğini sunar. Bilinen bütçe aynı hesabı karşılaştırır; yoksa sağlayıcı sınırı iddiası olmadan zaman çakışmaları gösterilir.
+
+Zamanlanmış kayıtların bağlam menüsünde yinelenen bir kayıt veya dizi kuralını belirli tarihler arasında duraklatabilirsiniz. İlk ve son gün araya dahildir. Kayıt sonraki uygun yayında sürer. Arayı daha erken de kaldırabilirsiniz. Birden fazla yaklaşan kaydı seçerek baştaki ve sondaki ek sürelerle birlikte tek bir .ics dosyasına aktarabilirsiniz. Normal çıkışta uygulama süren kaydı durdurmadan önce onay ister ve dosyaları yazmayı tamamlar. Onaylamadan önce, saatleri biliniyorsa atlanacak ilk kaydı ve aradan sonraki ilk kaydı görebilirsiniz.
 
 ### Zamanlama payı {#schedule-padding}
 
@@ -458,3 +464,5 @@ Sorular, hata raporları ve sürüm haberleri:
 - Forgejo'da hata raporları ve öneriler: https://git.serrebiradio.com/serrebi/Accessible-IPTV-Client/issues
 
 Yardım > Hakkında..., kullandığınız sürümü gösterir ve ikisine de bağlantı verir. Sorun bildirirken Yardım > Günlüğü ve hata ayıklama bilgilerini kopyala, izlenmesi için gereken ayrıntıları verir.
+
+Tarayıcı bildirimi açamazsa yeniden deneyebilir veya bildirimi kopyalayarak başlığı ve açıklamayı saklayabilirsiniz.

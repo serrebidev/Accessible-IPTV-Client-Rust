@@ -180,6 +180,8 @@ Ver EPG…, en el menú de un canal, enumera los programas de ese canal desde el
 - La tecla de aplicaciones o Shift+F10 sobre un programa ofrece Programar grabación.
 - Escape cierra la ventana.
 
+En los recordatorios de programas, revise los cambios de la guía para comparar el horario anterior con el nuevo. Confirme el cambio deseado. Si aplazó el aviso, puede mantener el aplazamiento respecto a la nueva hora de inicio o volver a la antelación habitual. Active la casilla para recibir avisos después de actualizar la guía.
+
 ## Repetición {#catch-up}
 
 Los canales que guardan un archivo permiten ver programas ya emitidos. Estos canales tienen Repetición en su menú en la lista de canales. Abre la ventana de repetición del canal, que lista sus programas pasados con fecha y hora.
@@ -245,6 +247,8 @@ Reproducción > Leer el subtítulo actual (C) lee el subtítulo que está en pan
 
 Reproducción > Sincronización de subtítulos (Ctrl+Mayús+T) ajusta hasta diez minutos en ambas direcciones, en milisegundos y pasos de 500 ms. Los valores positivos retrasan tanto la visualización como la lectura de archivos de subtítulos. Restablecer pone cero; Cancelar conserva el valor anterior. Un contenido nuevo restablece el ajuste. No cambia la velocidad del contenido ni del lector de pantalla.
 
+Durante la reproducción de una grabación local, el menú de reproducción permite buscar palabras en un archivo de subtítulos cargado o en una pista de texto integrada. Seleccione un resultado y pulse Intro para ir a ese punto. Puede elegir velocidades entre 0,75× y 2×. Seleccione «Velocidad normal» para volver a 1×.
+
 ### Dispositivo de salida de audio {#audio-output-device}
 
 Reproducción > Dispositivo de salida de audio… (D) elige los altavoces o auriculares que usa el reproductor, por ejemplo para alejar el sonido del TV de su lector de pantalla. Predeterminado del sistema sigue al dispositivo predeterminado de Windows. La elección se recuerda.
@@ -304,7 +308,7 @@ Todas las carpetas de grabaciones reúne las carpetas configuradas. Filtre por e
 Grabaciones > Formato de grabación elige cómo se guardan las grabaciones:
 
 - Calidad del proveedor (copia, MKV): el flujo exactamente como se emite, con todas las pistas de audio y subtítulos. Conserva todo lo que el proveedor envía.
-- Calidad del proveedor (copia, MP4): la misma imagen y sonido en un archivo MP4, que reproducen más dispositivos, sin subtítulos ni teletexto.
+- MP4 copia el vídeo original y codifica todas las pistas de audio en AAC con un objetivo de 192 kbit/s por pista. Se omiten los subtítulos y el teletexto. MKA conserva todas las pistas de audio con su codificación original.
 - Recodificación x264 (MKV o MP4): un archivo recodificado más pequeño. Usa mucho más tiempo de procesador.
 - Solo audio (MP3 V0, FLAC, WAV, AAC M4A u Opus): solo el sonido, útil para radio.
 
@@ -327,6 +331,8 @@ Cuando una nueva grabación se superpone a otra grabación programada, el progra
 El programa pregunta antes de cerrarse si quedan grabaciones programadas esperando a empezar, porque solo pueden empezar mientras el programa está abierto. Si lo cierra de todos modos, esas grabaciones no se iniciarán.
 
 Conflictos de grabación, en Grabaciones programadas, muestra las superposiciones de una entrada seleccionada, incluidos los márgenes. Los detalles indican canal, alias de cuenta y período real de grabación. Editar horarios abre el editor existente. La confirmación ofrece estos detalles y Programar de todos modos. Con un límite de grabación conocido se compara la misma cuenta; sin él se muestran superposiciones, sin afirmar un límite del proveedor.
+
+En el menú contextual de las grabaciones programadas puede pausar una regla de grabación periódica o de serie entre dos fechas, ambas incluidas. La grabación se reanuda con la siguiente emisión prevista. Puede quitar la pausa antes. Seleccione varias grabaciones futuras para exportarlas a un único archivo .ics con sus márgenes de grabación. Al salir, la aplicación pide confirmación antes de detener una grabación en curso y termina de escribir los archivos. Antes de confirmar, se muestran la primera grabación que se omitirá y la primera posterior a la pausa, si se conocen sus horarios.
 
 ### Margen de programación {#schedule-padding}
 
@@ -459,3 +465,5 @@ Preguntas, informes de errores y noticias de versiones:
 - Informes de errores y sugerencias en Forgejo: https://git.serrebiradio.com/serrebi/Accessible-IPTV-Client/issues
 
 Ayuda > Acerca de… muestra la versión en uso y enlaza ambos. Al reportar un problema, Ayuda > Copiar registro e información de depuración da los detalles necesarios para rastrearlo.
+
+Si el navegador no abre el informe, vuelva a intentarlo o copie el título y la descripción con «Copiar informe».
