@@ -180,6 +180,8 @@ EPG anzeigen…, im Menü eines Senders, listet die Sendungen dieses Senders von
 - Die Anwendungstaste oder Shift+F10 auf einer Sendung bietet Aufnahme planen an.
 - Escape schließt das Fenster.
 
+Unter Programmerinnerungen lassen sich mit „Programmänderungen prüfen“ alte und neue Sendezeiten vergleichen. Bestätigen Sie die gewünschte Änderung. Bei einer verschobenen Erinnerung können Sie deren Abstand zum neuen Beginn beibehalten oder die übliche Vorlaufzeit verwenden. Das Kontrollkästchen aktiviert Hinweise nach Programmaktualisierungen.
+
 ## Nachholen {#catch-up}
 
 Sender, die ein Archiv führen, lassen Sie Sendungen ansehen, die schon gelaufen sind. Solche Sender haben Nachholen in ihrem Menü in der Senderliste. Es öffnet das Nachholen-Fenster des Senders, das seine vergangenen Sendungen mit Datum und Uhrzeit auflistet.
@@ -245,6 +247,8 @@ Wiedergabe > Aktuellen Untertitel vorlesen (C) liest den Untertitel auf dem Bild
 
 Wiedergabe > Untertitelzeitversatz (Strg+Umschalt+T) verschiebt Untertitel um höchstens zehn Minuten in beide Richtungen. Die Eingabe erfolgt in Millisekunden mit 500-ms-Schritten; positive Werte verzögern Anzeige und Vorlesen von Untertiteldateien. Zurücksetzen stellt null ein, Abbrechen behält den bisherigen Wert. Neue Medien setzen die Anpassung zurück. Wiedergabe- und Screenreader-Geschwindigkeit bleiben unverändert.
 
+Bei einer lokalen Aufnahme können Sie im Wiedergabemenü den gesamten Text einer geladenen Untertiteldatei oder eingebetteten Textspur durchsuchen. Geben Sie den Suchtext ein und springen Sie mit Eingabe zum ausgewählten Treffer. Die Wiedergabegeschwindigkeit lässt sich zwischen 0,75× und 2× einstellen. Mit „Normale Geschwindigkeit“ kehren Sie zu 1× zurück.
+
 ### Audioausgabegerät {#audio-output-device}
 
 Wiedergabe > Audioausgabegerät… (D) wählt die Lautsprecher oder Kopfhörer, die der Player benutzt, etwa um TV-Ton von Ihrem Screenreader fernzuhalten. Systemstandard folgt dem Windows-Standardgerät. Die Wahl wird gemerkt.
@@ -304,7 +308,7 @@ Alle Aufnahmeordner zeigt die eingerichteten Ordner gemeinsam. Filtern Sie nach 
 Aufnahmen > Aufnahmeformat wählt, wie Aufnahmen gespeichert werden:
 
 - Anbieterqualität (Kopie, MKV): der Stream genau wie ausgestrahlt, mit allen Audio- und Untertitel-Spuren. Behält alles, was der Anbieter sendet.
-- Anbieterqualität (Kopie, MP4): dasselbe Bild und derselbe Ton in einer MP4-Datei, die mehr Geräte abspielen, ohne Untertitel und Videotext.
+- MP4 kopiert das Originalvideo und kodiert alle Tonspuren mit einer Zielbitrate von je 192 kbit/s als AAC. Untertitel und Teletext entfallen. MKA übernimmt alle Tonspuren in ihrer Originalkodierung.
 - x264-Neucodierung (MKV oder MP4): eine kleinere, neu kodierte Datei. Braucht viel mehr Prozessorzeit.
 - Nur Audio (MP3 V0, FLAC, WAV, AAC M4A oder Opus): nur der Ton, nützlich für Radio.
 
@@ -327,6 +331,8 @@ Wenn eine neue Aufnahme eine andere geplante Aufnahme überschneidet, warnt Sie 
 Das Programm fragt vor dem Schließen nach, solange geplante Aufnahmen noch auf ihren Start warten, denn sie können nur starten, während das Programm läuft. Schließen Sie es trotzdem, starten die wartenden Aufnahmen nicht.
 
 Aufnahmekonflikte in Geplante Aufnahmen zeigt Überschneidungen des ausgewählten Eintrags einschließlich Vor- und Nachlauf. Die Details nennen Kanal, Kontoname und Aufnahmezeitraum. Zeiten bearbeiten öffnet den vorhandenen Editor. Die Konfliktbestätigung bietet diese Details und Trotzdem planen. Bei bekanntem Aufnahmebudget wird nur dasselbe Konto verglichen; andernfalls werden zeitliche Überschneidungen ohne behauptetes Anbieterlimit gezeigt.
+
+Im Kontextmenü der geplanten Aufnahmen können Sie eine Aufnahme- oder Serienregel für einen Zeitraum pausieren. Beide angegebenen Tage zählen mit. Danach wird bei der nächsten passenden Sendung wieder aufgenommen. Die Pause lässt sich vorzeitig aufheben. Mehrere ausgewählte künftige Aufnahmen können mit Vor- und Nachlauf in eine einzige .ics-Datei exportiert werden. Beim regulären Beenden fragt die Anwendung vor dem Stoppen einer Aufnahme nach und schließt die Dateien ab. Vor der Bestätigung werden der erste ausgesetzte und der nächste Aufnahmetermin nach der Pause angezeigt, sofern sie bekannt sind.
 
 ### Zeitpuffer für Aufnahmen {#schedule-padding}
 
@@ -459,3 +465,5 @@ Fragen, Fehlerberichte und Release-Neuigkeiten:
 - Fehlerberichte und Vorschläge auf Forgejo: https://git.serrebiradio.com/serrebi/Accessible-IPTV-Client/issues
 
 Hilfe > Über… zeigt die laufende Version und verlinkt beides. Bei einem Problem liefert Hilfe > Protokoll und Debug-Informationen kopieren die nötigen Einzelheiten.
+
+Kann der Browser den Bericht nicht öffnen, wählen Sie „Erneut versuchen“ oder kopieren Sie Titel und Beschreibung mit „Bericht kopieren“.

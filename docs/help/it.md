@@ -180,6 +180,8 @@ Visualizza EPG…, nel menu di un canale, elenca le trasmissioni di quel canale 
 - Il tasto applicazioni o Shift+F10 su una trasmissione offre Programma registrazione.
 - Escape chiude la finestra.
 
+Nei promemoria dei programmi, consultare le modifiche alla guida per confrontare l’orario precedente con quello nuovo e confermare il cambiamento. Per un avviso rinviato è possibile mantenere il rinvio rispetto al nuovo inizio o ripristinare il consueto anticipo. Selezionare la casella di notifica per ricevere avvisi dopo gli aggiornamenti della guida.
+
 ## Replay {#catch-up}
 
 I canali che tengono un archivio permettono di guardare trasmissioni già andate in onda. Questi canali hanno Replay nel loro menu nell'elenco dei canali. Apre la finestra di replay del canale, che elenca le trasmissioni passate con data e ora.
@@ -245,6 +247,8 @@ Riproduzione > Leggi il sottotitolo attuale (C) legge il sottotitolo sullo scher
 
 Riproduzione > Sincronizzazione sottotitoli (Ctrl+Maiusc+T) regola fino a dieci minuti in entrambe le direzioni, in millisecondi con incrementi di 500 ms. I valori positivi ritardano visualizzazione e lettura dei file di sottotitoli. Ripristina imposta zero; Annulla conserva il valore precedente. Un nuovo contenuto ripristina il valore iniziale. La velocità del contenuto e del lettore di schermo resta invariata.
 
+Durante la riproduzione di una registrazione locale, il menu di riproduzione permette di cercare parole nel file di sottotitoli caricato o nella traccia di testo incorporata. Selezionare un risultato e premere Invio per raggiungerlo. La velocità può variare da 0,75× a 2×. Selezionare la velocità normale per tornare a 1×.
+
 ### Dispositivo di uscita audio {#audio-output-device}
 
 Riproduzione > Dispositivo di uscita audio… (D) sceglie gli altoparlanti o le cuffie che il lettore usa, per esempio per tenere lontano il suono della TV dal proprio lettore di schermo. Predefinito di sistema segue il dispositivo predefinito di Windows. La scelta è ricordata.
@@ -304,7 +308,7 @@ Tutte le cartelle delle registrazioni riunisce le cartelle configurate. Filtra p
 Registrazioni > Formato di registrazione sceglie come sono salvate le registrazioni:
 
 - Qualità del provider (copia, MKV): il flusso esattamente come trasmesso, con tutte le tracce audio e dei sottotitoli. Tutto ciò che il provider manda viene mantenuto.
-- Qualità del provider (copia, MP4): la stessa immagine e suono in un file MP4, che più dispositivi riproducono, senza sottotitoli e teletext.
+- Il formato MP4 copia il video originale e codifica tutte le tracce audio in AAC con un bitrate obiettivo di 192 kbit/s per traccia. I sottotitoli e il televideo sono esclusi. Il formato MKA conserva tutte le tracce audio nella codifica originale.
 - Ricodifica x264 (MKV o MP4): un file ricodificato più piccolo. Usa molto più tempo di processore.
 - Solo audio (MP3 V0, FLAC, WAV, AAC M4A o Opus): solo il suono, utile per la radio.
 
@@ -327,6 +331,8 @@ Quando una nuova registrazione si sovrappone ad un'altra registrazione programma
 Il programma chiede conferma prima di chiudersi se ci sono registrazioni programmate ancora in attesa di iniziare, perché possono iniziare solo mentre il programma è aperto. Se lo chiudi comunque, le registrazioni in attesa non partiranno.
 
 Conflitti di registrazione, in Registrazioni programmate, elenca le sovrapposizioni dell’elemento selezionato, inclusi i margini. I dettagli indicano canale, alias dell’account e intervallo effettivo. Modifica orari apre l’editor esistente. La conferma offre questi dettagli e Programma comunque. Un limite noto confronta solo lo stesso account; altrimenti mostra sovrapposizioni temporali senza presumere un limite del fornitore.
+
+Nel menu contestuale delle registrazioni programmate è possibile sospendere una regola ricorrente o una serie tra due date, entrambe incluse. La registrazione riprende dalla trasmissione successiva prevista. La sospensione si può rimuovere in anticipo. Selezionare più registrazioni future per esportarle in un unico file .ics con i rispettivi margini. All’uscita l’applicazione chiede conferma prima di interrompere una registrazione in corso e completa la scrittura dei file. Prima della conferma vengono mostrati, se disponibili, gli orari della prima registrazione che verrà saltata e della prima dopo la pausa.
 
 ### Margine di programmazione {#schedule-padding}
 
@@ -459,3 +465,5 @@ Domande, segnalazioni di errori e notizie delle versioni:
 - Segnalazioni di errori e suggerimenti su Forgejo: https://git.serrebiradio.com/serrebi/Accessible-IPTV-Client/issues
 
 Aiuto > Informazioni… mostra la versione in uso e collega entrambi. Quando si segnala un problema, Aiuto > Copia registro e informazioni di debug dà i dettagli necessari per trovarlo.
+
+Se il browser non apre la segnalazione, riprovare o scegliere «Copia segnalazione» per copiare il titolo e la descrizione.

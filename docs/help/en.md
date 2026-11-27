@@ -203,6 +203,8 @@ A programme reminder offers Remind Again in 5 Minutes and, before the start, Rem
 
 Export to Calendar on a programme’s context menu, or a selected reminder, saves an .ics file for import into a calendar. It includes title, channel and UTC start/end times, so the calendar can display its own local time. It does not create a recording, start playback or schedule a computer wake.
 
+In Programme Reminders, choose **Review Guide Changes** to compare the original and revised times on the same channel. Select a change and confirm it to keep your usual lead time. For a postponed alert you can keep its offset from the new start or return to the usual lead time. Enable the notification checkbox to hear about changes after guide updates.
+
 ### Channel guide (View EPG) {#channel-epg}
 
 View EPG, on a channel's menu, lists that channel's programmes from the one on air now to as far as the guide goes. The programme on air now comes first.
@@ -284,6 +286,8 @@ Playback > Read Current Subtitle (C) reads the subtitle on screen, or the last o
 
 Playback > Subtitle Timing (Ctrl+Shift+T) adjusts subtitle delay by up to ten minutes in either direction, in milliseconds. The control steps by 500 ms; a positive value delays both display and built-in file-subtitle speech. Reset Timing sets zero; Cancel preserves the previous value. New media resets the adjustment; this does not change media or screen-reader speed.
 
+During local recording playback, choose **Find Text in Recording Subtitles** in the Playback menu. Load a text subtitle file or select an embedded text track, enter a word or phrase, choose a result and press Enter to jump there. **Recording Playback Speed** changes the recording’s speed from 0.75× to 2×. Choose **Normal speed** to return to 1×.
+
 ### Audio output device {#audio-output-device}
 
 In the player window, open Playback > Audio Output Device to choose where the built-in player sends its sound, for example to keep TV sound away from your screen reader. The list starts with System default, followed by the output devices libVLC reports. Your choice is remembered and applied every time playback starts; System default leaves the choice to the operating system. The list comes from libVLC, so it is available when the libVLC engine is in use.
@@ -351,7 +355,7 @@ Recording Library > Add to Playback Queue adds the selected recordings to a sess
 Recordings > Recording Format chooses how recordings are saved:
 
 - Provider quality (copy, MKV): the stream exactly as broadcast, with every audio and subtitle track. Keeps everything the provider sends.
-- Provider quality (copy, MP4): the same picture and sound in an MP4 file, which more devices play, without subtitles and teletext.
+- MP4 (original video, AAC audio) copies the video and encodes all audio tracks as AAC at a target of 192 kbit/s. Subtitles and teletext are omitted. MKA copies all audio tracks in their original encoding.
 - x264 re-encode (MKV or MP4): a smaller re-encoded file. Uses much more processor time.
 - Audio only (MP3 V0, FLAC, WAV, AAC M4A or Opus): the sound only, useful for radio.
 
@@ -382,6 +386,8 @@ Wake for Scheduled Recordings (Windows) is off by default. When enabled, it requ
 Recording Conflicts in Scheduled Recordings lists overlaps for one selected entry, including padding. Details include the channel, configured account alias and actual recording window. Edit Times opens the existing timing editor. A conflict confirmation also offers these details and Schedule Anyway. Known account budgets restrict the comparison to that account; unknown budgets show time overlaps without claiming a provider limit.
 
 Recordings > Recording Connection Limits sets the connections available to recordings for each provider account: 1–64, or 0 for no additional limit. Allow for playback and other devices; this setting does not discover the provider's actual limit. Scheduling checks the peak number of simultaneous recording connections for the same known account. Exceeding its budget requires confirmation; without a known budget, overlapping schedules receive the usual warning. A new recording is refused when its budget is full; existing recordings continue. A recording using the player's local buffer does not count as another provider connection. Existing single-stream protections still apply.
+
+In Scheduled Recordings, open an item’s context menu and choose **Pause Recording Rule**. The first and last dates are both included. Recording resumes with the next eligible broadcast. Reopen the rule to remove the pause. To export several upcoming bookings, select them and choose **Export Selected Recordings to Calendar**. The single .ics file includes the recording margins. On normal exit, the app asks before stopping an active recording and finishes writing the files before closing. Before confirming, you can review the first skipped recording and the first one after the pause, when their times are known.
 
 ### Schedule padding {#schedule-padding}
 
@@ -528,3 +534,5 @@ Questions, bug reports and release news:
 - Bug reports and suggestions on Forgejo: https://git.serrebiradio.com/serrebi/Accessible-IPTV-Client/issues
 
 Help > About shows the version you are running and links to both. When you report a problem, Help > Copy Log and Debug Information gives the details needed to track it down.
+
+If the browser cannot open an issue report, choose **Try Again** or **Copy Report** to keep the title and description.

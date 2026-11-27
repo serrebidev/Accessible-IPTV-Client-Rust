@@ -4118,7 +4118,7 @@ msgstr "Előfizetés"
 
 #: main.py:7947
 msgid "Subtitle Capabilities"
-msgstr "A feliratkezelés támogatottsága"
+msgstr "Feliratfelolvasás támogatása"
 
 #: client_ui.py:443 main.py:7786 main.py:7857 main.py:7893 main.py:7897
 #: main.py:7901
@@ -4131,7 +4131,7 @@ msgstr "Felirat időzítése…"
 
 #: client_ui.py:441
 msgid "Subtitle capabilities..."
-msgstr "A feliratkezelés támogatottsága…"
+msgstr "Feliratfelolvasás támogatása…"
 
 #: media_navigation_ui.py:87
 msgid ""
@@ -4263,13 +4263,7 @@ msgid ""
 "Recording Format and try again.\n"
 "\n"
 "{detail}"
-msgstr ""
-"A hangsáv MKA-konténerbe másolása sikertelen volt, ezért a program nem "
-"készített felvételt, és átkódolást sem végzett. Válasszon másik "
-"hangformátumot a Felvételek > Rögzítési formátum menüben, majd próbálja meg "
-"újra.\n"
-"\n"
-"{detail}"
+msgstr "A hangadatokat nem sikerült MKA-konténerbe másolni, ezért nem készült felvétel, és újrakódolás sem történt. Válasszon másik hangformátumot a Felvételek > Rögzítési formátum menüben, majd próbálja meg újra.\n\n{detail}"
 
 #: named_bookmarks.py:64
 msgid "The bookmark is no longer available. Reopen the list."
@@ -4333,9 +4327,7 @@ msgstr "Időtúllépés történt a szolgáltatóhoz való kapcsolódás közben
 
 #: manual_schedule.py:49
 msgid "The end must be in the future and after the start, within seven days."
-msgstr ""
-"A befejezésnek a kezdésnél és a jelenlegi időpontnál is későbbinek kell "
-"lennie. A felvétel időtartama legfeljebb hét nap lehet."
+msgstr "A felvétel befejezéséhez olyan jövőbeli időpontot adjon meg, amely a kezdést követi. A rögzítés időtartama legfeljebb hét nap lehet."
 
 #: personal_tools_ui.py:156
 msgid "The first recording must start on a selected weekday."
@@ -4366,9 +4358,7 @@ msgstr "A telepítő 15 perc után is még futott."
 msgid ""
 "The language has been changed. Please restart Accessible IPTV Client for the "
 "change to take full effect."
-msgstr ""
-"A program nyelve megváltozott. A módosítás teljes érvénybe lépéséhez indítsa "
-"újra az Accessible IPTV Client alkalmazást."
+msgstr "A program nyelve megváltozott. Ahhoz, hogy minden felületi elem az új nyelven jelenjen meg, indítsa újra az Accessible IPTV Client alkalmazást."
 
 #: recording_library_ui.py:207
 msgid "The library can contain up to 20 folders."
@@ -5489,7 +5479,7 @@ msgid "Describe what you did, what happened, and what you expected.\nYour browse
 msgstr "Írja le, mit csinált, mi történt, és mire számított.\nEzután a böngésző megnyitja a GitHubot kitöltve. Jelentkezzen be, és nyomja meg a „Create” gombot."
 
 msgid "Finishing recordings before exit…"
-msgstr "Kilépés előtt a program lezárja a felvételeket…"
+msgstr "Felvételfájlok lezárása kilépés előtt…"
 
 msgid "Try Again"
 msgstr "Újrapróbálkozás"
@@ -5528,7 +5518,7 @@ msgid "The playback speed could not be changed."
 msgstr "Nem sikerült módosítani a lejátszási sebességet."
 
 msgid "Load a text subtitle file or select an embedded text track first."
-msgstr "A kereséshez szöveges felirat szükséges. Töltsön be egy külső fájlt, vagy válasszon sávot a „Beágyazott feliratsáv felolvasása…” paranccsal."
+msgstr "A kereséshez töltsön be szöveges feliratfájlt, vagy válasszon beágyazott szöveges feliratsávot. Az utóbbihoz használja a „Beágyazott feliratsáv felolvasása…” parancsot."
 
 msgid "No matching subtitles."
 msgstr "A feliratban nincs találat."
@@ -5537,13 +5527,13 @@ msgid "Reminder times have changed. Open Programme Reminders and choose Review G
 msgstr "Változhatott az értesítésre kijelölt műsorok adásideje. Az „Értesítések műsorkezdés előtt” ablakban válassza az „Időpontváltozások áttekintése…” gombot."
 
 msgid "No changes were found to upcoming reminder times."
-msgstr "A program nem talált időpontváltozást az értesítésre kijelölt műsoroknál."
+msgstr "A program nem talált változást az értesítésre kijelölt műsorok adásidejében."
 
 msgid "Use the new time for this reminder?"
 msgstr "Az új adásidőhöz igazítja az értesítést?"
 
 msgid "Keep the postponement relative to the new start time? Choose No to use the usual lead time."
-msgstr "Az elhalasztott értesítés időpontja is ugyanannyival változzon, mint a műsor kezdete? Ha a Nem gombot választja, ismét az eredeti értesítési beállítás lesz érvényben."
+msgstr "Az elhalasztott értesítés időpontja is annyival tolódjon el, amennyivel a műsor kezdete? Ha a Nem gombot választja, a műsor kezdete előtt az eredetileg megadott számú perccel kap értesítést."
 
 msgid "{title}, {channel}. Previous: {old}. New: {new}."
 msgstr "{title} ({channel}). Korábbi adásidő: {old}. Új adásidő: {new}."
@@ -5567,25 +5557,34 @@ msgid "Remove the pause"
 msgstr "Szüneteltetés megszüntetése"
 
 msgid "Choose a valid pause ending today or later."
-msgstr "Ellenőrizze a szünet dátumait. A zárónap nem előzheti meg sem a kezdőnapot, sem a mai napot."
+msgstr "A szünet utolsó napja nem előzheti meg sem az elsőt, sem a mai napot."
 
 msgid "Pause from {first} through {last}, inclusive?"
-msgstr "Szünetelteti a kijelölt felvételi szabályt {first} és {last} között, a két határnapot is beleértve?"
+msgstr "Szünetelteti a kijelölt felvételi szabályt {first} és {last} között, mindkét napot beleértve?"
 
 msgid "First skipped recording: {time}"
 msgstr "Az első kimaradó felvétel időpontja: {time}"
 
 msgid "Next recording after the pause: {time}"
-msgstr "A szünet utáni első felvétel: {time}"
+msgstr "A szünet utáni első felvétel időpontja: {time}"
 
 msgid "Connecting to {channel}…"
 msgstr "Kapcsolódás a csatornához: {channel}…"
 
 msgid "Enter a valid start date and an end date on or after it."
-msgstr "Adjon meg érvényes dátumokat. A zárónap nem előzheti meg a kezdőnapot."
+msgstr "Adjon meg érvényes dátumokat. A szünet utolsó napja nem előzheti meg az elsőt."
 
 msgid "Select upcoming recordings outside the pause period."
-msgstr "Olyan közelgő felvételeket jelöljön ki, amelyek nem esnek a szünet idejére."
+msgstr "Olyan ütemezett felvételeket jelöljön ki, amelyek még nem kezdődtek el, és nem esnek a szüneteltetés időszakára."
 
 msgid "Stopped because the app exited."
 msgstr "A rögzítés az alkalmazás bezárása miatt állt le."
+
+msgid "No local network address is available for casting. Reconnect and try again."
+msgstr "Az átküldéshez nincs elérhető helyi hálózati cím. Csatlakozzon újra a hálózathoz, majd próbálkozzon ismét."
+
+msgid "The application is closing."
+msgstr "Az alkalmazás bezárása folyamatban van."
+
+msgid "The postponed alert falls outside the new time window."
+msgstr "A halasztás csak akkor tartható meg, ha az értesítés új időpontja még nem érkezett el, és megelőzi a műsor befejezését."

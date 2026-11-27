@@ -180,6 +180,8 @@ Exibir EPG…, no menu de um canal, lista os programas daquele canal do que est�
 - A tecla de menu de aplicativo ou Shift+F10 sobre um programa oferece Agendar gravação.
 - Escape fecha a janela.
 
+Nos lembretes de programas, consulte as alterações do guia para comparar os horários antigo e novo. Confirme a mudança desejada. Se adiou o alerta, você pode manter o adiamento em relação ao novo início ou usar a antecedência habitual. Marque a opção de notificação para receber avisos após as atualizações do guia.
+
 ## Replay {#catch-up}
 
 Canais que guardam um arquivo permitem assistir programas que já foram transmitidos. Esses canais têm Replay no menu deles na lista de canais. Ele abre a janela de replay do canal, listando os programas passados com data e hora.
@@ -245,6 +247,8 @@ Reprodução > Ler a legenda atual (C) lê a legenda que está na tela, ou a úl
 
 Reprodução > Sincronização das legendas (Ctrl+Shift+T) ajusta até dez minutos em cada direção, em milissegundos e passos de 500 ms. Valores positivos atrasam a exibição e a leitura de arquivos de legendas. Redefinir define zero; Cancelar mantém o valor anterior. Uma nova mídia restaura o ajuste inicial. A velocidade da mídia e do leitor de tela não muda.
 
+Durante a reprodução de uma gravação local, use o menu de reprodução para buscar palavras no arquivo de legendas carregado ou em uma faixa de texto incorporada. Selecione um resultado e pressione Enter para ir até ele. A velocidade pode variar de 0,75× a 2×. Escolha a velocidade normal para voltar a 1×.
+
 ### Dispositivo de saída de áudio {#audio-output-device}
 
 Reprodução > Dispositivo de saída de áudio… (D) escolhe os alto-falantes ou fones que o reprodutor usa, por exemplo para manter o som da TV longe do seu leitor de tela. Predefinido do sistema segue o dispositivo predefinido do Windows. A escolha é lembrada.
@@ -304,7 +308,7 @@ Todas as pastas de gravações reúne as pastas configuradas. Filtre por estado 
 Gravações > Formato de gravação escolhe como as gravações são salvas:
 
 - Qualidade do provedor (cópia, MKV): o fluxo exatamente como transmitido, com todas as faixas de áudio e legendas. Mantém tudo que o provedor envia.
-- Qualidade do provedor (cópia, MP4): a mesma imagem e som em um arquivo MP4, que mais dispositivos reproduzem, sem legendas e teletexto.
+- O formato MP4 copia o vídeo original e codifica todas as faixas de áudio em AAC, com taxa-alvo de 192 kbit/s por faixa. Legendas e teletexto ficam de fora. O formato MKA preserva todas as faixas de áudio com a codificação original.
 - Recodificação x264 (MKV ou MP4): um arquivo recodificado menor. Usa muito mais tempo de processador.
 - Somente áudio (MP3 V0, FLAC, WAV, AAC M4A ou Opus): só o som, útil para rádio.
 
@@ -327,6 +331,8 @@ Quando uma nova gravação se sobrepõe a outra gravação agendada, o programa 
 O programa pergunta antes de fechar se ainda houver gravações agendadas esperando para começar, porque elas só começam com o programa aberto. Se você fechá-lo mesmo assim, essas gravações não vão começar.
 
 Conflitos de gravação, em Gravações agendadas, lista as sobreposições da entrada selecionada, incluindo as margens. Os detalhes mostram canal, apelido da conta e intervalo real. Editar horários abre o editor existente. A confirmação oferece esses detalhes e Agendar mesmo assim. Um limite conhecido compara apenas a mesma conta; sem ele, as sobreposições não representam necessariamente um limite do provedor.
+
+No menu de contexto das gravações agendadas, você pode pausar uma regra recorrente ou de série entre duas datas, incluindo ambas. A gravação será retomada na próxima transmissão prevista. É possível remover a pausa antes disso. Selecione várias gravações futuras para exportá-las, com as margens de gravação, para um único arquivo .ics. Ao sair, o aplicativo pede confirmação antes de interromper uma gravação em andamento e conclui a gravação dos arquivos. Antes de confirmar, pode consultar os horários da primeira gravação que será ignorada e da primeira após a pausa, caso já sejam conhecidos.
 
 ### Margem de agendamento {#schedule-padding}
 
@@ -459,3 +465,5 @@ Perguntas, relatórios de erro e notícias de versões:
 - Relatórios de erro e sugestões no Forgejo: https://git.serrebiradio.com/serrebi/Accessible-IPTV-Client/issues
 
 Ajuda > Sobre… mostra a versão em uso e linka ambos. Ao relatar um problema, Ajuda > Copiar registo e informações de depuração dá os detalhes necessários para rastreá-lo.
+
+Se o navegador não abrir o relato, tente novamente ou use a opção de copiar o relato para preservar o título e a descrição.

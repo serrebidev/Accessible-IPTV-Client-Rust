@@ -180,6 +180,8 @@ Pokaż EPG..., w menu kanału, wypisuje audycje tego kanału od nadawanej teraz 
 - Klawisz aplikacji albo Shift+F10 na audycji oferuje Zaplanuj nagrywanie.
 - Escape zamyka okno.
 
+W przypomnieniach o audycjach otwórz przegląd zmian w programie telewizyjnym. Porównaj wcześniejszą i nową godzinę i potwierdź zmianę. Jeśli powiadomienie zostało odroczone, możesz zachować odstęp względem nowej godziny rozpoczęcia lub przywrócić zwykłe wyprzedzenie. Zaznacz pole powiadomień, aby otrzymywać takie informacje po aktualizacji programu.
+
 ## Powtórki {#catch-up}
 
 Kanały, które trzymają archiwum, pozwalają oglądać audycje już nadane. Takie kanały mają Powtórki w swoim menu na liście kanałów. Otwiera okno powtórek kanału, wypisujące jego dawne audycje z datą i godziną.
@@ -245,6 +247,8 @@ Odtwarzanie > Odczytaj bieżący napis (C) odczytuje napis widoczny na ekranie a
 
 Odtwarzanie > Synchronizacja napisów (Ctrl+Shift+T) ustawia przesunięcie do dziesięciu minut w każdą stronę, w milisekundach z krokiem 500 ms. Wartości dodatnie opóźniają wyświetlanie i odczyt napisów z pliku. Reset ustawia zero; Anuluj zachowuje poprzednią wartość. Nowy materiał resetuje ustawienie. Prędkość materiału i czytnika ekranu pozostaje bez zmian.
 
+Podczas odtwarzania lokalnego nagrania menu odtwarzania umożliwia wyszukanie tekstu we wczytanym pliku napisów lub na osadzonej ścieżce tekstowej. Wybierz wynik i naciśnij Enter, aby przejść do tego miejsca. Możesz zmieniać prędkość od 0,75× do 2×. Wybierz normalną prędkość, aby wrócić do 1×.
+
 ### Urządzenie wyjścia audio {#audio-output-device}
 
 Odtwarzanie > Urządzenie wyjścia audio... (D) wybiera głośniki albo słuchawki, których używa odtwarzacz, na przykład aby odsunąć dźwięk telewizji od czytnika ekranu. Domyślne systemu podąża za domyślnym urządzeniem Windows. Wybór jest zapamiętywany.
@@ -304,7 +308,7 @@ Wszystkie foldery nagrań łączy skonfigurowane foldery. Filtruj według stanu 
 Nagrania > Format nagrywania wybiera, jak nagrania są zapisywane:
 
 - Jakość dostawcy (kopia, MKV): strumień dokładnie taki, jak nadany, ze wszystkimi ścieżkami audio i napisów. Zachowuje wszystko, co dostawca wysyła.
-- Jakość dostawcy (kopia, MP4): ten sam obraz i dźwięk w pliku MP4, który odtwarza więcej urządzeń, bez napisów i teletekstu.
+- MP4 kopiuje oryginalny obraz i koduje wszystkie ścieżki audio do AAC z docelową przepływnością 192 kbit/s na ścieżkę. Pomija napisy i teletekst. MKA zachowuje wszystkie ścieżki audio w oryginalnym kodowaniu.
 - Ponowne kodowanie x264 (MKV albo MP4): mniejszy, ponownie zakodowany plik. Zużywa znacznie więcej czasu procesora.
 - Tylko dźwięk (MP3 V0, FLAC, WAV, AAC M4A albo Opus): tylko dźwięk, przydatne dla radia.
 
@@ -327,6 +331,8 @@ Gdy nowe nagranie nakłada się na inne zaplanowane nagranie, program ostrzega p
 Program pyta przed zamknięciem, jeśli zaplanowane nagrania wciąż czekają na start, bo mogą się zacząć tylko wtedy, gdy program działa. Jeśli mimo to go zamkniesz, oczekujące nagrania się nie zaczną.
 
 Konflikty nagrań w Zaplanowanych nagraniach pokazują nakładanie się wybranego wpisu, uwzględniając zapas czasu. Szczegóły obejmują kanał, nazwę konta i rzeczywisty przedział. Edytuj godziny otwiera istniejący edytor. Potwierdzenie oferuje te szczegóły i Zaplanuj mimo to. Znany limit zawęża porównanie do tego samego konta; inaczej są to tylko nakładające się terminy, bez założenia limitu dostawcy.
+
+W menu kontekstowym zaplanowanych nagrań możesz wstrzymać regułę cykliczną lub nagrywanie serialu na okres obejmujący obie wskazane daty. Nagrywanie zostanie wznowione od następnej pasującej emisji. Przerwę można zakończyć wcześniej. Zaznacz kilka nadchodzących nagrań, aby wyeksportować je do jednego pliku .ics z uwzględnieniem dodatkowego czasu przed audycją i po niej. Przy zamykaniu aplikacja pyta o potwierdzenie zatrzymania trwającego nagrania i kończy zapis plików. Przed zatwierdzeniem można sprawdzić termin pierwszego pominiętego nagrania i pierwszego nagrania po przerwie, o ile są już znane.
 
 ### Margines nagrywania {#schedule-padding}
 
@@ -459,3 +465,5 @@ Pytania, zgłoszenia błędów i nowości o wydaniach:
 - Zgłoszenia błędów i sugestie na Forgejo: https://git.serrebiradio.com/serrebi/Accessible-IPTV-Client/issues
 
 Pomoc > O programie... pokazuje używaną wersję i linkuje obie. Przy zgłaszaniu problemu Pomoc > Kopiuj dziennik i informacje diagnostyczne daje szczegóły potrzebne do namierzenia go.
+
+Jeśli przeglądarka nie otworzy zgłoszenia, spróbuj ponownie lub skopiuj tytuł i opis przyciskiem „Kopiuj zgłoszenie”.
