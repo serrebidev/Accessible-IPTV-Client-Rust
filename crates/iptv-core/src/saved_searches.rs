@@ -242,6 +242,7 @@ pub struct RuleResult {
 ///
 /// # Errors
 /// Returns the store error text when the guide cannot be read.
+#[allow(clippy::too_many_lines)] // indexing, matching and row building in one pass
 pub fn scan(
     store: &EpgStore,
     rules: &[Rule],

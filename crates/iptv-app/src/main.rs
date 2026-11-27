@@ -1863,7 +1863,7 @@ fn bind_main_close(frame: Frame, wiring: &Wiring, status: Status) {
 /// application voice, player timers and the engine come
 /// down. Runs inline when no recording was active (the
 /// close event then destroys the frame), and from
-/// poll_recordings once a deferred exit's recordings have
+/// `poll_recordings` once a deferred exit's recordings have
 /// drained (which destroys the frame itself).
 fn exit_tail(wiring: &Wiring) {
     // C3: exit removes the wake timer and the
@@ -11807,6 +11807,7 @@ fn deliver_vlc_load(player: &Rc<RefCell<PlayerState>>, persist: &Persist, status
     }
 }
 #[allow(clippy::too_many_lines)]
+#[allow(clippy::float_cmp)] // the rate only ever holds one of the chooser's exact constants
 fn play_builtin(
     player: &Rc<RefCell<PlayerState>>,
     persist: &Persist,
@@ -17545,6 +17546,7 @@ fn local_recording_context(player: &Rc<RefCell<PlayerState>>) -> Option<(u64, bo
 
 /// PR #44: apply a recording playback rate through the VLC
 /// engine; the stored rate follows only on success.
+#[allow(clippy::cast_possible_truncation)] // libVLC takes f32; the rates are small constants
 fn apply_recording_speed(
     player: &Rc<RefCell<PlayerState>>,
     persist: &Persist,
@@ -17574,12 +17576,14 @@ fn apply_recording_speed(
 
 /// Playback > Recording Playback Speed... (PR #44, Python's
 /// `_choose_recording_speed`).
+#[allow(clippy::float_cmp)] // the rates are exact chooser constants
 fn prompt_recording_speed(
     player: &Rc<RefCell<PlayerState>>,
     frame: Frame,
     persist: &Persist,
     status: Status,
 ) {
+    const RATES: [f64; 5] = [0.75, 1.0, 1.25, 1.5, 2.0];
     let Some((generation, seekable)) = local_recording_context(player) else {
         player_status(status, persist, "Open a seekable local recording first.", 2);
         return;
@@ -17588,7 +17592,6 @@ fn prompt_recording_speed(
         player_status(status, persist, "Open a seekable local recording first.", 2);
         return;
     }
-    const RATES: [f64; 5] = [0.75, 1.0, 1.25, 1.5, 2.0];
     let current = player.borrow().local_playback_rate;
     let mut labels: Vec<String> = RATES.iter().map(|rate| format!("{rate}×")).collect();
     labels[1] = tr("Normal speed");
@@ -17632,6 +17635,7 @@ fn restore_normal_speed(player: &Rc<RefCell<PlayerState>>, persist: &Persist, st
 /// Playback > Find Text in Recording Subtitles... (PR #44,
 /// Python's `_find_subtitle_text`): search the loaded cues
 /// and seek to the chosen match.
+#[allow(clippy::too_many_lines)] // one dialog flow, as in Python
 fn prompt_subtitle_find(
     player: &Rc<RefCell<PlayerState>>,
     frame: Frame,
@@ -17714,7 +17718,10 @@ fn prompt_subtitle_find(
     list.on_item_activated(move |_| {
         let index = list.get_first_selected_item();
         if index >= 0 {
-            if let Some(cue) = matches_pick.get(index as usize) {
+            if let Some(cue) = usize::try_from(index)
+                .ok()
+                .and_then(|i| matches_pick.get(i))
+            {
                 *chosen_pick.borrow_mut() = Some(cue.start);
             }
         }
@@ -17725,7 +17732,7 @@ fn prompt_subtitle_find(
     ok.on_click(move |_| {
         let index = list.get_first_selected_item();
         if index >= 0 {
-            if let Some(cue) = matches_ok.get(index as usize) {
+            if let Some(cue) = usize::try_from(index).ok().and_then(|i| matches_ok.get(i)) {
                 *chosen_ok.borrow_mut() = Some(cue.start);
             }
         }
@@ -20955,8 +20962,7 @@ fn library_scan(
     let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
     for dir in &scope {
         let resolved = std::fs::canonicalize(dir)
-            .map(|path| path.to_string_lossy().into_owned())
-            .unwrap_or_else(|_| dir.clone());
+            .map_or_else(|_| dir.clone(), |path| path.to_string_lossy().into_owned());
         if !visited.insert(resolved.to_lowercase()) {
             continue;
         }
@@ -21222,10 +21228,7 @@ fn library_refresh(wiring: &Wiring, ui: &Rc<RefCell<LibraryUi>>, controls: &Libr
             None => true,
             Some(dir) => known.contains(dir),
         });
-        guard
-            .scan_tasks
-            .entry(key.clone())
-            .or_insert_with(iptv_core::background::LatestTask::new);
+        guard.scan_tasks.entry(key.clone()).or_default();
         (
             key,
             known,
@@ -24530,11 +24533,6 @@ fn export_reminder_calendar(frame: Frame, reminder: &Reminder) {
     dialog.show_modal_tracked();
 }
 
-/// The Reminders dialog (audit R13): rows carry time, title,
-/// channel, delivery status and lead; the lead is editable,
-/// and Clear All / Refresh / Open Channel are offered like
-/// Python's. Selection survives a refresh by reminder id.
-#[allow(clippy::too_many_lines)] // R13 dialog: lead editing, clear-all, status column
 /// Programme Reminders > Review Guide Changes... (PR #44,
 /// Python's `review_reminder_guide_changes`); with
 /// `notify_only`, the after-import notice instead. `after`
@@ -24746,6 +24744,11 @@ fn review_reminder_guide_changes(
     );
 }
 
+/// The Reminders dialog (audit R13): rows carry time, title,
+/// channel, delivery status and lead; the lead is editable,
+/// and Clear All / Refresh / Open Channel are offered like
+/// Python's. Selection survives a refresh by reminder id.
+#[allow(clippy::too_many_lines)] // R13 dialog: lead editing, clear-all, status column
 fn open_reminders_dialog(wiring: &Wiring, main_status: Status) {
     let (frame, panel, list, dstatus) = list_dialog("Reminders", "Reminders");
     let render = |wiring: &Wiring, list: ListBox, dstatus: Status| {
@@ -26807,6 +26810,7 @@ fn export_selected_recordings(wiring: &Wiring, frame: Frame, list: ListCtrl, dst
 /// `planning_tools_ui.pause_rule`): two date pickers and a
 /// remove option; a new pause is confirmed with the first
 /// skipped and next following recording times before it saves.
+#[allow(clippy::too_many_lines)] // one dialog flow, as in Python
 fn pause_recording_rule(wiring: &Wiring, frame: Frame, list: ListCtrl, dstatus: Status) {
     let title = tr("Pause Recording Rule...");
     let Some(job) = selected_single_job(wiring, list) else {

@@ -461,6 +461,7 @@ pub fn valid_pause_period(period: &[String; 2]) -> bool {
 /// record start shifted back by the pre-padding (Python
 /// `paused_occurrence`'s `programme_start`).
 #[must_use]
+#[allow(clippy::cast_possible_truncation)] // epoch seconds; the floor cast is Python's int() equivalent
 pub fn programme_local_start(
     start_ts: f64,
     pre_padding_minutes: i64,
@@ -1444,6 +1445,7 @@ impl DvrSchedule {
         keyed.into_iter().map(|k| k.2).collect()
     }
 
+    #[allow(clippy::too_many_lines)] // the pause branch is woven through the due-job flow
     pub fn tick_gated(
         &mut self,
         now: f64,
@@ -1706,6 +1708,7 @@ impl DvrSchedule {
     /// # Errors
     /// Returns Python's messages for an invalid period, a stale
     /// snapshot or an unpausable rule, and write errors.
+    #[allow(clippy::needless_pass_by_value)] // the period is stored on the rule and its episodes
     pub fn set_pause_period(
         &mut self,
         snapshot: &DvrJob,
@@ -1736,7 +1739,7 @@ impl DvrSchedule {
                     && row.series_source.as_deref() == Some(rule_id.as_str())
                     && row.status == STATUS_SCHEDULED;
                 if row.id == rule_id || is_episode {
-                    row.pause_dates = period.clone();
+                    row.pause_dates.clone_from(&period);
                 }
             }
             Ok(())

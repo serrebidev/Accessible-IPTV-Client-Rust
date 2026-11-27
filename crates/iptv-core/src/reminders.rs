@@ -812,7 +812,7 @@ pub fn retime_reminder(
         }
     }
     let row = &mut rows[index];
-    row.id = key.clone();
+    row.id.clone_from(&key);
     row.start = start;
     row.end = end;
     if !programme.channel_id.is_empty() {
@@ -883,14 +883,16 @@ pub fn guide_changes(
         let Some(channel) = find_channel_for_reminder(row, candidates) else {
             continue;
         };
-        let mut job = crate::dvr::DvrJob::default();
-        job.id = row.id.clone();
-        job.title = row.title.clone();
-        job.status = crate::dvr::STATUS_SCHEDULED.to_string();
         #[allow(clippy::cast_precision_loss)] // whole seconds; Python's are floats too
         let start_ts = row.start as f64;
-        job.start_ts = start_ts;
-        job.channel = crate::dvr::channel_snapshot(&channel);
+        let mut job = crate::dvr::DvrJob {
+            id: row.id.clone(),
+            title: row.title.clone(),
+            status: crate::dvr::STATUS_SCHEDULED.to_string(),
+            start_ts,
+            channel: crate::dvr::channel_snapshot(channel),
+            ..crate::dvr::DvrJob::default()
+        };
         job.program = serde_json::json!({
             "title": row.title,
             "start": stamp(row.start),

@@ -109,7 +109,7 @@ fn strip_markup(text: &str) -> String {
         match rest.find(closer) {
             Some(end) => {
                 parts.push(text[offset..start].to_string());
-                if closer == '>' && is_br_tag(&text[start..scan + end + 1]) {
+                if closer == '>' && is_br_tag(&text[start..=scan + end]) {
                     // Python: a line break becomes a space, not nothing.
                     parts.push(" ".to_string());
                 }

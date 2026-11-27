@@ -152,8 +152,10 @@ new strings were already in the Rust catalogues.
 
 ## Gate
 
-fmt --check, clippy --locked -D warnings, cargo test --locked
-(workspace), playlist parity against the pinned Python tree,
-git diff --check — see the PR for the recorded results.
+fmt --check clean; clippy --locked --workspace --all-targets
+-D warnings clean; cargo test --locked --workspace: 555 passed,
+0 failed (iptv-core 510, iptv-app 25, iptv-vlc 9, the rest
+small suites); playlist parity PASS against the pinned Python
+tree (a29ad9a3, v1.151.6); git diff --check clean.
 Brandon's NVDA pass over the new dialogs and flows is the
 acceptance check, as usual.

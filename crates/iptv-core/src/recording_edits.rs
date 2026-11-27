@@ -328,6 +328,7 @@ pub type GuideChange = (DvrJob, Programme, bool);
 ///
 /// # Errors
 /// Returns the store's error text.
+#[allow(clippy::too_many_lines)] // one pass over jobs, guide rows and fingerprints
 pub fn changed_guide_times(
     store: &crate::epgstore::EpgStore,
     jobs: &[DvrJob],

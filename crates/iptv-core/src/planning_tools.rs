@@ -96,6 +96,8 @@ fn calendar(events: &[(String, String, String, i64, i64)], now: i64) -> Result<V
     Ok((folded.join("\r\n") + "\r\n").into_bytes())
 }
 
+/// # Errors
+/// Returns "Invalid programme times." when the window is empty.
 pub fn programme_calendar(
     title: &str,
     channel: &str,
