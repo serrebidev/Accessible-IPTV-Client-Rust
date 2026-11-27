@@ -31,6 +31,7 @@ type PlayFn = unsafe extern "C" fn(*mut c_void) -> c_int;
 type VoidFn = unsafe extern "C" fn(*mut c_void);
 type SetTimeFn = unsafe extern "C" fn(*mut c_void, i64) -> i32;
 type IsSeekableFn = unsafe extern "C" fn(*mut c_void) -> i32;
+type SetRateFn = unsafe extern "C" fn(*mut c_void, f32) -> i32;
 type GetTimeFn = unsafe extern "C" fn(*mut c_void) -> i64;
 type GetStateFn = unsafe extern "C" fn(*mut c_void) -> c_int;
 type SetVolumeFn = unsafe extern "C" fn(*mut c_void, c_int) -> c_int;
@@ -224,6 +225,7 @@ struct Functions {
     stop: VoidFn,
     set_time: SetTimeFn,
     is_seekable: Option<IsSeekableFn>,
+    set_rate: Option<SetRateFn>,
     get_time: GetTimeFn,
     get_length: GetTimeFn,
     get_state: GetStateFn,
@@ -441,6 +443,9 @@ impl VlcEngine {
             is_seekable: unsafe { lib.get::<IsSeekableFn>(b"libvlc_media_player_is_seekable") }
                 .ok()
                 .map(|symbol| *symbol),
+            set_rate: unsafe { lib.get::<SetRateFn>(b"libvlc_media_player_set_rate") }
+                .ok()
+                .map(|symbol| *symbol),
             get_time: sym!(b"libvlc_media_player_get_time", GetTimeFn),
             get_length: sym!(b"libvlc_media_player_get_length", GetTimeFn),
             get_state: sym!(b"libvlc_media_player_get_state", GetStateFn),
@@ -612,6 +617,15 @@ impl VlcEngine {
         match self.inner.fns.is_seekable {
             Some(is_seekable) => unsafe { is_seekable(self.inner.player) != 0 },
             None => true,
+        }
+    }
+
+    /// Set the playback rate (PR #44); false when the
+    /// loaded libVLC has no rate call or it refused.
+    pub fn set_rate(&self, rate: f32) -> bool {
+        match self.inner.fns.set_rate {
+            Some(set_rate) => unsafe { set_rate(self.inner.player, rate) == 0 },
+            None => false,
         }
     }
 
