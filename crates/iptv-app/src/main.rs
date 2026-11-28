@@ -968,6 +968,9 @@ struct PlayerState {
     /// Playback rate for local recordings (PR #44); reset
     /// to 1.0 whenever new media starts.
     local_playback_rate: f64,
+    /// PR #46: cancellation flag of a running excerpt
+    /// export; stopping or loading new media sets it.
+    excerpt_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     last_spoken_cue: Option<usize>,
     /// Subtitle review state (P11): the cursor bounded by
     /// shown history, the sampled active/latest-shown indexes,
@@ -1109,6 +1112,7 @@ impl Default for PlayerState {
             subtitle_cues: Vec::new(),
             play_generation: 0,
             local_playback_rate: 1.0,
+            excerpt_cancel: None,
             last_spoken_cue: None,
             review: ReviewCursor::default(),
             active_cue_index: None,
@@ -3125,6 +3129,9 @@ fn poll_epg(wiring: &Wiring, frame: Frame, status: Status) {
                     "epg_last_sources_hash",
                     serde_json::json!(hash_epg_sources(&imported)),
                 );
+                // PR #46: a fresh guide requests a series
+                // scan, as Python does after an import.
+                wiring.series_last_scan.set(0.0);
                 let notify = wiring
                     .persist
                     .config
@@ -10775,7 +10782,15 @@ fn add_dvr_job(
                 dvr.set_repeat(&duplicate_id, repeat)
             };
             match updated {
-                Ok(true) => status.set_label("Recording updated to repeat."),
+                Ok(true) => {
+                    // PR #46: Python's set_repeat requests
+                    // a series scan when a job becomes a
+                    // series rule.
+                    if repeat == "series" {
+                        wiring.series_last_scan.set(0.0);
+                    }
+                    status.set_label("Recording updated to repeat.");
+                }
                 Ok(false) => status.set_label("This programme is already scheduled to record."),
                 Err(error) => status.set_label(&tr(&error)),
             }
@@ -12005,6 +12020,11 @@ fn play_builtin(
     {
         // PR #44: a fresh load starts at normal speed.
         let mut state = player.borrow_mut();
+        // PR #46: a fresh load cancels a running excerpt
+        // export of the previous media.
+        if let Some(flag) = &state.excerpt_cancel {
+            flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         if state.local_playback_rate != 1.0 {
             let cleared = state
                 .vlc
@@ -12642,6 +12662,8 @@ const PM_MUTE: i32 = 5341;
 const PM_SUBTITLE_FIND: i32 = 5343;
 const PM_SPEED: i32 = 5344;
 const PM_NORMAL_SPEED: i32 = 5345;
+const PM_SUBTITLE_TRANSCRIPT: i32 = 5346;
+const PM_EXCERPT: i32 = 5347;
 const PM_SEEK_BACK_10: i32 = 5460;
 const PM_SEEK_FORWARD_10: i32 = 5461;
 const PM_SEEK_BACK_60: i32 = 5462;
@@ -12935,6 +12957,22 @@ fn build_playback_menu(
         ItemKind::Normal,
     );
     menu_add(&menu, PM_NORMAL_SPEED, "Normal speed", "", ItemKind::Normal);
+    // PR #46: the transcript and excerpt exports follow,
+    // before the chapters.
+    menu_add(
+        &menu,
+        PM_SUBTITLE_TRANSCRIPT,
+        "Save Subtitle Transcript...",
+        "",
+        ItemKind::Normal,
+    );
+    menu_add(
+        &menu,
+        PM_EXCERPT,
+        "Save Recording Excerpt...",
+        "",
+        ItemKind::Normal,
+    );
     // C6: Python's Recording Chapters follows Subtitle Timing
     // (neither carries a shortcut).
     menu_add(
@@ -13055,6 +13093,8 @@ fn dispatch_player_menu(
         PM_SUBTITLE_FIND => prompt_subtitle_find(player, win.frame, persist, status),
         PM_SPEED => prompt_recording_speed(player, win.frame, persist, status),
         PM_NORMAL_SPEED => restore_normal_speed(player, persist, status),
+        PM_SUBTITLE_TRANSCRIPT => save_subtitle_transcript(player, win.frame, persist, status),
+        PM_EXCERPT => save_recording_excerpt(player, win.frame, persist, status),
         PM_CHAPTERS => prompt_recording_chapters(player, win.frame, persist, status),
         PM_SEEK_BACK_10 => player_seek_media(player, status, Some(-10_000), None),
         PM_SEEK_FORWARD_10 => player_seek_media(player, status, Some(10_000), None),
@@ -14786,7 +14826,9 @@ fn save_buffer_clip(
                 "A file with this name already exists in the selected folder.",
             ));
         }
-        std::fs::rename(&part, destination).map_err(|e| e.to_string())?;
+        // PR #46: publish through the shared exclusive
+        // publish (hard link where supported), not a rename.
+        iptv_core::recording::publish_new_file(&part, destination)?;
         Ok(())
     })();
     if !staged {
@@ -15058,7 +15100,14 @@ fn release_recording_lease(buffers: &Rc<RefCell<buffer::BufferRegistry>>, key: &
 fn player_stop(player: &Rc<RefCell<PlayerState>>, persist: &Persist, status: Status) {
     // PR #44: stopping cancels a pending Stalker play
     // resolution (its captured generation goes stale).
-    player.borrow_mut().play_generation += 1;
+    {
+        let mut state = player.borrow_mut();
+        state.play_generation += 1;
+        // PR #46: stopping cancels a running excerpt export.
+        if let Some(flag) = &state.excerpt_cancel {
+            flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
     cancel_sleep_timer(player);
     if let Some(buffers) = buffers_of(player) {
         buffers.borrow_mut().release_current();
@@ -17870,6 +17919,266 @@ fn restore_normal_speed(player: &Rc<RefCell<PlayerState>>, persist: &Persist, st
 /// Python's `_find_subtitle_text`): search the loaded cues
 /// and seek to the chosen match.
 #[allow(clippy::too_many_lines)] // one dialog flow, as in Python
+/// PR #46: Python's `export_file` for text: a save dialog
+/// (overwrite prompt built in), the extension appended
+/// when missing — with a replace confirmation when the
+/// appended name already exists — then an atomic write;
+/// the outcome is boxed under the export's own title.
+fn export_text_file(parent: &dyn WxWidget, title: &str, content: &[u8]) {
+    let wildcard = format!("{}|*.txt", tr("Text file (*.txt)"));
+    let dialog = FileDialog::builder(parent)
+        .with_message(title)
+        .with_wildcard(&wildcard)
+        .with_style(FileDialogStyle::Save | FileDialogStyle::OverwritePrompt)
+        .build();
+    if dialog.show_modal_tracked() != ID_OK {
+        return;
+    }
+    let Some(mut path) = dialog.get_path() else {
+        return;
+    };
+    if !path.to_lowercase().ends_with(".txt") {
+        path.push_str(".txt");
+        if std::path::Path::new(&path).exists() {
+            let answer = MessageDialog::builder(
+                parent,
+                &tr("Replace the existing export file?"),
+                title,
+            )
+            .with_style(
+                MessageDialogStyle::YesNo
+                    | MessageDialogStyle::NoDefault
+                    | MessageDialogStyle::IconWarning,
+            )
+            .build()
+            .show_modal_tracked();
+            if answer != ID_YES {
+                return;
+            }
+        }
+    }
+    let (message, style) = match iptv_core::planning_tools::atomic_export(
+        std::path::Path::new(&path),
+        content,
+    ) {
+        Ok(()) => (
+            tr("Export saved."),
+            MessageDialogStyle::OK | MessageDialogStyle::IconInformation,
+        ),
+        Err(error) => (
+            trf("The operation failed:\n{error}", &[("error", &error)]),
+            MessageDialogStyle::OK | MessageDialogStyle::IconError,
+        ),
+    };
+    let dialog = MessageDialog::builder(parent, &message, title)
+        .with_style(style)
+        .build();
+    dialog.show_modal_tracked();
+}
+
+/// Player > Save Subtitle Transcript... (PR #46, Python's
+/// `_save_subtitle_transcript`): every loaded cue, in the
+/// transcript's timestamped plain-text form.
+fn save_subtitle_transcript(
+    player: &Rc<RefCell<PlayerState>>,
+    frame: Frame,
+    persist: &Persist,
+    status: Status,
+) {
+    let cues = player.borrow().subtitle_cues.clone();
+    if local_recording_context(player).is_none() || cues.is_empty() {
+        player_status(
+            status,
+            persist,
+            "Open a local recording with text subtitles first.",
+            2,
+        );
+        return;
+    }
+    export_text_file(
+        &frame,
+        &tr("Save Subtitle Transcript..."),
+        &iptv_core::recording_media::transcript(&cues),
+    );
+}
+
+/// Player > Save Recording Excerpt... (PR #46, Python's
+/// `_save_recording_excerpt`): the excerpt points are the
+/// start, the named bookmarks strictly inside the media,
+/// and the end; start and end are chosen, then a .mkv save
+/// dialog, then the encode runs in the background, canceled
+/// by a stop, a new load or the window closing.
+#[allow(clippy::too_many_lines)] // excerpt flow: points, choosers, save dialog, background encode
+fn save_recording_excerpt(
+    player: &Rc<RefCell<PlayerState>>,
+    frame: Frame,
+    persist: &Persist,
+    status: Status,
+) {
+    let title = tr("Save Recording Excerpt...");
+    let fail = |message: &str| {
+        let dialog = MessageDialog::builder(&frame, message, &title)
+            .with_style(MessageDialogStyle::OK | MessageDialogStyle::IconError)
+            .build();
+        dialog.show_modal_tracked();
+    };
+    let Some((generation, seekable)) = local_recording_context(player) else {
+        player_status(status, persist, "Open a seekable local recording first.", 2);
+        return;
+    };
+    if !seekable {
+        player_status(status, persist, "Open a seekable local recording first.", 2);
+        return;
+    }
+    if player.borrow().excerpt_cancel.is_some() {
+        player_status(status, persist, "In Progress", 2);
+        return;
+    }
+    let (key, length, path, identity) = {
+        let state = player.borrow();
+        let Some(channel) = state.current_channel.as_ref() else {
+            return;
+        };
+        let Some(path) = channel
+            .unknown_attributes
+            .get("local-recording")
+            .filter(|value| !value.is_empty())
+        else {
+            return;
+        };
+        let identity = channel
+            .unknown_attributes
+            .get("provider-id")
+            .cloned()
+            .unwrap_or_default();
+        (
+            state.resume_key.clone(),
+            position_length(&state).1,
+            path.clone(),
+            identity,
+        )
+    };
+    if length <= 0 {
+        return;
+    }
+    let rows = iptv_core::named_bookmarks::rows_for(&bookmark_store(persist), &key);
+    let mut points: Vec<(i64, String)> = vec![(0, tr("Start of recording"))];
+    for row in rows {
+        if row.position_ms > 0 && row.position_ms < length {
+            points.push((row.position_ms, row.name));
+        }
+    }
+    points.push((length, tr("End of recording")));
+    if points.len() < 3 {
+        fail(&tr(
+            "Add a named bookmark to mark a point inside the recording first.",
+        ));
+        return;
+    }
+    let choose = |prompt: &str, choices: &[(i64, String)]| -> Option<i64> {
+        let labels: Vec<String> = choices
+            .iter()
+            .map(|(position, name)| {
+                format!(
+                    "{} \u{2013} {}",
+                    iptv_core::recording_media::clock_text(*position),
+                    name
+                )
+            })
+            .collect();
+        let dialog = SingleChoiceDialog::builder(
+            &frame,
+            prompt,
+            &title,
+            &labels.iter().map(String::as_str).collect::<Vec<_>>(),
+        )
+        .build();
+        dialog.set_selection(0);
+        if dialog.show_modal_tracked() != ID_OK {
+            return None;
+        }
+        // The media may have changed behind the chooser.
+        if local_recording_context(player).map(|(now, _)| now) != Some(generation) {
+            return None;
+        }
+        usize::try_from(dialog.get_selection())
+            .ok()
+            .and_then(|index| choices.get(index))
+            .map(|(position, _)| *position)
+    };
+    let Some(first) = choose(
+        &tr("Choose the start of the excerpt:"),
+        &points[..points.len() - 1],
+    ) else {
+        return;
+    };
+    let ends: Vec<(i64, String)> = points
+        .iter()
+        .filter(|(position, _)| *position > first)
+        .cloned()
+        .collect();
+    let Some(last) = choose(&tr("Choose the end of the excerpt:"), &ends) else {
+        return;
+    };
+    let dialog = FileDialog::builder(&frame)
+        .with_message(&title)
+        .with_wildcard("Matroska (*.mkv)|*.mkv")
+        .with_style(FileDialogStyle::Save | FileDialogStyle::OverwritePrompt)
+        .build();
+    if dialog.show_modal_tracked() != ID_OK {
+        return;
+    }
+    let Some(mut destination) = dialog.get_path() else {
+        return;
+    };
+    if !destination.to_lowercase().ends_with(".mkv") {
+        destination.push_str(".mkv");
+    }
+    if local_recording_context(player).map(|(now, _)| now) != Some(generation) {
+        return;
+    }
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    player.borrow_mut().excerpt_cancel = Some(std::sync::Arc::clone(&cancel));
+    player_status(status, persist, "Saving recording excerpt...", 2);
+    let done_player = Rc::clone(player);
+    let work_cancel = std::sync::Arc::clone(&cancel);
+    run_in_background(
+        &frame,
+        move || {
+            let canceled = || work_cancel.load(std::sync::atomic::Ordering::Relaxed);
+            iptv_core::recording_media::save_excerpt(
+                "ffmpeg",
+                std::path::Path::new(&path),
+                &identity,
+                std::path::Path::new(&destination),
+                first,
+                last,
+                &canceled,
+            )
+        },
+        move |result| {
+            done_player.borrow_mut().excerpt_cancel = None;
+            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                return;
+            }
+            let (message, style) = match result {
+                Ok(()) => (
+                    tr("Export saved."),
+                    MessageDialogStyle::OK | MessageDialogStyle::IconInformation,
+                ),
+                Err(error) => (
+                    error,
+                    MessageDialogStyle::OK | MessageDialogStyle::IconError,
+                ),
+            };
+            let dialog = MessageDialog::builder(&frame, &message, &title)
+                .with_style(style)
+                .build();
+            dialog.show_modal_tracked();
+        },
+    );
+}
+
 fn prompt_subtitle_find(
     player: &Rc<RefCell<PlayerState>>,
     frame: Frame,
@@ -17916,8 +18225,9 @@ fn prompt_subtitle_find(
     dialog.set_accessibility_label(&title);
     bind_escape_cancel(dialog);
     let panel = Panel::builder(&dialog).build();
+    // PR #46: multi-select, so a subset can be exported.
     let list = ListCtrl::builder(&panel)
-        .with_style(ListCtrlStyle::Report | ListCtrlStyle::Virtual | ListCtrlStyle::SingleSel)
+        .with_style(ListCtrlStyle::Report | ListCtrlStyle::Virtual)
         .build();
     list.set_accessibility_label(&tr("Subtitle matches"));
     list.insert_column(0, &tr("Time"), ListColumnFormat::Left, 90);
@@ -17936,41 +18246,77 @@ fn prompt_subtitle_find(
             _ => cue.text.clone(),
         }
     });
-    let ok = Button::builder(&panel).with_label("&OK").build();
+    let go = Button::builder(&panel)
+        .with_label(&tr("Go to Time..."))
+        .build();
+    let save = Button::builder(&panel)
+        .with_label(&tr("Save Selected Subtitles..."))
+        .build();
     let cancel = Button::builder(&panel).with_label("&Cancel").build();
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     sizer.add(&list, 1, SizerFlag::Expand | SizerFlag::All, 4);
     let buttons = BoxSizer::builder(Orientation::Horizontal).build();
-    buttons.add(&ok, 0, SizerFlag::All, 4);
+    buttons.add(&go, 0, SizerFlag::All, 4);
+    buttons.add(&save, 0, SizerFlag::All, 4);
     buttons.add(&cancel, 0, SizerFlag::All, 4);
     sizer.add_sizer(&buttons, 0, SizerFlag::Expand, 0);
     panel.set_sizer(sizer, true);
-    let chosen: Rc<RefCell<Option<i64>>> = Rc::new(RefCell::new(None));
-    let chosen_pick = Rc::clone(&chosen);
-    let matches_pick = Rc::clone(&matches);
-    let dialog_pick = dialog;
-    list.on_item_activated(move |_| {
-        let index = list.get_first_selected_item();
-        if index >= 0 {
-            if let Some(cue) = usize::try_from(index)
-                .ok()
-                .and_then(|i| matches_pick.get(i))
-            {
-                *chosen_pick.borrow_mut() = Some(cue.start);
-            }
-        }
-        dialog_pick.end_modal(ID_OK);
+    // The selected match indexes, in row order.
+    let matches_sel = Rc::clone(&matches);
+    let selected_rows = Rc::new(move |list: ListCtrl| -> Vec<usize> {
+        (0..matches_sel.len())
+            .filter(|row| {
+                i64::try_from(*row)
+                    .is_ok_and(|index| list.get_item_state(index, ListItemState::Selected))
+            })
+            .collect()
     });
-    let chosen_ok = Rc::clone(&chosen);
-    let matches_ok = Rc::clone(&matches);
-    ok.on_click(move |_| {
-        let index = list.get_first_selected_item();
-        if index >= 0 {
-            if let Some(cue) = usize::try_from(index).ok().and_then(|i| matches_ok.get(i)) {
-                *chosen_ok.borrow_mut() = Some(cue.start);
+    let chosen: Rc<RefCell<Option<i64>>> = Rc::new(RefCell::new(None));
+    // Go to Time (and double-click): exactly one selected
+    // row jumps; anything else is announced and the dialog
+    // stays open (Python's jump()).
+    let jump = Rc::new({
+        let chosen = Rc::clone(&chosen);
+        let matches = Rc::clone(&matches);
+        let selected_rows = Rc::clone(&selected_rows);
+        let persist = persist.clone();
+        move |list: ListCtrl| {
+            let rows = selected_rows(list);
+            if rows.len() == 1 {
+                if let Some(cue) = matches.get(rows[0]) {
+                    *chosen.borrow_mut() = Some(cue.start);
+                }
+                dialog.end_modal(ID_OK);
+            } else {
+                player_status(
+                    status,
+                    &persist,
+                    "Select one subtitle to jump to its position.",
+                    2,
+                );
             }
         }
-        dialog.end_modal(ID_OK);
+    });
+    let jump_activated = Rc::clone(&jump);
+    list.on_item_activated(move |_| jump_activated(list));
+    let jump_click = Rc::clone(&jump);
+    go.on_click(move |_| jump_click(list));
+    let matches_save = Rc::clone(&matches);
+    let selected_save = Rc::clone(&selected_rows);
+    save.on_click(move |_| {
+        let rows = selected_save(list);
+        if rows.is_empty() {
+            return;
+        }
+        let cues: Vec<iptv_core::subtitles::Cue> = rows
+            .iter()
+            .filter_map(|row| matches_save.get(*row).cloned())
+            .collect();
+        export_text_file(
+            &dialog,
+            &tr("Save Subtitle Transcript..."),
+            &iptv_core::recording_media::transcript(&cues),
+        );
     });
     let dialog_cancel = dialog;
     cancel.on_click(move |_| {
@@ -27306,7 +27652,13 @@ fn pause_recording_rule(ui: &ScheduledUi, wiring: &Wiring, frame: Frame, list: L
         Ok(())
     };
     let finish = |wiring: &Wiring, result: Result<(), String>| match result {
-        Ok(()) => render_scheduled_jobs(ui, wiring, list, dstatus),
+        Ok(()) => {
+            // PR #46: Python's set_pause_period requests a
+            // series scan (a lifted pause lets the scan fill
+            // the episodes it covers).
+            wiring.series_last_scan.set(0.0);
+            render_scheduled_jobs(ui, wiring, list, dstatus);
+        }
         Err(error) => {
             let dialog = MessageDialog::builder(&frame, &tr(&error), &title)
                 .with_style(MessageDialogStyle::OK | MessageDialogStyle::IconError)
