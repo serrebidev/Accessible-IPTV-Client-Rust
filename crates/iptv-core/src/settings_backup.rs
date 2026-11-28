@@ -374,10 +374,33 @@ struct DvrJobCheck {
     future_padding: Option<serde_json::Value>,
     #[serde(default)]
     series_padding_changes: Option<serde_json::Value>,
+    // PR #48: backup validation uses the same stored-job
+    // check as DVR loading, which includes the pause period.
+    #[serde(default)]
+    pause_dates: Option<serde_json::Value>,
+    #[serde(default)]
+    start_ts: f64,
 }
 
 impl DvrJobCheck {
     fn valid(&self) -> bool {
+        if let Some(pause) = &self.pause_dates {
+            let period = pause.as_array().and_then(|row| {
+                if row.len() == 2 {
+                    Some([
+                        row[0].as_str()?.to_string(),
+                        row[1].as_str()?.to_string(),
+                    ])
+                } else {
+                    None
+                }
+            });
+            if period.as_ref().is_none_or(|p| !crate::dvr::valid_pause_period(p))
+                || !(0.0..=253_402_300_799.0).contains(&self.start_ts)
+            {
+                return false;
+            }
+        }
         if self
             .future_padding
             .as_ref()
@@ -733,6 +756,15 @@ mod tests {
         let mut bad_days = sample_bundle(now);
         bad_days["jobs"][1]["repeat"] = serde_json::json!("weekdays");
         assert_eq!(validate_bundle(&bad_days, now), bad);
+        // PR #48: an invalid pause period refuses the bundle,
+        // like the DVR loader's stored-job check; a valid one
+        // passes.
+        let mut bad_pause = sample_bundle(now);
+        bad_pause["jobs"][1]["pause_dates"] = serde_json::json!(["2027-02-01", "2027-01-01"]);
+        assert_eq!(validate_bundle(&bad_pause, now), bad);
+        let mut good_pause = sample_bundle(now);
+        good_pause["jobs"][1]["pause_dates"] = serde_json::json!(["2027-01-01", "2027-02-01"]);
+        assert!(validate_bundle(&good_pause, now).is_ok());
         let only = serde_json::json!({"config": {"playlists": [], "epgs": []}});
         assert_eq!(validate_bundle(&only, now), Ok(only.clone()));
         // A settings-only (v1) backup imports as settings only.
