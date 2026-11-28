@@ -5593,22 +5593,22 @@ msgid "A saved queue with this name already exists."
 msgstr "Már van ilyen nevű mentett lejátszási sor."
 
 msgid "Add a named bookmark to mark a point inside the recording first."
-msgstr "Először jelöljön meg egy pontot a felvételben a „Könyvjelző hozzáadása…” paranccsal."
+msgstr "Először jelöljön meg egy pontot a felvétel eleje és vége között a „Könyvjelző hozzáadása…” paranccsal."
 
 msgid "All"
 msgstr "Összes"
 
 msgid "Announce and save in history"
-msgstr "Bemondás és előzménybejegyzés"
+msgstr "Bemondás és mentés az értesítési előzményekbe"
 
 msgid "Choose a new filename for the excerpt."
-msgstr "A megadott néven már létezik fájl. Adjon másik nevet a részletnek."
+msgstr "A megadott fájlnév már foglalt. Adjon meg másik nevet."
 
 msgid "Choose a saved queue:"
 msgstr "Válasszon mentett lejátszási sort:"
 
 msgid "Choose a valid recording range and an MKV filename."
-msgstr "Adja meg a részlet érvényes kezdő- és végpontját, valamint egy .mkv kiterjesztésű fájlnevet."
+msgstr "Adjon meg érvényes kezdő- és végpontot a részlethez, valamint .mkv kiterjesztésű fájlnevet."
 
 msgid "Choose the end of the excerpt:"
 msgstr "Válassza ki a részlet végpontját:"
@@ -5620,10 +5620,10 @@ msgid "Could not save the recording excerpt."
 msgstr "A felvételrészlet mentése nem sikerült."
 
 msgid "Delete Saved Queue..."
-msgstr "Mentett sor törlése…"
+msgstr "Mentett lejátszási sor törlése…"
 
 msgid "Delete this saved queue?"
-msgstr "Törli ezt a mentett sort?"
+msgstr "Törli ezt a mentett lejátszási sort?"
 
 msgid "End of recording"
 msgstr "A felvétel vége"
@@ -5632,13 +5632,13 @@ msgid "Enter a queue name of 1 to 80 characters and include a recording."
 msgstr "Adjon a lejátszási sornak 1–80 karakter hosszú nevet. A sorban legalább egy felvételnek szerepelnie kell."
 
 msgid "Failed and Partial"
-msgstr "Sikertelen, kimaradt és részleges"
+msgstr "Sikertelen, elmaradt és részleges"
 
 msgid "Filter by title or channel"
 msgstr "Szűrés cím vagy csatorna szerint"
 
 msgid "Load Saved Queue..."
-msgstr "Mentett sor betöltése…"
+msgstr "Mentett lejátszási sor betöltése…"
 
 msgid "Name for this queue:"
 msgstr "A lejátszási sor neve:"
@@ -5647,10 +5647,10 @@ msgid "Next 7 Days"
 msgstr "Következő 7 nap"
 
 msgid "Open a local recording with text subtitles first."
-msgstr "Nyisson meg egy helyi felvételt, majd töltsön be szöveges feliratot."
+msgstr "Nyisson meg egy helyi felvételt, majd töltsön be szöveges feliratfájlt, vagy válasszon beágyazott szöveges feliratsávot."
 
 msgid "Paused Recording Rules"
-msgstr "Felvételek szüneteltetési időszakkal"
+msgstr "Szüneteltetésre beállított felvételi szabályok"
 
 msgid "Recording Notifications..."
 msgstr "Felvételi értesítések…"
@@ -5674,22 +5674,22 @@ msgid "Save Selected Subtitles..."
 msgstr "Kijelölt találatok mentése…"
 
 msgid "Save Subtitle Transcript..."
-msgstr "Feliratátirat mentése…"
+msgstr "Felirat mentése szövegfájlba…"
 
 msgid "Save in history only"
-msgstr "Csak előzménybejegyzés"
+msgstr "Csak mentés az értesítési előzményekbe"
 
 msgid "Saved Playback Queues"
 msgstr "Mentett lejátszási sorok"
 
 msgid "Saving recording excerpt..."
-msgstr "Felvételrészlet mentése…"
+msgstr "Felvételrészlet mentése folyamatban…"
 
 msgid "Saving the recording excerpt timed out."
-msgstr "Lejárt a felvételrészlet mentésére rendelkezésre álló idő."
+msgstr "A felvételrészlet mentése időtúllépés miatt megszakadt."
 
 msgid "Schedule view"
-msgstr "Az ütemezés nézete"
+msgstr "Ütemezett felvételek nézete"
 
 msgid "Select one subtitle to jump to its position."
 msgstr "Az ugráshoz egyetlen találatot jelöljön ki."
@@ -5707,10 +5707,10 @@ msgid "The queue could not be saved."
 msgstr "A lejátszási sort nem sikerült menteni."
 
 msgid "The recording did not cover the full scheduled time."
-msgstr "A felvétel az ütemezett időszaknak csak egy részét tartalmazza."
+msgstr "A felvétel nem terjed ki a teljes ütemezett időszakra."
 
 msgid "The saved queue limit has been reached."
-msgstr "Elérte a mentett lejátszási sorok megengedett számát."
+msgstr "Elérte a menthető lejátszási sorok maximális számát."
 
 msgid "When a recording starts or finishes successfully:"
-msgstr "Értesítés a felvétel sikeres indításáról és befejezéséről:"
+msgstr "Értesítés a felvétel sikeres megkezdésekor és befejezésekor:"
