@@ -968,6 +968,9 @@ struct PlayerState {
     /// Playback rate for local recordings (PR #44); reset
     /// to 1.0 whenever new media starts.
     local_playback_rate: f64,
+    /// PR #46: cancellation flag of a running excerpt
+    /// export; stopping or loading new media sets it.
+    excerpt_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     last_spoken_cue: Option<usize>,
     /// Subtitle review state (P11): the cursor bounded by
     /// shown history, the sampled active/latest-shown indexes,
@@ -1109,6 +1112,7 @@ impl Default for PlayerState {
             subtitle_cues: Vec::new(),
             play_generation: 0,
             local_playback_rate: 1.0,
+            excerpt_cancel: None,
             last_spoken_cue: None,
             review: ReviewCursor::default(),
             active_cue_index: None,
@@ -1584,6 +1588,7 @@ fn bind_browser(
         proxy: Rc::clone(&wiring.proxy),
         cast_worker: Rc::clone(&wiring.cast_worker),
         cast_pending: Rc::clone(&wiring.cast_pending),
+        recording_queue: Rc::clone(&wiring.recording_queue),
         timer: Rc::clone(&wiring.timer),
         guide_ui: Rc::clone(&wiring.guide_ui),
         i18n: Rc::clone(&wiring.i18n),
@@ -2068,10 +2073,17 @@ fn poll_space_monitor(frame: Frame, wiring: &Wiring) {
             None,
         );
     };
-    wiring.space_monitor.borrow_mut().check(
+    // PR #46: probes run on the monitor's own threads, so
+    // a destination on an offline share cannot stall the
+    // healthy drives' warnings (Python's background check).
+    let measure: std::sync::Arc<iptv_core::storage_monitor::Measure> =
+        std::sync::Arc::new(|dir: &std::path::Path| {
+            iptv_core::storage_monitor::measure_directory(dir)
+        });
+    wiring.space_monitor.borrow_mut().check_background(
         &rows,
         &prefs,
-        |dir| recording::free_space_bytes(dir).ok(),
+        &measure,
         &mut notify,
         &mut stop,
     );
@@ -3117,6 +3129,9 @@ fn poll_epg(wiring: &Wiring, frame: Frame, status: Status) {
                     "epg_last_sources_hash",
                     serde_json::json!(hash_epg_sources(&imported)),
                 );
+                // PR #46: a fresh guide requests a series
+                // scan, as Python does after an import.
+                wiring.series_last_scan.set(0.0);
                 let notify = wiring
                     .persist
                     .config
@@ -5033,6 +5048,7 @@ fn player_is_showing(player: &Rc<RefCell<PlayerState>>, channel: &Channel) -> bo
 /// when the caller has it, witnesses the heard audio track
 /// (audit R10).
 #[allow(clippy::too_many_arguments)] // window parts, like prepare_recording
+#[allow(clippy::too_many_lines)] // one start/stop flow, as in Python
 fn toggle_recording(
     parent: &dyn WxWidget,
     recordings: &Rc<RefCell<RecordingEngine>>,
@@ -5151,10 +5167,33 @@ fn toggle_recording(
                     &[("fmt", format_label), ("path", &path_text)],
                 )
             };
-            let _ = MessageDialog::builder(parent, &message, &tr("Recording"))
-                .with_style(MessageDialogStyle::OK | MessageDialogStyle::IconInformation)
-                .build()
-                .show_modal_tracked();
+            // PR #46: in speech/history mode the start is
+            // reported through the success preference,
+            // spoken as "Recording: {name}"; the dialog
+            // mode keeps Python's plain box here.
+            let mode = persist
+                .config
+                .borrow()
+                .value("recording_success_notification")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("dialog")
+                .to_string();
+            if mode == "speech" || mode == "history" {
+                let spoken = format!("{}: {}", tr("Recording"), channel.name);
+                report_recording_success(
+                    None,
+                    status,
+                    persist,
+                    &message,
+                    &tr("Recording"),
+                    &spoken,
+                );
+            } else {
+                let _ = MessageDialog::builder(parent, &message, &tr("Recording"))
+                    .with_style(MessageDialogStyle::OK | MessageDialogStyle::IconInformation)
+                    .build()
+                    .show_modal_tracked();
+            }
         }
         Err(error) => status.set_label(&tr(&error)),
     }
@@ -5519,7 +5558,30 @@ fn record_dvr_channel(
         // N12: the job's span is the capture's planned length.
         Some((job.stop_ts - job.start_ts).max(0.0)),
     ) {
-        Ok(_) => status.set_label(&trf("Recording {display}.", &[("display", &display)])),
+        Ok(_) => {
+            status.set_label(&trf("Recording {display}.", &[("display", &display)]));
+            // PR #46: a scheduled start reports through the
+            // success-notification preference (Python shows
+            // this box via _show_or_queue_message_box; the
+            // Rust port previously only set the status line).
+            let title = if job.display_title.is_empty() {
+                job.title.clone()
+            } else {
+                job.display_title.clone()
+            };
+            let message = trf(
+                "Scheduled recording started:\n{title}",
+                &[("title", &title)],
+            );
+            report_recording_success(
+                status.bar,
+                status,
+                &wiring.persist,
+                &message,
+                &tr("Scheduled Recording"),
+                &message.clone(),
+            );
+        }
         Err(error) => {
             wiring
                 .dvr
@@ -5860,7 +5922,21 @@ fn poll_recordings(wiring: &Wiring, frame: Frame, status: Status) {
         let produced = recording::output_has_media(&finished.out_path);
         let success = finished.success && produced;
         // Python `recording_outcome.classify`, shared by the library
-        // index and the scheduled job's status.
+        // index and the scheduled job's status. PR #46: a DVR
+        // capture is classified against its scheduled window —
+        // the job supplies the planned length and the scheduled
+        // start, so a late start is partial however much media
+        // it wrote.
+        let dvr_job = finished
+            .key
+            .strip_prefix("dvr:")
+            .and_then(|job_id| wiring.dvr.borrow().get(job_id).cloned());
+        let (planned_seconds, scheduled_start) = match &dvr_job {
+            Some(job) if job.stop_ts > job.start_ts => {
+                (Some(job.stop_ts - job.start_ts), Some(job.start_ts))
+            }
+            _ => (finished.planned_seconds, None),
+        };
         let outcome = iptv_core::recording_library::classify_outcome(
             &iptv_core::recording_library::Outcome {
                 produced,
@@ -5869,7 +5945,10 @@ fn poll_recordings(wiring: &Wiring, frame: Frame, status: Status) {
                 stopped_by_user: finished.stopped_by_user,
                 exit_code: finished.exit_code,
                 written_seconds: finished.media_written_seconds,
-                planned_seconds: finished.planned_seconds,
+                planned_seconds,
+                started_at: Some(finished.started_at),
+                ended_at: Some(now),
+                scheduled_start,
             },
         );
         // PR #36: every finished recording joins the recording
@@ -5936,6 +6015,10 @@ fn poll_recordings(wiring: &Wiring, frame: Frame, status: Status) {
                     .cloned()
                     .collect::<Vec<_>>()
                     .join("\n")
+            } else if outcome == "partial" && produced {
+                // PR #46: a clean-exit capture that missed
+                // part of its window says so on the job.
+                "The recording did not cover the full scheduled time.".to_string()
             } else if !produced {
                 "Nothing was recorded: the stream ended before it wrote anything.".to_string()
             } else {
@@ -5954,7 +6037,7 @@ fn poll_recordings(wiring: &Wiring, frame: Frame, status: Status) {
         // four-way wording) for every recording the downloads
         // window does not already report on.
         if !wiring.closing_application.get() {
-            report_recording_finished(frame, &finished, produced);
+            report_recording_finished(frame, status, &wiring.persist, &finished, produced);
         }
         if success {
             let size = std::fs::metadata(&finished.out_path).map_or(0, |m| m.len());
@@ -6044,11 +6127,96 @@ fn recording_failure_detail(finished: &recording::RecordingFinished) -> String {
     lines.join("\n")
 }
 
+/// How successful recording starts and finishes are
+/// reported (PR #46, Python `_report_recording_success`):
+/// the `recording_success_notification` preference chooses
+/// a dialog (the default), speech with a history entry, or
+/// history only. `message`, `caption` and `spoken` arrive
+/// translated.
+fn report_recording_success(
+    parent: Option<Frame>,
+    status: Status,
+    persist: &Persist,
+    message: &str,
+    caption: &str,
+    spoken: &str,
+) {
+    let mode = persist
+        .config
+        .borrow()
+        .value("recording_success_notification")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("dialog")
+        .to_string();
+    match mode.as_str() {
+        "speech" | "history" => {
+            record_notification(caption, message);
+            if mode == "speech" {
+                live_region::announce_with_priority(
+                    status.label,
+                    spoken,
+                    live_region::Priority::Medium,
+                );
+            }
+        }
+        _ => match parent {
+            Some(frame) => show_or_queue_notification(
+                frame,
+                message,
+                caption,
+                MessageDialogStyle::OK | MessageDialogStyle::IconInformation,
+                None,
+            ),
+            None => record_notification(caption, message),
+        },
+    }
+}
+
+/// Recordings > Recording Notifications... (PR #46, Python
+/// `_configure_recording_notices`): choose how successful
+/// recording starts and finishes are reported.
+fn configure_recording_notifications(wiring: &Wiring, frame: Frame) {
+    const KEYS: [&str; 3] = ["dialog", "speech", "history"];
+    let labels = [
+        tr("Show a dialog"),
+        tr("Announce and save in history"),
+        tr("Save in history only"),
+    ];
+    let current = wiring
+        .persist
+        .config
+        .borrow()
+        .value("recording_success_notification")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("dialog")
+        .to_string();
+    let dialog = SingleChoiceDialog::builder(
+        &frame,
+        &tr("When a recording starts or finishes successfully:"),
+        &tr("Recording Notifications..."),
+        &labels.iter().map(String::as_str).collect::<Vec<_>>(),
+    )
+    .build();
+    let position = KEYS.iter().position(|key| *key == current).unwrap_or(0);
+    dialog.set_selection(i32::try_from(position).unwrap_or(0));
+    if dialog.show_modal_tracked() != ID_OK {
+        return;
+    }
+    let selection = usize::try_from(dialog.get_selection()).unwrap_or(usize::MAX);
+    if let Some(choice) = KEYS.get(selection) {
+        wiring
+            .persist
+            .set_and_save("recording_success_notification", serde_json::json!(choice));
+    }
+}
+
 /// Python's recording outcome report (N12; `client_recording.py`):
 /// saved, nothing recorded, stopped-by-user warning, or error,
 /// each a dialog in Python's wording.
 fn report_recording_finished(
     frame: Frame,
+    status: Status,
+    persist: &Persist,
     finished: &recording::RecordingFinished,
     produced: bool,
 ) {
@@ -6061,10 +6229,16 @@ fn report_recording_finished(
         show_or_queue_notification(frame, &message, &tr(title), style, None);
     };
     if rc == 0 && produced {
-        show(
-            trf("Recording saved:\n{path}", &[("path", &path)]),
-            "Recording Complete",
-            MessageDialogStyle::OK | MessageDialogStyle::IconInformation,
+        // PR #46: a saved recording reports through the
+        // success-notification preference, spoken as
+        // "Recording saved: {title}".
+        report_recording_success(
+            Some(frame),
+            status,
+            persist,
+            &trf("Recording saved:\n{path}", &[("path", &path)]),
+            &tr("Recording Complete"),
+            &trf("Recording saved: {title}", &[("title", &finished.title)]),
         );
     } else if rc == 0 && !finished.stopped_by_user {
         show(
@@ -7364,6 +7538,7 @@ pub const REC_PREVENT_SLEEP: i32 = 5227;
 pub const REC_WAKE_RECORDINGS: i32 = 5228;
 pub const REC_SPACE_MONITOR: i32 = 5229;
 pub const REC_LIMITS: i32 = 5230;
+pub const REC_NOTIFICATIONS: i32 = 5231;
 
 /// The Recording Format submenu inside the Recordings menu
 /// (found by its label, the same fetch-by-parent pattern the
@@ -7891,6 +8066,13 @@ fn build_recordings_menu(config: &Config) -> Menu {
         &menu,
         REC_SPACE_MONITOR,
         "Recording Space Monitor...",
+        "",
+        ItemKind::Normal,
+    );
+    menu_add(
+        &menu,
+        REC_NOTIFICATIONS,
+        "Recording Notifications...",
         "",
         ItemKind::Normal,
     );
@@ -8831,7 +9013,9 @@ fn menu_item_topic(id: i32) -> Option<&'static str> {
         WHATS_NEW => "updates",
         REC_START | REC_STOP | REC_STOP_ALL | REC_STORAGE | REC_MIN_FREE | REC_SET_FOLDER
         | REC_OPEN_FOLDER | REC_PROBLEM_TIMES | REC_LIBRARY | REC_PREVENT_SLEEP
-        | REC_WAKE_RECORDINGS | REC_SPACE_MONITOR | REC_LIMITS | CTX_RECORD => "recordings",
+        | REC_WAKE_RECORDINGS | REC_SPACE_MONITOR | REC_NOTIFICATIONS | REC_LIMITS | CTX_RECORD => {
+            "recordings"
+        }
         REC_REMINDERS | CTX_REMINDER => "reminders",
         REC_SCHEDULED | CTX_SCHEDULE => "scheduled-recordings",
         REC_PADDING => "schedule-padding",
@@ -9094,6 +9278,7 @@ fn menu_recordings_action(
         REC_BY_TIME => schedule_by_time(wiring, &frame, list, status),
         REC_STORAGE => show_recording_storage(wiring, frame, status),
         REC_SPACE_MONITOR => show_space_monitor_dialog(wiring, frame, status),
+        REC_NOTIFICATIONS => configure_recording_notifications(wiring, frame),
         REC_LIBRARY => open_recording_library(wiring, status),
         REC_LIMITS => open_recording_limits(wiring, frame),
         REC_MIN_FREE => prompt_min_free_space(wiring, frame, status),
@@ -10600,7 +10785,15 @@ fn add_dvr_job(
                 dvr.set_repeat(&duplicate_id, repeat)
             };
             match updated {
-                Ok(true) => status.set_label("Recording updated to repeat."),
+                Ok(true) => {
+                    // PR #46: Python's set_repeat requests
+                    // a series scan when a job becomes a
+                    // series rule.
+                    if repeat == "series" {
+                        wiring.series_last_scan.set(0.0);
+                    }
+                    status.set_label("Recording updated to repeat.");
+                }
                 Ok(false) => status.set_label("This programme is already scheduled to record."),
                 Err(error) => status.set_label(&tr(&error)),
             }
@@ -11830,6 +12023,11 @@ fn play_builtin(
     {
         // PR #44: a fresh load starts at normal speed.
         let mut state = player.borrow_mut();
+        // PR #46: a fresh load cancels a running excerpt
+        // export of the previous media.
+        if let Some(flag) = &state.excerpt_cancel {
+            flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         if state.local_playback_rate != 1.0 {
             let cleared = state
                 .vlc
@@ -12248,6 +12446,10 @@ struct PlayerShared {
     proxy: Rc<RefCell<Option<iptv_core::proxy::ProxyServer>>>,
     cast_worker: Rc<CastWorker>,
     cast_pending: Rc<std::cell::Cell<bool>>,
+    /// PR #46: the recording playback queue, so the player
+    /// polls can confirm a started item and fail an errored
+    /// one (Python's queue lives beside its player).
+    recording_queue: Rc<RefCell<QueueInner>>,
     timer: Rc<Timer<Frame>>,
     /// Guide window + language, so F1 in the player reaches its
     /// own topic without the full wiring (S10).
@@ -12463,6 +12665,8 @@ const PM_MUTE: i32 = 5341;
 const PM_SUBTITLE_FIND: i32 = 5343;
 const PM_SPEED: i32 = 5344;
 const PM_NORMAL_SPEED: i32 = 5345;
+const PM_SUBTITLE_TRANSCRIPT: i32 = 5346;
+const PM_EXCERPT: i32 = 5347;
 const PM_SEEK_BACK_10: i32 = 5460;
 const PM_SEEK_FORWARD_10: i32 = 5461;
 const PM_SEEK_BACK_60: i32 = 5462;
@@ -12756,6 +12960,22 @@ fn build_playback_menu(
         ItemKind::Normal,
     );
     menu_add(&menu, PM_NORMAL_SPEED, "Normal speed", "", ItemKind::Normal);
+    // PR #46: the transcript and excerpt exports follow,
+    // before the chapters.
+    menu_add(
+        &menu,
+        PM_SUBTITLE_TRANSCRIPT,
+        "Save Subtitle Transcript...",
+        "",
+        ItemKind::Normal,
+    );
+    menu_add(
+        &menu,
+        PM_EXCERPT,
+        "Save Recording Excerpt...",
+        "",
+        ItemKind::Normal,
+    );
     // C6: Python's Recording Chapters follows Subtitle Timing
     // (neither carries a shortcut).
     menu_add(
@@ -12876,6 +13096,8 @@ fn dispatch_player_menu(
         PM_SUBTITLE_FIND => prompt_subtitle_find(player, win.frame, persist, status),
         PM_SPEED => prompt_recording_speed(player, win.frame, persist, status),
         PM_NORMAL_SPEED => restore_normal_speed(player, persist, status),
+        PM_SUBTITLE_TRANSCRIPT => save_subtitle_transcript(player, win.frame, persist, status),
+        PM_EXCERPT => save_recording_excerpt(player, win.frame, persist, status),
         PM_CHAPTERS => prompt_recording_chapters(player, win.frame, persist, status),
         PM_SEEK_BACK_10 => player_seek_media(player, status, Some(-10_000), None),
         PM_SEEK_FORWARD_10 => player_seek_media(player, status, Some(10_000), None),
@@ -14607,7 +14829,9 @@ fn save_buffer_clip(
                 "A file with this name already exists in the selected folder.",
             ));
         }
-        std::fs::rename(&part, destination).map_err(|e| e.to_string())?;
+        // PR #46: publish through the shared exclusive
+        // publish (hard link where supported), not a rename.
+        iptv_core::recording::publish_new_file(&part, destination)?;
         Ok(())
     })();
     if !staged {
@@ -14879,7 +15103,14 @@ fn release_recording_lease(buffers: &Rc<RefCell<buffer::BufferRegistry>>, key: &
 fn player_stop(player: &Rc<RefCell<PlayerState>>, persist: &Persist, status: Status) {
     // PR #44: stopping cancels a pending Stalker play
     // resolution (its captured generation goes stale).
-    player.borrow_mut().play_generation += 1;
+    {
+        let mut state = player.borrow_mut();
+        state.play_generation += 1;
+        // PR #46: stopping cancels a running excerpt export.
+        if let Some(flag) = &state.excerpt_cancel {
+            flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
     cancel_sleep_timer(player);
     if let Some(buffers) = buffers_of(player) {
         buffers.borrow_mut().release_current();
@@ -15698,6 +15929,25 @@ fn rollover_action(state: &mut PlayerState) -> Option<EngineAction> {
 /// track setup, and end/error transitions into the session
 /// machine (with its reconnect handling).
 #[allow(clippy::too_many_lines)] // engine poll legs, as in Python
+/// PR #46: confirm the recording queue's opening row now
+/// that the player reports this generation playing (Python's
+/// `started`): only then is the head consumed, so a start
+/// that never plays leaves the row queued.
+fn queue_confirm_started(state: &PlayerState) {
+    let Some(shared) = &state.shared else {
+        return;
+    };
+    let Some(ticket) = state.queue_ticket else {
+        return;
+    };
+    shared.recording_queue.borrow_mut().queue.started(
+        ticket,
+        state.queue_generation,
+        state.session.generation(),
+    );
+}
+
+#[allow(clippy::too_many_lines)] // one poll over every engine state, as in Python
 fn poll_vlc_state(player: &Rc<RefCell<PlayerState>>, persist: &Persist, status: Status) {
     let mut setup_tracks = false;
     let mut confirm_history = false;
@@ -15725,6 +15975,7 @@ fn poll_vlc_state(player: &Rc<RefCell<PlayerState>>, persist: &Persist, status: 
                     player_status(status, persist, &state.session.announcement(), 3);
                     confirm_history = true;
                 }
+                queue_confirm_started(&state);
                 if let Some(ms) = state.pending_resume_ms.take() {
                     engine.set_time(ms);
                 }
@@ -15796,6 +16047,41 @@ fn poll_vlc_state(player: &Rc<RefCell<PlayerState>>, persist: &Persist, status: 
             }
             iptv_vlc::VlcState::Ended | iptv_vlc::VlcState::Error => {
                 let ended = engine.state() == iptv_vlc::VlcState::Ended;
+                // PR #46: an engine error on the queue's
+                // opening item fails the queue at that title
+                // before any restart recovery (Python's
+                // failed()); the row stays queued for a retry.
+                if !ended {
+                    let failed_title = state.shared.as_ref().and_then(|shared| {
+                        let mut inner = shared.recording_queue.borrow_mut();
+                        if state.queue_ticket != Some(inner.queue.ticket()) {
+                            return None;
+                        }
+                        let title = inner.queue.opening()?.title.clone();
+                        inner.queue.stop();
+                        Some(title)
+                    });
+                    if let Some(title) = failed_title {
+                        state.queue_ticket = None;
+                        state.vlc_active = false;
+                        let parent = state.window.as_ref().map(|win| win.frame);
+                        drop(state);
+                        player_stop(player, persist, status);
+                        let message =
+                            iptv_core::recording_queue::stopped_at(&title, "Playback Error");
+                        match parent {
+                            Some(frame) => show_or_queue_notification(
+                                frame,
+                                &message,
+                                &tr("Recording Playback Queue"),
+                                MessageDialogStyle::OK | MessageDialogStyle::IconInformation,
+                                None,
+                            ),
+                            None => status.set_label(&message),
+                        }
+                        return;
+                    }
+                }
                 // An expected TS segment ending refreshes on
                 // the rollover path (P04), never the failure
                 // budget.
@@ -15868,6 +16154,7 @@ fn poll_fallback_state(player: &Rc<RefCell<PlayerState>>, persist: &Persist, sta
                     Act::None
                 } else {
                     state.session.on_event(EngineEvent::Started, now_ms());
+                    queue_confirm_started(&state);
                     if let Some(ms) = state.pending_resume_ms.take() {
                         win.media.seek(ms, SeekMode::FromStart);
                     }
@@ -17636,6 +17923,262 @@ fn restore_normal_speed(player: &Rc<RefCell<PlayerState>>, persist: &Persist, st
 /// Python's `_find_subtitle_text`): search the loaded cues
 /// and seek to the chosen match.
 #[allow(clippy::too_many_lines)] // one dialog flow, as in Python
+/// PR #46: Python's `export_file` for text: a save dialog
+/// (overwrite prompt built in), the extension appended
+/// when missing — with a replace confirmation when the
+/// appended name already exists — then an atomic write;
+/// the outcome is boxed under the export's own title.
+fn export_text_file(parent: &dyn WxWidget, title: &str, content: &[u8]) {
+    let wildcard = format!("{}|*.txt", tr("Text file (*.txt)"));
+    let dialog = FileDialog::builder(parent)
+        .with_message(title)
+        .with_wildcard(&wildcard)
+        .with_style(FileDialogStyle::Save | FileDialogStyle::OverwritePrompt)
+        .build();
+    if dialog.show_modal_tracked() != ID_OK {
+        return;
+    }
+    let Some(mut path) = dialog.get_path() else {
+        return;
+    };
+    if !path.to_lowercase().ends_with(".txt") {
+        path.push_str(".txt");
+        if std::path::Path::new(&path).exists() {
+            let answer =
+                MessageDialog::builder(parent, &tr("Replace the existing export file?"), title)
+                    .with_style(
+                        MessageDialogStyle::YesNo
+                            | MessageDialogStyle::NoDefault
+                            | MessageDialogStyle::IconWarning,
+                    )
+                    .build()
+                    .show_modal_tracked();
+            if answer != ID_YES {
+                return;
+            }
+        }
+    }
+    let (message, style) =
+        match iptv_core::planning_tools::atomic_export(std::path::Path::new(&path), content) {
+            Ok(()) => (
+                tr("Export saved."),
+                MessageDialogStyle::OK | MessageDialogStyle::IconInformation,
+            ),
+            Err(error) => (
+                trf("The operation failed:\n{error}", &[("error", &error)]),
+                MessageDialogStyle::OK | MessageDialogStyle::IconError,
+            ),
+        };
+    let dialog = MessageDialog::builder(parent, &message, title)
+        .with_style(style)
+        .build();
+    dialog.show_modal_tracked();
+}
+
+/// Player > Save Subtitle Transcript... (PR #46, Python's
+/// `_save_subtitle_transcript`): every loaded cue, in the
+/// transcript's timestamped plain-text form.
+fn save_subtitle_transcript(
+    player: &Rc<RefCell<PlayerState>>,
+    frame: Frame,
+    persist: &Persist,
+    status: Status,
+) {
+    let cues = player.borrow().subtitle_cues.clone();
+    if local_recording_context(player).is_none() || cues.is_empty() {
+        player_status(
+            status,
+            persist,
+            "Open a local recording with text subtitles first.",
+            2,
+        );
+        return;
+    }
+    export_text_file(
+        &frame,
+        &tr("Save Subtitle Transcript..."),
+        &iptv_core::recording_media::transcript(&cues),
+    );
+}
+
+/// Player > Save Recording Excerpt... (PR #46, Python's
+/// `_save_recording_excerpt`): the excerpt points are the
+/// start, the named bookmarks strictly inside the media,
+/// and the end; start and end are chosen, then a .mkv save
+/// dialog, then the encode runs in the background, canceled
+/// by a stop, a new load or the window closing.
+#[allow(clippy::too_many_lines)] // excerpt flow: points, choosers, save dialog, background encode
+fn save_recording_excerpt(
+    player: &Rc<RefCell<PlayerState>>,
+    frame: Frame,
+    persist: &Persist,
+    status: Status,
+) {
+    let title = tr("Save Recording Excerpt...");
+    let fail = |message: &str| {
+        let dialog = MessageDialog::builder(&frame, message, &title)
+            .with_style(MessageDialogStyle::OK | MessageDialogStyle::IconError)
+            .build();
+        dialog.show_modal_tracked();
+    };
+    let Some((generation, seekable)) = local_recording_context(player) else {
+        player_status(status, persist, "Open a seekable local recording first.", 2);
+        return;
+    };
+    if !seekable {
+        player_status(status, persist, "Open a seekable local recording first.", 2);
+        return;
+    }
+    if player.borrow().excerpt_cancel.is_some() {
+        player_status(status, persist, "In Progress", 2);
+        return;
+    }
+    let (key, length, path, identity) = {
+        let state = player.borrow();
+        let Some(channel) = state.current_channel.as_ref() else {
+            return;
+        };
+        let Some(path) = channel
+            .unknown_attributes
+            .get("local-recording")
+            .filter(|value| !value.is_empty())
+        else {
+            return;
+        };
+        let identity = channel
+            .unknown_attributes
+            .get("provider-id")
+            .cloned()
+            .unwrap_or_default();
+        (
+            state.resume_key.clone(),
+            position_length(&state).1,
+            path.clone(),
+            identity,
+        )
+    };
+    if length <= 0 {
+        return;
+    }
+    let rows = iptv_core::named_bookmarks::rows_for(&bookmark_store(persist), &key);
+    let mut points: Vec<(i64, String)> = vec![(0, tr("Start of recording"))];
+    for row in rows {
+        if row.position_ms > 0 && row.position_ms < length {
+            points.push((row.position_ms, row.name));
+        }
+    }
+    points.push((length, tr("End of recording")));
+    if points.len() < 3 {
+        fail(&tr(
+            "Add a named bookmark to mark a point inside the recording first.",
+        ));
+        return;
+    }
+    let choose = |prompt: &str, choices: &[(i64, String)]| -> Option<i64> {
+        let labels: Vec<String> = choices
+            .iter()
+            .map(|(position, name)| {
+                format!(
+                    "{} \u{2013} {}",
+                    iptv_core::recording_media::clock_text(*position),
+                    name
+                )
+            })
+            .collect();
+        let dialog = SingleChoiceDialog::builder(
+            &frame,
+            prompt,
+            &title,
+            &labels.iter().map(String::as_str).collect::<Vec<_>>(),
+        )
+        .build();
+        dialog.set_selection(0);
+        if dialog.show_modal_tracked() != ID_OK {
+            return None;
+        }
+        // The media may have changed behind the chooser.
+        if local_recording_context(player).map(|(now, _)| now) != Some(generation) {
+            return None;
+        }
+        usize::try_from(dialog.get_selection())
+            .ok()
+            .and_then(|index| choices.get(index))
+            .map(|(position, _)| *position)
+    };
+    let Some(first) = choose(
+        &tr("Choose the start of the excerpt:"),
+        &points[..points.len() - 1],
+    ) else {
+        return;
+    };
+    let ends: Vec<(i64, String)> = points
+        .iter()
+        .filter(|(position, _)| *position > first)
+        .cloned()
+        .collect();
+    let Some(last) = choose(&tr("Choose the end of the excerpt:"), &ends) else {
+        return;
+    };
+    let dialog = FileDialog::builder(&frame)
+        .with_message(&title)
+        .with_wildcard("Matroska (*.mkv)|*.mkv")
+        .with_style(FileDialogStyle::Save | FileDialogStyle::OverwritePrompt)
+        .build();
+    if dialog.show_modal_tracked() != ID_OK {
+        return;
+    }
+    let Some(mut destination) = dialog.get_path() else {
+        return;
+    };
+    if !destination.to_lowercase().ends_with(".mkv") {
+        destination.push_str(".mkv");
+    }
+    if local_recording_context(player).map(|(now, _)| now) != Some(generation) {
+        return;
+    }
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    player.borrow_mut().excerpt_cancel = Some(std::sync::Arc::clone(&cancel));
+    player_status(status, persist, "Saving recording excerpt...", 2);
+    let done_player = Rc::clone(player);
+    let work_cancel = std::sync::Arc::clone(&cancel);
+    run_in_background(
+        &frame,
+        move || {
+            let canceled = || work_cancel.load(std::sync::atomic::Ordering::Relaxed);
+            iptv_core::recording_media::save_excerpt(
+                "ffmpeg",
+                std::path::Path::new(&path),
+                &identity,
+                std::path::Path::new(&destination),
+                first,
+                last,
+                &canceled,
+            )
+        },
+        move |result| {
+            done_player.borrow_mut().excerpt_cancel = None;
+            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                return;
+            }
+            let (message, style) = match result {
+                Ok(()) => (
+                    tr("Export saved."),
+                    MessageDialogStyle::OK | MessageDialogStyle::IconInformation,
+                ),
+                Err(error) => (
+                    error,
+                    MessageDialogStyle::OK | MessageDialogStyle::IconError,
+                ),
+            };
+            let dialog = MessageDialog::builder(&frame, &message, &title)
+                .with_style(style)
+                .build();
+            dialog.show_modal_tracked();
+        },
+    );
+}
+
+#[allow(clippy::too_many_lines)] // search prompt, results and export in one flow, as in Python
 fn prompt_subtitle_find(
     player: &Rc<RefCell<PlayerState>>,
     frame: Frame,
@@ -17682,8 +18225,9 @@ fn prompt_subtitle_find(
     dialog.set_accessibility_label(&title);
     bind_escape_cancel(dialog);
     let panel = Panel::builder(&dialog).build();
+    // PR #46: multi-select, so a subset can be exported.
     let list = ListCtrl::builder(&panel)
-        .with_style(ListCtrlStyle::Report | ListCtrlStyle::Virtual | ListCtrlStyle::SingleSel)
+        .with_style(ListCtrlStyle::Report | ListCtrlStyle::Virtual)
         .build();
     list.set_accessibility_label(&tr("Subtitle matches"));
     list.insert_column(0, &tr("Time"), ListColumnFormat::Left, 90);
@@ -17702,41 +18246,77 @@ fn prompt_subtitle_find(
             _ => cue.text.clone(),
         }
     });
-    let ok = Button::builder(&panel).with_label("&OK").build();
+    let go = Button::builder(&panel)
+        .with_label(&tr("Go to Time..."))
+        .build();
+    let save = Button::builder(&panel)
+        .with_label(&tr("Save Selected Subtitles..."))
+        .build();
     let cancel = Button::builder(&panel).with_label("&Cancel").build();
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     sizer.add(&list, 1, SizerFlag::Expand | SizerFlag::All, 4);
     let buttons = BoxSizer::builder(Orientation::Horizontal).build();
-    buttons.add(&ok, 0, SizerFlag::All, 4);
+    buttons.add(&go, 0, SizerFlag::All, 4);
+    buttons.add(&save, 0, SizerFlag::All, 4);
     buttons.add(&cancel, 0, SizerFlag::All, 4);
     sizer.add_sizer(&buttons, 0, SizerFlag::Expand, 0);
     panel.set_sizer(sizer, true);
-    let chosen: Rc<RefCell<Option<i64>>> = Rc::new(RefCell::new(None));
-    let chosen_pick = Rc::clone(&chosen);
-    let matches_pick = Rc::clone(&matches);
-    let dialog_pick = dialog;
-    list.on_item_activated(move |_| {
-        let index = list.get_first_selected_item();
-        if index >= 0 {
-            if let Some(cue) = usize::try_from(index)
-                .ok()
-                .and_then(|i| matches_pick.get(i))
-            {
-                *chosen_pick.borrow_mut() = Some(cue.start);
-            }
-        }
-        dialog_pick.end_modal(ID_OK);
+    // The selected match indexes, in row order.
+    let matches_sel = Rc::clone(&matches);
+    let selected_rows = Rc::new(move |list: ListCtrl| -> Vec<usize> {
+        (0..matches_sel.len())
+            .filter(|row| {
+                i64::try_from(*row)
+                    .is_ok_and(|index| list.get_item_state(index, ListItemState::Selected))
+            })
+            .collect()
     });
-    let chosen_ok = Rc::clone(&chosen);
-    let matches_ok = Rc::clone(&matches);
-    ok.on_click(move |_| {
-        let index = list.get_first_selected_item();
-        if index >= 0 {
-            if let Some(cue) = usize::try_from(index).ok().and_then(|i| matches_ok.get(i)) {
-                *chosen_ok.borrow_mut() = Some(cue.start);
+    let chosen: Rc<RefCell<Option<i64>>> = Rc::new(RefCell::new(None));
+    // Go to Time (and double-click): exactly one selected
+    // row jumps; anything else is announced and the dialog
+    // stays open (Python's jump()).
+    let jump = Rc::new({
+        let chosen = Rc::clone(&chosen);
+        let matches = Rc::clone(&matches);
+        let selected_rows = Rc::clone(&selected_rows);
+        let persist = persist.clone();
+        move |list: ListCtrl| {
+            let rows = selected_rows(list);
+            if rows.len() == 1 {
+                if let Some(cue) = matches.get(rows[0]) {
+                    *chosen.borrow_mut() = Some(cue.start);
+                }
+                dialog.end_modal(ID_OK);
+            } else {
+                player_status(
+                    status,
+                    &persist,
+                    "Select one subtitle to jump to its position.",
+                    2,
+                );
             }
         }
-        dialog.end_modal(ID_OK);
+    });
+    let jump_activated = Rc::clone(&jump);
+    list.on_item_activated(move |_| jump_activated(list));
+    let jump_click = Rc::clone(&jump);
+    go.on_click(move |_| jump_click(list));
+    let matches_save = Rc::clone(&matches);
+    let selected_save = Rc::clone(&selected_rows);
+    save.on_click(move |_| {
+        let rows = selected_save(list);
+        if rows.is_empty() {
+            return;
+        }
+        let cues: Vec<iptv_core::subtitles::Cue> = rows
+            .iter()
+            .filter_map(|row| matches_save.get(*row).cloned())
+            .collect();
+        export_text_file(
+            &dialog,
+            &tr("Save Subtitle Transcript..."),
+            &iptv_core::recording_media::transcript(&cues),
+        );
     });
     let dialog_cancel = dialog;
     cancel.on_click(move |_| {
@@ -20867,7 +21447,7 @@ fn queue_poll(wiring: &Wiring, status: Status) {
 /// ticket, the Ended session state separates a natural
 /// finish from a manual stop (which leaves the session Idle).
 fn queue_maybe_advance(wiring: &Wiring, status: Status) {
-    let (_ticket, _generation, should) = {
+    let (queue_ticket, queue_generation, current, should) = {
         let inner = wiring.recording_queue.borrow();
         let state = wiring.player.borrow();
         let (queue_ticket, queue_generation) = (state.queue_ticket, state.queue_generation);
@@ -20877,7 +21457,8 @@ fn queue_maybe_advance(wiring: &Wiring, status: Status) {
             iptv_core::playback::SessionState::Ended
         );
         (
-            inner.queue.ticket(),
+            queue_ticket,
+            queue_generation,
             current,
             ended
                 && inner.queue.should_advance(
@@ -20890,6 +21471,16 @@ fn queue_maybe_advance(wiring: &Wiring, status: Status) {
         )
     };
     if should {
+        // Python `ended` confirms the opening row first
+        // (PR #46): a start the Playing poll somehow missed
+        // is still consumed before the next hand-off.
+        if let Some(ticket) = queue_ticket {
+            wiring
+                .recording_queue
+                .borrow_mut()
+                .queue
+                .started(ticket, queue_generation, current);
+        }
         queue_next(wiring, status);
     }
 }
@@ -21469,6 +22060,16 @@ fn show_recording_queue_editor(wiring: &Wiring, parent: Frame, status: Status) -
     let halt = Button::builder(&panel)
         .with_label(&tr("Stop after Current Recording"))
         .build();
+    // PR #46: named saved queues.
+    let save_queue = Button::builder(&panel)
+        .with_label(&tr("Save Queue..."))
+        .build();
+    let load_queue = Button::builder(&panel)
+        .with_label(&tr("Load Saved Queue..."))
+        .build();
+    let delete_queue = Button::builder(&panel)
+        .with_label(&tr("Delete Saved Queue..."))
+        .build();
     let sizer = BoxSizer::builder(Orientation::Vertical).build();
     sizer.add(&list, 1, SizerFlag::Expand | SizerFlag::All, 12);
     let controls_row = BoxSizer::builder(Orientation::Horizontal).build();
@@ -21479,6 +22080,9 @@ fn show_recording_queue_editor(wiring: &Wiring, parent: Frame, status: Status) -
     let buttons = BoxSizer::builder(Orientation::Horizontal).build();
     buttons.add(&play, 0, SizerFlag::All, 4);
     buttons.add(&halt, 0, SizerFlag::All, 4);
+    buttons.add(&save_queue, 0, SizerFlag::All, 4);
+    buttons.add(&load_queue, 0, SizerFlag::All, 4);
+    buttons.add(&delete_queue, 0, SizerFlag::All, 4);
     sizer.add_sizer(&buttons, 0, SizerFlag::Expand, 0);
     panel.set_sizer(sizer, true);
     let wiring_refresh = clone_wiring(wiring);
@@ -21504,6 +22108,16 @@ fn show_recording_queue_editor(wiring: &Wiring, parent: Frame, status: Status) -
         remove.enable(count > 0);
         play.enable(count > 0 && !inner.queue.playing());
         halt.enable(inner.queue.playing());
+        // PR #46: saved-queue buttons follow Python's
+        // enablement (never while the queue is playing).
+        let empty = serde_json::Value::Null;
+        let config = wiring_refresh.persist.config.borrow();
+        let saved = iptv_core::recording_queue::saved_queues(
+            config.value("saved_recording_queues").unwrap_or(&empty),
+        );
+        save_queue.enable(count > 0 && !inner.queue.playing());
+        load_queue.enable(!saved.is_empty() && !inner.queue.playing());
+        delete_queue.enable(!saved.is_empty() && !inner.queue.playing());
     });
     refresh(None);
     let wiring_edit = clone_wiring(wiring);
@@ -21561,6 +22175,22 @@ fn show_recording_queue_editor(wiring: &Wiring, parent: Frame, status: Status) -
         queue_ref.borrow_mut().queue.stop();
         halt_refresh(None);
     });
+    // PR #46: the saved-queue buttons run Python's manage()
+    // and always refresh afterwards.
+    let manage = Rc::new({
+        let wiring_m = clone_wiring(wiring);
+        let refresh_m = Rc::clone(&refresh);
+        move |mode: &'static str| {
+            manage_saved_queue(&wiring_m, &dialog, mode);
+            refresh_m(None);
+        }
+    });
+    let manage_save = Rc::clone(&manage);
+    save_queue.on_click(move |_| manage_save("save"));
+    let manage_load = Rc::clone(&manage);
+    load_queue.on_click(move |_| manage_load("load"));
+    let manage_delete = Rc::clone(&manage);
+    delete_queue.on_click(move |_| manage_delete("delete"));
     let play_answer = Rc::new(std::cell::Cell::new(false));
     let play_flag = Rc::clone(&play_answer);
     let dialog_play = dialog;
@@ -21571,6 +22201,107 @@ fn show_recording_queue_editor(wiring: &Wiring, parent: Frame, status: Status) -
     list.set_focus();
     dialog.show_modal_tracked();
     play_answer.get()
+}
+
+/// PR #46: Save / Load / Delete a named recording playback
+/// queue (Python's editor `manage`): save asks a name and
+/// confirms replacing a case-insensitive clash, load and
+/// delete pick from the saved names sorted case-insensitively
+/// and confirm first, and core validation errors show in a
+/// box titled "Saved Playback Queues". Persistence is the
+/// `saved_recording_queues` config value, the same JSON shape
+/// Python writes.
+fn manage_saved_queue(wiring: &Wiring, parent: &dyn WxWidget, mode: &str) {
+    let caption = tr("Saved Playback Queues");
+    let empty = serde_json::Value::Null;
+    let current = {
+        let config = wiring.persist.config.borrow();
+        config
+            .value("saved_recording_queues")
+            .unwrap_or(&empty)
+            .clone()
+    };
+    let queues = iptv_core::recording_queue::saved_queues(&current);
+    let fail = |error: &str| {
+        let dialog = MessageDialog::builder(parent, error, &caption)
+            .with_style(MessageDialogStyle::OK | MessageDialogStyle::IconError)
+            .build();
+        dialog.show_modal_tracked();
+    };
+    let confirm = |message: &str| {
+        MessageDialog::builder(parent, message, &caption)
+            .with_style(MessageDialogStyle::YesNo | MessageDialogStyle::NoDefault)
+            .build()
+            .show_modal_tracked()
+            == ID_YES
+    };
+    if mode == "save" {
+        let entry = TextEntryDialog::builder(parent, &tr("Name for this queue:"), &caption).build();
+        if entry.show_modal_tracked() != ID_OK {
+            return;
+        }
+        let name = entry.get_value().unwrap_or_default().trim().to_string();
+        let replace = queues
+            .iter()
+            .any(|(existing, _)| existing.to_lowercase() == name.to_lowercase());
+        if replace && !confirm(&tr("Replace the saved queue with this name?")) {
+            return;
+        }
+        let rows = wiring.recording_queue.borrow().queue.pending().to_vec();
+        match iptv_core::recording_queue::save_named(&current, &name, &rows, replace) {
+            Ok(saved) => wiring.persist.set_and_save(
+                "saved_recording_queues",
+                iptv_core::recording_queue::saved_queues_json(&saved),
+            ),
+            Err(error) => fail(&error),
+        }
+        return;
+    }
+    let mut names: Vec<String> = queues.iter().map(|(name, _)| name.clone()).collect();
+    names.sort_by_key(|name| name.to_lowercase());
+    if names.is_empty() {
+        return;
+    }
+    let choice = SingleChoiceDialog::builder(
+        parent,
+        &tr("Choose a saved queue:"),
+        &caption,
+        &names.iter().map(String::as_str).collect::<Vec<_>>(),
+    )
+    .build();
+    if choice.show_modal_tracked() != ID_OK {
+        return;
+    }
+    let selection = usize::try_from(choice.get_selection()).unwrap_or(usize::MAX);
+    let Some(name) = names.get(selection).cloned() else {
+        return;
+    };
+    if mode == "delete" {
+        if !confirm(&tr("Delete this saved queue?")) {
+            return;
+        }
+        let kept: Vec<(String, Vec<iptv_core::recording_library::LibraryRow>)> =
+            queues.into_iter().filter(|(n, _)| *n != name).collect();
+        wiring.persist.set_and_save(
+            "saved_recording_queues",
+            iptv_core::recording_queue::saved_queues_json(&kept),
+        );
+        return;
+    }
+    // Load: a non-empty current queue confirms replacement.
+    if !wiring.recording_queue.borrow().queue.is_empty()
+        && !confirm(&tr("Replace the current playback queue?"))
+    {
+        return;
+    }
+    if let Some((_, rows)) = queues.iter().find(|(n, _)| *n == name) {
+        let rows = rows.clone();
+        wiring
+            .recording_queue
+            .borrow_mut()
+            .queue
+            .replace_pending(rows);
+    }
 }
 
 /// Choose a problem time to start from (C7, Python
@@ -25035,10 +25766,22 @@ fn open_conflict_dialog(wiring: &Wiring, job: &iptv_core::dvr::DvrJob, main_stat
     frame.show(true);
 }
 
+/// The Scheduled Recordings dialog's filter state (PR #46,
+/// Python's `schedule_filter` / `schedule_view`): the query
+/// and view the list is filtered by, plus the job ids the
+/// last render actually showed, in row order — selection
+/// maps through the shown rows, never the full job list.
+#[derive(Clone, Default)]
+struct ScheduledUi {
+    query: Rc<RefCell<String>>,
+    view: Rc<RefCell<String>>,
+    shown: Rc<RefCell<Vec<String>>>,
+}
+
 /// The job ids behind the Scheduled Recordings list's
 /// selected rows, in row order.
-fn selected_job_ids(wiring: &Wiring, list: ListCtrl) -> Vec<String> {
-    let dvr = wiring.dvr.borrow();
+fn selected_job_ids(ui: &ScheduledUi, list: ListCtrl) -> Vec<String> {
+    let shown = ui.shown.borrow();
     let mut ids = Vec::new();
     let mut item: i64 = -1;
     loop {
@@ -25046,8 +25789,8 @@ fn selected_job_ids(wiring: &Wiring, list: ListCtrl) -> Vec<String> {
         if next < 0 {
             break;
         }
-        if let Some(job) = dvr.jobs().get(usize::try_from(next).unwrap_or(usize::MAX)) {
-            ids.push(job.id.clone());
+        if let Some(id) = shown.get(usize::try_from(next).unwrap_or(usize::MAX)) {
+            ids.push(id.clone());
         }
         item = i64::from(next);
     }
@@ -25060,9 +25803,18 @@ fn selected_job_ids(wiring: &Wiring, list: ListCtrl) -> Vec<String> {
 /// the rebuild (waiting jobs carry their conflict reason in
 /// the status column).
 #[allow(clippy::cast_possible_truncation)] // epoch seconds to i64 for local stamps
-fn render_scheduled_jobs(wiring: &Wiring, list: ListCtrl, dstatus: Status) {
-    let selected = selected_job_ids(wiring, list);
+fn render_scheduled_jobs(ui: &ScheduledUi, wiring: &Wiring, list: ListCtrl, dstatus: Status) {
+    let selected = selected_job_ids(ui, list);
     let dvr = wiring.dvr.borrow();
+    // PR #46: the list shows the filtered jobs (Python's
+    // refresh applies filter_recording_schedule).
+    let jobs = iptv_core::planning_tools::filter_recording_schedule(
+        dvr.jobs(),
+        &ui.query.borrow(),
+        &ui.view.borrow(),
+        now_seconds(),
+    );
+    *ui.shown.borrow_mut() = jobs.iter().map(|job| job.id.clone()).collect();
     list.delete_all_items();
     let stamp = |ts: f64| {
         chrono::TimeZone::timestamp_opt(&chrono::Local, ts as i64, 0)
@@ -25070,7 +25822,7 @@ fn render_scheduled_jobs(wiring: &Wiring, list: ListCtrl, dstatus: Status) {
             .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
             .unwrap_or_default()
     };
-    for (index, job) in dvr.jobs().iter().enumerate() {
+    for (index, job) in jobs.iter().enumerate() {
         let row = i64::try_from(index).unwrap_or(0);
         let window = format!("{} - {}", stamp(job.start_ts), stamp(job.stop_ts));
         list.insert_item(row, &window, None);
@@ -25108,7 +25860,7 @@ fn render_scheduled_jobs(wiring: &Wiring, list: ListCtrl, dstatus: Status) {
     }
     dstatus.set_label(&trf(
         "{count} scheduled recordings.",
-        &[("count", &dvr.jobs().len().to_string())],
+        &[("count", &jobs.len().to_string())],
     ));
 }
 
@@ -25117,8 +25869,8 @@ fn render_scheduled_jobs(wiring: &Wiring, list: ListCtrl, dstatus: Status) {
 /// also stops the capture: a canceled job leaves the Recording
 /// state, so the scheduler will never emit its Stop action
 /// (issue #130).
-fn cancel_first_selected_job(wiring: &Wiring, list: ListCtrl, dstatus: Status) {
-    let Some(id) = selected_job_ids(wiring, list).into_iter().next() else {
+fn cancel_first_selected_job(ui: &ScheduledUi, wiring: &Wiring, list: ListCtrl, dstatus: Status) {
+    let Some(id) = selected_job_ids(ui, list).into_iter().next() else {
         dstatus.set_label("Choose a recording to cancel first.");
         return;
     };
@@ -25137,14 +25889,19 @@ fn cancel_first_selected_job(wiring: &Wiring, list: ListCtrl, dstatus: Status) {
             .pending_resolves
             .borrow_mut()
             .retain(|_, pending| !matches!(pending, PendingResolve::Dvr(job) if job == &id));
-        render_scheduled_jobs(wiring, list, dstatus);
+        render_scheduled_jobs(ui, wiring, list, dstatus);
     }
 }
 
 /// Delete every selected finished job (the Delete button and
 /// the Delete key share this; audit R19).
-fn delete_selected_finished_jobs(wiring: &Wiring, list: ListCtrl, dstatus: Status) {
-    let ids = selected_job_ids(wiring, list);
+fn delete_selected_finished_jobs(
+    ui: &ScheduledUi,
+    wiring: &Wiring,
+    list: ListCtrl,
+    dstatus: Status,
+) {
+    let ids = selected_job_ids(ui, list);
     if ids.is_empty() {
         dstatus.set_label("Choose a finished recording to delete first.");
         return;
@@ -25167,7 +25924,7 @@ fn delete_selected_finished_jobs(wiring: &Wiring, list: ListCtrl, dstatus: Statu
     if removed == 0 {
         dstatus.set_label("Only finished recordings can be deleted.");
     }
-    render_scheduled_jobs(wiring, list, dstatus);
+    render_scheduled_jobs(ui, wiring, list, dstatus);
 }
 
 /// DVR jobs projected for budget/conflict math (PR #36):
@@ -25869,8 +26626,12 @@ fn programme_window_label(start: i64, stop: i64) -> String {
     format!("{} – {}", local(start), local(stop))
 }
 
-fn selected_single_job(wiring: &Wiring, list: ListCtrl) -> Option<iptv_core::dvr::DvrJob> {
-    let ids = selected_job_ids(wiring, list);
+fn selected_single_job(
+    ui: &ScheduledUi,
+    wiring: &Wiring,
+    list: ListCtrl,
+) -> Option<iptv_core::dvr::DvrJob> {
+    let ids = selected_job_ids(ui, list);
     (ids.len() == 1)
         .then(|| wiring.dvr.borrow().get(&ids[0]).cloned())
         .flatten()
@@ -25878,9 +26639,9 @@ fn selected_single_job(wiring: &Wiring, list: ListCtrl) -> Option<iptv_core::dvr
 
 /// The selected jobs themselves, in row order (PR #44's menu
 /// conditions and exports work on the jobs, not just their ids).
-fn selected_jobs(wiring: &Wiring, list: ListCtrl) -> Vec<iptv_core::dvr::DvrJob> {
+fn selected_jobs(ui: &ScheduledUi, wiring: &Wiring, list: ListCtrl) -> Vec<iptv_core::dvr::DvrJob> {
     let dvr = wiring.dvr.borrow();
-    selected_job_ids(wiring, list)
+    selected_job_ids(ui, list)
         .iter()
         .filter_map(|id| dvr.get(id).cloned())
         .collect()
@@ -25942,8 +26703,14 @@ fn publish_reviewed_edit(
 }
 
 /// Scheduled Recordings > Skip This Occurrence (Python `_skip_occurrence`).
-fn skip_selected_occurrence(wiring: &Wiring, frame: Frame, list: ListCtrl, dstatus: Status) {
-    let Some(job) = selected_single_job(wiring, list) else {
+fn skip_selected_occurrence(
+    ui: &ScheduledUi,
+    wiring: &Wiring,
+    frame: Frame,
+    list: ListCtrl,
+    dstatus: Status,
+) {
+    let Some(job) = selected_single_job(ui, wiring, list) else {
         return;
     };
     let title = if job.display_title.is_empty() {
@@ -25962,7 +26729,7 @@ fn skip_selected_occurrence(wiring: &Wiring, frame: Frame, list: ListCtrl, dstat
         .dvr
         .borrow_mut()
         .skip_occurrence(&job.id, job.start_ts, now_seconds());
-    render_scheduled_jobs(wiring, list, dstatus);
+    render_scheduled_jobs(ui, wiring, list, dstatus);
     let (text, style) = match result {
         Ok(next) => (
             trf(
@@ -26044,8 +26811,14 @@ fn active_account_keys(wiring: &Wiring, channels: &[Channel]) -> Vec<String> {
 /// download) collapse into one call, with the channel list
 /// re-resolved between the budget checks, exactly where Python
 /// re-checks the list identity in its `ready` leg.
-fn recover_selected_archive(wiring: &Wiring, frame: Frame, list: ListCtrl, dstatus: Status) {
-    let Some(job) = selected_single_job(wiring, list) else {
+fn recover_selected_archive(
+    ui: &ScheduledUi,
+    wiring: &Wiring,
+    frame: Frame,
+    list: ListCtrl,
+    dstatus: Status,
+) {
+    let Some(job) = selected_single_job(ui, wiring, list) else {
         return;
     };
     let config = config_value(wiring);
@@ -26108,8 +26881,14 @@ fn recover_selected_archive(wiring: &Wiring, frame: Frame, list: ListCtrl, dstat
 
 /// Scheduled Recordings > Repeat on Weekdays... (Python
 /// `planning_tools_ui.weekdays` + `_edit_weekdays`).
-fn edit_selected_weekdays(wiring: &Wiring, frame: Frame, list: ListCtrl, dstatus: Status) {
-    let Some(job) = selected_single_job(wiring, list) else {
+fn edit_selected_weekdays(
+    ui: &ScheduledUi,
+    wiring: &Wiring,
+    frame: Frame,
+    list: ListCtrl,
+    dstatus: Status,
+) {
+    let Some(job) = selected_single_job(ui, wiring, list) else {
         dstatus.set_label(&tr(
             "Select one pending recording that is not a series rule.",
         ));
@@ -26154,7 +26933,7 @@ fn edit_selected_weekdays(wiring: &Wiring, frame: Frame, list: ListCtrl, dstatus
         .filter_map(|day| u8::try_from(day).ok())
         .collect();
     let result = wiring.dvr.borrow_mut().set_weekdays(&job.id, &days);
-    render_scheduled_jobs(wiring, list, dstatus);
+    render_scheduled_jobs(ui, wiring, list, dstatus);
     if let Err(error) = result {
         operation_failed_box(&frame, &error);
     }
@@ -26162,8 +26941,14 @@ fn edit_selected_weekdays(wiring: &Wiring, frame: Frame, list: ListCtrl, dstatus
 
 /// Scheduled Recordings > Padding for This Recording... (Python
 /// `RecordingPaddingDialog(job=)` + `padding_dialog`).
-fn padding_for_selected(wiring: &Wiring, frame: Frame, list: ListCtrl, dstatus: Status) {
-    let Some(job) = selected_single_job(wiring, list) else {
+fn padding_for_selected(
+    ui: &ScheduledUi,
+    wiring: &Wiring,
+    frame: Frame,
+    list: ListCtrl,
+    dstatus: Status,
+) {
+    let Some(job) = selected_single_job(ui, wiring, list) else {
         return;
     };
     let caption = tr("Padding for This Recording...");
@@ -26238,7 +27023,7 @@ fn padding_for_selected(wiring: &Wiring, frame: Frame, list: ListCtrl, dstatus: 
         }
         Err(error) => operation_failed_box(&frame, &error),
     }
-    render_scheduled_jobs(wiring, list, dstatus);
+    render_scheduled_jobs(ui, wiring, list, dstatus);
 }
 
 /// The automatic guide matcher over a store; C10's guide assignment
@@ -26276,7 +27061,7 @@ fn pending_jobs(wiring: &Wiring) -> Vec<iptv_core::dvr::DvrJob> {
 fn review_guide_changes(
     wiring: &Wiring,
     frame: Frame,
-    refresh: Option<(ListCtrl, Status)>,
+    refresh: Option<(ScheduledUi, ListCtrl, Status)>,
     notify_only: bool,
 ) {
     let jobs = pending_jobs(wiring);
@@ -26432,8 +27217,8 @@ fn review_guide_changes(
                 Some(future_start),
                 Some(&still_current),
             );
-            if let Some((list, dstatus)) = refresh {
-                render_scheduled_jobs(wiring, list, dstatus);
+            if let Some((ui, list, dstatus)) = refresh {
+                render_scheduled_jobs(&ui, wiring, list, dstatus);
             }
         },
     );
@@ -26441,8 +27226,16 @@ fn review_guide_changes(
 
 /// Scheduled Recordings > Find Another Airing... (Python `find_airing`).
 #[allow(clippy::too_many_lines)] // one dialog flow, as in Python
-fn find_another_airing(wiring: &Wiring, frame: Frame, list: ListCtrl, dstatus: Status) {
-    let Some(job) = selected_single_job(wiring, list) else {
+fn find_another_airing(
+    ui: &ScheduledUi,
+    wiring: &Wiring,
+    frame: Frame,
+    list: ListCtrl,
+    dstatus: Status,
+) {
+    // Owned: the background completion renders through it.
+    let ui = ui.clone();
+    let Some(job) = selected_single_job(&ui, wiring, list) else {
         return;
     };
     let model = wiring.browser.borrow().catalogue_model();
@@ -26716,7 +27509,7 @@ fn find_another_airing(wiring: &Wiring, frame: Frame, list: ListCtrl, dstatus: S
                 Some(future_start),
                 Some(&validate),
             );
-            render_scheduled_jobs(wiring, list, dstatus);
+            render_scheduled_jobs(&ui, wiring, list, dstatus);
         },
     );
 }
@@ -26725,9 +27518,15 @@ fn find_another_airing(wiring: &Wiring, frame: Frame, list: ListCtrl, dstatus: S
 /// Calendar... (Python `planning_tools_ui.export_recordings`):
 /// the save dialog first, then the selection is re-read and
 /// must still equal the snapshot the menu was built from.
-fn export_selected_recordings(wiring: &Wiring, frame: Frame, list: ListCtrl, dstatus: Status) {
+fn export_selected_recordings(
+    ui: &ScheduledUi,
+    wiring: &Wiring,
+    frame: Frame,
+    list: ListCtrl,
+    dstatus: Status,
+) {
     let title = tr("Export Selected Recordings to Calendar...");
-    let snapshot = selected_jobs(wiring, list);
+    let snapshot = selected_jobs(ui, wiring, list);
     if snapshot.is_empty() {
         return;
     }
@@ -26811,9 +27610,15 @@ fn export_selected_recordings(wiring: &Wiring, frame: Frame, list: ListCtrl, dst
 /// remove option; a new pause is confirmed with the first
 /// skipped and next following recording times before it saves.
 #[allow(clippy::too_many_lines)] // one dialog flow, as in Python
-fn pause_recording_rule(wiring: &Wiring, frame: Frame, list: ListCtrl, dstatus: Status) {
+fn pause_recording_rule(
+    ui: &ScheduledUi,
+    wiring: &Wiring,
+    frame: Frame,
+    list: ListCtrl,
+    dstatus: Status,
+) {
     let title = tr("Pause Recording Rule...");
-    let Some(job) = selected_single_job(wiring, list) else {
+    let Some(job) = selected_single_job(ui, wiring, list) else {
         return;
     };
     let rule_id = job.series_source.clone().unwrap_or_else(|| job.id.clone());
@@ -26897,7 +27702,13 @@ fn pause_recording_rule(wiring: &Wiring, frame: Frame, list: ListCtrl, dstatus: 
         Ok(())
     };
     let finish = |wiring: &Wiring, result: Result<(), String>| match result {
-        Ok(()) => render_scheduled_jobs(wiring, list, dstatus),
+        Ok(()) => {
+            // PR #46: Python's set_pause_period requests a
+            // series scan (a lifted pause lets the scan fill
+            // the episodes it covers).
+            wiring.series_last_scan.set(0.0);
+            render_scheduled_jobs(ui, wiring, list, dstatus);
+        }
         Err(error) => {
             let dialog = MessageDialog::builder(&frame, &tr(&error), &title)
                 .with_style(MessageDialogStyle::OK | MessageDialogStyle::IconError)
@@ -26979,6 +27790,28 @@ fn open_scheduled_dialog(wiring: &Wiring, main_status: Status) {
     frame.set_accessibility_label("Scheduled Recordings");
     bind_escape_hide(frame);
     let panel = Panel::builder(&frame).build();
+    let ui = ScheduledUi::default();
+    *ui.view.borrow_mut() = "all".to_string();
+    // PR #46: the filter row above the list (Python's
+    // schedule_filter / schedule_view): a title/channel
+    // search and the view choice.
+    let filter_label = StaticText::builder(&panel)
+        .with_label(&tr("Filter by title or channel"))
+        .build();
+    let _ = filter_label;
+    let filter_text = TextCtrl::builder(&panel).build();
+    filter_text.set_accessibility_label(&tr("Filter by title or channel"));
+    let view_choice = Choice::builder(&panel).build();
+    view_choice.set_accessibility_label(&tr("Schedule view"));
+    for label in [
+        "All",
+        "Next 7 Days",
+        "Failed and Partial",
+        "Paused Recording Rules",
+    ] {
+        view_choice.append(&tr(label));
+    }
+    view_choice.set_selection(0);
     let list = ListCtrl::builder(&panel)
         .with_style(ListCtrlStyle::Report)
         .build();
@@ -27024,10 +27857,38 @@ fn open_scheduled_dialog(wiring: &Wiring, main_status: Status) {
         bar: None,
     };
     let render = render_scheduled_jobs;
-    render(wiring, list, dstatus);
+    render(&ui, wiring, list, dstatus);
     if wiring.dvr.borrow().jobs().is_empty() {
         main_status.set_label("No scheduled recordings.");
     }
+    // PR #46: typing in the filter re-renders after a
+    // 130 ms debounce (Python's CallLater); the view choice
+    // re-renders at once. The timer is retained by the text
+    // handler below — dropping it would destroy it.
+    let search_timer = Rc::new(Timer::new(&frame));
+    {
+        let wiring_s = clone_wiring(wiring);
+        let ui_s = ui.clone();
+        search_timer.on_tick(move |_| {
+            render_scheduled_jobs(&ui_s, &wiring_s, list, dstatus);
+        });
+    }
+    let ui_f = ui.clone();
+    let timer_f = Rc::clone(&search_timer);
+    filter_text.bind_internal(EventType::TEXT, move |_| {
+        *ui_f.query.borrow_mut() = filter_text.get_value();
+        let _ = timer_f.start(130, true);
+    });
+    let ui_ch = ui.clone();
+    let wiring_ch = clone_wiring(wiring);
+    view_choice.bind_internal(EventType::COMMAND_CHOICE_SELECTED, move |_| {
+        let index = usize::try_from(view_choice.get_selection().unwrap_or(0)).unwrap_or(0);
+        *ui_ch.view.borrow_mut() = ["all", "week", "problems", "paused"]
+            .get(index)
+            .unwrap_or(&"all")
+            .to_string();
+        render_scheduled_jobs(&ui_ch, &wiring_ch, list, dstatus);
+    });
     let cancel_job = Button::builder(&panel)
         .with_label("&Cancel Recording")
         .build();
@@ -27054,21 +27915,25 @@ fn open_scheduled_dialog(wiring: &Wiring, main_status: Status) {
         .build();
     review.set_accessibility_label(&tr("Review Guide Changes..."));
     let wiring_w = clone_wiring(wiring);
+    let ui_w = ui.clone();
     repeat_weekdays.on_click(move |_| {
-        edit_selected_weekdays(&wiring_w, frame, list, dstatus);
+        edit_selected_weekdays(&ui_w, &wiring_w, frame, list, dstatus);
     });
     let wiring_g = clone_wiring(wiring);
+    let ui_g = ui.clone();
     review.on_click(move |_| {
-        review_guide_changes(&wiring_g, frame, Some((list, dstatus)), false);
+        review_guide_changes(&wiring_g, frame, Some((ui_g.clone(), list, dstatus)), false);
     });
     let close = Button::builder(&panel).with_label("&Close").build();
     let wiring_c = clone_wiring(wiring);
+    let ui_c = ui.clone();
     cancel_job.on_click(move |_| {
-        cancel_first_selected_job(&wiring_c, list, dstatus);
+        cancel_first_selected_job(&ui_c, &wiring_c, list, dstatus);
     });
     let wiring_x = clone_wiring(wiring);
+    let ui_x = ui.clone();
     resolve_conflict.on_click(move |_| {
-        let Some(id) = selected_job_ids(&wiring_x, list).into_iter().next() else {
+        let Some(id) = selected_job_ids(&ui_x, list).into_iter().next() else {
             dstatus.set_label("Choose a waiting recording first.");
             return;
         };
@@ -27076,25 +27941,27 @@ fn open_scheduled_dialog(wiring: &Wiring, main_status: Status) {
         match job {
             Some(job) if job.status == iptv_core::dvr::STATUS_WAITING => {
                 open_conflict_dialog(&wiring_x, &job, main_status);
-                render(&wiring_x, list, dstatus);
+                render(&ui_x, &wiring_x, list, dstatus);
             }
             Some(_) => dstatus.set_label("That recording is not waiting on a conflict."),
             None => dstatus.set_label("Choose a waiting recording first."),
         }
     });
     let wiring_t = clone_wiring(wiring);
+    let ui_t = ui.clone();
     edit_times.on_click(move |_| {
-        let ids = selected_job_ids(&wiring_t, list);
+        let ids = selected_job_ids(&ui_t, list);
         if ids.len() == 1 {
             edit_job_times(&wiring_t, &frame, &ids[0], dstatus);
-            render(&wiring_t, list, dstatus);
+            render(&ui_t, &wiring_t, list, dstatus);
         } else {
             dstatus.set_label("Select a scheduled recording first.");
         }
     });
     let wiring_v = clone_wiring(wiring);
+    let ui_v = ui.clone();
     view_conflicts.on_click(move |_| {
-        let ids = selected_job_ids(&wiring_v, list);
+        let ids = selected_job_ids(&ui_v, list);
         let job = (ids.len() == 1)
             .then(|| wiring_v.dvr.borrow().get(&ids[0]).cloned())
             .flatten();
@@ -27112,19 +27979,31 @@ fn open_scheduled_dialog(wiring: &Wiring, main_status: Status) {
         }
     });
     let wiring_d = clone_wiring(wiring);
+    let ui_d = ui.clone();
     delete_job.on_click(move |_| {
-        delete_selected_finished_jobs(&wiring_d, list, dstatus);
+        delete_selected_finished_jobs(&ui_d, &wiring_d, list, dstatus);
     });
     let wiring_r = clone_wiring(wiring);
+    let ui_r = ui.clone();
     refresh.on_click(move |_| {
-        render(&wiring_r, list, dstatus);
+        render(&ui_r, &wiring_r, list, dstatus);
     });
     // Keyboard batch operations (Python's list keys): Ctrl+A
     // selects every row; Delete removes the selected finished
     // jobs. Matched keys are consumed.
     let wiring_k = clone_wiring(wiring);
+    let ui_k = ui.clone();
     let wiring_ctx = clone_wiring(wiring);
+    let ui_ctx = ui.clone();
     list.bind_internal(EventType::KEY_DOWN, move |event| {
+        if key_event_label(event) == Some("Ctrl+F".to_string()) {
+            // PR #46: Ctrl+F jumps to the filter with its
+            // text selected (Python's char hook).
+            filter_text.set_focus();
+            filter_text.select_all();
+            event.skip(false);
+            return;
+        }
         if key_event_label(event) == Some("Ctrl+A".to_string()) {
             let count = list.get_item_count();
             for row in 0..i64::from(count) {
@@ -27134,7 +28013,7 @@ fn open_scheduled_dialog(wiring: &Wiring, main_status: Status) {
             return;
         }
         if event.get_key_code() == Some(127) {
-            delete_selected_finished_jobs(&wiring_k, list, dstatus);
+            delete_selected_finished_jobs(&ui_k, &wiring_k, list, dstatus);
             event.skip(false);
             return;
         }
@@ -27153,7 +28032,7 @@ fn open_scheduled_dialog(wiring: &Wiring, main_status: Status) {
             menu.append(DVR_CTX_DELETE, &tr("Delete\tDel"), "", ItemKind::Normal);
             // PR #44: export the selection when every selected
             // job is an unpaused future booking.
-            let selected = selected_jobs(&wiring_ctx, list);
+            let selected = selected_jobs(&ui_ctx, &wiring_ctx, list);
             let now = now_seconds();
             if !selected.is_empty()
                 && selected.iter().all(|job| {
@@ -27170,7 +28049,7 @@ fn open_scheduled_dialog(wiring: &Wiring, main_status: Status) {
                 );
             }
             // Python's single-selection items for a pending entry.
-            if let Some(job) = selected_single_job(&wiring_ctx, list) {
+            if let Some(job) = selected_single_job(&ui_ctx, &wiring_ctx, list) {
                 if iptv_core::archive_recovery::recoverable_status(&job.status) {
                     menu.append(
                         DVR_CTX_RECOVER,
@@ -27226,20 +28105,24 @@ fn open_scheduled_dialog(wiring: &Wiring, main_status: Status) {
         list.popup_menu(&mut menu, None);
     });
     let wiring_m = clone_wiring(wiring);
+    let ui_m = ui.clone();
     frame.on_menu(move |event| match event.get_id() {
-        DVR_CTX_REFRESH => render_scheduled_jobs(&wiring_m, list, dstatus),
-        DVR_CTX_CANCEL => cancel_first_selected_job(&wiring_m, list, dstatus),
-        DVR_CTX_DELETE => delete_selected_finished_jobs(&wiring_m, list, dstatus),
-        DVR_CTX_PADDING => padding_for_selected(&wiring_m, frame, list, dstatus),
-        DVR_CTX_FIND_AIRING => find_another_airing(&wiring_m, frame, list, dstatus),
-        DVR_CTX_SKIP => skip_selected_occurrence(&wiring_m, frame, list, dstatus),
-        DVR_CTX_EXPORT_CAL => export_selected_recordings(&wiring_m, frame, list, dstatus),
-        DVR_CTX_PAUSE => pause_recording_rule(&wiring_m, frame, list, dstatus),
-        DVR_CTX_RECOVER => recover_selected_archive(&wiring_m, frame, list, dstatus),
+        DVR_CTX_REFRESH => render_scheduled_jobs(&ui_m, &wiring_m, list, dstatus),
+        DVR_CTX_CANCEL => cancel_first_selected_job(&ui_m, &wiring_m, list, dstatus),
+        DVR_CTX_DELETE => delete_selected_finished_jobs(&ui_m, &wiring_m, list, dstatus),
+        DVR_CTX_PADDING => padding_for_selected(&ui_m, &wiring_m, frame, list, dstatus),
+        DVR_CTX_FIND_AIRING => find_another_airing(&ui_m, &wiring_m, frame, list, dstatus),
+        DVR_CTX_SKIP => skip_selected_occurrence(&ui_m, &wiring_m, frame, list, dstatus),
+        DVR_CTX_EXPORT_CAL => export_selected_recordings(&ui_m, &wiring_m, frame, list, dstatus),
+        DVR_CTX_PAUSE => pause_recording_rule(&ui_m, &wiring_m, frame, list, dstatus),
+        DVR_CTX_RECOVER => recover_selected_archive(&ui_m, &wiring_m, frame, list, dstatus),
         _ => {}
     });
     close.on_click(move |_| frame.hide());
     frame.show(true);
+    // PR #46: the list takes the focus when the dialog
+    // opens, as in Python.
+    list.set_focus();
 }
 
 /// The Catch-up dialog for one channel: past programmes with Play
@@ -29177,7 +30060,7 @@ fn open_whats_new(wiring: &Wiring, status: Status) {
 }
 
 /// The What's New text for the running version (updated per release).
-const WHATS_NEW_TEXT: &str = "Version 0.4.40 The Hungarian translation is polished throughout, and the user guide now covers the newest recording features in every language: pausing a recording rule, reviewing guide time changes for reminders, recording playback speed and subtitle text search.\n\nVersion 0.4.39 Recording rules can pause from Scheduled Recordings, reminders can follow programme moves in the guide, and exiting now lets recordings in progress finish after naming them and asking first. Stalker channels connect in the background with a Playback Error box when the portal fails, the Recording Library scans each folder on its own worker and always plays finished recordings inside the app at the saved position, and the player gains Recording Playback Speed and Find Text in Recording Subtitles for local recordings.\n\nVersion 0.4.33 When a stream cannot be recovered, the Stream Lost message now appears once. Before, closing it could open another one, over and over.\n\nVersion 0.4.32The built-in player can now boost volume up to 200 percent for quiet streams: the slider, volume keys and mouse wheel all run to 200, matching the Python client.\n\nVersion 0.4.31 Help > About now has a separate link for each of GitHub, Forgejo, the projects site, Telegram and the full credits: Tab reaches each one and Enter or Space opens it.\n\nVersion 0.4.30 Help > About now lists the author, the GitHub and Forgejo pages, the projects site and the Telegram channel, and points to CREDITS.md for full credits. The README follows the shared layout and credits the libraries and upstream code the app uses.\n\nVersion 0.4.29 No more console windows: every tool the app runs in the background, ffmpeg included, now starts hidden. Before, a terminal window could open at startup and every time you paused on a channel, taking the focus away, which made arrowing and Alt+Tab back into the app feel frozen. Search now waits for you: typing in Search channels no longer refilters the list on every key; press Enter to search and move to the channel list, or leave the field with Tab, Shift+Tab or a click. Clear the field and leave it to see every channel again. And moving through the channel list does less work, so your screen reader has fewer updates to process.\n\nVersion 0.4.28 The recording tools from the Python client’s latest update are here. Recordings > Recording Library lists your finished recordings from up to 20 folders: search, filter by status, sort, play or resume, rename titles, move recordings to the recording trash and restore them, with active recordings always left out. The built-in player gains Previous Episode and Next Episode (Ctrl+PageUp and Ctrl+PageDown) and Playback > Subtitle Timing (Ctrl+Shift+T), which shifts subtitle display and speech by up to ten minutes either way for the current media. Scheduled Recordings gains Edit Times and Recording Conflicts: overlaps are checked against your per-account recording connection limits, shown with their real windows including padding, and a new recording that would exceed a known limit asks first. Continue Watching gains a Type choice: recordings keep their own saved positions, separate from Video on Demand, and removing or clearing affects only the type you are looking at. An Xtream account whose server rejects the saved credentials now says so plainly instead of looking like an empty catalogue. And copied text now survives closing the app: copies are flushed to the clipboard before the app exits, so a stream URL you copied is still there to paste afterwards.\n\nVersion 0.4.26 The About box links and the user guide's bug-report address now point to the project's Forgejo home, as the Python client's do; the old GitHub addresses no longer open. All three packages (Windows, Linux and macOS) are now built and published by the Forgejo release workflow.\n\nVersion 0.4.25 Updates now come from the project's Forgejo home instead of GitHub: Check for Updates, and the optional launch check in Options, ask the Forgejo release page for the newest version, and releases are published there from now on. The previous version still checked GitHub, so this one must be installed by hand; afterwards updates resume automatically from Forgejo. This release carries the Windows package.\n\nVersion 0.4.24 Category names are spoken again in the Categories tree. NVDA announced only “Categories, tree view” for every item and never the category itself, because naming the tree the way the newer interface library prefers had replaced the tree’s own accessibility with a stub that knows no items. The tree now takes its name the way the Python client does, so All Channels, Favorites and every playlist category are read aloud with their position and level as you move through them. The tree also gains the expand buttons and root lines the Python tree shows.\n\nVersion 0.4.23 Translations now run on patois, the gettext library that translates Paperback: the catalogues for all 13 languages are compiled into the program itself instead of travelling as a folder of files beside it, and the standard dialogs’ own strings now follow the app’s language too. Same translations, same language menu, same best-fit choice for your system language — nothing else changes.\n\nVersion 0.4.22 Release notes are now written for people, in the changelog in the project repository, and the GitHub release page shows them. Every past release’s notes have been filled in the same way, back to the first one. The release process now refuses to publish a version whose changelog section is missing, so an empty release page cannot ship again.\n\nVersion 0.4.21 Escape now closes windows, as it always did in the Python app: every list window (What’s on Now, Continue Watching, Recently Watched, Reminders, Account Info, Downloads, the programme guide and more), the Playlist and EPG managers, the account form, Scheduled Recordings, Recording Conflicts, the Reminder, VOD, Cast, Audio Preferences, Shutdown Countdown and User Guide windows all hide on Escape, and the hand-built dialogs (sliders, Recording Problem Times, About, Custom Player, Resume) cancel on Escape. Before, Escape did nothing in any of them.\n\nVersion 0.4.20 stops the Windows console window from opening alongside the app: the program is now a proper Windows GUI application, like the Python client. Nothing else changes from 0.4.19.\n\nVersion 0.4.19 removes the Windows debugging-check dialogs for good. They were never app errors: the interface library was being built with its developer consistency checks switched on, so an internal check that a shipped build is supposed to skip could stop the app with a dialog (the menu check and the tree check in earlier versions were the same thing). The library is now built the way release builds are meant to be, with those checks compiled out, matching the Python client. Also fixed: switching the player into or out of fullscreen now settles its layout and focus just after the switch, as the Python client defers them.\n\nVersion 0.4.18 completes the second parity pass against the Python client. Chromecast casting works now: devices are found on your network, the channel plays through the cast proxy, the app asks before disconnecting, saved positions and local buffering are refused while casting, and a casting session counts against one-connection providers. Translations ship with the app: the Python client's catalogues and help guides in 14 languages are bundled, so a non-English system language now actually translates the interface and the guides. A new Account Info window finds your provider accounts, including accounts detected from playlist and channel addresses, and shows each account's status and limits, with Copy Details. Guide imports match Python: gzipped guides resume after an interruption, imports lock across app copies, an old guide database offers Python's repair prompt, and the import's start and finish are announced. Dialogs carry Python's explanations as readable text, the About box gains the community links, What Is Playing and Go to Channel answer the way Python's do, the category tree branches per playlist with an Other playlists branch and channel counts, Favorites messages match Python's, the player status line shows buffer, bitrate and volume in Python's format, audio track changes are spoken, and the mouse wheel over the player changes the volume. Recording formats now follow the selected channel's stream type, failed catch-up downloads retry and explain themselves, and message boxes that arrive while another is open now queue instead of stacking. The guide import lock also clears promptly on Windows and macOS when the copy of the app that held it has closed.\n\nVersion 0.4.14 keeps the window responsive while the saved guide loads, and brings more of the Python client's behaviour across. Channel details, series scans, guide search and What's on Now now read the saved guide on a background thread instead of freezing the window, and results that arrive after you have moved on are dropped instead of replacing what you are looking at. Guide matching now uses the Python client's scored matcher, so channels find their correct guide listings more reliably. Recordings gain the Python client's per-recording logs, outcome reports and Recording Problem Times view, and a failed download now explains the provider error in plain words instead of leaving a raw code.\n\nVersion 0.4.13 makes the built-in player's timers actually run, and stops decoding video when the player window is hidden. Reconnect, resume, subtitle speech and the sleep timer now work in the real app; they were silently dead in every earlier build. Hidden playback uses far less processing power (about 1.5 percent of one core instead of about 12), and pressing Enter while the player engine is still starting no longer freezes the window; playback begins when the engine is ready. Also fixed: two libVLC data layouts that could corrupt memory, and the release packages now bundle the newest VLC 3 release.\\n\\nVersion 0.4.12 adds VOD search and item details, and stops the window freezing during playback. In the VOD window, the new Search VOD field searches movies and series across every group: type a title and press Enter; each result row names its group and where it comes from, the status line says how many items matched, and clearing the search brings back the group you were browsing. The new Item details view shows the selected item's title, type, group, source, its guide description when one is available, and its stream address. Opening a series from the results and going back returns you to the same results with that series still selected. Also fixed: the guide information on channel rows now refreshes on a background thread instead of on the window itself, so alt-tabbing back into the app during playback answers right away instead of taking five to ten seconds, and a refreshed guide merges in much faster.\\n\\nVersion 0.4.11 makes startup and channel changes feel instant with a large guide. The channel rows used to freeze for several seconds after each playlist load, because refreshing the guide information on each row scanned the whole saved guide; it now looks at just the hours around the current time, the same way the Python client does. On a guide with about 800,000 programmes that step drops from about five seconds to a fraction of a second, so new channels are ready to use as soon as they appear.\n\nVersion 0.4.10 speeds up the programme guide and fixes a recording check. The guide now loads and refreshes as fast as the Python client or faster: on a large test guide, a first load dropped from about thirteen minutes to about two and a half, a refresh from about three minutes to about one, and opening the app with a guide already saved is instant instead of taking most of a minute. Recordings work again on non-English Windows systems: the free-space check before recording no longer depends on localized command output (thanks to Farhan Khan for that fix). And the player no longer logs a warning about a plugin-path option that current libVLC removed; it uses the mechanism libVLC supports now.\n\nVersion 0.4.9 refreshes everything under the hood: the cryptography, the guide parser, the database and the platform libraries are all at their newest released versions. Nothing changes on screen, and settings backups stay fully compatible; backups written by earlier versions still restore.\n\nVersion 0.4.8\n\nCasting works with header-protected streams again. The built-in cast proxy now answers the HEAD requests casting devices send before playing, follows redirects so playlists resolve against the address they actually live at, and passes range and duration headers through, so casting devices can probe a stream properly. Streams that need a specific player identity now get the default one automatically. Thanks to Farhan Khan for the fix. The PR validation gate also checks whitespace properly again.\n\nVersion 0.4.7\n\nFaster with big playlists and guides, and the last parity gaps closed. Large playlists now keep a background index, so switching playlists or categories and searching stay quick even with hundreds of thousands of channels, and the guide shown on each row refreshes almost instantly instead of re-checking every channel against the guide every minute. Scheduled Recordings has the right-click menu (Refresh, Cancel, Delete) like the Python client. The preferred audio track check now waits as long as the Python client does, so a slow stream is less likely to lose your saved track. Closing the app no longer waits on the player engine. The log file lives where the Python client puts it. And pressing F1 while a menu is open now opens the help for the menu item you are on.\n\nVersion 0.4.6\n\nFix: single-instance handover now works on Windows (the lock file is opened with the access Windows requires). Plus the Python parity catch-up. Guide sources saved by the Python client now load, the saved guide is there again after a restart, and search finds programmes as well as channels. Provider playlists keep their own channels separate, replace cleanly on refresh, and a failed refresh keeps the channels you had. Resume positions now read the Python client's bookmarks, so Continue Watching carries across. Recordings get unique file names, retries, destination space checks, and honest empty-recording reports; reminders and series recording match the Python dialogs. The app is single-instance (a second launch hands over to the running one), keeps a real log file under Help, checks for updates hourly, and F1 opens the help topic for the window you are in.\n\nVersion 0.4.4\n\nLess talk, working keys. Controls no longer read out instructional sentences when you land on them — Categories, Search, and Channels announce their names, like the Python app, and the channel list no longer repeats the playlist status message every time you tab to it. Ctrl+Up and Ctrl+Down now only change the volume; they no longer move the channel or category selection at the same time. And the search field selects your whole query when you enter it, so typing replaces it, with Ctrl+A selecting all.\n\nVersion 0.4.3\n\nRecording conflicts and safer imports. When a scheduled recording would take a provider connection your watching is using, the recording waits with its reason shown in Scheduled Recordings instead of cutting in; you choose there: keep watching and let it wait, stop playback and record, or cancel the recording. Waiting recordings start fairly, earliest first, when a connection frees. And importing settings now first saves a verified encrypted recovery copy of your current settings where you choose, under its own password, and refuses to run while recordings or downloads are active. The basic player (when libVLC is unavailable) also reports its state honestly now, and its menus no longer offer full-player-only controls.\n\nVersion 0.4.2\n\nReliability and subtitle speech. Playback now confirms before it counts as playing, and a failing stream retries inside one 30-second budget with a clear Stream lost message instead of spinning forever. Recordings that start late say so honestly, and cancelling a scheduled recording now stops its capture. Settings backups interchange with the Python client, verified both ways. Subtitles can now speak through an application voice on Windows (SAPI), not only through your screen reader: pick the backend, output device, volume, and speed under Options, Subtitle Speech, and if the chosen output device disappears, speech pauses until it returns or falls back to the system default, per the device policy.\n\nVersion 0.4.1\n\nLess talk. Channel rows now carry the guide the way the Python app does — channel name first, then the current and next programmes after it — and moving through the list no longer speaks the guide out loud on every step; the description panel still fills in silently.\n\nVersion 0.4.0\n\nSigned updates. Check for Updates now uses the ship-shape updater, the same signed updater as BlindRadio: update packages are cryptographically signed and verified before anything installs, then install and relaunch on their own (Windows and Linux; macOS opens the verified disk image for a manual install). Releases before this one can still update forward onto it.\n\nVersion 0.3.4\n\nFix: large playlists load promptly at startup. The playlist now loads first and the programme guide follows once it settles, instead of the two downloads racing; the guide database write no longer freezes the window; and the channel list says Loading playlist while a load is in flight instead of claiming no playlist is loaded.\n\nVersion 0.3.3\n\nFix: streams play again. The packages now bundle libVLC (the built-in player engine) beside the app on Windows, Linux, and macOS, so playback works with no separate VLC install. If libVLC still cannot load, pressing play now says so instead of failing silently.\n\nVersion 0.3.2\n\nFix: large playlists and guides now load. The HTTP library silently capped downloads at 10 MB, so a big provider playlist (for example a 28 MB, 115,000-channel list) failed to add and its EPG could never load. Playlist, EPG, Xtream, and Stalker fetches now take the full body.\n\nVersion 0.3.1\n\nFix: the Windows build no longer shows a wxWidgets debug dialog (\"Can't expand/collapse hidden root node!\") at startup or when the category list rebuilds. Nothing else changes from 0.3.0.\n\nVersion 0.3.0\n\nMain window: the layout now matches the Python client exactly (Playlist view and Categories on the left; Search, Channels, description and Stream URL on the right), and the menu-less shortcuts from the Python client work here: Ctrl+Up/Down volume, Ctrl+Shift+R record, Ctrl+D favorite and the rest of the documented set.\n\nPlayer: a Playback menu in Python's order, a Sleep Timer with an optional volume fade-out, and an Audio Output Device dialog that lists the real libVLC devices (System default first) and applies the saved choice at playback start. Announcement levels now gate player speech exactly as Python's do (None, Errors only, Important events, Detailed status).\n\nLocal Live Buffer: live TV in the built-in player can be buffered locally (off by default; set it up from the player's Playback menu), which enables pausing live TV, Rewind Live TV and Return to Live. A recording of a buffered channel reads the buffer instead of opening a second provider connection.\n\nDialogs: What's on Now has its filter box with a program count; Continue Watching gains Check Availability, which re-resolves each saved position against the current playlists and reports Available or Unavailable per row. Settings backup and restore now use Python's password-protected encrypted format, so backups interchange with the Python client both ways.\n\nMenus and shell: the Media Player menu lists all 32 players the Python client offers, with its exact per-platform program lookup. The tray icon builds Python's popup fresh on every right-click (Restore, Player Controls, Stop Recording(s) while recording, Exit) and left-click restores the window. The Recordings menu's minimum-free-space reserve and schedule padding use Python's values.";
+const WHATS_NEW_TEXT: &str = "Version 0.4.41 Scheduled Recordings gains a filter: Ctrl+F searches by title or channel, and the view selector shows the next seven days, failed and partial recordings, or paused rules. Recording Notifications chooses a dialog, an announcement, or history only for successful starts and finishes, and a recording that misses part of its scheduled time now says so. The playback queue keeps an item until playback really starts, and the queue editor can save, load and delete named queues. The player gains Save Subtitle Transcript, Save Selected Subtitles in the subtitle search, and Save Recording Excerpt, which writes a bookmarked range of a local recording to a new MKV in the background.\n\nVersion 0.4.40 The Hungarian translation is polished throughout, and the user guide now covers the newest recording features in every language: pausing a recording rule, reviewing guide time changes for reminders, recording playback speed and subtitle text search.\n\nVersion 0.4.39 Recording rules can pause from Scheduled Recordings, reminders can follow programme moves in the guide, and exiting now lets recordings in progress finish after naming them and asking first. Stalker channels connect in the background with a Playback Error box when the portal fails, the Recording Library scans each folder on its own worker and always plays finished recordings inside the app at the saved position, and the player gains Recording Playback Speed and Find Text in Recording Subtitles for local recordings.\n\nVersion 0.4.33 When a stream cannot be recovered, the Stream Lost message now appears once. Before, closing it could open another one, over and over.\n\nVersion 0.4.32The built-in player can now boost volume up to 200 percent for quiet streams: the slider, volume keys and mouse wheel all run to 200, matching the Python client.\n\nVersion 0.4.31 Help > About now has a separate link for each of GitHub, Forgejo, the projects site, Telegram and the full credits: Tab reaches each one and Enter or Space opens it.\n\nVersion 0.4.30 Help > About now lists the author, the GitHub and Forgejo pages, the projects site and the Telegram channel, and points to CREDITS.md for full credits. The README follows the shared layout and credits the libraries and upstream code the app uses.\n\nVersion 0.4.29 No more console windows: every tool the app runs in the background, ffmpeg included, now starts hidden. Before, a terminal window could open at startup and every time you paused on a channel, taking the focus away, which made arrowing and Alt+Tab back into the app feel frozen. Search now waits for you: typing in Search channels no longer refilters the list on every key; press Enter to search and move to the channel list, or leave the field with Tab, Shift+Tab or a click. Clear the field and leave it to see every channel again. And moving through the channel list does less work, so your screen reader has fewer updates to process.\n\nVersion 0.4.28 The recording tools from the Python client’s latest update are here. Recordings > Recording Library lists your finished recordings from up to 20 folders: search, filter by status, sort, play or resume, rename titles, move recordings to the recording trash and restore them, with active recordings always left out. The built-in player gains Previous Episode and Next Episode (Ctrl+PageUp and Ctrl+PageDown) and Playback > Subtitle Timing (Ctrl+Shift+T), which shifts subtitle display and speech by up to ten minutes either way for the current media. Scheduled Recordings gains Edit Times and Recording Conflicts: overlaps are checked against your per-account recording connection limits, shown with their real windows including padding, and a new recording that would exceed a known limit asks first. Continue Watching gains a Type choice: recordings keep their own saved positions, separate from Video on Demand, and removing or clearing affects only the type you are looking at. An Xtream account whose server rejects the saved credentials now says so plainly instead of looking like an empty catalogue. And copied text now survives closing the app: copies are flushed to the clipboard before the app exits, so a stream URL you copied is still there to paste afterwards.\n\nVersion 0.4.26 The About box links and the user guide's bug-report address now point to the project's Forgejo home, as the Python client's do; the old GitHub addresses no longer open. All three packages (Windows, Linux and macOS) are now built and published by the Forgejo release workflow.\n\nVersion 0.4.25 Updates now come from the project's Forgejo home instead of GitHub: Check for Updates, and the optional launch check in Options, ask the Forgejo release page for the newest version, and releases are published there from now on. The previous version still checked GitHub, so this one must be installed by hand; afterwards updates resume automatically from Forgejo. This release carries the Windows package.\n\nVersion 0.4.24 Category names are spoken again in the Categories tree. NVDA announced only “Categories, tree view” for every item and never the category itself, because naming the tree the way the newer interface library prefers had replaced the tree’s own accessibility with a stub that knows no items. The tree now takes its name the way the Python client does, so All Channels, Favorites and every playlist category are read aloud with their position and level as you move through them. The tree also gains the expand buttons and root lines the Python tree shows.\n\nVersion 0.4.23 Translations now run on patois, the gettext library that translates Paperback: the catalogues for all 13 languages are compiled into the program itself instead of travelling as a folder of files beside it, and the standard dialogs’ own strings now follow the app’s language too. Same translations, same language menu, same best-fit choice for your system language — nothing else changes.\n\nVersion 0.4.22 Release notes are now written for people, in the changelog in the project repository, and the GitHub release page shows them. Every past release’s notes have been filled in the same way, back to the first one. The release process now refuses to publish a version whose changelog section is missing, so an empty release page cannot ship again.\n\nVersion 0.4.21 Escape now closes windows, as it always did in the Python app: every list window (What’s on Now, Continue Watching, Recently Watched, Reminders, Account Info, Downloads, the programme guide and more), the Playlist and EPG managers, the account form, Scheduled Recordings, Recording Conflicts, the Reminder, VOD, Cast, Audio Preferences, Shutdown Countdown and User Guide windows all hide on Escape, and the hand-built dialogs (sliders, Recording Problem Times, About, Custom Player, Resume) cancel on Escape. Before, Escape did nothing in any of them.\n\nVersion 0.4.20 stops the Windows console window from opening alongside the app: the program is now a proper Windows GUI application, like the Python client. Nothing else changes from 0.4.19.\n\nVersion 0.4.19 removes the Windows debugging-check dialogs for good. They were never app errors: the interface library was being built with its developer consistency checks switched on, so an internal check that a shipped build is supposed to skip could stop the app with a dialog (the menu check and the tree check in earlier versions were the same thing). The library is now built the way release builds are meant to be, with those checks compiled out, matching the Python client. Also fixed: switching the player into or out of fullscreen now settles its layout and focus just after the switch, as the Python client defers them.\n\nVersion 0.4.18 completes the second parity pass against the Python client. Chromecast casting works now: devices are found on your network, the channel plays through the cast proxy, the app asks before disconnecting, saved positions and local buffering are refused while casting, and a casting session counts against one-connection providers. Translations ship with the app: the Python client's catalogues and help guides in 14 languages are bundled, so a non-English system language now actually translates the interface and the guides. A new Account Info window finds your provider accounts, including accounts detected from playlist and channel addresses, and shows each account's status and limits, with Copy Details. Guide imports match Python: gzipped guides resume after an interruption, imports lock across app copies, an old guide database offers Python's repair prompt, and the import's start and finish are announced. Dialogs carry Python's explanations as readable text, the About box gains the community links, What Is Playing and Go to Channel answer the way Python's do, the category tree branches per playlist with an Other playlists branch and channel counts, Favorites messages match Python's, the player status line shows buffer, bitrate and volume in Python's format, audio track changes are spoken, and the mouse wheel over the player changes the volume. Recording formats now follow the selected channel's stream type, failed catch-up downloads retry and explain themselves, and message boxes that arrive while another is open now queue instead of stacking. The guide import lock also clears promptly on Windows and macOS when the copy of the app that held it has closed.\n\nVersion 0.4.14 keeps the window responsive while the saved guide loads, and brings more of the Python client's behaviour across. Channel details, series scans, guide search and What's on Now now read the saved guide on a background thread instead of freezing the window, and results that arrive after you have moved on are dropped instead of replacing what you are looking at. Guide matching now uses the Python client's scored matcher, so channels find their correct guide listings more reliably. Recordings gain the Python client's per-recording logs, outcome reports and Recording Problem Times view, and a failed download now explains the provider error in plain words instead of leaving a raw code.\n\nVersion 0.4.13 makes the built-in player's timers actually run, and stops decoding video when the player window is hidden. Reconnect, resume, subtitle speech and the sleep timer now work in the real app; they were silently dead in every earlier build. Hidden playback uses far less processing power (about 1.5 percent of one core instead of about 12), and pressing Enter while the player engine is still starting no longer freezes the window; playback begins when the engine is ready. Also fixed: two libVLC data layouts that could corrupt memory, and the release packages now bundle the newest VLC 3 release.\\n\\nVersion 0.4.12 adds VOD search and item details, and stops the window freezing during playback. In the VOD window, the new Search VOD field searches movies and series across every group: type a title and press Enter; each result row names its group and where it comes from, the status line says how many items matched, and clearing the search brings back the group you were browsing. The new Item details view shows the selected item's title, type, group, source, its guide description when one is available, and its stream address. Opening a series from the results and going back returns you to the same results with that series still selected. Also fixed: the guide information on channel rows now refreshes on a background thread instead of on the window itself, so alt-tabbing back into the app during playback answers right away instead of taking five to ten seconds, and a refreshed guide merges in much faster.\\n\\nVersion 0.4.11 makes startup and channel changes feel instant with a large guide. The channel rows used to freeze for several seconds after each playlist load, because refreshing the guide information on each row scanned the whole saved guide; it now looks at just the hours around the current time, the same way the Python client does. On a guide with about 800,000 programmes that step drops from about five seconds to a fraction of a second, so new channels are ready to use as soon as they appear.\n\nVersion 0.4.10 speeds up the programme guide and fixes a recording check. The guide now loads and refreshes as fast as the Python client or faster: on a large test guide, a first load dropped from about thirteen minutes to about two and a half, a refresh from about three minutes to about one, and opening the app with a guide already saved is instant instead of taking most of a minute. Recordings work again on non-English Windows systems: the free-space check before recording no longer depends on localized command output (thanks to Farhan Khan for that fix). And the player no longer logs a warning about a plugin-path option that current libVLC removed; it uses the mechanism libVLC supports now.\n\nVersion 0.4.9 refreshes everything under the hood: the cryptography, the guide parser, the database and the platform libraries are all at their newest released versions. Nothing changes on screen, and settings backups stay fully compatible; backups written by earlier versions still restore.\n\nVersion 0.4.8\n\nCasting works with header-protected streams again. The built-in cast proxy now answers the HEAD requests casting devices send before playing, follows redirects so playlists resolve against the address they actually live at, and passes range and duration headers through, so casting devices can probe a stream properly. Streams that need a specific player identity now get the default one automatically. Thanks to Farhan Khan for the fix. The PR validation gate also checks whitespace properly again.\n\nVersion 0.4.7\n\nFaster with big playlists and guides, and the last parity gaps closed. Large playlists now keep a background index, so switching playlists or categories and searching stay quick even with hundreds of thousands of channels, and the guide shown on each row refreshes almost instantly instead of re-checking every channel against the guide every minute. Scheduled Recordings has the right-click menu (Refresh, Cancel, Delete) like the Python client. The preferred audio track check now waits as long as the Python client does, so a slow stream is less likely to lose your saved track. Closing the app no longer waits on the player engine. The log file lives where the Python client puts it. And pressing F1 while a menu is open now opens the help for the menu item you are on.\n\nVersion 0.4.6\n\nFix: single-instance handover now works on Windows (the lock file is opened with the access Windows requires). Plus the Python parity catch-up. Guide sources saved by the Python client now load, the saved guide is there again after a restart, and search finds programmes as well as channels. Provider playlists keep their own channels separate, replace cleanly on refresh, and a failed refresh keeps the channels you had. Resume positions now read the Python client's bookmarks, so Continue Watching carries across. Recordings get unique file names, retries, destination space checks, and honest empty-recording reports; reminders and series recording match the Python dialogs. The app is single-instance (a second launch hands over to the running one), keeps a real log file under Help, checks for updates hourly, and F1 opens the help topic for the window you are in.\n\nVersion 0.4.4\n\nLess talk, working keys. Controls no longer read out instructional sentences when you land on them — Categories, Search, and Channels announce their names, like the Python app, and the channel list no longer repeats the playlist status message every time you tab to it. Ctrl+Up and Ctrl+Down now only change the volume; they no longer move the channel or category selection at the same time. And the search field selects your whole query when you enter it, so typing replaces it, with Ctrl+A selecting all.\n\nVersion 0.4.3\n\nRecording conflicts and safer imports. When a scheduled recording would take a provider connection your watching is using, the recording waits with its reason shown in Scheduled Recordings instead of cutting in; you choose there: keep watching and let it wait, stop playback and record, or cancel the recording. Waiting recordings start fairly, earliest first, when a connection frees. And importing settings now first saves a verified encrypted recovery copy of your current settings where you choose, under its own password, and refuses to run while recordings or downloads are active. The basic player (when libVLC is unavailable) also reports its state honestly now, and its menus no longer offer full-player-only controls.\n\nVersion 0.4.2\n\nReliability and subtitle speech. Playback now confirms before it counts as playing, and a failing stream retries inside one 30-second budget with a clear Stream lost message instead of spinning forever. Recordings that start late say so honestly, and cancelling a scheduled recording now stops its capture. Settings backups interchange with the Python client, verified both ways. Subtitles can now speak through an application voice on Windows (SAPI), not only through your screen reader: pick the backend, output device, volume, and speed under Options, Subtitle Speech, and if the chosen output device disappears, speech pauses until it returns or falls back to the system default, per the device policy.\n\nVersion 0.4.1\n\nLess talk. Channel rows now carry the guide the way the Python app does — channel name first, then the current and next programmes after it — and moving through the list no longer speaks the guide out loud on every step; the description panel still fills in silently.\n\nVersion 0.4.0\n\nSigned updates. Check for Updates now uses the ship-shape updater, the same signed updater as BlindRadio: update packages are cryptographically signed and verified before anything installs, then install and relaunch on their own (Windows and Linux; macOS opens the verified disk image for a manual install). Releases before this one can still update forward onto it.\n\nVersion 0.3.4\n\nFix: large playlists load promptly at startup. The playlist now loads first and the programme guide follows once it settles, instead of the two downloads racing; the guide database write no longer freezes the window; and the channel list says Loading playlist while a load is in flight instead of claiming no playlist is loaded.\n\nVersion 0.3.3\n\nFix: streams play again. The packages now bundle libVLC (the built-in player engine) beside the app on Windows, Linux, and macOS, so playback works with no separate VLC install. If libVLC still cannot load, pressing play now says so instead of failing silently.\n\nVersion 0.3.2\n\nFix: large playlists and guides now load. The HTTP library silently capped downloads at 10 MB, so a big provider playlist (for example a 28 MB, 115,000-channel list) failed to add and its EPG could never load. Playlist, EPG, Xtream, and Stalker fetches now take the full body.\n\nVersion 0.3.1\n\nFix: the Windows build no longer shows a wxWidgets debug dialog (\"Can't expand/collapse hidden root node!\") at startup or when the category list rebuilds. Nothing else changes from 0.3.0.\n\nVersion 0.3.0\n\nMain window: the layout now matches the Python client exactly (Playlist view and Categories on the left; Search, Channels, description and Stream URL on the right), and the menu-less shortcuts from the Python client work here: Ctrl+Up/Down volume, Ctrl+Shift+R record, Ctrl+D favorite and the rest of the documented set.\n\nPlayer: a Playback menu in Python's order, a Sleep Timer with an optional volume fade-out, and an Audio Output Device dialog that lists the real libVLC devices (System default first) and applies the saved choice at playback start. Announcement levels now gate player speech exactly as Python's do (None, Errors only, Important events, Detailed status).\n\nLocal Live Buffer: live TV in the built-in player can be buffered locally (off by default; set it up from the player's Playback menu), which enables pausing live TV, Rewind Live TV and Return to Live. A recording of a buffered channel reads the buffer instead of opening a second provider connection.\n\nDialogs: What's on Now has its filter box with a program count; Continue Watching gains Check Availability, which re-resolves each saved position against the current playlists and reports Available or Unavailable per row. Settings backup and restore now use Python's password-protected encrypted format, so backups interchange with the Python client both ways.\n\nMenus and shell: the Media Player menu lists all 32 players the Python client offers, with its exact per-platform program lookup. The tray icon builds Python's popup fresh on every right-click (Restore, Player Controls, Stop Recording(s) while recording, Exit) and left-click restores the window. The Recordings menu's minimum-free-space reserve and schedule padding use Python's values.";
 
 /// Run the platform shutdown (factored out of the recordings poll
 /// for the countdown dialog).

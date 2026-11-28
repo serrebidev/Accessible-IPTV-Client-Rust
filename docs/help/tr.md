@@ -248,6 +248,8 @@ Oynatma > Altyazı Zamanlaması (Ctrl+Shift+T), her iki yönde en çok on dakika
 
 Yerel kayıt oynatılırken oynatma menüsünden yüklenmiş altyazı dosyasında veya gömülü metin izinde sözcük arayabilirsiniz. Bir sonucu seçip Enter tuşuna basarak o konuma gidin. Kayıt oynatma hızını 0,75× ile 2× arasında ayarlayabilirsiniz. 1× hızına dönmek için normal hızı seçin.
 
+Oynatma menüsünde **Altyazı dökümünü kaydet**, yüklenen metin parçasını zaman damgalarıyla dışa aktarır. Arama sonuçlarında satırları seçip **Seçili altyazıları kaydet** komutunu kullanın. Bir konuma gitmek için tek bir satır seçip Enter tuşuna basın.
+
 ### Ses çıkış cihazı {#audio-output-device}
 
 Oynatma > Ses çıkış cihazı... (D), oynatıcının hangi hoparlörleri ya da kulaklıkları kullanacağını seçer; örneğin TV sesini ekran okuyucunuzdan uzak tutmak için. Sistem varsayılanı, Windows'un varsayılan cihazını izler. Seçim hatırlanır.
@@ -292,7 +294,7 @@ Program, siz başka bir şey izlerken ya da hiçbir şey oynamazken herhangi bir
 
 Yerleşik oynatıcıda izlediğinizi kaydetmek sağlayıcıyla aynı bağlantıyı kullanır; bir kerede yalnızca bir akışa izin veren hesaplarda bile çalışır.
 
-Bir kaydı durdurmak, dosyası tamamlanırken biraz sürebilir. Uygulamadan çıkıldığında hâlâ süren kayıtlar da durdurulur; program önce dosyalarını tamamlamaları için onlara kısa bir süre tanır.
+Kaydı durdurduğunuzda veya uygulamadan çıktığınızda dosyanın yazımını tamamlaması için süre tanınır. Bu süre dosyaya ve kayıt biçimine bağlıdır.
 
 Kayıtlar > Kayıt Kitaplığı, geçerli kayıt klasörü dahil en fazla 20 klasördeki tamamlanmış dosyaları listeler. Klasör Ekle, mevcut bir klasörü ekler; yeni kayıtların kaydedileceği yeri değiştirmez. Klasörü Kitaplıktan Kaldır dosyalara dokunmaz. Geçerli kayıt klasörü kaldırılamaz.
 
@@ -301,6 +303,8 @@ Başlık, kanal veya tarihe göre arayın. Oynat / Sürdür dosyayı açar ve va
 Kayıt Çöp Kutusuna Taşı dosyayı kendi kayıt klasöründeki uygulama çöp kutusuna taşır; disk alanı boşaltmaz. Silinen Kayıtları Göster bu dosyaları listeler. Kaydı Geri Yükle, mevcut dosyaların üzerine yazmadan dosyayı özgün klasörüne döndürür. Bu görünümde Kayıt Dosyasını Sil, onaydan sonra dosyayı kalıcı olarak siler. Zamanlanmış Kayıtlar listesinden bir girdiyi kaldırmak medya dosyasını silmez.
 
 Tüm Kayıt Klasörleri yapılandırılan klasörleri birleştirir. Duruma göre filtreleyin; tarih, başlık, süre veya boyuta göre sıralayın. Azalan sıralamayı tersine çevirir. Ctrl+A görünen tüm satırları seçer; sayı ve toplam boyut gösterilir. Çöp kutusu, kalıcı silme ve geri yükleme çoklu seçimi destekler; oynatma ve yeniden adlandırma tek kayıt gerektirir. Tarama ve filtreleme arka plandadır; kapatma onaylanmış işlemleri iptal etmez.
+
+Düzenleyicide **Sırayı kaydet**, kalan kayıtları sırasıyla saklar. Aynı pencereden kayıtlı sıra yüklenebilir veya silinebilir. Her dosya sırası geldiğinde denetlenir. Başarılı başlangıç ve bitişler için **Kayıt bildirimleri** bölümünde iletişim kutusu, sesli bildirim veya yalnızca geçmiş seçilebilir. Yerel bir kayıttan kesit almak için adlandırılmış bir yer imi ekleyin, Oynatma menüsünde **Kayıt kesitini kaydet** komutunu seçip sınırları belirtin. Görüntü ve ses arka planda yeni bir MKV dosyasına kaydedilir.
 
 ### Kayıt biçimi {#recording-formats}
 
@@ -332,6 +336,8 @@ Başlamayı bekleyen zamanlanmış kayıtlar varken program kapanmadan önce sor
 Zamanlanmış Kayıtlar içindeki Kayıt Çakışmaları, seçilen kaydın zaman payları dahil çakışmalarını listeler. Ayrıntılarda kanal, hesap takma adı ve gerçek kayıt aralığı bulunur. Zamanları Düzenle mevcut düzenleyiciyi açar. Onay penceresi bu ayrıntıları ve Yine de Zamanla seçeneğini sunar. Bilinen bütçe aynı hesabı karşılaştırır; yoksa sağlayıcı sınırı iddiası olmadan zaman çakışmaları gösterilir.
 
 Zamanlanmış kayıtların bağlam menüsünde yinelenen bir kayıt veya dizi kuralını belirli tarihler arasında duraklatabilirsiniz. İlk ve son gün araya dahildir. Kayıt sonraki uygun yayında sürer. Arayı daha erken de kaldırabilirsiniz. Birden fazla yaklaşan kaydı seçerek baştaki ve sondaki ek sürelerle birlikte tek bir .ics dosyasına aktarabilirsiniz. Normal çıkışta uygulama süren kaydı durdurmadan önce onay ister ve dosyaları yazmayı tamamlar. Onaylamadan önce, saatleri biliniyorsa atlanacak ilk kaydı ve aradan sonraki ilk kaydı görebilirsiniz.
+
+Zamanlanmış Kayıtlar’da başlığa veya kanala göre filtrelemek için Ctrl+F tuşlarına basın. Gelecek yedi günü, başarısız ve kısmi kayıtları veya duraklatılan kuralları seçin. Tam liste için aramayı temizleyip Tümü’nü seçin.
 
 ### Zamanlama payı {#schedule-padding}
 

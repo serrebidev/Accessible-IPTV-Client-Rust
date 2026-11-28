@@ -5477,3 +5477,129 @@ msgstr "Wybierz nadchodzące nagrania przypadające poza okresem przerwy."
 
 msgid "Stopped because the app exited."
 msgstr "Nagrywanie przerwano po zamknięciu aplikacji."
+
+msgid "A saved queue with this name already exists."
+msgstr "Zapisana kolejka o tej nazwie już istnieje."
+
+msgid "Add a named bookmark to mark a point inside the recording first."
+msgstr "Najpierw dodaj nazwaną zakładkę wewnątrz nagrania."
+
+msgid "All"
+msgstr "Wszystkie"
+
+msgid "Announce and save in history"
+msgstr "Odczytaj i zapisz w historii"
+
+msgid "Choose a new filename for the excerpt."
+msgstr "Wybierz nową nazwę pliku z fragmentem."
+
+msgid "Choose a saved queue:"
+msgstr "Wybierz zapisaną kolejkę:"
+
+msgid "Choose a valid recording range and an MKV filename."
+msgstr "Wybierz prawidłowy zakres nagrania i nazwę pliku MKV."
+
+msgid "Choose the end of the excerpt:"
+msgstr "Wybierz koniec fragmentu:"
+
+msgid "Choose the start of the excerpt:"
+msgstr "Wybierz początek fragmentu:"
+
+msgid "Could not save the recording excerpt."
+msgstr "Nie można zapisać fragmentu nagrania."
+
+msgid "Delete Saved Queue..."
+msgstr "Usuń zapisaną kolejkę…"
+
+msgid "Delete this saved queue?"
+msgstr "Usunąć tę zapisaną kolejkę?"
+
+msgid "End of recording"
+msgstr "Koniec nagrania"
+
+msgid "Enter a queue name of 1 to 80 characters and include a recording."
+msgstr "Wprowadź nazwę od 1 do 80 znaków i dodaj nagranie."
+
+msgid "Failed and Partial"
+msgstr "Nieudane i częściowe"
+
+msgid "Filter by title or channel"
+msgstr "Filtruj według tytułu lub kanału"
+
+msgid "Load Saved Queue..."
+msgstr "Wczytaj zapisaną kolejkę…"
+
+msgid "Name for this queue:"
+msgstr "Nazwa kolejki:"
+
+msgid "Next 7 Days"
+msgstr "Następne 7 dni"
+
+msgid "Open a local recording with text subtitles first."
+msgstr "Najpierw otwórz lokalne nagranie z napisami tekstowymi."
+
+msgid "Paused Recording Rules"
+msgstr "Wstrzymane reguły nagrywania"
+
+msgid "Recording Notifications..."
+msgstr "Powiadomienia o nagraniach…"
+
+msgid "Recording saved: {title}"
+msgstr "Zapisano nagranie: {title}"
+
+msgid "Replace the current playback queue?"
+msgstr "Zastąpić bieżącą kolejkę odtwarzania?"
+
+msgid "Replace the saved queue with this name?"
+msgstr "Zastąpić zapisaną kolejkę o tej nazwie?"
+
+msgid "Save Queue..."
+msgstr "Zapisz kolejkę…"
+
+msgid "Save Recording Excerpt..."
+msgstr "Zapisz fragment nagrania…"
+
+msgid "Save Selected Subtitles..."
+msgstr "Zapisz wybrane napisy…"
+
+msgid "Save Subtitle Transcript..."
+msgstr "Zapisz transkrypcję napisów…"
+
+msgid "Save in history only"
+msgstr "Zapisz tylko w historii"
+
+msgid "Saved Playback Queues"
+msgstr "Zapisane kolejki odtwarzania"
+
+msgid "Saving recording excerpt..."
+msgstr "Zapisywanie fragmentu nagrania…"
+
+msgid "Saving the recording excerpt timed out."
+msgstr "Upłynął limit czasu zapisywania fragmentu."
+
+msgid "Schedule view"
+msgstr "Widok harmonogramu"
+
+msgid "Select one subtitle to jump to its position."
+msgstr "Wybierz jeden napis, aby przejść do jego pozycji."
+
+msgid "Show a dialog"
+msgstr "Pokaż okno dialogowe"
+
+msgid "Start of recording"
+msgstr "Początek nagrania"
+
+msgid "Text file (*.txt)"
+msgstr "Plik tekstowy (*.txt)"
+
+msgid "The queue could not be saved."
+msgstr "Nie można zapisać kolejki."
+
+msgid "The recording did not cover the full scheduled time."
+msgstr "Nagranie nie objęło całego zaplanowanego czasu."
+
+msgid "The saved queue limit has been reached."
+msgstr "Osiągnięto limit zapisanych kolejek."
+
+msgid "When a recording starts or finishes successfully:"
+msgstr "Po pomyślnym rozpoczęciu lub zakończeniu nagrywania:"

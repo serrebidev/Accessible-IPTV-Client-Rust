@@ -5474,3 +5474,129 @@ msgstr "Выберите предстоящие записи за предела
 
 msgid "Stopped because the app exited."
 msgstr "Запись остановлена при выходе из приложения."
+
+msgid "A saved queue with this name already exists."
+msgstr "Сохранённая очередь с таким именем уже существует."
+
+msgid "Add a named bookmark to mark a point inside the recording first."
+msgstr "Сначала добавьте именованную закладку внутри записи."
+
+msgid "All"
+msgstr "Все"
+
+msgid "Announce and save in history"
+msgstr "Озвучить и сохранить в истории"
+
+msgid "Choose a new filename for the excerpt."
+msgstr "Выберите новое имя файла отрывка."
+
+msgid "Choose a saved queue:"
+msgstr "Выберите сохранённую очередь:"
+
+msgid "Choose a valid recording range and an MKV filename."
+msgstr "Укажите допустимый интервал записи и имя файла MKV."
+
+msgid "Choose the end of the excerpt:"
+msgstr "Выберите конец отрывка:"
+
+msgid "Choose the start of the excerpt:"
+msgstr "Выберите начало отрывка:"
+
+msgid "Could not save the recording excerpt."
+msgstr "Не удалось сохранить отрывок записи."
+
+msgid "Delete Saved Queue..."
+msgstr "Удалить сохранённую очередь…"
+
+msgid "Delete this saved queue?"
+msgstr "Удалить эту сохранённую очередь?"
+
+msgid "End of recording"
+msgstr "Конец записи"
+
+msgid "Enter a queue name of 1 to 80 characters and include a recording."
+msgstr "Введите имя длиной от 1 до 80 символов и добавьте запись."
+
+msgid "Failed and Partial"
+msgstr "Неудачные и неполные"
+
+msgid "Filter by title or channel"
+msgstr "Фильтр по названию или каналу"
+
+msgid "Load Saved Queue..."
+msgstr "Загрузить сохранённую очередь…"
+
+msgid "Name for this queue:"
+msgstr "Имя очереди:"
+
+msgid "Next 7 Days"
+msgstr "Следующие 7 дней"
+
+msgid "Open a local recording with text subtitles first."
+msgstr "Сначала откройте локальную запись с текстовыми субтитрами."
+
+msgid "Paused Recording Rules"
+msgstr "Приостановленные правила записи"
+
+msgid "Recording Notifications..."
+msgstr "Уведомления о записи…"
+
+msgid "Recording saved: {title}"
+msgstr "Запись сохранена: {title}"
+
+msgid "Replace the current playback queue?"
+msgstr "Заменить текущую очередь воспроизведения?"
+
+msgid "Replace the saved queue with this name?"
+msgstr "Заменить сохранённую очередь с таким именем?"
+
+msgid "Save Queue..."
+msgstr "Сохранить очередь…"
+
+msgid "Save Recording Excerpt..."
+msgstr "Сохранить отрывок записи…"
+
+msgid "Save Selected Subtitles..."
+msgstr "Сохранить выбранные субтитры…"
+
+msgid "Save Subtitle Transcript..."
+msgstr "Сохранить расшифровку субтитров…"
+
+msgid "Save in history only"
+msgstr "Только сохранить в истории"
+
+msgid "Saved Playback Queues"
+msgstr "Сохранённые очереди воспроизведения"
+
+msgid "Saving recording excerpt..."
+msgstr "Сохранение отрывка записи…"
+
+msgid "Saving the recording excerpt timed out."
+msgstr "Истекло время ожидания сохранения отрывка."
+
+msgid "Schedule view"
+msgstr "Вид расписания"
+
+msgid "Select one subtitle to jump to its position."
+msgstr "Выберите одну строку субтитров, чтобы перейти к её позиции."
+
+msgid "Show a dialog"
+msgstr "Показать диалоговое окно"
+
+msgid "Start of recording"
+msgstr "Начало записи"
+
+msgid "Text file (*.txt)"
+msgstr "Текстовый файл (*.txt)"
+
+msgid "The queue could not be saved."
+msgstr "Не удалось сохранить очередь."
+
+msgid "The recording did not cover the full scheduled time."
+msgstr "Запись охватывает лишь часть запланированного времени."
+
+msgid "The saved queue limit has been reached."
+msgstr "Достигнут предел числа сохранённых очередей."
+
+msgid "When a recording starts or finishes successfully:"
+msgstr "При успешном начале или завершении записи:"

@@ -457,6 +457,362 @@ pub fn clock_text(milliseconds: i64) -> String {
     format!("{hours:02}:{minutes:02}:{secs:02}")
 }
 
+/// The subtitle transcript export (Python PR #46
+/// `transcript`): every cue with its original timestamps,
+/// as UTF-8 with a byte-order mark, so Notepad and screen
+/// readers open it in the right encoding.
+#[must_use]
+pub fn transcript(cues: &[Cue]) -> Vec<u8> {
+    let mut out = vec![0xEF, 0xBB, 0xBF];
+    for cue in cues {
+        out.extend_from_slice(
+            format!(
+                "{}.{:03} – {}.{:03}\n{}\n\n",
+                clock_text(cue.start),
+                cue.start.rem_euclid(1000),
+                clock_text(cue.end),
+                cue.end.rem_euclid(1000),
+                cue.text
+            )
+            .as_bytes(),
+        );
+    }
+    out
+}
+
+/// Removes the excerpt staging directory on drop, success
+/// or failure alike (Python's `TemporaryDirectory`).
+struct StagingDir(std::path::PathBuf);
+
+impl Drop for StagingDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Whether `nice` is on the PATH (Python's `shutil.which`
+/// gate for the encoder's lower priority on POSIX).
+#[cfg(unix)]
+fn nice_path() -> Option<std::path::PathBuf> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let path_var = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path_var) {
+        let candidate = dir.join("nice");
+        if let Ok(meta) = std::fs::metadata(&candidate) {
+            if meta.is_file() && meta.permissions().mode() & 0o111 != 0 {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+/// Save a bookmarked range of a local recording to a new
+/// MKV file (Python PR #46 `save_excerpt`): the range is
+/// re-encoded (libx264/aac, one thread, low priority) into
+/// a staging file beside the destination and published
+/// only on success, so the original is never touched and
+/// an existing file is never replaced. A cancelled export
+/// returns `Ok` silently, before the source is even
+/// looked at.
+///
+/// # Errors
+/// Python's messages: an invalid range or non-MKV name,
+/// a missing source, a changed source, an existing
+/// destination, an encoder failure, or the two-hour
+/// deadline passing.
+#[allow(clippy::too_many_arguments)] // Python's positional signature.
+#[allow(clippy::too_many_lines, clippy::cast_precision_loss)] // one linear encode flow, as in Python; milliseconds to seconds for ffmpeg
+pub fn save_excerpt(
+    ffmpeg: &str,
+    path: &Path,
+    identity: &str,
+    destination: &Path,
+    first: i64,
+    last: i64,
+    canceled: &dyn Fn() -> bool,
+) -> Result<(), String> {
+    if canceled() {
+        return Ok(());
+    }
+    let suffix = destination
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    if suffix != "mkv" || !(0 <= first && first < last && last <= 7 * 24 * 3600 * 1000) {
+        return Err("Choose a valid recording range and an MKV filename.".to_string());
+    }
+    if !path.is_file() {
+        return Err("The recording file is no longer available.".to_string());
+    }
+    let signature = file_signature(path)?;
+    if identity != recording_id(signature) {
+        return Err("The recording file changed. Refresh the library.".to_string());
+    }
+    if std::fs::symlink_metadata(destination).is_ok() {
+        return Err("Choose a new filename for the excerpt.".to_string());
+    }
+    let parent = destination
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .map_or_else(|| std::path::PathBuf::from("."), Path::to_path_buf);
+    let unique = format!(
+        ".iptv-excerpt-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_nanos())
+    );
+    let staging = StagingDir(parent.join(unique));
+    std::fs::create_dir(&staging.0).map_err(|e| e.to_string())?;
+    let temporary = staging.0.join("excerpt.mkv");
+    let absolute = std::path::absolute(path).map_or_else(
+        |_| path.to_string_lossy().into_owned(),
+        |resolved| resolved.to_string_lossy().into_owned(),
+    );
+    let mut args: Vec<String> = vec![
+        "-hide_banner".into(),
+        "-nostdin".into(),
+        "-loglevel".into(),
+        "error".into(),
+        "-protocol_whitelist".into(),
+        "file".into(),
+        "-threads".into(),
+        "1".into(),
+        "-ss".into(),
+        format!("{:.3}", first as f64 / 1000.0),
+        "-i".into(),
+        absolute,
+        "-t".into(),
+        format!("{:.3}", (last - first) as f64 / 1000.0),
+        "-map".into(),
+        "0:V:0?".into(),
+        "-map".into(),
+        "0:a?".into(),
+        "-map_chapters".into(),
+        "-1".into(),
+        "-map_metadata".into(),
+        "-1".into(),
+        "-c:v".into(),
+        "libx264".into(),
+        "-preset".into(),
+        "veryfast".into(),
+        "-threads:v".into(),
+        "1".into(),
+        "-c:a".into(),
+        "aac".into(),
+        "-filter_threads".into(),
+        "1".into(),
+        temporary.to_string_lossy().into_owned(),
+    ];
+    #[allow(unused_mut)] // mut is only used by the platform arms below
+    let mut command;
+    #[cfg(unix)]
+    {
+        if let Some(nice) = nice_path() {
+            let mut prefixed = vec!["-n".to_string(), "10".to_string(), ffmpeg.to_string()];
+            prefixed.append(&mut args);
+            command = crate::hidden_command(nice);
+            command.args(prefixed);
+        } else {
+            command = crate::hidden_command(ffmpeg);
+            command.args(&args);
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        command = crate::hidden_command(ffmpeg);
+        command.args(&args);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        // CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS.
+        command.creation_flags(0x0800_0000 | 0x0000_4000);
+    }
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let mut child = command.spawn().map_err(|e| e.to_string())?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_hours(2);
+    let outcome = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) => {
+                if canceled() {
+                    break None;
+                }
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err("Saving the recording excerpt timed out.".to_string());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(e.to_string());
+            }
+        }
+    };
+    let Some(status) = outcome else {
+        // Cancelled mid-encode: Python's finally kills the
+        // process and the export simply does not happen.
+        let _ = child.kill();
+        let _ = child.wait();
+        return Ok(());
+    };
+    let staged_ok = temporary
+        .metadata()
+        .is_ok_and(|meta| meta.is_file() && meta.len() > 0);
+    if !status.success() || !staged_ok {
+        return Err("Could not save the recording excerpt.".to_string());
+    }
+    if canceled() {
+        return Ok(());
+    }
+    if file_signature(path)? != signature {
+        return Err("The recording file changed. Refresh the library.".to_string());
+    }
+    {
+        let output = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&temporary)
+            .map_err(|e| e.to_string())?;
+        output.sync_all().map_err(|e| e.to_string())?;
+    }
+    if !canceled() {
+        crate::recording::publish_new_file(&temporary, destination)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod excerpt_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("iptv-excerpt-test-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        dir
+    }
+
+    #[test]
+    fn transcript_keeps_original_timestamps_and_accents() {
+        // Python test_transcript_keeps_original_timestamps_and_accents.
+        let bytes = transcript(&[
+            Cue {
+                start: 1500,
+                end: 2200,
+                text: "Jó estét!".to_string(),
+            },
+            Cue {
+                start: 5000,
+                end: 6000,
+                text: "Őrjárat".to_string(),
+            },
+        ]);
+        let text = String::from_utf8(bytes).expect("utf-8");
+        assert!(text.starts_with('\u{feff}'), "BOM first");
+        assert_eq!(
+            text.strip_prefix('\u{feff}').expect("bom"),
+            "00:00:01.500 – 00:00:02.200\nJó estét!\n\n00:00:05.000 – 00:00:06.000\nŐrjárat\n\n"
+        );
+    }
+
+    #[test]
+    fn canceled_excerpt_does_not_touch_the_input_or_start_ffmpeg() {
+        // Python test_canceled_excerpt_does_not_touch_the_input_or_start_ffmpeg:
+        // a bogus ffmpeg path proves nothing was spawned.
+        let dir = temp_dir("canceled");
+        let target = dir.join("output.mkv");
+        let result = save_excerpt(
+            "/nonexistent/ffmpeg-should-not-run",
+            &dir.join("missing.mkv"),
+            "",
+            &target,
+            0,
+            2000,
+            &|| true,
+        );
+        assert_eq!(result, Ok(()));
+        assert_eq!(
+            std::fs::read_dir(&dir).expect("list").count(),
+            0,
+            "nothing created"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn excerpt_encodes_and_never_replaces_an_existing_output() {
+        // Python test_local_excerpt_encodes_audio_and_does_not_replace_existing_output.
+        let mut candidates: Vec<PathBuf> = vec![
+            PathBuf::from("/usr/bin/ffmpeg"),
+            PathBuf::from("/usr/local/bin/ffmpeg"),
+        ];
+        if let Some(paths) = std::env::var_os("PATH") {
+            candidates.extend(std::env::split_paths(&paths).map(|dir| dir.join("ffmpeg")));
+        }
+        let Some(ffmpeg) = candidates.into_iter().find(|candidate| candidate.is_file()) else {
+            return; // ffmpeg unavailable: Python skips too.
+        };
+        let ffmpeg = ffmpeg.to_string_lossy().into_owned();
+        let dir = temp_dir("encode");
+        let source = dir.join("source.wav");
+        let made = crate::hidden_command(&ffmpeg)
+            .args([
+                "-nostdin",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=800:duration=3",
+            ])
+            .arg(&source)
+            .status();
+        if !matches!(made, Ok(status) if status.success()) {
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        let before = std::fs::read(&source).expect("source bytes");
+        let identity = recording_id(file_signature(&source).expect("signature"));
+        let output = dir.join("clip.mkv");
+        save_excerpt(&ffmpeg, &source, &identity, &output, 1000, 2000, &|| false)
+            .expect("excerpt saves");
+        assert!(output.metadata().is_ok_and(|meta| meta.len() > 0));
+        assert_eq!(
+            std::fs::read(&source).expect("source after"),
+            before,
+            "the original is untouched"
+        );
+        let again = save_excerpt(&ffmpeg, &source, &identity, &output, 1000, 2000, &|| false);
+        assert_eq!(
+            again,
+            Err("Choose a new filename for the excerpt.".to_string())
+        );
+        assert!(
+            !std::fs::read_dir(&dir)
+                .expect("list")
+                .filter_map(Result::ok)
+                .any(|entry| entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".iptv-excerpt-")),
+            "no staging directory left behind"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

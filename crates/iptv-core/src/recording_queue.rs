@@ -28,6 +28,11 @@ pub struct RecordingQueue {
     playing: bool,
     loading: bool,
     ticket: u64,
+    /// The head row handed to the player but not yet
+    /// confirmed playing (Python PR #46 `opening`): it stays
+    /// queued until playback actually starts, so an
+    /// unconfirmed entry is retried instead of lost.
+    opening: Option<LibraryRow>,
 }
 
 impl RecordingQueue {
@@ -65,6 +70,19 @@ impl RecordingQueue {
     #[must_use]
     pub fn ticket(&self) -> u64 {
         self.ticket
+    }
+
+    /// The row handed to the player, awaiting its playback
+    /// confirmation (Python `opening`).
+    #[must_use]
+    pub fn opening(&self) -> Option<&LibraryRow> {
+        self.opening.as_ref()
+    }
+
+    /// Replace the pending rows wholesale (Python's saved
+    /// queue load: `queue.pending[:] = queues[name]`).
+    pub fn replace_pending(&mut self, rows: Vec<LibraryRow>) {
+        self.pending = rows;
     }
 
     /// Add rows, skipping paths already queued (Python `add`:
@@ -124,7 +142,7 @@ impl RecordingQueue {
                 };
             }
         }
-        let restart = self.loading
+        let restart = (self.loading || self.opening.is_some())
             && (self.pending.is_empty()
                 || self.pending.first().map(|row| row.path.clone()) != head_first);
         Edit {
@@ -143,6 +161,7 @@ impl RecordingQueue {
         self.bump_ticket();
         self.playing = false;
         self.loading = false;
+        self.opening = None;
     }
 
     /// Start playing from the head (Python `start`): any
@@ -172,8 +191,10 @@ impl RecordingQueue {
     }
 
     /// A hand-off finished (Python `ready`): on success the
-    /// head is consumed and loading clears; on failure the
-    /// queue stops. Returns the stopped-at message on failure.
+    /// head becomes the opening row and stays queued until
+    /// the player confirms it started (`started`); on
+    /// failure the queue stops. Returns the stopped-at
+    /// message on failure.
     pub fn finish_next(
         &mut self,
         ticket: u64,
@@ -192,8 +213,27 @@ impl RecordingQueue {
             return Some(stopped_at(&title, &reason));
         }
         self.loading = false;
-        self.pending.remove(0);
+        self.opening = self.pending.first().cloned();
         None
+    }
+
+    /// The player confirmed the opening row is playing
+    /// (Python PR #46 `started`): only now is the head
+    /// consumed. A stale ticket or generation, or a head
+    /// that is no longer the opening row, consumes nothing.
+    pub fn started(&mut self, ticket: u64, generation: u64, current_generation: u64) -> bool {
+        let Some(opening) = &self.opening else {
+            return false;
+        };
+        if ticket != self.ticket || generation != current_generation {
+            return false;
+        }
+        if self.pending.first().map(|row| &row.path) != Some(&opening.path) {
+            return false;
+        }
+        self.pending.remove(0);
+        self.opening = None;
+        true
     }
 
     /// The player ended the queue's item (Python `ended`): the
@@ -245,6 +285,176 @@ pub fn queued_count_text(count: usize) -> String {
 #[must_use]
 pub fn stopped_at(title: &str, reason: &str) -> String {
     format!("Playback queue stopped at {title}. {reason}")
+}
+
+// ------------------------------------------------------------ saved queues
+
+/// Most named queues kept (Python `MAX_SAVED_QUEUES`).
+pub const MAX_SAVED_QUEUES: usize = 30;
+
+/// Most entries in one saved queue (Python
+/// `MAX_QUEUE_ENTRIES`).
+pub const MAX_QUEUE_ENTRIES: usize = 500;
+
+/// One saved queue's stored form: the five fields a
+/// hand-off needs to re-validate the file (Python's entry
+/// dicts).
+fn entry_json(row: &LibraryRow) -> serde_json::Value {
+    serde_json::json!({
+        "path": row.path,
+        "directory": row.directory,
+        "title": row.title,
+        "size": row.size,
+        "modified_ns": row.modified_ns,
+    })
+}
+
+/// Validate one stored entry (Python `saved_queues`' row
+/// filter): non-empty NUL-free strings, absolute paths, the
+/// file directly inside its directory, a non-negative size.
+fn entry_row(entry: &serde_json::Value) -> Option<LibraryRow> {
+    let path = entry.get("path")?.as_str()?;
+    let directory = entry.get("directory")?.as_str()?;
+    let title = entry.get("title")?.as_str()?;
+    if [path, directory, title]
+        .iter()
+        .any(|text| text.is_empty() || text.contains('\0'))
+    {
+        return None;
+    }
+    let path_ref = std::path::Path::new(path);
+    if !path_ref.is_absolute() || !std::path::Path::new(directory).is_absolute() {
+        return None;
+    }
+    if path_ref.parent() != Some(std::path::Path::new(directory)) {
+        return None;
+    }
+    let size = entry.get("size")?.as_i64()?;
+    if size < 0 {
+        return None;
+    }
+    let modified_ns = entry.get("modified_ns")?.as_i64()?;
+    Some(LibraryRow {
+        path: path.to_string(),
+        title: title.to_string(),
+        channel: String::new(),
+        duration: None,
+        status: "completed".to_string(),
+        size: u64::try_from(size).ok()?,
+        modified_ns,
+        date: String::new(),
+        directory: directory.to_string(),
+        trash_id: None,
+        original_name: None,
+    })
+}
+
+/// A queue name as Python accepts it: 1–80 characters once
+/// trimmed, nothing unprintable (control characters here).
+/// Returns the trimmed name.
+fn valid_queue_name(name: &str) -> Option<String> {
+    let trimmed = name.trim();
+    let count = trimmed.chars().count();
+    if !(1..=80).contains(&count) || name.chars().any(char::is_control) {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
+/// The validated saved queues in a stored value (Python
+/// `saved_queues`): bad names, case-folded duplicates and
+/// bad entries are dropped; a queue with no valid entry
+/// left is dropped; at most [`MAX_SAVED_QUEUES`] survive.
+#[must_use]
+pub fn saved_queues(value: &serde_json::Value) -> Vec<(String, Vec<LibraryRow>)> {
+    let mut result: Vec<(String, Vec<LibraryRow>)> = Vec::new();
+    let Some(object) = value.as_object() else {
+        return result;
+    };
+    for (name, entries) in object {
+        let Some(name) = valid_queue_name(name) else {
+            continue;
+        };
+        if result
+            .iter()
+            .any(|(existing, _)| existing.to_lowercase() == name.to_lowercase())
+        {
+            continue;
+        }
+        let Some(entries) = entries.as_array() else {
+            continue;
+        };
+        let rows: Vec<LibraryRow> = entries
+            .iter()
+            .take(MAX_QUEUE_ENTRIES)
+            .filter_map(entry_row)
+            .collect();
+        if rows.is_empty() {
+            continue;
+        }
+        result.push((name, rows));
+        if result.len() >= MAX_SAVED_QUEUES {
+            break;
+        }
+    }
+    result
+}
+
+/// The stored JSON form of validated saved queues.
+#[must_use]
+pub fn saved_queues_json(queues: &[(String, Vec<LibraryRow>)]) -> serde_json::Value {
+    let mut object = serde_json::Map::new();
+    for (name, rows) in queues {
+        object.insert(
+            name.clone(),
+            serde_json::Value::Array(rows.iter().map(entry_json).collect()),
+        );
+    }
+    serde_json::Value::Object(object)
+}
+
+/// Save the current queue under a name (Python `save_named`).
+///
+/// # Errors
+/// Python's messages: an unusable name or empty queue, a
+/// case-folded name clash without `replace`, the saved
+/// queue limit, or entries that fail validation.
+pub fn save_named(
+    value: &serde_json::Value,
+    name: &str,
+    rows: &[LibraryRow],
+    replace: bool,
+) -> Result<Vec<(String, Vec<LibraryRow>)>, String> {
+    let single = saved_queues_json(&[(name.to_string(), rows.to_vec())]);
+    let entries = saved_queues(&single);
+    if entries.is_empty() {
+        return Err(
+            "Enter a queue name of 1 to 80 characters and include a recording.".to_string(),
+        );
+    }
+    let count = rows.len();
+    let Some((name, rows)) = entries.into_iter().next() else {
+        return Err(
+            "Enter a queue name of 1 to 80 characters and include a recording.".to_string(),
+        );
+    };
+    let mut queues = saved_queues(value);
+    let existing = queues
+        .iter()
+        .position(|(key, _)| key.to_lowercase() == name.to_lowercase());
+    if let Some(position) = existing {
+        if !replace {
+            return Err("A saved queue with this name already exists.".to_string());
+        }
+        queues.remove(position);
+    } else if queues.len() >= MAX_SAVED_QUEUES {
+        return Err("The saved queue limit has been reached.".to_string());
+    }
+    if rows.len() != count {
+        return Err("The queue could not be saved.".to_string());
+    }
+    queues.push((name, rows));
+    Ok(queues)
 }
 
 #[cfg(test)]
@@ -361,8 +571,14 @@ mod tests {
         let (head, ticket) = queue.begin_next(false).expect("head");
         assert_eq!(head.title, "A");
         assert!(queue.finish_next(ticket, false, None).is_none());
-        assert_eq!(queue.len(), 1);
+        // PR #46: success only marks the head as opening; it
+        // is consumed when playback is confirmed started.
+        assert_eq!(queue.len(), 2);
+        assert_eq!(queue.opening().map(|row| row.title.as_str()), Some("A"));
         assert!(!queue.loading());
+        assert!(queue.started(ticket, 5, 5));
+        assert_eq!(queue.len(), 1);
+        assert!(queue.opening().is_none());
         // A stale ticket (a stop intervened) finishes nothing.
         queue.begin_next(false);
         queue.stop();
@@ -400,6 +616,71 @@ mod tests {
         assert!(!queue.should_advance(None, 7, 7, false, false));
         queue.begin_next(false);
         assert!(!queue.should_advance(Some(ticket), 7, 7, false, false));
+    }
+
+    #[test]
+    fn unconfirmed_opening_stays_queued_for_a_retry() {
+        // Python: an entry whose playback never confirms is
+        // not lost; a stale generation confirms nothing, and
+        // stopping keeps the row queued.
+        let mut queue = RecordingQueue::new();
+        queue.add(vec![row("C:\\a.mkv", "A"), row("C:\\b.mkv", "B")]);
+        let ticket = queue.start().expect("starts");
+        queue.begin_next(false);
+        assert!(queue.finish_next(ticket, false, None).is_none());
+        assert!(!queue.started(ticket, 5, 6), "stale generation");
+        assert_eq!(queue.len(), 2);
+        queue.stop();
+        assert!(queue.opening().is_none());
+        assert_eq!(queue.len(), 2, "the unconfirmed entry is kept");
+        // A fresh start hands the same head off again.
+        let ticket = queue.start().expect("restarts");
+        let (head, _) = queue.begin_next(false).expect("head again");
+        assert_eq!(head.title, "A");
+        assert!(queue.finish_next(ticket, false, None).is_none());
+        assert!(queue.started(ticket, 1, 1));
+        assert_eq!(queue.len(), 1);
+    }
+
+    #[test]
+    fn saved_queue_round_trip_order_and_confirmation() {
+        // Python test_saved_queue_round_trip_order_and_confirmation.
+        let base = std::env::temp_dir().to_string_lossy().into_owned();
+        let mut first = row(&format!("{base}/b.mkv"), "b.mkv");
+        first.directory = base.clone();
+        first.size = 12;
+        first.modified_ns = 1;
+        let mut second = row(&format!("{base}/a.mkv"), "a.mkv");
+        second.directory = base;
+        second.size = 12;
+        second.modified_ns = 1;
+        let rows = vec![first, second];
+        let data = save_named(&serde_json::json!({}), "Este", &rows, false).expect("saves");
+        let stored = saved_queues_json(&data);
+        assert_eq!(saved_queues(&stored), data);
+        assert_eq!(saved_queues(&stored)[0].1, rows);
+        // A case-folded clash needs replace=True.
+        assert_eq!(
+            save_named(&stored, "ESTE", &rows, false),
+            Err("A saved queue with this name already exists.".to_string())
+        );
+        let replaced = save_named(
+            &stored,
+            "ESTE",
+            &rows.iter().rev().cloned().collect::<Vec<_>>(),
+            true,
+        )
+        .expect("replaces");
+        assert_eq!(replaced.len(), 1);
+        assert_eq!(
+            replaced[0].1,
+            rows.iter().rev().cloned().collect::<Vec<_>>()
+        );
+        // A wholly invalid stored queue validates to nothing.
+        assert!(saved_queues(&serde_json::json!({
+            "invalid": [{"path": "https://example.invalid"}]
+        }))
+        .is_empty());
     }
 
     #[test]

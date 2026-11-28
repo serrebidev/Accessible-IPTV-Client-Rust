@@ -5451,3 +5451,129 @@ msgstr "休止期間外の今後の録画予定を選択してください。"
 
 msgid "Stopped because the app exited."
 msgstr "アプリの終了に伴い録画を停止しました。"
+
+msgid "A saved queue with this name already exists."
+msgstr "同じ名前の保存済みキューが既にあります。"
+
+msgid "Add a named bookmark to mark a point inside the recording first."
+msgstr "先に録画の途中に名前付きブックマークを追加してください。"
+
+msgid "All"
+msgstr "すべて"
+
+msgid "Announce and save in history"
+msgstr "読み上げて履歴に保存"
+
+msgid "Choose a new filename for the excerpt."
+msgstr "抜粋には新しいファイル名を選んでください。"
+
+msgid "Choose a saved queue:"
+msgstr "保存済みキューを選択："
+
+msgid "Choose a valid recording range and an MKV filename."
+msgstr "有効な範囲とMKVファイル名を指定してください。"
+
+msgid "Choose the end of the excerpt:"
+msgstr "抜粋の終了位置を選択："
+
+msgid "Choose the start of the excerpt:"
+msgstr "抜粋の開始位置を選択："
+
+msgid "Could not save the recording excerpt."
+msgstr "録画の抜粋を保存できませんでした。"
+
+msgid "Delete Saved Queue..."
+msgstr "保存済みキューを削除…"
+
+msgid "Delete this saved queue?"
+msgstr "この保存済みキューを削除しますか？"
+
+msgid "End of recording"
+msgstr "録画の終わり"
+
+msgid "Enter a queue name of 1 to 80 characters and include a recording."
+msgstr "1～80文字の名前を入力し、録画を1件以上追加してください。"
+
+msgid "Failed and Partial"
+msgstr "失敗と一部のみ"
+
+msgid "Filter by title or channel"
+msgstr "タイトルまたはチャンネルで絞り込み"
+
+msgid "Load Saved Queue..."
+msgstr "保存済みキューを読み込む…"
+
+msgid "Name for this queue:"
+msgstr "キューの名前："
+
+msgid "Next 7 Days"
+msgstr "今後7日間"
+
+msgid "Open a local recording with text subtitles first."
+msgstr "先にテキスト字幕のあるローカル録画を開いてください。"
+
+msgid "Paused Recording Rules"
+msgstr "一時停止中の録画ルール"
+
+msgid "Recording Notifications..."
+msgstr "録画通知…"
+
+msgid "Recording saved: {title}"
+msgstr "録画を保存しました：{title}"
+
+msgid "Replace the current playback queue?"
+msgstr "現在の再生キューを置き換えますか？"
+
+msgid "Replace the saved queue with this name?"
+msgstr "同じ名前の保存済みキューを置き換えますか？"
+
+msgid "Save Queue..."
+msgstr "キューを保存…"
+
+msgid "Save Recording Excerpt..."
+msgstr "録画の抜粋を保存…"
+
+msgid "Save Selected Subtitles..."
+msgstr "選択した字幕を保存…"
+
+msgid "Save Subtitle Transcript..."
+msgstr "字幕の書き起こしを保存…"
+
+msgid "Save in history only"
+msgstr "履歴にのみ保存"
+
+msgid "Saved Playback Queues"
+msgstr "保存済み再生キュー"
+
+msgid "Saving recording excerpt..."
+msgstr "録画の抜粋を保存中…"
+
+msgid "Saving the recording excerpt timed out."
+msgstr "抜粋の保存がタイムアウトしました。"
+
+msgid "Schedule view"
+msgstr "録画予約の表示"
+
+msgid "Select one subtitle to jump to its position."
+msgstr "移動先の字幕を1件選択してください。"
+
+msgid "Show a dialog"
+msgstr "ダイアログを表示"
+
+msgid "Start of recording"
+msgstr "録画の先頭"
+
+msgid "Text file (*.txt)"
+msgstr "テキストファイル (*.txt)"
+
+msgid "The queue could not be saved."
+msgstr "キューを保存できませんでした。"
+
+msgid "The recording did not cover the full scheduled time."
+msgstr "録画は予約した時間の一部だけを含んでいます。"
+
+msgid "The saved queue limit has been reached."
+msgstr "保存済みキューの上限に達しました。"
+
+msgid "When a recording starts or finishes successfully:"
+msgstr "録画が正常に開始または終了したとき："

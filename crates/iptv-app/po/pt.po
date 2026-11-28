@@ -5502,3 +5502,129 @@ msgstr "Selecione gravações futuras fora do período de pausa."
 
 msgid "Stopped because the app exited."
 msgstr "A gravação foi interrompida ao sair do aplicativo."
+
+msgid "A saved queue with this name already exists."
+msgstr "Já existe uma fila guardada com este nome."
+
+msgid "Add a named bookmark to mark a point inside the recording first."
+msgstr "Adicione primeiro um marcador com nome num ponto da gravação."
+
+msgid "All"
+msgstr "Tudo"
+
+msgid "Announce and save in history"
+msgstr "Anunciar e guardar no histórico"
+
+msgid "Choose a new filename for the excerpt."
+msgstr "Escolha um novo nome de ficheiro para o excerto."
+
+msgid "Choose a saved queue:"
+msgstr "Escolha uma fila guardada:"
+
+msgid "Choose a valid recording range and an MKV filename."
+msgstr "Escolha um intervalo válido e um nome de ficheiro MKV."
+
+msgid "Choose the end of the excerpt:"
+msgstr "Escolha o fim do excerto:"
+
+msgid "Choose the start of the excerpt:"
+msgstr "Escolha o início do excerto:"
+
+msgid "Could not save the recording excerpt."
+msgstr "Não foi possível guardar o excerto da gravação."
+
+msgid "Delete Saved Queue..."
+msgstr "Eliminar fila guardada…"
+
+msgid "Delete this saved queue?"
+msgstr "Eliminar esta fila guardada?"
+
+msgid "End of recording"
+msgstr "Fim da gravação"
+
+msgid "Enter a queue name of 1 to 80 characters and include a recording."
+msgstr "Introduza um nome de 1 a 80 caracteres e inclua uma gravação."
+
+msgid "Failed and Partial"
+msgstr "Falhadas e parciais"
+
+msgid "Filter by title or channel"
+msgstr "Filtrar por título ou canal"
+
+msgid "Load Saved Queue..."
+msgstr "Carregar fila guardada…"
+
+msgid "Name for this queue:"
+msgstr "Nome da fila:"
+
+msgid "Next 7 Days"
+msgstr "Próximos 7 dias"
+
+msgid "Open a local recording with text subtitles first."
+msgstr "Abra primeiro uma gravação local com legendas de texto."
+
+msgid "Paused Recording Rules"
+msgstr "Regras de gravação suspensas"
+
+msgid "Recording Notifications..."
+msgstr "Notificações de gravação…"
+
+msgid "Recording saved: {title}"
+msgstr "Gravação guardada: {title}"
+
+msgid "Replace the current playback queue?"
+msgstr "Substituir a fila de reprodução atual?"
+
+msgid "Replace the saved queue with this name?"
+msgstr "Substituir a fila guardada com este nome?"
+
+msgid "Save Queue..."
+msgstr "Guardar fila…"
+
+msgid "Save Recording Excerpt..."
+msgstr "Guardar excerto da gravação…"
+
+msgid "Save Selected Subtitles..."
+msgstr "Guardar legendas selecionadas…"
+
+msgid "Save Subtitle Transcript..."
+msgstr "Guardar transcrição das legendas…"
+
+msgid "Save in history only"
+msgstr "Guardar apenas no histórico"
+
+msgid "Saved Playback Queues"
+msgstr "Filas de reprodução guardadas"
+
+msgid "Saving recording excerpt..."
+msgstr "A guardar o excerto da gravação…"
+
+msgid "Saving the recording excerpt timed out."
+msgstr "O tempo para guardar o excerto esgotou-se."
+
+msgid "Schedule view"
+msgstr "Vista do agendamento"
+
+msgid "Select one subtitle to jump to its position."
+msgstr "Selecione uma legenda para saltar para a respetiva posição."
+
+msgid "Show a dialog"
+msgstr "Mostrar uma caixa de diálogo"
+
+msgid "Start of recording"
+msgstr "Início da gravação"
+
+msgid "Text file (*.txt)"
+msgstr "Ficheiro de texto (*.txt)"
+
+msgid "The queue could not be saved."
+msgstr "Não foi possível guardar a fila."
+
+msgid "The recording did not cover the full scheduled time."
+msgstr "A gravação não abrangeu todo o período agendado."
+
+msgid "The saved queue limit has been reached."
+msgstr "Foi atingido o limite de filas guardadas."
+
+msgid "When a recording starts or finishes successfully:"
+msgstr "Quando uma gravação começa ou termina com sucesso:"

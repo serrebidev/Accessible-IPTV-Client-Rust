@@ -1,10 +1,13 @@
-//! Python `background_tasks`: one daemon worker with a single
+//! Python `background_tasks`: daemon workers with a single
 //! replaceable pending task and no growing queue. Submitting
 //! supersedes any not-yet-started task; a running task observes
 //! supersession through its cancel token; results are delivered
 //! on the caller's thread via [`LatestTask::poll`], which
 //! re-checks the version and the closed flag at delivery time —
 //! the Rust shape of Python's `wx.CallAfter` delivery closure.
+//! Python PR #46 added bounded parallelism: up to
+//! `parallelism` workers run at once, so a stalled item cannot
+//! block the newest one; only the newest result is delivered.
 
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
@@ -17,6 +20,7 @@ struct State {
     pending: Option<(u64, Work)>,
     deliveries: Vec<(u64, Delivery)>,
     closed: bool,
+    running: usize,
 }
 
 struct Shared {
@@ -43,10 +47,13 @@ impl CancelToken {
     }
 }
 
-/// A single-worker, latest-wins background task runner.
+/// A latest-wins background task runner with bounded
+/// parallelism (Python `LatestTask`): one pending slot, up to
+/// `parallelism` workers running at once.
 pub struct LatestTask {
     shared: Arc<Shared>,
-    thread: Mutex<Option<JoinHandle<()>>>,
+    workers: Mutex<Vec<JoinHandle<()>>>,
+    parallelism: usize,
 }
 
 impl Default for LatestTask {
@@ -58,6 +65,16 @@ impl Default for LatestTask {
 impl LatestTask {
     #[must_use]
     pub fn new() -> Self {
+        Self::with_parallelism(1)
+    }
+
+    /// A runner allowing up to `parallelism` items in flight
+    /// (Python PR #46: the Stalker playback worker runs with
+    /// parallelism 2, so the latest selection progresses while
+    /// one obsolete lookup is stalled; superseded results are
+    /// still dropped at delivery).
+    #[must_use]
+    pub fn with_parallelism(parallelism: usize) -> Self {
         Self {
             shared: Arc::new(Shared {
                 state: Mutex::new(State {
@@ -65,10 +82,12 @@ impl LatestTask {
                     pending: None,
                     deliveries: Vec::new(),
                     closed: false,
+                    running: 0,
                 }),
                 ready: Condvar::new(),
             }),
-            thread: Mutex::new(None),
+            workers: Mutex::new(Vec::new()),
+            parallelism: parallelism.max(1),
         }
     }
 
@@ -97,18 +116,25 @@ impl LatestTask {
         state.version += 1;
         let version = state.version;
         state.pending = Some((version, wrapped));
-        if self.thread.lock().unwrap().is_none() {
+        // Python: spawn another worker only when every existing
+        // worker is busy and the parallelism bound allows it.
+        let mut workers = self.workers.lock().unwrap();
+        if workers.len() == state.running && workers.len() < self.parallelism {
             let shared = Arc::clone(&self.shared);
-            if let Ok(handle) = std::thread::Builder::new()
-                .name("LibraryWorker".to_string())
+            match std::thread::Builder::new()
+                .name("IPTV background task".to_string())
                 .spawn(move || run_worker(&shared))
             {
-                *self.thread.lock().unwrap() = Some(handle);
-            } else {
-                state.pending = None;
-                return false;
+                Ok(handle) => workers.push(handle),
+                Err(_) => {
+                    if workers.is_empty() {
+                        state.pending = None;
+                        return false;
+                    }
+                }
             }
         }
+        drop(workers);
         self.shared.ready.notify_one();
         true
     }
@@ -177,6 +203,7 @@ fn run_worker(shared: &Arc<Shared>) {
                     return;
                 }
                 if let Some(pending) = state.pending.take() {
+                    state.running += 1;
                     break pending;
                 }
                 state = shared.ready.wait(state).unwrap();
@@ -187,8 +214,9 @@ fn run_worker(shared: &Arc<Shared>) {
             version,
         };
         let delivery = work(&token);
-        if !token.is_canceled() {
-            let mut state = shared.state.lock().unwrap();
+        let mut state = shared.state.lock().unwrap();
+        state.running -= 1;
+        if !state.closed && state.version == version {
             state.deliveries.push((version, delivery));
         }
     }
@@ -292,6 +320,36 @@ mod tests {
         assert!(!*delivered.lock().unwrap());
         // And a closed task accepts no new work.
         assert!(!task.submit(|_| Ok("x"), |_| {}));
+    }
+
+    #[test]
+    fn a_second_worker_runs_the_latest_item_while_the_first_is_stalled() {
+        // Python test_latest_playback_can_use_second_worker_and_ignores_obsolete_result.
+        let task = LatestTask::with_parallelism(2);
+        let (entered_tx, entered_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let release_rx = Mutex::new(release_rx);
+        let delivered = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&delivered);
+        task.submit(
+            move |_| {
+                entered_tx.send(()).unwrap();
+                let _ = release_rx.lock().unwrap().recv();
+                Ok("obsolete")
+            },
+            move |result| sink.lock().unwrap().push(result.unwrap()),
+        );
+        entered_rx.recv().unwrap();
+        let sink = Arc::clone(&delivered);
+        task.submit(
+            |_| Ok("current"),
+            move |result| sink.lock().unwrap().push(result.unwrap()),
+        );
+        wait_for_delivery(&task);
+        task.poll();
+        assert_eq!(*delivered.lock().unwrap(), ["current"]);
+        release_tx.send(()).unwrap();
+        task.close();
     }
 
     #[test]
