@@ -4508,6 +4508,17 @@ fn probe_channel_media_now(wiring: &Wiring, channel: &Channel) {
     if wiring.player.borrow().session.current().is_some() {
         return;
     }
+    // PR #48: no new probe while a playback request is being
+    // resolved — the probe could take the connection the
+    // playback is waiting for.
+    if wiring
+        .pending_resolves
+        .borrow()
+        .values()
+        .any(|pending| matches!(pending, PendingResolve::Play(..)))
+    {
+        return;
+    }
     let cast_url = cast_source_url(&wiring.cast_ui);
     if single_stream_busy(
         &wiring.recordings,
@@ -4717,24 +4728,34 @@ fn terminate_media_probes(probe: &MediaProbe) {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .drain()
         .collect();
+    if procs.is_empty() {
+        return;
+    }
     let urls = probe
         .urls
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone();
-    for (identity, handle) in procs {
-        if let Some(mut child) = handle
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take()
-        {
-            let _ = child.kill();
-            let _ = child.wait();
+    // PR #48: killing and reaping a stuck probe child can
+    // block; Python retires probes on their own thread for
+    // the same reason. The state above is already drained,
+    // so the session proceeds at once and the release is
+    // noted when the child is actually gone.
+    std::thread::spawn(move || {
+        for (identity, handle) in procs {
+            if let Some(mut child) = handle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+            {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            if let Some(url) = urls.get(&identity) {
+                iptv_core::catchup_direct::note_media_released(url);
+            }
         }
-        if let Some(url) = urls.get(&identity) {
-            iptv_core::catchup_direct::note_media_released(url);
-        }
-    }
+    });
 }
 
 /// The media kind the channel's own metadata states (port of
@@ -10336,7 +10357,34 @@ fn import_blocker(wiring: &Wiring) -> Option<&'static str> {
     if wiring.downloads.borrow().iter().any(|row| !row.done) {
         return Some("downloads are in progress");
     }
+    // PR #48: a catch-up download still being prepared (its
+    // address resolving or its probe staged) is pending work
+    // too — a settings restore must wait for it.
+    let preparing = !wiring.staged_downloads.borrow().is_empty()
+        || wiring
+            .pending_resolves
+            .borrow()
+            .values()
+            .any(|pending| matches!(pending, PendingResolve::Download { .. }));
+    if preparing {
+        return Some("downloads are in progress");
+    }
     None
+}
+
+/// Whether this catch-up programme's download is already
+/// being prepared: a resolve in flight for it, or a staged
+/// probe waiting on its media check (PR #48).
+fn catchup_preparation_in_flight(wiring: &Wiring, key: &str) -> bool {
+    if wiring.staged_downloads.borrow().contains_key(key) {
+        return true;
+    }
+    wiring.pending_resolves.borrow().values().any(|pending| match pending {
+        PendingResolve::Download {
+            channel, programme, ..
+        } => catchup_download_key(channel, programme) == key,
+        _ => false,
+    })
 }
 
 /// The recovery step of an import: prompt for the recovery
@@ -21439,10 +21487,13 @@ fn render_cw_rows(rows: &[CwRow], list: ListBox) {
 
 /// Scan results handed from the library worker's completion
 /// callback to the dialog timer (PR #36).
+/// Scan deliveries carry the folder they belong to (PR #48):
+/// each folder publishes its rows as its own scan lands.
 type LibraryScanDeliveries = std::sync::Arc<
     std::sync::Mutex<
         Vec<(
             u64,
+            String,
             Result<(Vec<iptv_core::recording_library::LibraryRow>, Vec<String>), String>,
         )>,
     >,
@@ -21630,13 +21681,19 @@ fn queue_maybe_advance(wiring: &Wiring, status: Status) {
 /// Python's `RecordingLibraryDialog`).
 #[allow(clippy::struct_excessive_bools)] // independent dialog state flags, as in Python
 struct LibraryUi {
-    /// One scan worker per folder key (PR #44): `None` is
-    /// the all-folders scan, `Some(dir)` a single folder.
-    scan_tasks: std::collections::HashMap<Option<String>, iptv_core::background::LatestTask>,
+    /// One scan worker per folder (PR #44, keyed per folder
+    /// since PR #48: every folder scans and publishes on its
+    /// own, so a slow share never delays the healthy folders).
+    scan_tasks: std::collections::HashMap<String, iptv_core::background::LatestTask>,
     scan_version: u64,
     scanning: bool,
     deliveries: LibraryScanDeliveries,
     directories: Vec<String>,
+    /// The latest published rows per folder; `rows` is their
+    /// merged, deduplicated union.
+    folder_rows: std::collections::HashMap<String, Vec<iptv_core::recording_library::LibraryRow>>,
+    folder_warnings: std::collections::HashMap<String, Vec<String>>,
+    scan_outstanding: std::collections::HashSet<String>,
     rows: Vec<iptv_core::recording_library::LibraryRow>,
     view: Vec<iptv_core::recording_library::LibraryRow>,
     warnings: Vec<String>,
@@ -21674,65 +21731,66 @@ const LIBRARY_STATUS_VALUES: [&str; 6] =
     ["", "completed", "partial", "stopped", "failed", "unknown"];
 const LIBRARY_SORT_KEYS: [&str; 4] = ["date", "title", "duration", "size"];
 
-/// One library scan over the chosen scope (Python's refresh
-/// work): per-folder warnings collect instead of aborting,
-/// and an all-folders scan dedupes by resolved path.
+/// One folder's library scan (Python's refresh work, per
+/// folder since PR #48): its warnings collect instead of
+/// aborting the other folders.
 fn library_scan(
-    directories: &[String],
-    selection: usize,
+    dir: &str,
     trash_view: bool,
     active_paths: &[PathBuf],
     token: &iptv_core::background::CancelToken,
 ) -> (Vec<iptv_core::recording_library::LibraryRow>, Vec<String>) {
+    // PR #48: one folder per scan, so each folder publishes
+    // on its own and a blocked share delays nothing else.
+    let mut warnings = Vec::new();
+    let found = if trash_view {
+        iptv_core::recording_library::scan_trash(
+            Path::new(dir),
+            &|| token.is_canceled(),
+            &mut warnings,
+        )
+    } else {
+        iptv_core::recording_library::scan(
+            Path::new(dir),
+            active_paths,
+            &|| token.is_canceled(),
+            &mut warnings,
+        )
+    };
+    match found {
+        Ok(rows) => (rows, warnings),
+        Err(error) => {
+            warnings.push(error);
+            (Vec::new(), warnings)
+        }
+    }
+}
+
+/// Rebuild the merged row list and warning list from the
+/// per-folder publications, in folder order, deduplicated
+/// by canonical path (the same file reached through two
+/// folders lists once).
+fn library_merge(guard: &mut LibraryUi) {
     let mut rows = Vec::new();
     let mut warnings = Vec::new();
-    let scope: Vec<String> = if selection < directories.len() {
-        vec![directories[selection].clone()]
-    } else {
-        directories.to_vec()
-    };
-    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for dir in &scope {
-        let resolved = std::fs::canonicalize(dir)
-            .map_or_else(|_| dir.clone(), |path| path.to_string_lossy().into_owned());
-        if !visited.insert(resolved.to_lowercase()) {
-            continue;
+    for dir in &guard.directories {
+        if let Some(found) = guard.folder_rows.get(dir) {
+            rows.extend(found.iter().cloned());
         }
-        let mut folder_warnings = Vec::new();
-        let found = if trash_view {
-            iptv_core::recording_library::scan_trash(
-                Path::new(dir),
-                &|| token.is_canceled(),
-                &mut folder_warnings,
-            )
-        } else {
-            iptv_core::recording_library::scan(
-                Path::new(dir),
-                active_paths,
-                &|| token.is_canceled(),
-                &mut folder_warnings,
-            )
+        if let Some(found) = guard.folder_warnings.get(dir) {
+            warnings.extend(found.iter().cloned());
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    rows.retain(|row| {
+        let resolved = match std::fs::canonicalize(&row.path) {
+            Ok(path) => path.to_string_lossy().into_owned(),
+            Err(_) => row.path.clone(),
         };
-        warnings.append(&mut folder_warnings);
-        match found {
-            Ok(mut found) => rows.append(&mut found),
-            Err(error) => warnings.push(error),
-        }
-        if token.is_canceled() {
-            return (Vec::new(), Vec::new());
-        }
-    }
-    if selection >= directories.len() {
-        let mut seen = std::collections::HashSet::new();
-        rows.retain(|row| {
-            let resolved = match std::fs::canonicalize(&row.path) {
-                Ok(path) => path.to_string_lossy().into_owned(),
-                Err(_) => row.path.clone(),
-            };
-            seen.insert(resolved.to_lowercase())
-        });
-    }
-    (rows, warnings)
+        seen.insert(resolved.to_lowercase())
+    });
+    guard.rows = rows;
+    guard.warnings = warnings;
 }
 
 /// The paths a library operation must not touch (Python's
@@ -21796,14 +21854,26 @@ fn library_selected(controls: &LibraryControls, count: usize) -> Vec<usize> {
 #[allow(clippy::cast_possible_wrap)] // row counts fit an i64
 #[allow(clippy::cast_precision_loss)] // MiB display only
 fn library_render(ui: &Rc<RefCell<LibraryUi>>, controls: &LibraryControls) {
-    let (rows, warnings, busy, op_busy) = {
+    let (rows, warnings, scanning, op_busy) = {
         let guard = ui.borrow();
         (
             guard.rows.clone(),
             guard.warnings.clone(),
-            guard.busy,
+            guard.scanning,
             guard.op_busy,
         )
+    };
+    // PR #48: a filter re-render keeps the focused row (by
+    // path), not just the selection.
+    let focused_path: Option<String> = {
+        let guard = ui.borrow();
+        let focused =
+            controls
+                .list
+                .get_next_item(-1, ListNextItemFlag::All, ListItemState::Focused);
+        usize::try_from(focused)
+            .ok()
+            .and_then(|index| guard.view.get(index).map(|row| row.path.clone()))
     };
     let selected_paths: Vec<String> = {
         let guard = ui.borrow();
@@ -21860,12 +21930,23 @@ fn library_render(ui: &Rc<RefCell<LibraryUi>>, controls: &LibraryControls) {
             ListItemState::Selected | ListItemState::Focused,
         );
     }
+    if let Some(path) = &focused_path {
+        if let Some(index) = guard.view.iter().position(|row| &row.path == path) {
+            controls.list.set_item_state(
+                index as i64,
+                ListItemState::Focused,
+                ListItemState::Focused,
+            );
+        }
+    }
     let selected = library_selected(controls, guard.view.len());
     let selected_rows: Vec<&iptv_core::recording_library::LibraryRow> = selected
         .iter()
         .filter_map(|index| guard.view.get(*index))
         .collect();
-    let ready = !busy && !op_busy;
+    // PR #48: controls stay live while folders scan; only a
+    // file operation disables them.
+    let ready = !op_busy;
     let trash_view = guard.trash_view;
     controls
         .play
@@ -21890,12 +21971,6 @@ fn library_render(ui: &Rc<RefCell<LibraryUi>>, controls: &LibraryControls) {
     controls.add_folder.enable(ready);
     controls.refresh.enable(ready);
     controls.export_list.enable(ready && !guard.view.is_empty());
-    if busy {
-        controls
-            .status_label
-            .set_label(&tr("Loading recordings..."));
-        return;
-    }
     if op_busy {
         controls
             .status_label
@@ -21914,6 +21989,9 @@ fn library_render(ui: &Rc<RefCell<LibraryUi>>, controls: &LibraryControls) {
             ("size", &format!("{:.2}", total_size as f64 / 1_048_576.0)),
         ],
     );
+    if scanning {
+        text += &tr(" Loading recordings...");
+    }
     let mut unique_warnings: Vec<&String> = Vec::new();
     for warning in &warnings {
         if !unique_warnings.contains(&warning) {
@@ -21931,59 +22009,60 @@ fn library_render(ui: &Rc<RefCell<LibraryUi>>, controls: &LibraryControls) {
     controls.status_label.set_label(&text);
 }
 
-/// Submit a fresh scan (Python's `refresh`): the action
-/// controls disable while it runs.
+/// Submit fresh per-folder scans (Python's `refresh`).
 fn library_refresh(wiring: &Wiring, ui: &Rc<RefCell<LibraryUi>>, controls: &LibraryControls) {
-    // PR #44: a refresh is allowed while a scan runs (the
-    // folder choice stays live); only a file operation
-    // blocks it. Each folder keeps its own scan worker and
-    // a version counter drops stale deliveries.
-    let (key, directories, selection, trash_view, deliveries, version) = {
+    // PR #48: one scan worker per folder in scope, each
+    // publishing as it lands; a refresh is allowed while a
+    // scan runs (the folder choice stays live); only a file
+    // operation blocks it.
+    let (scope, trash_view, deliveries, version) = {
         let mut guard = ui.borrow_mut();
-        if guard.busy && !guard.scanning {
+        if guard.op_busy {
             return;
         }
         guard.busy = true;
         guard.scanning = true;
         guard.scan_version += 1;
         let selection = controls.folder.get_selection().unwrap_or(0) as usize;
-        let key = if selection < guard.directories.len() {
-            Some(guard.directories[selection].clone())
+        let scope: Vec<String> = if selection < guard.directories.len() {
+            vec![guard.directories[selection].clone()]
         } else {
-            None
+            guard.directories.clone()
         };
         for task in guard.scan_tasks.values() {
             task.cancel();
         }
         let known = guard.directories.clone();
-        guard.scan_tasks.retain(|task_key, _| match task_key {
-            None => true,
-            Some(dir) => known.contains(dir),
-        });
-        guard.scan_tasks.entry(key.clone()).or_default();
+        guard.scan_tasks.retain(|dir, _| known.contains(dir));
+        guard.folder_rows.retain(|dir, _| known.contains(dir));
+        guard.folder_warnings.retain(|dir, _| known.contains(dir));
+        guard.scan_outstanding = scope.iter().cloned().collect();
         (
-            key,
-            known,
-            selection,
+            scope,
             guard.trash_view,
             std::sync::Arc::clone(&guard.deliveries),
             guard.scan_version,
         )
     };
     let active = library_active_paths(wiring);
-    if let Some(task) = ui.borrow().scan_tasks.get(&key) {
-        task.submit(
-            move |token| {
-                let (rows, warnings) =
-                    library_scan(&directories, selection, trash_view, &active, token);
-                Ok((rows, warnings))
-            },
-            move |result| {
-                if let Ok(mut queue) = deliveries.lock() {
-                    queue.push((version, result));
-                }
-            },
-        );
+    for dir in scope {
+        ui.borrow_mut().scan_tasks.entry(dir.clone()).or_default();
+        let active = active.clone();
+        let delivery_dir = dir.clone();
+        let delivery_queue = std::sync::Arc::clone(&deliveries);
+        if let Some(task) = ui.borrow().scan_tasks.get(&dir) {
+            task.submit(
+                move |token| {
+                    let (rows, warnings) = library_scan(&dir, trash_view, &active, token);
+                    Ok((rows, warnings))
+                },
+                move |result| {
+                    if let Ok(mut queue) = delivery_queue.lock() {
+                        queue.push((version, delivery_dir, result));
+                    }
+                },
+            );
+        }
     }
     library_render(ui, controls);
 }
@@ -22000,9 +22079,19 @@ fn library_run_op(
 ) {
     {
         let mut guard = ui.borrow_mut();
-        if guard.busy || guard.op_busy {
+        if guard.op_busy {
             return;
         }
+        // PR #48: starting an operation cancels every scan
+        // worker and bumps the scan version, so no stale
+        // delivery can publish over the operation's refresh.
+        for task in guard.scan_tasks.values() {
+            task.cancel();
+        }
+        guard.scan_version += 1;
+        guard.scan_outstanding.clear();
+        guard.scanning = false;
+        guard.busy = false;
         guard.op_busy = true;
     }
     let (tx, rx) = std::sync::mpsc::channel();
@@ -22801,6 +22890,9 @@ fn open_recording_library(wiring: &Wiring, main_status: Status) {
         scanning: false,
         deliveries: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
         directories,
+        folder_rows: std::collections::HashMap::new(),
+        folder_warnings: std::collections::HashMap::new(),
+        scan_outstanding: std::collections::HashSet::new(),
         rows: Vec::new(),
         view: Vec::new(),
         warnings: Vec::new(),
@@ -23152,16 +23244,22 @@ fn open_recording_library(wiring: &Wiring, main_status: Status) {
             let mut queue = guard.deliveries.lock().unwrap();
             std::mem::take(&mut *queue)
         };
-        for (version, delivery) in deliveries {
+        for (version, dir, delivery) in deliveries {
             let mut guard = ui_poll.borrow_mut();
             if version != guard.scan_version {
                 continue;
             }
-            guard.busy = false;
-            guard.scanning = false;
+            // PR #48: each folder publishes as its scan lands;
+            // the scan round ends when the last folder reports.
+            guard.scan_outstanding.remove(&dir);
             if let Ok((rows, warnings)) = delivery {
-                guard.rows = rows;
-                guard.warnings = warnings;
+                guard.folder_rows.insert(dir.clone(), rows);
+                guard.folder_warnings.insert(dir, warnings);
+                library_merge(&mut guard);
+            }
+            if guard.scan_outstanding.is_empty() {
+                guard.busy = false;
+                guard.scanning = false;
             }
             changed = true;
         }
@@ -28421,6 +28519,12 @@ fn start_catchup_download(
     programme: &Programme,
     status: Status,
 ) {
+    // PR #48: a second request for a programme whose download
+    // is already being prepared is refused, not resolved again.
+    if catchup_preparation_in_flight(wiring, &catchup_download_key(channel, programme)) {
+        status.set_label("This catch-up programme is already downloading.");
+        return;
+    }
     let now = now_epoch();
     match iptv_core::catchup::resolve_show_url(channel, programme.start, programme.stop, now) {
         Ok(
@@ -28483,6 +28587,10 @@ fn start_recovered_download(
     status: Status,
 ) {
     let pad = (pre_minutes, post_minutes);
+    if catchup_preparation_in_flight(wiring, &catchup_download_key(channel, programme)) {
+        status.set_label("This catch-up programme is already downloading.");
+        return;
+    }
     let now = now_epoch();
     match iptv_core::catchup::resolve_show_url(channel, programme.start, programme.stop, now) {
         Ok(
@@ -28662,9 +28770,11 @@ fn begin_catchup_download_with_padding(
     // like a playback or recording session.
     terminate_media_probes(&wiring.media_probe);
     // Audit R03: refuse a duplicate active capture of the same
-    // programme instead of overwriting its output.
+    // programme instead of overwriting its output. PR #48: a
+    // download still being prepared counts too.
     let key = catchup_download_key(channel, programme);
     let duplicate = wiring.recordings.borrow().is_recording(&key)
+        || catchup_preparation_in_flight(wiring, &key)
         || wiring
             .downloads
             .borrow()
