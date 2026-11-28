@@ -5656,3 +5656,12 @@ msgstr "È stato raggiunto il limite delle code salvate."
 
 msgid "When a recording starts or finishes successfully:"
 msgstr "Quando una registrazione inizia o termina correttamente:"
+
+msgid "The recording schedule could not be saved. Check available disk space and write permissions."
+msgstr "Impossibile salvare la pianificazione delle registrazioni. Verificare lo spazio su disco disponibile e i permessi di scrittura."
+
+msgid "Partial EPG Import"
+msgstr "Importazione parziale della guida ai programmi"
+
+msgid "The EPG import loaded {loaded} of {total} sources. The programme guide may be incomplete."
+msgstr "Sono state importate {loaded} fonti su {total}. La guida ai programmi potrebbe essere incompleta."

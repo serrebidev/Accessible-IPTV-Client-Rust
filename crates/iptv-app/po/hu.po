@@ -5714,3 +5714,12 @@ msgstr "Elérte a menthető lejátszási sorok maximális számát."
 
 msgid "When a recording starts or finishes successfully:"
 msgstr "Értesítés a felvétel sikeres megkezdésekor és befejezésekor:"
+
+msgid "The recording schedule could not be saved. Check available disk space and write permissions."
+msgstr "Nem sikerÃ¼lt menteni a felvÃ©teli Ã¼temezÃ©st. EllenÅrizze a szabad lemezterÃ¼letet Ã©s az Ã­rÃ¡si jogosultsÃ¡gokat."
+
+msgid "Partial EPG Import"
+msgstr "RÃ©szleges mÅ±sorÃºjsÃ¡g-importÃ¡lÃ¡s"
+
+msgid "The EPG import loaded {loaded} of {total} sources. The programme guide may be incomplete."
+msgstr "A megadott {total} forrÃ¡sbÃ³l {loaded} adatait sikerÃ¼lt importÃ¡lni. A mÅ±sorÃºjsÃ¡g hiÃ¡nyos lehet."

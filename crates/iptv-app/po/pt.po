@@ -5628,3 +5628,12 @@ msgstr "Foi atingido o limite de filas guardadas."
 
 msgid "When a recording starts or finishes successfully:"
 msgstr "Quando uma gravação começa ou termina com sucesso:"
+
+msgid "The recording schedule could not be saved. Check available disk space and write permissions."
+msgstr "NÃ£o foi possÃ­vel guardar o agendamento das gravaÃ§Ãµes. Verifique o espaÃ§o disponÃ­vel no disco e as permissÃµes de escrita."
+
+msgid "Partial EPG Import"
+msgstr "ImportaÃ§Ã£o parcial do guia de programaÃ§Ã£o"
+
+msgid "The EPG import loaded {loaded} of {total} sources. The programme guide may be incomplete."
+msgstr "Foram importadas {loaded} de {total} fontes. O guia de programaÃ§Ã£o poderÃ¡ estar incompleto."

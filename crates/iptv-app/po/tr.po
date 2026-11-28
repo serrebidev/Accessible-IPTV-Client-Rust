@@ -5583,3 +5583,12 @@ msgstr "Kayıtlı sıra sınırına ulaşıldı."
 
 msgid "When a recording starts or finishes successfully:"
 msgstr "Kayıt başarıyla başladığında veya bittiğinde:"
+
+msgid "The recording schedule could not be saved. Check available disk space and write permissions."
+msgstr "KayÄ±t zamanlamasÄ± kaydedilemedi. Diskteki boÅ alanÄ± ve yazma izinlerini kontrol edin."
+
+msgid "Partial EPG Import"
+msgstr "Program rehberi kÄ±smen iÃ§e aktarÄ±ldÄ±"
+
+msgid "The EPG import loaded {loaded} of {total} sources. The programme guide may be incomplete."
+msgstr "{total} kaynaÄÄ±n {loaded} tanesi iÃ§e aktarÄ±ldÄ±. Program rehberi eksik olabilir."

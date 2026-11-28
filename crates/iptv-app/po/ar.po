@@ -5521,3 +5521,12 @@ msgstr "بلغت الحد الأقصى للقوائم المحفوظة."
 
 msgid "When a recording starts or finishes successfully:"
 msgstr "عند بدء تسجيل أو انتهائه بنجاح:"
+
+msgid "The recording schedule could not be saved. Check available disk space and write permissions."
+msgstr "ØªØ¹Ø°ÙØ± Ø­ÙØ¸ Ø¬Ø¯ÙÙ Ø§ÙØªØ³Ø¬ÙÙØ§Øª. ØªØ­ÙÙÙ ÙÙ Ø§ÙÙØ³Ø§Ø­Ø© Ø§ÙÙØªØ§Ø­Ø© Ø¹ÙÙ Ø§ÙÙØ±Øµ ÙØ£Ø°ÙÙØ§Øª Ø§ÙÙØªØ§Ø¨Ø©."
+
+msgid "Partial EPG Import"
+msgstr "Ø§Ø³ØªÙØ±Ø§Ø¯ Ø¬Ø²Ø¦Ù ÙØ¯ÙÙÙ Ø§ÙØ¨Ø±Ø§ÙØ¬"
+
+msgid "The EPG import loaded {loaded} of {total} sources. The programme guide may be incomplete."
+msgstr "Ø§Ø³ØªÙØ±Ø¯ Ø¯ÙÙÙ Ø§ÙØ¨Ø±Ø§ÙØ¬ {loaded} ÙÙ Ø£ØµÙ {total} ÙØµØ¯Ø±ÙØ§. ÙØ¯ ÙÙÙÙ Ø§ÙØ¯ÙÙÙ ØºÙØ± ÙÙØªÙÙ."
