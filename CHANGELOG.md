@@ -5,6 +5,10 @@ adjacent releases were part of the same fix stream, they are combined with a
 version range such as `0.2.2-0.2.3`. Each release's section below is its
 Forgejo release note, taken from this file by the release workflow.
 
+## 0.4.42
+
+- Hungarian polish (Python PR #47, by Tibor): the recording-workflow strings added in 0.4.41 and the Hungarian user guide are revised to match the Python client's v1.152.5 wording exactly.
+
 ## 0.4.41
 
 - Scheduled Recordings can be filtered: Ctrl+F jumps to a title or channel search, and the view selector shows All, the Next 7 Days, Failed and Partial recordings, or Paused Recording Rules. The exit confirmation now names the next eligible recording when a rule is paused, and series scans are requested after a guide import, a pause change, or a repeat change, so new episodes are filled in promptly.
