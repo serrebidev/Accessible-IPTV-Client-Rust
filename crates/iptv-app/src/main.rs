@@ -672,6 +672,10 @@ struct Wiring {
     /// message when it lands (N21; Python's `_epg_import_notify`).
     /// Automatic loads never set it, so they stay quiet.
     epg_import_notify: Rc<std::cell::Cell<bool>>,
+    /// PR #48: the last incomplete import attempt (sources hash
+    /// + the epoch second an automatic retry becomes due), so a
+    /// partial guide is not re-fetched continuously.
+    epg_incomplete: Rc<RefCell<Option<(String, i64)>>>,
     /// The independent 60-second guide-freshness timer (audit
     /// E11): row suffixes track programme boundaries even when
     /// every worker is idle.
@@ -1504,6 +1508,7 @@ fn bind_browser(
         epg_inflight_sources: Rc::new(RefCell::new(Vec::new())),
         epg_recheck: Rc::new(std::cell::Cell::new(false)),
         epg_import_notify: Rc::new(std::cell::Cell::new(false)),
+        epg_incomplete: Rc::new(RefCell::new(None)),
         epg_timer: Rc::new(Timer::new(&frame)),
         search_results: Rc::new(RefCell::new(Vec::new())),
         search_status: Rc::new(RefCell::new(String::new())),
@@ -3074,23 +3079,48 @@ fn poll_providers(wiring: &Wiring, controls: Controls, frame: Frame) {
 /// Python's `_report_epg_import_finished`). Both boxes go
 /// through the N18 notification queue, so a modal already
 /// open defers them instead of stacking.
-fn report_epg_import_finished(frame: Frame, success: bool) {
-    if success {
-        show_or_queue_notification(
-            frame,
-            "The EPG import has finished. The programme guide is up to date.",
-            "Import Complete",
-            MessageDialogStyle::OK | MessageDialogStyle::IconInformation,
-            None,
-        );
-    } else {
-        show_or_queue_notification(
-            frame,
-            "The EPG import did not finish. The programme guide may be incomplete or unchanged.\n\nCheck that the EPG sources in File > EPG Manager are reachable, then try again.",
-            "Import Failed",
-            MessageDialogStyle::OK | MessageDialogStyle::IconWarning,
-            None,
-        );
+/// How a hand-started import turned out (PR #48): complete,
+/// partial (some sources loaded), or failed (none did).
+enum EpgImportReport {
+    Complete,
+    Partial(usize, usize),
+    Failed,
+}
+
+fn report_epg_import_finished(frame: Frame, report: EpgImportReport) {
+    match report {
+        EpgImportReport::Complete => {
+            show_or_queue_notification(
+                frame,
+                "The EPG import has finished. The programme guide is up to date.",
+                "Import Complete",
+                MessageDialogStyle::OK | MessageDialogStyle::IconInformation,
+                None,
+            );
+        }
+        EpgImportReport::Partial(loaded, total) => {
+            let message = trf(
+                "The EPG import loaded {loaded} of {total} sources. The programme guide may be incomplete.",
+                &[("loaded", &loaded.to_string()), ("total", &total.to_string())],
+            ) + "\n\n"
+                + &tr("Check that the EPG sources in File > EPG Manager are reachable, then try again.");
+            show_or_queue_notification(
+                frame,
+                &message,
+                "Partial EPG Import",
+                MessageDialogStyle::OK | MessageDialogStyle::IconWarning,
+                None,
+            );
+        }
+        EpgImportReport::Failed => {
+            show_or_queue_notification(
+                frame,
+                "The EPG import did not finish. The programme guide may be incomplete or unchanged.\n\nCheck that the EPG sources in File > EPG Manager are reachable, then try again.",
+                "Import Failed",
+                MessageDialogStyle::OK | MessageDialogStyle::IconWarning,
+                None,
+            );
+        }
     }
 }
 
@@ -3107,7 +3137,7 @@ fn poll_epg(wiring: &Wiring, frame: Frame, status: Status) {
         let notify = wiring.epg_import_notify.get();
         wiring.epg_import_notify.set(false);
         match result {
-            Ok((snapshot, store_note)) => {
+            Ok((snapshot, store_note, loaded, total)) => {
                 let counts = (
                     snapshot.guide.channels.len(),
                     snapshot.guide.programme_count(),
@@ -3121,14 +3151,26 @@ fn poll_epg(wiring: &Wiring, frame: Frame, status: Status) {
                 // Python records the import stamp and the hash of
                 // the sources actually imported, so the next
                 // automatic decision can respect the interval.
+                // PR #48: only a COMPLETE import (every source
+                // loaded) extends guide freshness; a partial one
+                // still feeds the guide and the scans below, and
+                // an automatic retry of the same sources waits
+                // five minutes instead of re-fetching at once.
                 let imported = wiring.epg_inflight_sources.borrow().clone();
-                wiring
-                    .persist
-                    .set_and_save("epg_last_import_epoch", serde_json::json!(now_epoch()));
-                wiring.persist.set_and_save(
-                    "epg_last_sources_hash",
-                    serde_json::json!(hash_epg_sources(&imported)),
-                );
+                let complete = total > 0 && loaded == total;
+                if complete {
+                    *wiring.epg_incomplete.borrow_mut() = None;
+                    wiring
+                        .persist
+                        .set_and_save("epg_last_import_epoch", serde_json::json!(now_epoch()));
+                    wiring.persist.set_and_save(
+                        "epg_last_sources_hash",
+                        serde_json::json!(hash_epg_sources(&imported)),
+                    );
+                } else {
+                    *wiring.epg_incomplete.borrow_mut() =
+                        Some((hash_epg_sources(&imported), now_epoch() + 300));
+                }
                 // PR #46: a fresh guide requests a series
                 // scan, as Python does after an import.
                 wiring.series_last_scan.set(0.0);
@@ -3166,7 +3208,14 @@ fn poll_epg(wiring: &Wiring, frame: Frame, status: Status) {
                     "guide",
                 );
                 if notify {
-                    report_epg_import_finished(frame, true);
+                    if complete {
+                        report_epg_import_finished(frame, EpgImportReport::Complete);
+                    } else {
+                        report_epg_import_finished(
+                            frame,
+                            EpgImportReport::Partial(loaded, total),
+                        );
+                    }
                 }
                 // Saved searches run after every guide import
                 // (C11, Python `_scan_saved_searches`).
@@ -3186,8 +3235,13 @@ fn poll_epg(wiring: &Wiring, frame: Frame, status: Status) {
             Err(error) => {
                 iptv_core::applog::error("epg", &format!("Guide failed to load: {error}"));
                 status.set_label(&trf("Guide failed to load: {error}", &[("error", &error)]));
+                // PR #48: a failed attempt also defers the next
+                // automatic retry of the same sources.
+                let imported = wiring.epg_inflight_sources.borrow().clone();
+                *wiring.epg_incomplete.borrow_mut() =
+                    Some((hash_epg_sources(&imported), now_epoch() + 300));
                 if notify {
-                    report_epg_import_finished(frame, false);
+                    report_epg_import_finished(frame, EpgImportReport::Failed);
                 }
             }
         }
@@ -6056,6 +6110,17 @@ fn poll_recordings(wiring: &Wiring, frame: Frame, status: Status) {
     if !wiring.closing_application.get() && now - wiring.last_dvr_tick.get() >= 10.0 {
         wiring.last_dvr_tick.set(now);
         run_dvr_tick(wiring, status, now);
+        // PR #48: a schedule write that failed is reported
+        // once per outage (the core retries it on its own).
+        if wiring.dvr.borrow_mut().take_save_warning() {
+            show_or_queue_notification(
+                frame,
+                "The recording schedule could not be saved. Check available disk space and write permissions.",
+                "Scheduled Recordings",
+                MessageDialogStyle::OK | MessageDialogStyle::IconWarning,
+                None,
+            );
+        }
         if now - wiring.series_last_scan.get() >= 3600.0 {
             run_series_scan(wiring);
         }
@@ -7240,6 +7305,7 @@ fn clone_wiring(wiring: &Wiring) -> Wiring {
         epg_inflight_sources: Rc::clone(&wiring.epg_inflight_sources),
         epg_recheck: Rc::clone(&wiring.epg_recheck),
         epg_import_notify: Rc::clone(&wiring.epg_import_notify),
+        epg_incomplete: Rc::clone(&wiring.epg_incomplete),
         epg_timer: Rc::clone(&wiring.epg_timer),
         search_results: Rc::clone(&wiring.search_results),
         search_status: Rc::clone(&wiring.search_status),
@@ -9902,7 +9968,7 @@ fn menu_import_epg(wiring: &Wiring, frame: Frame, status: Status) {
 /// number warns, and a number no channel carries and no
 /// position reaches reports not found.
 fn menu_go_to_channel_number(wiring: &Wiring, frame: Frame, list: ListCtrl, status: Status) {
-    let (row, index, number) = {
+    let found = {
         let model = wiring.model.borrow();
         if model.is_empty() {
             // Python returns silently when nothing is in scope.
@@ -9948,17 +10014,85 @@ fn menu_go_to_channel_number(wiring: &Wiring, frame: Frame, list: ListCtrl, stat
         // (`number`, then `tvg-chno`), then falls back to
         // the 1-based position — only when the channel at
         // that position carries no number of its own.
-        let mut row = None;
+        let mut matches: Vec<(usize, Channel)> = Vec::new();
         for candidate in 0..row_count {
             let Some(channel) = model.channel(candidate) else {
                 continue;
             };
             if own_number(channel) == digits {
-                row = Some(candidate);
-                break;
+                matches.push((candidate, channel.clone()));
             }
         }
-        let row = row.or_else(|| {
+        (matches, digits)
+    };
+    let (matches, digits) = found;
+    // PR #48: the same number on several channels (one per
+    // playlist, usually) asks which one instead of silently
+    // taking the first.
+    let picked = if matches.len() > 1 {
+        let mut labels: Vec<String> = matches
+            .iter()
+            .map(|(_, channel)| {
+                let name = channel.name.trim();
+                let name = if name.is_empty() {
+                    tr("Untitled channel")
+                } else {
+                    name.to_string()
+                };
+                let duplicated = matches
+                    .iter()
+                    .filter(|(_, other)| other.name.trim().eq_ignore_ascii_case(name.as_str()))
+                    .count()
+                    > 1;
+                if duplicated && !channel.group.trim().is_empty() {
+                    format!("{} ({})", name, channel.group.trim())
+                } else {
+                    name
+                }
+            })
+            .collect();
+        let folded: Vec<String> = labels.iter().map(|label| label.to_lowercase()).collect();
+        if folded.iter().collect::<std::collections::BTreeSet<_>>().len() != folded.len() {
+            labels = labels
+                .iter()
+                .enumerate()
+                .map(|(index, label)| format!("{}. {}", index + 1, label))
+                .collect();
+        }
+        let dialog = SingleChoiceDialog::builder(
+            &frame,
+            &tr("Choose a channel to play:"),
+            &tr("Go to Channel Number"),
+            &labels.iter().map(String::as_str).collect::<Vec<_>>(),
+        )
+        .build();
+        dialog.set_selection(0);
+        if dialog.show_modal_tracked() != ID_OK {
+            return;
+        }
+        let selection = dialog.get_selection();
+        if selection < 0 {
+            return;
+        }
+        matches
+            .get(usize::try_from(selection).unwrap_or(usize::MAX))
+            .map(|(row, _)| *row)
+    } else {
+        matches.first().map(|(row, _)| *row)
+    };
+    let (row, index, number) = {
+        let model = wiring.model.borrow();
+        let row_count = model.len();
+        let own_number = |channel: &Channel| -> String {
+            let raw = channel
+                .unknown_attributes
+                .get("number")
+                .filter(|own| !own.is_empty())
+                .or_else(|| channel.unknown_attributes.get("tvg-chno"))
+                .map_or("", |own| own.as_str());
+            iptv_core::navindex::channel_number(raw)
+        };
+        let row = picked.or_else(|| {
             if digits.len() > row_count.to_string().len() {
                 return None;
             }
@@ -18971,6 +19105,13 @@ fn finish_epg_auto_import(wiring: &Wiring, sources: Vec<String>, usable: bool) {
     if wiring.epg_pending.get() {
         wiring.epg_recheck.set(true);
         return;
+    }
+    // PR #48: an incomplete attempt at these same sources
+    // defers the automatic retry until its time comes.
+    if let Some((hash, retry_at)) = &*wiring.epg_incomplete.borrow() {
+        if *hash == hash_epg_sources(&sources) && now_epoch() < *retry_at {
+            return;
+        }
     }
     let should_import = {
         let config = wiring.persist.config.borrow();
