@@ -32,6 +32,7 @@ pub fn ical_text(value: &str) -> String {
 /// `waiting` status counts as Python's `scheduled` here: it is
 /// a scheduled booking held by a conflict or a limit.
 #[must_use]
+#[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)] // epoch seconds
 pub fn filter_recording_schedule(
     jobs: &[crate::dvr::DvrJob],
     query: &str,
@@ -42,10 +43,13 @@ pub fn filter_recording_schedule(
         paused_occurrence, STATUS_CANCELED, STATUS_FAILED, STATUS_MISSED, STATUS_PARTIAL,
         STATUS_SCHEDULED, STATUS_WAITING,
     };
-    let words: Vec<String> = query.to_lowercase().split_whitespace().map(str::to_string).collect();
+    let words: Vec<String> = query
+        .to_lowercase()
+        .split_whitespace()
+        .map(str::to_string)
+        .collect();
     let local_now = chrono::DateTime::from_timestamp(now as i64, 0)
-        .map(|utc| utc.with_timezone(&chrono::Local))
-        .unwrap_or_else(chrono::Local::now);
+        .map_or_else(chrono::Local::now, |utc| utc.with_timezone(&chrono::Local));
     let week_end = (local_now + chrono::Duration::days(7)).timestamp() as f64;
     let today = local_now.format("%Y-%m-%d").to_string();
     let mut rows = Vec::new();
@@ -72,8 +76,8 @@ pub fn filter_recording_schedule(
                 continue;
             }
         }
-        let text = format!("{} {} {}", job.title, job.display_title, job.channel_name)
-            .to_lowercase();
+        let text =
+            format!("{} {} {}", job.title, job.display_title, job.channel_name).to_lowercase();
         if words.iter().all(|word| text.contains(word.as_str())) {
             rows.push(job.clone());
         }
@@ -352,12 +356,12 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::cast_possible_truncation)] // test epochs
     fn schedule_filter_views_and_words() {
         // Python test_schedule_filters_exclude_paused_items_from_the_week.
         let now = 1_800_000_000.0;
         let today = chrono::DateTime::from_timestamp(now as i64, 0)
-            .map(|utc| utc.with_timezone(&chrono::Local))
-            .unwrap_or_else(chrono::Local::now)
+            .map_or_else(chrono::Local::now, |utc| utc.with_timezone(&chrono::Local))
             .format("%Y-%m-%d")
             .to_string();
         let mut active = booking("active", now + 60.0, now + 3600.0);
@@ -384,12 +388,12 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::cast_possible_truncation)] // test epochs
     fn schedule_filter_paused_view_keeps_a_completed_series_rule() {
         // Python test_pause_filter_includes_existing_series_rule_after_its_first_recording.
         let now = 1_800_000_000.0;
         let local = chrono::DateTime::from_timestamp(now as i64, 0)
-            .map(|utc| utc.with_timezone(&chrono::Local))
-            .unwrap_or_else(chrono::Local::now);
+            .map_or_else(chrono::Local::now, |utc| utc.with_timezone(&chrono::Local));
         let today = local.format("%Y-%m-%d").to_string();
         let later = (local + chrono::Duration::days(2))
             .format("%Y-%m-%d")

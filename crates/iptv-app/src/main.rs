@@ -5048,6 +5048,7 @@ fn player_is_showing(player: &Rc<RefCell<PlayerState>>, channel: &Channel) -> bo
 /// when the caller has it, witnesses the heard audio track
 /// (audit R10).
 #[allow(clippy::too_many_arguments)] // window parts, like prepare_recording
+#[allow(clippy::too_many_lines)] // one start/stop flow, as in Python
 fn toggle_recording(
     parent: &dyn WxWidget,
     recordings: &Rc<RefCell<RecordingEngine>>,
@@ -9012,7 +9013,9 @@ fn menu_item_topic(id: i32) -> Option<&'static str> {
         WHATS_NEW => "updates",
         REC_START | REC_STOP | REC_STOP_ALL | REC_STORAGE | REC_MIN_FREE | REC_SET_FOLDER
         | REC_OPEN_FOLDER | REC_PROBLEM_TIMES | REC_LIBRARY | REC_PREVENT_SLEEP
-        | REC_WAKE_RECORDINGS | REC_SPACE_MONITOR | REC_NOTIFICATIONS | REC_LIMITS | CTX_RECORD => "recordings",
+        | REC_WAKE_RECORDINGS | REC_SPACE_MONITOR | REC_NOTIFICATIONS | REC_LIMITS | CTX_RECORD => {
+            "recordings"
+        }
         REC_REMINDERS | CTX_REMINDER => "reminders",
         REC_SCHEDULED | CTX_SCHEDULE => "scheduled-recordings",
         REC_PADDING => "schedule-padding",
@@ -15944,6 +15947,7 @@ fn queue_confirm_started(state: &PlayerState) {
     );
 }
 
+#[allow(clippy::too_many_lines)] // one poll over every engine state, as in Python
 fn poll_vlc_state(player: &Rc<RefCell<PlayerState>>, persist: &Persist, status: Status) {
     let mut setup_tracks = false;
     let mut confirm_history = false;
@@ -17940,36 +17944,31 @@ fn export_text_file(parent: &dyn WxWidget, title: &str, content: &[u8]) {
     if !path.to_lowercase().ends_with(".txt") {
         path.push_str(".txt");
         if std::path::Path::new(&path).exists() {
-            let answer = MessageDialog::builder(
-                parent,
-                &tr("Replace the existing export file?"),
-                title,
-            )
-            .with_style(
-                MessageDialogStyle::YesNo
-                    | MessageDialogStyle::NoDefault
-                    | MessageDialogStyle::IconWarning,
-            )
-            .build()
-            .show_modal_tracked();
+            let answer =
+                MessageDialog::builder(parent, &tr("Replace the existing export file?"), title)
+                    .with_style(
+                        MessageDialogStyle::YesNo
+                            | MessageDialogStyle::NoDefault
+                            | MessageDialogStyle::IconWarning,
+                    )
+                    .build()
+                    .show_modal_tracked();
             if answer != ID_YES {
                 return;
             }
         }
     }
-    let (message, style) = match iptv_core::planning_tools::atomic_export(
-        std::path::Path::new(&path),
-        content,
-    ) {
-        Ok(()) => (
-            tr("Export saved."),
-            MessageDialogStyle::OK | MessageDialogStyle::IconInformation,
-        ),
-        Err(error) => (
-            trf("The operation failed:\n{error}", &[("error", &error)]),
-            MessageDialogStyle::OK | MessageDialogStyle::IconError,
-        ),
-    };
+    let (message, style) =
+        match iptv_core::planning_tools::atomic_export(std::path::Path::new(&path), content) {
+            Ok(()) => (
+                tr("Export saved."),
+                MessageDialogStyle::OK | MessageDialogStyle::IconInformation,
+            ),
+            Err(error) => (
+                trf("The operation failed:\n{error}", &[("error", &error)]),
+                MessageDialogStyle::OK | MessageDialogStyle::IconError,
+            ),
+        };
     let dialog = MessageDialog::builder(parent, &message, title)
         .with_style(style)
         .build();
@@ -18179,6 +18178,7 @@ fn save_recording_excerpt(
     );
 }
 
+#[allow(clippy::too_many_lines)] // search prompt, results and export in one flow, as in Python
 fn prompt_subtitle_find(
     player: &Rc<RefCell<PlayerState>>,
     frame: Frame,
@@ -22236,8 +22236,7 @@ fn manage_saved_queue(wiring: &Wiring, parent: &dyn WxWidget, mode: &str) {
             == ID_YES
     };
     if mode == "save" {
-        let entry =
-            TextEntryDialog::builder(parent, &tr("Name for this queue:"), &caption).build();
+        let entry = TextEntryDialog::builder(parent, &tr("Name for this queue:"), &caption).build();
         if entry.show_modal_tracked() != ID_OK {
             return;
         }
@@ -22259,7 +22258,7 @@ fn manage_saved_queue(wiring: &Wiring, parent: &dyn WxWidget, mode: &str) {
         return;
     }
     let mut names: Vec<String> = queues.iter().map(|(name, _)| name.clone()).collect();
-    names.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
+    names.sort_by_key(|name| name.to_lowercase());
     if names.is_empty() {
         return;
     }
@@ -25896,7 +25895,12 @@ fn cancel_first_selected_job(ui: &ScheduledUi, wiring: &Wiring, list: ListCtrl, 
 
 /// Delete every selected finished job (the Delete button and
 /// the Delete key share this; audit R19).
-fn delete_selected_finished_jobs(ui: &ScheduledUi, wiring: &Wiring, list: ListCtrl, dstatus: Status) {
+fn delete_selected_finished_jobs(
+    ui: &ScheduledUi,
+    wiring: &Wiring,
+    list: ListCtrl,
+    dstatus: Status,
+) {
     let ids = selected_job_ids(ui, list);
     if ids.is_empty() {
         dstatus.set_label("Choose a finished recording to delete first.");
@@ -26622,7 +26626,11 @@ fn programme_window_label(start: i64, stop: i64) -> String {
     format!("{} – {}", local(start), local(stop))
 }
 
-fn selected_single_job(ui: &ScheduledUi, wiring: &Wiring, list: ListCtrl) -> Option<iptv_core::dvr::DvrJob> {
+fn selected_single_job(
+    ui: &ScheduledUi,
+    wiring: &Wiring,
+    list: ListCtrl,
+) -> Option<iptv_core::dvr::DvrJob> {
     let ids = selected_job_ids(ui, list);
     (ids.len() == 1)
         .then(|| wiring.dvr.borrow().get(&ids[0]).cloned())
@@ -26695,7 +26703,13 @@ fn publish_reviewed_edit(
 }
 
 /// Scheduled Recordings > Skip This Occurrence (Python `_skip_occurrence`).
-fn skip_selected_occurrence(ui: &ScheduledUi, wiring: &Wiring, frame: Frame, list: ListCtrl, dstatus: Status) {
+fn skip_selected_occurrence(
+    ui: &ScheduledUi,
+    wiring: &Wiring,
+    frame: Frame,
+    list: ListCtrl,
+    dstatus: Status,
+) {
     let Some(job) = selected_single_job(ui, wiring, list) else {
         return;
     };
@@ -26797,7 +26811,13 @@ fn active_account_keys(wiring: &Wiring, channels: &[Channel]) -> Vec<String> {
 /// download) collapse into one call, with the channel list
 /// re-resolved between the budget checks, exactly where Python
 /// re-checks the list identity in its `ready` leg.
-fn recover_selected_archive(ui: &ScheduledUi, wiring: &Wiring, frame: Frame, list: ListCtrl, dstatus: Status) {
+fn recover_selected_archive(
+    ui: &ScheduledUi,
+    wiring: &Wiring,
+    frame: Frame,
+    list: ListCtrl,
+    dstatus: Status,
+) {
     let Some(job) = selected_single_job(ui, wiring, list) else {
         return;
     };
@@ -26861,7 +26881,13 @@ fn recover_selected_archive(ui: &ScheduledUi, wiring: &Wiring, frame: Frame, lis
 
 /// Scheduled Recordings > Repeat on Weekdays... (Python
 /// `planning_tools_ui.weekdays` + `_edit_weekdays`).
-fn edit_selected_weekdays(ui: &ScheduledUi, wiring: &Wiring, frame: Frame, list: ListCtrl, dstatus: Status) {
+fn edit_selected_weekdays(
+    ui: &ScheduledUi,
+    wiring: &Wiring,
+    frame: Frame,
+    list: ListCtrl,
+    dstatus: Status,
+) {
     let Some(job) = selected_single_job(ui, wiring, list) else {
         dstatus.set_label(&tr(
             "Select one pending recording that is not a series rule.",
@@ -26915,7 +26941,13 @@ fn edit_selected_weekdays(ui: &ScheduledUi, wiring: &Wiring, frame: Frame, list:
 
 /// Scheduled Recordings > Padding for This Recording... (Python
 /// `RecordingPaddingDialog(job=)` + `padding_dialog`).
-fn padding_for_selected(ui: &ScheduledUi, wiring: &Wiring, frame: Frame, list: ListCtrl, dstatus: Status) {
+fn padding_for_selected(
+    ui: &ScheduledUi,
+    wiring: &Wiring,
+    frame: Frame,
+    list: ListCtrl,
+    dstatus: Status,
+) {
     let Some(job) = selected_single_job(ui, wiring, list) else {
         return;
     };
@@ -27194,7 +27226,13 @@ fn review_guide_changes(
 
 /// Scheduled Recordings > Find Another Airing... (Python `find_airing`).
 #[allow(clippy::too_many_lines)] // one dialog flow, as in Python
-fn find_another_airing(ui: &ScheduledUi, wiring: &Wiring, frame: Frame, list: ListCtrl, dstatus: Status) {
+fn find_another_airing(
+    ui: &ScheduledUi,
+    wiring: &Wiring,
+    frame: Frame,
+    list: ListCtrl,
+    dstatus: Status,
+) {
     // Owned: the background completion renders through it.
     let ui = ui.clone();
     let Some(job) = selected_single_job(&ui, wiring, list) else {
@@ -27480,7 +27518,13 @@ fn find_another_airing(ui: &ScheduledUi, wiring: &Wiring, frame: Frame, list: Li
 /// Calendar... (Python `planning_tools_ui.export_recordings`):
 /// the save dialog first, then the selection is re-read and
 /// must still equal the snapshot the menu was built from.
-fn export_selected_recordings(ui: &ScheduledUi, wiring: &Wiring, frame: Frame, list: ListCtrl, dstatus: Status) {
+fn export_selected_recordings(
+    ui: &ScheduledUi,
+    wiring: &Wiring,
+    frame: Frame,
+    list: ListCtrl,
+    dstatus: Status,
+) {
     let title = tr("Export Selected Recordings to Calendar...");
     let snapshot = selected_jobs(ui, wiring, list);
     if snapshot.is_empty() {
@@ -27566,7 +27610,13 @@ fn export_selected_recordings(ui: &ScheduledUi, wiring: &Wiring, frame: Frame, l
 /// remove option; a new pause is confirmed with the first
 /// skipped and next following recording times before it saves.
 #[allow(clippy::too_many_lines)] // one dialog flow, as in Python
-fn pause_recording_rule(ui: &ScheduledUi, wiring: &Wiring, frame: Frame, list: ListCtrl, dstatus: Status) {
+fn pause_recording_rule(
+    ui: &ScheduledUi,
+    wiring: &Wiring,
+    frame: Frame,
+    list: ListCtrl,
+    dstatus: Status,
+) {
     let title = tr("Pause Recording Rule...");
     let Some(job) = selected_single_job(ui, wiring, list) else {
         return;
@@ -27753,7 +27803,12 @@ fn open_scheduled_dialog(wiring: &Wiring, main_status: Status) {
     filter_text.set_accessibility_label(&tr("Filter by title or channel"));
     let view_choice = Choice::builder(&panel).build();
     view_choice.set_accessibility_label(&tr("Schedule view"));
-    for label in ["All", "Next 7 Days", "Failed and Partial", "Paused Recording Rules"] {
+    for label in [
+        "All",
+        "Next 7 Days",
+        "Failed and Partial",
+        "Paused Recording Rules",
+    ] {
         view_choice.append(&tr(label));
     }
     view_choice.set_selection(0);
@@ -30005,7 +30060,7 @@ fn open_whats_new(wiring: &Wiring, status: Status) {
 }
 
 /// The What's New text for the running version (updated per release).
-const WHATS_NEW_TEXT: &str = "Version 0.4.40 The Hungarian translation is polished throughout, and the user guide now covers the newest recording features in every language: pausing a recording rule, reviewing guide time changes for reminders, recording playback speed and subtitle text search.\n\nVersion 0.4.39 Recording rules can pause from Scheduled Recordings, reminders can follow programme moves in the guide, and exiting now lets recordings in progress finish after naming them and asking first. Stalker channels connect in the background with a Playback Error box when the portal fails, the Recording Library scans each folder on its own worker and always plays finished recordings inside the app at the saved position, and the player gains Recording Playback Speed and Find Text in Recording Subtitles for local recordings.\n\nVersion 0.4.33 When a stream cannot be recovered, the Stream Lost message now appears once. Before, closing it could open another one, over and over.\n\nVersion 0.4.32The built-in player can now boost volume up to 200 percent for quiet streams: the slider, volume keys and mouse wheel all run to 200, matching the Python client.\n\nVersion 0.4.31 Help > About now has a separate link for each of GitHub, Forgejo, the projects site, Telegram and the full credits: Tab reaches each one and Enter or Space opens it.\n\nVersion 0.4.30 Help > About now lists the author, the GitHub and Forgejo pages, the projects site and the Telegram channel, and points to CREDITS.md for full credits. The README follows the shared layout and credits the libraries and upstream code the app uses.\n\nVersion 0.4.29 No more console windows: every tool the app runs in the background, ffmpeg included, now starts hidden. Before, a terminal window could open at startup and every time you paused on a channel, taking the focus away, which made arrowing and Alt+Tab back into the app feel frozen. Search now waits for you: typing in Search channels no longer refilters the list on every key; press Enter to search and move to the channel list, or leave the field with Tab, Shift+Tab or a click. Clear the field and leave it to see every channel again. And moving through the channel list does less work, so your screen reader has fewer updates to process.\n\nVersion 0.4.28 The recording tools from the Python client’s latest update are here. Recordings > Recording Library lists your finished recordings from up to 20 folders: search, filter by status, sort, play or resume, rename titles, move recordings to the recording trash and restore them, with active recordings always left out. The built-in player gains Previous Episode and Next Episode (Ctrl+PageUp and Ctrl+PageDown) and Playback > Subtitle Timing (Ctrl+Shift+T), which shifts subtitle display and speech by up to ten minutes either way for the current media. Scheduled Recordings gains Edit Times and Recording Conflicts: overlaps are checked against your per-account recording connection limits, shown with their real windows including padding, and a new recording that would exceed a known limit asks first. Continue Watching gains a Type choice: recordings keep their own saved positions, separate from Video on Demand, and removing or clearing affects only the type you are looking at. An Xtream account whose server rejects the saved credentials now says so plainly instead of looking like an empty catalogue. And copied text now survives closing the app: copies are flushed to the clipboard before the app exits, so a stream URL you copied is still there to paste afterwards.\n\nVersion 0.4.26 The About box links and the user guide's bug-report address now point to the project's Forgejo home, as the Python client's do; the old GitHub addresses no longer open. All three packages (Windows, Linux and macOS) are now built and published by the Forgejo release workflow.\n\nVersion 0.4.25 Updates now come from the project's Forgejo home instead of GitHub: Check for Updates, and the optional launch check in Options, ask the Forgejo release page for the newest version, and releases are published there from now on. The previous version still checked GitHub, so this one must be installed by hand; afterwards updates resume automatically from Forgejo. This release carries the Windows package.\n\nVersion 0.4.24 Category names are spoken again in the Categories tree. NVDA announced only “Categories, tree view” for every item and never the category itself, because naming the tree the way the newer interface library prefers had replaced the tree’s own accessibility with a stub that knows no items. The tree now takes its name the way the Python client does, so All Channels, Favorites and every playlist category are read aloud with their position and level as you move through them. The tree also gains the expand buttons and root lines the Python tree shows.\n\nVersion 0.4.23 Translations now run on patois, the gettext library that translates Paperback: the catalogues for all 13 languages are compiled into the program itself instead of travelling as a folder of files beside it, and the standard dialogs’ own strings now follow the app’s language too. Same translations, same language menu, same best-fit choice for your system language — nothing else changes.\n\nVersion 0.4.22 Release notes are now written for people, in the changelog in the project repository, and the GitHub release page shows them. Every past release’s notes have been filled in the same way, back to the first one. The release process now refuses to publish a version whose changelog section is missing, so an empty release page cannot ship again.\n\nVersion 0.4.21 Escape now closes windows, as it always did in the Python app: every list window (What’s on Now, Continue Watching, Recently Watched, Reminders, Account Info, Downloads, the programme guide and more), the Playlist and EPG managers, the account form, Scheduled Recordings, Recording Conflicts, the Reminder, VOD, Cast, Audio Preferences, Shutdown Countdown and User Guide windows all hide on Escape, and the hand-built dialogs (sliders, Recording Problem Times, About, Custom Player, Resume) cancel on Escape. Before, Escape did nothing in any of them.\n\nVersion 0.4.20 stops the Windows console window from opening alongside the app: the program is now a proper Windows GUI application, like the Python client. Nothing else changes from 0.4.19.\n\nVersion 0.4.19 removes the Windows debugging-check dialogs for good. They were never app errors: the interface library was being built with its developer consistency checks switched on, so an internal check that a shipped build is supposed to skip could stop the app with a dialog (the menu check and the tree check in earlier versions were the same thing). The library is now built the way release builds are meant to be, with those checks compiled out, matching the Python client. Also fixed: switching the player into or out of fullscreen now settles its layout and focus just after the switch, as the Python client defers them.\n\nVersion 0.4.18 completes the second parity pass against the Python client. Chromecast casting works now: devices are found on your network, the channel plays through the cast proxy, the app asks before disconnecting, saved positions and local buffering are refused while casting, and a casting session counts against one-connection providers. Translations ship with the app: the Python client's catalogues and help guides in 14 languages are bundled, so a non-English system language now actually translates the interface and the guides. A new Account Info window finds your provider accounts, including accounts detected from playlist and channel addresses, and shows each account's status and limits, with Copy Details. Guide imports match Python: gzipped guides resume after an interruption, imports lock across app copies, an old guide database offers Python's repair prompt, and the import's start and finish are announced. Dialogs carry Python's explanations as readable text, the About box gains the community links, What Is Playing and Go to Channel answer the way Python's do, the category tree branches per playlist with an Other playlists branch and channel counts, Favorites messages match Python's, the player status line shows buffer, bitrate and volume in Python's format, audio track changes are spoken, and the mouse wheel over the player changes the volume. Recording formats now follow the selected channel's stream type, failed catch-up downloads retry and explain themselves, and message boxes that arrive while another is open now queue instead of stacking. The guide import lock also clears promptly on Windows and macOS when the copy of the app that held it has closed.\n\nVersion 0.4.14 keeps the window responsive while the saved guide loads, and brings more of the Python client's behaviour across. Channel details, series scans, guide search and What's on Now now read the saved guide on a background thread instead of freezing the window, and results that arrive after you have moved on are dropped instead of replacing what you are looking at. Guide matching now uses the Python client's scored matcher, so channels find their correct guide listings more reliably. Recordings gain the Python client's per-recording logs, outcome reports and Recording Problem Times view, and a failed download now explains the provider error in plain words instead of leaving a raw code.\n\nVersion 0.4.13 makes the built-in player's timers actually run, and stops decoding video when the player window is hidden. Reconnect, resume, subtitle speech and the sleep timer now work in the real app; they were silently dead in every earlier build. Hidden playback uses far less processing power (about 1.5 percent of one core instead of about 12), and pressing Enter while the player engine is still starting no longer freezes the window; playback begins when the engine is ready. Also fixed: two libVLC data layouts that could corrupt memory, and the release packages now bundle the newest VLC 3 release.\\n\\nVersion 0.4.12 adds VOD search and item details, and stops the window freezing during playback. In the VOD window, the new Search VOD field searches movies and series across every group: type a title and press Enter; each result row names its group and where it comes from, the status line says how many items matched, and clearing the search brings back the group you were browsing. The new Item details view shows the selected item's title, type, group, source, its guide description when one is available, and its stream address. Opening a series from the results and going back returns you to the same results with that series still selected. Also fixed: the guide information on channel rows now refreshes on a background thread instead of on the window itself, so alt-tabbing back into the app during playback answers right away instead of taking five to ten seconds, and a refreshed guide merges in much faster.\\n\\nVersion 0.4.11 makes startup and channel changes feel instant with a large guide. The channel rows used to freeze for several seconds after each playlist load, because refreshing the guide information on each row scanned the whole saved guide; it now looks at just the hours around the current time, the same way the Python client does. On a guide with about 800,000 programmes that step drops from about five seconds to a fraction of a second, so new channels are ready to use as soon as they appear.\n\nVersion 0.4.10 speeds up the programme guide and fixes a recording check. The guide now loads and refreshes as fast as the Python client or faster: on a large test guide, a first load dropped from about thirteen minutes to about two and a half, a refresh from about three minutes to about one, and opening the app with a guide already saved is instant instead of taking most of a minute. Recordings work again on non-English Windows systems: the free-space check before recording no longer depends on localized command output (thanks to Farhan Khan for that fix). And the player no longer logs a warning about a plugin-path option that current libVLC removed; it uses the mechanism libVLC supports now.\n\nVersion 0.4.9 refreshes everything under the hood: the cryptography, the guide parser, the database and the platform libraries are all at their newest released versions. Nothing changes on screen, and settings backups stay fully compatible; backups written by earlier versions still restore.\n\nVersion 0.4.8\n\nCasting works with header-protected streams again. The built-in cast proxy now answers the HEAD requests casting devices send before playing, follows redirects so playlists resolve against the address they actually live at, and passes range and duration headers through, so casting devices can probe a stream properly. Streams that need a specific player identity now get the default one automatically. Thanks to Farhan Khan for the fix. The PR validation gate also checks whitespace properly again.\n\nVersion 0.4.7\n\nFaster with big playlists and guides, and the last parity gaps closed. Large playlists now keep a background index, so switching playlists or categories and searching stay quick even with hundreds of thousands of channels, and the guide shown on each row refreshes almost instantly instead of re-checking every channel against the guide every minute. Scheduled Recordings has the right-click menu (Refresh, Cancel, Delete) like the Python client. The preferred audio track check now waits as long as the Python client does, so a slow stream is less likely to lose your saved track. Closing the app no longer waits on the player engine. The log file lives where the Python client puts it. And pressing F1 while a menu is open now opens the help for the menu item you are on.\n\nVersion 0.4.6\n\nFix: single-instance handover now works on Windows (the lock file is opened with the access Windows requires). Plus the Python parity catch-up. Guide sources saved by the Python client now load, the saved guide is there again after a restart, and search finds programmes as well as channels. Provider playlists keep their own channels separate, replace cleanly on refresh, and a failed refresh keeps the channels you had. Resume positions now read the Python client's bookmarks, so Continue Watching carries across. Recordings get unique file names, retries, destination space checks, and honest empty-recording reports; reminders and series recording match the Python dialogs. The app is single-instance (a second launch hands over to the running one), keeps a real log file under Help, checks for updates hourly, and F1 opens the help topic for the window you are in.\n\nVersion 0.4.4\n\nLess talk, working keys. Controls no longer read out instructional sentences when you land on them — Categories, Search, and Channels announce their names, like the Python app, and the channel list no longer repeats the playlist status message every time you tab to it. Ctrl+Up and Ctrl+Down now only change the volume; they no longer move the channel or category selection at the same time. And the search field selects your whole query when you enter it, so typing replaces it, with Ctrl+A selecting all.\n\nVersion 0.4.3\n\nRecording conflicts and safer imports. When a scheduled recording would take a provider connection your watching is using, the recording waits with its reason shown in Scheduled Recordings instead of cutting in; you choose there: keep watching and let it wait, stop playback and record, or cancel the recording. Waiting recordings start fairly, earliest first, when a connection frees. And importing settings now first saves a verified encrypted recovery copy of your current settings where you choose, under its own password, and refuses to run while recordings or downloads are active. The basic player (when libVLC is unavailable) also reports its state honestly now, and its menus no longer offer full-player-only controls.\n\nVersion 0.4.2\n\nReliability and subtitle speech. Playback now confirms before it counts as playing, and a failing stream retries inside one 30-second budget with a clear Stream lost message instead of spinning forever. Recordings that start late say so honestly, and cancelling a scheduled recording now stops its capture. Settings backups interchange with the Python client, verified both ways. Subtitles can now speak through an application voice on Windows (SAPI), not only through your screen reader: pick the backend, output device, volume, and speed under Options, Subtitle Speech, and if the chosen output device disappears, speech pauses until it returns or falls back to the system default, per the device policy.\n\nVersion 0.4.1\n\nLess talk. Channel rows now carry the guide the way the Python app does — channel name first, then the current and next programmes after it — and moving through the list no longer speaks the guide out loud on every step; the description panel still fills in silently.\n\nVersion 0.4.0\n\nSigned updates. Check for Updates now uses the ship-shape updater, the same signed updater as BlindRadio: update packages are cryptographically signed and verified before anything installs, then install and relaunch on their own (Windows and Linux; macOS opens the verified disk image for a manual install). Releases before this one can still update forward onto it.\n\nVersion 0.3.4\n\nFix: large playlists load promptly at startup. The playlist now loads first and the programme guide follows once it settles, instead of the two downloads racing; the guide database write no longer freezes the window; and the channel list says Loading playlist while a load is in flight instead of claiming no playlist is loaded.\n\nVersion 0.3.3\n\nFix: streams play again. The packages now bundle libVLC (the built-in player engine) beside the app on Windows, Linux, and macOS, so playback works with no separate VLC install. If libVLC still cannot load, pressing play now says so instead of failing silently.\n\nVersion 0.3.2\n\nFix: large playlists and guides now load. The HTTP library silently capped downloads at 10 MB, so a big provider playlist (for example a 28 MB, 115,000-channel list) failed to add and its EPG could never load. Playlist, EPG, Xtream, and Stalker fetches now take the full body.\n\nVersion 0.3.1\n\nFix: the Windows build no longer shows a wxWidgets debug dialog (\"Can't expand/collapse hidden root node!\") at startup or when the category list rebuilds. Nothing else changes from 0.3.0.\n\nVersion 0.3.0\n\nMain window: the layout now matches the Python client exactly (Playlist view and Categories on the left; Search, Channels, description and Stream URL on the right), and the menu-less shortcuts from the Python client work here: Ctrl+Up/Down volume, Ctrl+Shift+R record, Ctrl+D favorite and the rest of the documented set.\n\nPlayer: a Playback menu in Python's order, a Sleep Timer with an optional volume fade-out, and an Audio Output Device dialog that lists the real libVLC devices (System default first) and applies the saved choice at playback start. Announcement levels now gate player speech exactly as Python's do (None, Errors only, Important events, Detailed status).\n\nLocal Live Buffer: live TV in the built-in player can be buffered locally (off by default; set it up from the player's Playback menu), which enables pausing live TV, Rewind Live TV and Return to Live. A recording of a buffered channel reads the buffer instead of opening a second provider connection.\n\nDialogs: What's on Now has its filter box with a program count; Continue Watching gains Check Availability, which re-resolves each saved position against the current playlists and reports Available or Unavailable per row. Settings backup and restore now use Python's password-protected encrypted format, so backups interchange with the Python client both ways.\n\nMenus and shell: the Media Player menu lists all 32 players the Python client offers, with its exact per-platform program lookup. The tray icon builds Python's popup fresh on every right-click (Restore, Player Controls, Stop Recording(s) while recording, Exit) and left-click restores the window. The Recordings menu's minimum-free-space reserve and schedule padding use Python's values.";
+const WHATS_NEW_TEXT: &str = "Version 0.4.41 Scheduled Recordings gains a filter: Ctrl+F searches by title or channel, and the view selector shows the next seven days, failed and partial recordings, or paused rules. Recording Notifications chooses a dialog, an announcement, or history only for successful starts and finishes, and a recording that misses part of its scheduled time now says so. The playback queue keeps an item until playback really starts, and the queue editor can save, load and delete named queues. The player gains Save Subtitle Transcript, Save Selected Subtitles in the subtitle search, and Save Recording Excerpt, which writes a bookmarked range of a local recording to a new MKV in the background.\n\nVersion 0.4.40 The Hungarian translation is polished throughout, and the user guide now covers the newest recording features in every language: pausing a recording rule, reviewing guide time changes for reminders, recording playback speed and subtitle text search.\n\nVersion 0.4.39 Recording rules can pause from Scheduled Recordings, reminders can follow programme moves in the guide, and exiting now lets recordings in progress finish after naming them and asking first. Stalker channels connect in the background with a Playback Error box when the portal fails, the Recording Library scans each folder on its own worker and always plays finished recordings inside the app at the saved position, and the player gains Recording Playback Speed and Find Text in Recording Subtitles for local recordings.\n\nVersion 0.4.33 When a stream cannot be recovered, the Stream Lost message now appears once. Before, closing it could open another one, over and over.\n\nVersion 0.4.32The built-in player can now boost volume up to 200 percent for quiet streams: the slider, volume keys and mouse wheel all run to 200, matching the Python client.\n\nVersion 0.4.31 Help > About now has a separate link for each of GitHub, Forgejo, the projects site, Telegram and the full credits: Tab reaches each one and Enter or Space opens it.\n\nVersion 0.4.30 Help > About now lists the author, the GitHub and Forgejo pages, the projects site and the Telegram channel, and points to CREDITS.md for full credits. The README follows the shared layout and credits the libraries and upstream code the app uses.\n\nVersion 0.4.29 No more console windows: every tool the app runs in the background, ffmpeg included, now starts hidden. Before, a terminal window could open at startup and every time you paused on a channel, taking the focus away, which made arrowing and Alt+Tab back into the app feel frozen. Search now waits for you: typing in Search channels no longer refilters the list on every key; press Enter to search and move to the channel list, or leave the field with Tab, Shift+Tab or a click. Clear the field and leave it to see every channel again. And moving through the channel list does less work, so your screen reader has fewer updates to process.\n\nVersion 0.4.28 The recording tools from the Python client’s latest update are here. Recordings > Recording Library lists your finished recordings from up to 20 folders: search, filter by status, sort, play or resume, rename titles, move recordings to the recording trash and restore them, with active recordings always left out. The built-in player gains Previous Episode and Next Episode (Ctrl+PageUp and Ctrl+PageDown) and Playback > Subtitle Timing (Ctrl+Shift+T), which shifts subtitle display and speech by up to ten minutes either way for the current media. Scheduled Recordings gains Edit Times and Recording Conflicts: overlaps are checked against your per-account recording connection limits, shown with their real windows including padding, and a new recording that would exceed a known limit asks first. Continue Watching gains a Type choice: recordings keep their own saved positions, separate from Video on Demand, and removing or clearing affects only the type you are looking at. An Xtream account whose server rejects the saved credentials now says so plainly instead of looking like an empty catalogue. And copied text now survives closing the app: copies are flushed to the clipboard before the app exits, so a stream URL you copied is still there to paste afterwards.\n\nVersion 0.4.26 The About box links and the user guide's bug-report address now point to the project's Forgejo home, as the Python client's do; the old GitHub addresses no longer open. All three packages (Windows, Linux and macOS) are now built and published by the Forgejo release workflow.\n\nVersion 0.4.25 Updates now come from the project's Forgejo home instead of GitHub: Check for Updates, and the optional launch check in Options, ask the Forgejo release page for the newest version, and releases are published there from now on. The previous version still checked GitHub, so this one must be installed by hand; afterwards updates resume automatically from Forgejo. This release carries the Windows package.\n\nVersion 0.4.24 Category names are spoken again in the Categories tree. NVDA announced only “Categories, tree view” for every item and never the category itself, because naming the tree the way the newer interface library prefers had replaced the tree’s own accessibility with a stub that knows no items. The tree now takes its name the way the Python client does, so All Channels, Favorites and every playlist category are read aloud with their position and level as you move through them. The tree also gains the expand buttons and root lines the Python tree shows.\n\nVersion 0.4.23 Translations now run on patois, the gettext library that translates Paperback: the catalogues for all 13 languages are compiled into the program itself instead of travelling as a folder of files beside it, and the standard dialogs’ own strings now follow the app’s language too. Same translations, same language menu, same best-fit choice for your system language — nothing else changes.\n\nVersion 0.4.22 Release notes are now written for people, in the changelog in the project repository, and the GitHub release page shows them. Every past release’s notes have been filled in the same way, back to the first one. The release process now refuses to publish a version whose changelog section is missing, so an empty release page cannot ship again.\n\nVersion 0.4.21 Escape now closes windows, as it always did in the Python app: every list window (What’s on Now, Continue Watching, Recently Watched, Reminders, Account Info, Downloads, the programme guide and more), the Playlist and EPG managers, the account form, Scheduled Recordings, Recording Conflicts, the Reminder, VOD, Cast, Audio Preferences, Shutdown Countdown and User Guide windows all hide on Escape, and the hand-built dialogs (sliders, Recording Problem Times, About, Custom Player, Resume) cancel on Escape. Before, Escape did nothing in any of them.\n\nVersion 0.4.20 stops the Windows console window from opening alongside the app: the program is now a proper Windows GUI application, like the Python client. Nothing else changes from 0.4.19.\n\nVersion 0.4.19 removes the Windows debugging-check dialogs for good. They were never app errors: the interface library was being built with its developer consistency checks switched on, so an internal check that a shipped build is supposed to skip could stop the app with a dialog (the menu check and the tree check in earlier versions were the same thing). The library is now built the way release builds are meant to be, with those checks compiled out, matching the Python client. Also fixed: switching the player into or out of fullscreen now settles its layout and focus just after the switch, as the Python client defers them.\n\nVersion 0.4.18 completes the second parity pass against the Python client. Chromecast casting works now: devices are found on your network, the channel plays through the cast proxy, the app asks before disconnecting, saved positions and local buffering are refused while casting, and a casting session counts against one-connection providers. Translations ship with the app: the Python client's catalogues and help guides in 14 languages are bundled, so a non-English system language now actually translates the interface and the guides. A new Account Info window finds your provider accounts, including accounts detected from playlist and channel addresses, and shows each account's status and limits, with Copy Details. Guide imports match Python: gzipped guides resume after an interruption, imports lock across app copies, an old guide database offers Python's repair prompt, and the import's start and finish are announced. Dialogs carry Python's explanations as readable text, the About box gains the community links, What Is Playing and Go to Channel answer the way Python's do, the category tree branches per playlist with an Other playlists branch and channel counts, Favorites messages match Python's, the player status line shows buffer, bitrate and volume in Python's format, audio track changes are spoken, and the mouse wheel over the player changes the volume. Recording formats now follow the selected channel's stream type, failed catch-up downloads retry and explain themselves, and message boxes that arrive while another is open now queue instead of stacking. The guide import lock also clears promptly on Windows and macOS when the copy of the app that held it has closed.\n\nVersion 0.4.14 keeps the window responsive while the saved guide loads, and brings more of the Python client's behaviour across. Channel details, series scans, guide search and What's on Now now read the saved guide on a background thread instead of freezing the window, and results that arrive after you have moved on are dropped instead of replacing what you are looking at. Guide matching now uses the Python client's scored matcher, so channels find their correct guide listings more reliably. Recordings gain the Python client's per-recording logs, outcome reports and Recording Problem Times view, and a failed download now explains the provider error in plain words instead of leaving a raw code.\n\nVersion 0.4.13 makes the built-in player's timers actually run, and stops decoding video when the player window is hidden. Reconnect, resume, subtitle speech and the sleep timer now work in the real app; they were silently dead in every earlier build. Hidden playback uses far less processing power (about 1.5 percent of one core instead of about 12), and pressing Enter while the player engine is still starting no longer freezes the window; playback begins when the engine is ready. Also fixed: two libVLC data layouts that could corrupt memory, and the release packages now bundle the newest VLC 3 release.\\n\\nVersion 0.4.12 adds VOD search and item details, and stops the window freezing during playback. In the VOD window, the new Search VOD field searches movies and series across every group: type a title and press Enter; each result row names its group and where it comes from, the status line says how many items matched, and clearing the search brings back the group you were browsing. The new Item details view shows the selected item's title, type, group, source, its guide description when one is available, and its stream address. Opening a series from the results and going back returns you to the same results with that series still selected. Also fixed: the guide information on channel rows now refreshes on a background thread instead of on the window itself, so alt-tabbing back into the app during playback answers right away instead of taking five to ten seconds, and a refreshed guide merges in much faster.\\n\\nVersion 0.4.11 makes startup and channel changes feel instant with a large guide. The channel rows used to freeze for several seconds after each playlist load, because refreshing the guide information on each row scanned the whole saved guide; it now looks at just the hours around the current time, the same way the Python client does. On a guide with about 800,000 programmes that step drops from about five seconds to a fraction of a second, so new channels are ready to use as soon as they appear.\n\nVersion 0.4.10 speeds up the programme guide and fixes a recording check. The guide now loads and refreshes as fast as the Python client or faster: on a large test guide, a first load dropped from about thirteen minutes to about two and a half, a refresh from about three minutes to about one, and opening the app with a guide already saved is instant instead of taking most of a minute. Recordings work again on non-English Windows systems: the free-space check before recording no longer depends on localized command output (thanks to Farhan Khan for that fix). And the player no longer logs a warning about a plugin-path option that current libVLC removed; it uses the mechanism libVLC supports now.\n\nVersion 0.4.9 refreshes everything under the hood: the cryptography, the guide parser, the database and the platform libraries are all at their newest released versions. Nothing changes on screen, and settings backups stay fully compatible; backups written by earlier versions still restore.\n\nVersion 0.4.8\n\nCasting works with header-protected streams again. The built-in cast proxy now answers the HEAD requests casting devices send before playing, follows redirects so playlists resolve against the address they actually live at, and passes range and duration headers through, so casting devices can probe a stream properly. Streams that need a specific player identity now get the default one automatically. Thanks to Farhan Khan for the fix. The PR validation gate also checks whitespace properly again.\n\nVersion 0.4.7\n\nFaster with big playlists and guides, and the last parity gaps closed. Large playlists now keep a background index, so switching playlists or categories and searching stay quick even with hundreds of thousands of channels, and the guide shown on each row refreshes almost instantly instead of re-checking every channel against the guide every minute. Scheduled Recordings has the right-click menu (Refresh, Cancel, Delete) like the Python client. The preferred audio track check now waits as long as the Python client does, so a slow stream is less likely to lose your saved track. Closing the app no longer waits on the player engine. The log file lives where the Python client puts it. And pressing F1 while a menu is open now opens the help for the menu item you are on.\n\nVersion 0.4.6\n\nFix: single-instance handover now works on Windows (the lock file is opened with the access Windows requires). Plus the Python parity catch-up. Guide sources saved by the Python client now load, the saved guide is there again after a restart, and search finds programmes as well as channels. Provider playlists keep their own channels separate, replace cleanly on refresh, and a failed refresh keeps the channels you had. Resume positions now read the Python client's bookmarks, so Continue Watching carries across. Recordings get unique file names, retries, destination space checks, and honest empty-recording reports; reminders and series recording match the Python dialogs. The app is single-instance (a second launch hands over to the running one), keeps a real log file under Help, checks for updates hourly, and F1 opens the help topic for the window you are in.\n\nVersion 0.4.4\n\nLess talk, working keys. Controls no longer read out instructional sentences when you land on them — Categories, Search, and Channels announce their names, like the Python app, and the channel list no longer repeats the playlist status message every time you tab to it. Ctrl+Up and Ctrl+Down now only change the volume; they no longer move the channel or category selection at the same time. And the search field selects your whole query when you enter it, so typing replaces it, with Ctrl+A selecting all.\n\nVersion 0.4.3\n\nRecording conflicts and safer imports. When a scheduled recording would take a provider connection your watching is using, the recording waits with its reason shown in Scheduled Recordings instead of cutting in; you choose there: keep watching and let it wait, stop playback and record, or cancel the recording. Waiting recordings start fairly, earliest first, when a connection frees. And importing settings now first saves a verified encrypted recovery copy of your current settings where you choose, under its own password, and refuses to run while recordings or downloads are active. The basic player (when libVLC is unavailable) also reports its state honestly now, and its menus no longer offer full-player-only controls.\n\nVersion 0.4.2\n\nReliability and subtitle speech. Playback now confirms before it counts as playing, and a failing stream retries inside one 30-second budget with a clear Stream lost message instead of spinning forever. Recordings that start late say so honestly, and cancelling a scheduled recording now stops its capture. Settings backups interchange with the Python client, verified both ways. Subtitles can now speak through an application voice on Windows (SAPI), not only through your screen reader: pick the backend, output device, volume, and speed under Options, Subtitle Speech, and if the chosen output device disappears, speech pauses until it returns or falls back to the system default, per the device policy.\n\nVersion 0.4.1\n\nLess talk. Channel rows now carry the guide the way the Python app does — channel name first, then the current and next programmes after it — and moving through the list no longer speaks the guide out loud on every step; the description panel still fills in silently.\n\nVersion 0.4.0\n\nSigned updates. Check for Updates now uses the ship-shape updater, the same signed updater as BlindRadio: update packages are cryptographically signed and verified before anything installs, then install and relaunch on their own (Windows and Linux; macOS opens the verified disk image for a manual install). Releases before this one can still update forward onto it.\n\nVersion 0.3.4\n\nFix: large playlists load promptly at startup. The playlist now loads first and the programme guide follows once it settles, instead of the two downloads racing; the guide database write no longer freezes the window; and the channel list says Loading playlist while a load is in flight instead of claiming no playlist is loaded.\n\nVersion 0.3.3\n\nFix: streams play again. The packages now bundle libVLC (the built-in player engine) beside the app on Windows, Linux, and macOS, so playback works with no separate VLC install. If libVLC still cannot load, pressing play now says so instead of failing silently.\n\nVersion 0.3.2\n\nFix: large playlists and guides now load. The HTTP library silently capped downloads at 10 MB, so a big provider playlist (for example a 28 MB, 115,000-channel list) failed to add and its EPG could never load. Playlist, EPG, Xtream, and Stalker fetches now take the full body.\n\nVersion 0.3.1\n\nFix: the Windows build no longer shows a wxWidgets debug dialog (\"Can't expand/collapse hidden root node!\") at startup or when the category list rebuilds. Nothing else changes from 0.3.0.\n\nVersion 0.3.0\n\nMain window: the layout now matches the Python client exactly (Playlist view and Categories on the left; Search, Channels, description and Stream URL on the right), and the menu-less shortcuts from the Python client work here: Ctrl+Up/Down volume, Ctrl+Shift+R record, Ctrl+D favorite and the rest of the documented set.\n\nPlayer: a Playback menu in Python's order, a Sleep Timer with an optional volume fade-out, and an Audio Output Device dialog that lists the real libVLC devices (System default first) and applies the saved choice at playback start. Announcement levels now gate player speech exactly as Python's do (None, Errors only, Important events, Detailed status).\n\nLocal Live Buffer: live TV in the built-in player can be buffered locally (off by default; set it up from the player's Playback menu), which enables pausing live TV, Rewind Live TV and Return to Live. A recording of a buffered channel reads the buffer instead of opening a second provider connection.\n\nDialogs: What's on Now has its filter box with a program count; Continue Watching gains Check Availability, which re-resolves each saved position against the current playlists and reports Available or Unavailable per row. Settings backup and restore now use Python's password-protected encrypted format, so backups interchange with the Python client both ways.\n\nMenus and shell: the Media Player menu lists all 32 players the Python client offers, with its exact per-platform program lookup. The tray icon builds Python's popup fresh on every right-click (Restore, Player Controls, Stop Recording(s) while recording, Exit) and left-click restores the window. The Recordings menu's minimum-free-space reserve and schedule padding use Python's values.";
 
 /// Run the platform shutdown (factored out of the recordings poll
 /// for the countdown dialog).

@@ -425,7 +425,7 @@ pub fn save_named(
     rows: &[LibraryRow],
     replace: bool,
 ) -> Result<Vec<(String, Vec<LibraryRow>)>, String> {
-    let single = saved_queues_json(&vec![(name.to_string(), rows.to_vec())]);
+    let single = saved_queues_json(&[(name.to_string(), rows.to_vec())]);
     let entries = saved_queues(&single);
     if entries.is_empty() {
         return Err(
@@ -433,7 +433,11 @@ pub fn save_named(
         );
     }
     let count = rows.len();
-    let (name, rows) = entries.into_iter().next().expect("one validated queue");
+    let Some((name, rows)) = entries.into_iter().next() else {
+        return Err(
+            "Enter a queue name of 1 to 80 characters and include a recording.".to_string(),
+        );
+    };
     let mut queues = saved_queues(value);
     let existing = queues
         .iter()
@@ -660,10 +664,18 @@ mod tests {
             save_named(&stored, "ESTE", &rows, false),
             Err("A saved queue with this name already exists.".to_string())
         );
-        let replaced = save_named(&stored, "ESTE", &rows.iter().rev().cloned().collect::<Vec<_>>(), true)
-            .expect("replaces");
+        let replaced = save_named(
+            &stored,
+            "ESTE",
+            &rows.iter().rev().cloned().collect::<Vec<_>>(),
+            true,
+        )
+        .expect("replaces");
         assert_eq!(replaced.len(), 1);
-        assert_eq!(replaced[0].1, rows.iter().rev().cloned().collect::<Vec<_>>());
+        assert_eq!(
+            replaced[0].1,
+            rows.iter().rev().cloned().collect::<Vec<_>>()
+        );
         // A wholly invalid stored queue validates to nothing.
         assert!(saved_queues(&serde_json::json!({
             "invalid": [{"path": "https://example.invalid"}]

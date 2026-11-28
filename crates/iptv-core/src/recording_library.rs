@@ -1246,12 +1246,13 @@ pub fn classify_outcome(outcome: &Outcome<'_>) -> &'static str {
     }
     // Python: without a media-written figure, the written
     // length is the capture's own wall-clock span.
-    let written = outcome.written_seconds.or_else(|| {
-        match (outcome.started_at, outcome.ended_at) {
-            (Some(started), Some(ended)) => Some((ended - started).max(0.0)),
-            _ => None,
-        }
-    });
+    let written =
+        outcome
+            .written_seconds
+            .or_else(|| match (outcome.started_at, outcome.ended_at) {
+                (Some(started), Some(ended)) => Some((ended - started).max(0.0)),
+                _ => None,
+            });
     if let (Some(expected), Some(written)) = (outcome.planned_seconds, written) {
         if expected.is_finite() && written.is_finite() && expected > 0.0 {
             let slack = (expected * 0.02).clamp(5.0, 30.0);

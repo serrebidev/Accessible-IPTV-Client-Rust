@@ -341,9 +341,10 @@ mod tests {
         );
         entered_rx.recv().unwrap();
         let sink = Arc::clone(&delivered);
-        task.submit(|_| Ok("current"), move |result| {
-            sink.lock().unwrap().push(result.unwrap())
-        });
+        task.submit(
+            |_| Ok("current"),
+            move |result| sink.lock().unwrap().push(result.unwrap()),
+        );
         wait_for_delivery(&task);
         task.poll();
         assert_eq!(*delivered.lock().unwrap(), ["current"]);

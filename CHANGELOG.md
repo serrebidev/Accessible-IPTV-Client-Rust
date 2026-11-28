@@ -5,6 +5,14 @@ adjacent releases were part of the same fix stream, they are combined with a
 version range such as `0.2.2-0.2.3`. Each release's section below is its
 Forgejo release note, taken from this file by the release workflow.
 
+## 0.4.41
+
+- Scheduled Recordings can be filtered: Ctrl+F jumps to a title or channel search, and the view selector shows All, the Next 7 Days, Failed and Partial recordings, or Paused Recording Rules. The exit confirmation now names the next eligible recording when a rule is paused, and series scans are requested after a guide import, a pause change, or a repeat change, so new episodes are filled in promptly.
+- Recordings > Recording Notifications... chooses how successful recording starts and finishes are reported: a dialog, a short announcement saved to Notification History, or history only. A recording that starts late or ends before its scheduled window is now reported as not covering the full scheduled time.
+- The recording playback queue only removes an item once playback actually starts, and a player error stops the queue at that title with the entry kept for a retry. The queue editor gains Save Queue..., Load Saved Queue... and Delete Saved Queue..., storing the remaining recordings in order under a name.
+- The player gains Save Subtitle Transcript... and, in the subtitle search results, multi-select with Go to Time... and Save Selected Subtitles.... Save Recording Excerpt... writes a range of a local recording to a new MKV in the background: mark a point inside the recording with a named bookmark, then pick the start and end from the bookmarks or the file boundaries. Stopping playback or loading other media cancels the export.
+- Recording space checks now probe each drive in the background, so one stuck or disconnected drive cannot stall the checks for the others, and finished files are published without overwriting a file that arrived in the meantime. Stalker portal lookups run two at a time, so a newer selection is never stuck behind a stalled one.
+
 ## 0.4.40
 
 - Hungarian localization polished to match the Python client (Python PR #45, shipped there as v1.152.3): 17 corrected message translations, including the pause-rule, reminder and exit messages.

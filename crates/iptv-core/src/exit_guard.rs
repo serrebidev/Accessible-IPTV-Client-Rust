@@ -58,9 +58,7 @@ pub fn upcoming_recording_jobs(jobs: &[DvrJob], now: f64) -> Vec<DvrJob> {
             let Some(dates) = &job.pause_dates else {
                 continue;
             };
-            let Some(last) =
-                chrono::NaiveDate::parse_from_str(&dates[1], "%Y-%m-%d").ok()
-            else {
+            let Some(last) = chrono::NaiveDate::parse_from_str(&dates[1], "%Y-%m-%d").ok() else {
                 continue;
             };
             if last > chrono::NaiveDate::MAX - chrono::Duration::days(8) {
@@ -131,6 +129,7 @@ pub fn exit_prompts(
 /// recordings. Catch-up downloads are not recordings for this
 /// box; the caller leaves them out.
 #[must_use]
+#[allow(clippy::cast_precision_loss)] // epoch seconds
 pub fn exit_prompts_with_active(
     reminders: &[Reminder],
     jobs: &[DvrJob],
@@ -319,6 +318,11 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_precision_loss,
+        clippy::float_cmp
+    )] // test epochs
     fn leaving_lists_the_next_unpaused_recurrence() {
         // Python test_leaving_lists_next_unpaused_recurrence_instead_of_paused_occurrence.
         use chrono::TimeZone as _;

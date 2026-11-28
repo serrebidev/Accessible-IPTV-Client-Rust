@@ -6,8 +6,8 @@
 //! exactly like the reference (server URL credentials stripped, MAC
 //! masked, secret payload fields never echoed).
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde_json::Value;
 
@@ -1158,7 +1158,10 @@ fn handle_load(
     accounts: Vec<ProviderAccount>,
     cache_dir: Option<&std::path::Path>,
     force: bool,
-) -> (ProviderEvent, Vec<(String, ProviderAccount, std::sync::Arc<Client>)>) {
+) -> (
+    ProviderEvent,
+    Vec<(String, ProviderAccount, std::sync::Arc<Client>)>,
+) {
     let mut channels = Vec::new();
     let mut epg_urls = Vec::new();
     let mut failures = Vec::new();
@@ -1439,8 +1442,7 @@ impl ProviderWorker {
                     }
                     let event = match job {
                         ProviderJob::Load { accounts, force } => {
-                            let (event, built) =
-                                handle_load(accounts, cache_dir.as_deref(), force);
+                            let (event, built) = handle_load(accounts, cache_dir.as_deref(), force);
                             let mut table = clients
                                 .lock()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner);

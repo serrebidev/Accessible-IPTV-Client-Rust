@@ -98,6 +98,10 @@ pub type DriveKey = (Option<u64>, String);
 /// it (`None` when the filesystem could not be queried).
 type Group<'a> = (DriveKey, PathBuf, Option<u64>, Vec<&'a SpaceRecording>);
 
+/// One destination's latest measurement: its drive key and
+/// free bytes (`None` when the probe could not read it).
+type MeasureMap = HashMap<PathBuf, (DriveKey, Option<u64>)>;
+
 /// One destination measurement (Python `_measure`): the
 /// drive key and the free bytes, `None` when the filesystem
 /// cannot be queried.
@@ -175,9 +179,9 @@ enum Probe {
 pub struct SpaceMonitor {
     notified: HashMap<(Option<u64>, String), SpaceState>,
     probes: HashMap<PathBuf, Probe>,
-    measured: HashMap<PathBuf, (DriveKey, Option<u64>)>,
+    measured: MeasureMap,
     next_probe: HashMap<PathBuf, Instant>,
-    probe_results: Arc<Mutex<HashMap<PathBuf, (DriveKey, Option<u64>)>>>,
+    probe_results: Arc<Mutex<MeasureMap>>,
 }
 
 impl SpaceMonitor {
@@ -226,12 +230,14 @@ impl SpaceMonitor {
         for rec in recordings {
             let dir = parent_dir(&rec.path);
             let key = drive_key(&dir);
-            match groups.iter_mut().find(|(existing, _, _, _)| *existing == key) {
-                Some((_, _, _, rows)) => rows.push(rec),
-                None => {
-                    let free = free_bytes(&dir);
-                    groups.push((key, dir, free, vec![rec]));
-                }
+            if let Some((_, _, _, rows)) = groups
+                .iter_mut()
+                .find(|(existing, _, _, _)| *existing == key)
+            {
+                rows.push(rec);
+            } else {
+                let free = free_bytes(&dir);
+                groups.push((key, dir, free, vec![rec]));
             }
         }
         self.apply_groups(&groups, prefs, true, notify, stop);
@@ -261,7 +267,10 @@ impl SpaceMonitor {
         let mut destinations: Vec<(PathBuf, Vec<&SpaceRecording>)> = Vec::new();
         for rec in recordings {
             let dir = parent_dir(&rec.path);
-            match destinations.iter_mut().find(|(existing, _)| *existing == dir) {
+            match destinations
+                .iter_mut()
+                .find(|(existing, _)| *existing == dir)
+            {
                 Some((_, rows)) => rows.push(rec),
                 None => destinations.push((dir, vec![rec])),
             }
@@ -332,26 +341,29 @@ impl SpaceMonitor {
         // smallest free figure (and its directory), as Python.
         let mut groups: Vec<Group<'_>> = Vec::new();
         for (dir, key, free) in measurements {
-            let rows = &destinations
+            let Some(rows) = destinations
                 .iter()
                 .find(|(existing, _)| *existing == dir)
-                .expect("measured destination")
-                .1;
-            match groups
+                .map(|(_, rows)| rows)
+            else {
+                continue;
+            };
+            if let Some((_, group_dir, group_free, group_rows)) = groups
                 .iter_mut()
                 .find(|(existing, _, _, _)| *existing == key)
             {
-                Some((_, group_dir, group_free, group_rows)) => {
-                    if group_free.is_none()
-                        || (free.is_some()
-                            && group_free.is_some_and(|prev| free.expect("some") < prev))
-                    {
-                        *group_dir = dir;
-                        *group_free = free;
-                    }
-                    group_rows.extend(rows.iter().copied());
+                let take = match (free, *group_free) {
+                    (_, None) => true,
+                    (Some(new_free), Some(prev)) => new_free < prev,
+                    (None, Some(_)) => false,
+                };
+                if take {
+                    *group_dir = dir;
+                    *group_free = free;
                 }
-                None => groups.push((key, dir, free, rows.clone())),
+                group_rows.extend(rows.iter().copied());
+            } else {
+                groups.push((key, dir, free, rows.clone()));
             }
         }
         self.apply_groups(&groups, prefs, complete, notify, stop);
@@ -369,9 +381,8 @@ impl SpaceMonitor {
         stop: &mut impl FnMut(&str),
     ) {
         if retain {
-            self.notified.retain(|key, _| {
-                groups.iter().any(|(existing, _, _, _)| existing == key)
-            });
+            self.notified
+                .retain(|key, _| groups.iter().any(|(existing, _, _, _)| existing == key));
         }
         for (key, dir, free, rows) in groups {
             let Some(free) = *free else {

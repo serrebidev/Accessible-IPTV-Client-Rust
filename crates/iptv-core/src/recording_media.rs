@@ -522,6 +522,7 @@ fn nice_path() -> Option<std::path::PathBuf> {
 /// destination, an encoder failure, or the two-hour
 /// deadline passing.
 #[allow(clippy::too_many_arguments)] // Python's positional signature.
+#[allow(clippy::too_many_lines, clippy::cast_precision_loss)] // one linear encode flow, as in Python; milliseconds to seconds for ffmpeg
 pub fn save_excerpt(
     ffmpeg: &str,
     path: &Path,
@@ -635,7 +636,7 @@ pub fn save_excerpt(
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
     let mut child = command.spawn().map_err(|e| e.to_string())?;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(7200);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_hours(2);
     let outcome = loop {
         match child.try_wait() {
             Ok(Some(status)) => break Some(status),
@@ -696,10 +697,8 @@ mod excerpt_tests {
     use std::path::PathBuf;
 
     fn temp_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "iptv-excerpt-test-{}-{name}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("iptv-excerpt-test-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("temp dir");
         dir
