@@ -2280,8 +2280,10 @@ mod tests {
     fn resolution_results_carry_their_request_id() {
         // Issue #68: with no portal loaded every resolution fails,
         // but each result must still arrive tagged with the exact
-        // request id it was dispatched with, in dispatch order, so
-        // callers can never consume each other's results.
+        // request id it was dispatched with, so callers can never
+        // consume each other's results. Since PR #46 the two
+        // resolve lanes may complete out of dispatch order; the
+        // id tag, not the arrival order, is the contract.
         let worker = ProviderWorker::new();
         let data = std::collections::BTreeMap::new();
         worker.resolve(41, "missing".to_string(), data.clone());
@@ -2305,6 +2307,7 @@ mod tests {
                 None => std::thread::sleep(std::time::Duration::from_millis(10)),
             }
         }
+        ids.sort_unstable();
         assert_eq!(ids, vec![41, 42, 43]);
     }
 
