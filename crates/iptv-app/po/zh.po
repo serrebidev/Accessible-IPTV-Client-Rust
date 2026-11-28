@@ -5452,3 +5452,12 @@ msgstr "已达到保存队列数量上限。"
 
 msgid "When a recording starts or finishes successfully:"
 msgstr "录制成功开始或结束时："
+
+msgid "The recording schedule could not be saved. Check available disk space and write permissions."
+msgstr "æ æ³ä¿å­å½å¶è®¡åãè¯·æ£æ¥å¯ç¨ç£çç©ºé´ååå¥æéã"
+
+msgid "Partial EPG Import"
+msgstr "é¨åå¯¼å¥èç®æå"
+
+msgid "The EPG import loaded {loaded} of {total} sources. The programme guide may be incomplete."
+msgstr "å·²å¯¼å¥ {total} ä¸ªæ¥æºä¸­ç {loaded} ä¸ªãèç®æåå¯è½ä¸å®æ´ã"

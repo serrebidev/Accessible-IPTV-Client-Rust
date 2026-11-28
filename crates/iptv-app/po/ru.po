@@ -5600,3 +5600,12 @@ msgstr "Достигнут предел числа сохранённых оче
 
 msgid "When a recording starts or finishes successfully:"
 msgstr "При успешном начале или завершении записи:"
+
+msgid "The recording schedule could not be saved. Check available disk space and write permissions."
+msgstr "ÐÐµ ÑÐ´Ð°Ð»Ð¾ÑÑ ÑÐ¾ÑÑÐ°Ð½Ð¸ÑÑ ÑÐ°ÑÐ¿Ð¸ÑÐ°Ð½Ð¸Ðµ Ð·Ð°Ð¿Ð¸ÑÐµÐ¹. ÐÑÐ¾Ð²ÐµÑÑÑÐµ ÑÐ²Ð¾Ð±Ð¾Ð´Ð½Ð¾Ðµ Ð¼ÐµÑÑÐ¾ Ð½Ð° Ð´Ð¸ÑÐºÐµ Ð¸ Ð¿ÑÐ°Ð²Ð° Ð½Ð° Ð·Ð°Ð¿Ð¸ÑÑ."
+
+msgid "Partial EPG Import"
+msgstr "Ð§Ð°ÑÑÐ¸ÑÐ½ÑÐ¹ Ð¸Ð¼Ð¿Ð¾ÑÑ Ð¿ÑÐ¾Ð³ÑÐ°Ð¼Ð¼Ñ Ð¿ÐµÑÐµÐ´Ð°Ñ"
+
+msgid "The EPG import loaded {loaded} of {total} sources. The programme guide may be incomplete."
+msgstr "ÐÐ¼Ð¿Ð¾ÑÑÐ¸ÑÐ¾Ð²Ð°Ð½Ð¾ {loaded} Ð¸Ð· {total} Ð¸ÑÑÐ¾ÑÐ½Ð¸ÐºÐ¾Ð². ÐÑÐ¾Ð³ÑÐ°Ð¼Ð¼Ð° Ð¿ÐµÑÐµÐ´Ð°Ñ Ð¼Ð¾Ð¶ÐµÑ Ð±ÑÑÑ Ð½ÐµÐ¿Ð¾Ð»Ð½Ð¾Ð¹."

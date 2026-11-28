@@ -5699,3 +5699,12 @@ msgstr "La limite de files enregistrées est atteinte."
 
 msgid "When a recording starts or finishes successfully:"
 msgstr "Lorsqu’un enregistrement démarre ou se termine normalement :"
+
+msgid "The recording schedule could not be saved. Check available disk space and write permissions."
+msgstr "Impossible dâenregistrer la planification des enregistrements. VÃ©rifiez lâespace disque disponible et les droits dâÃ©criture."
+
+msgid "Partial EPG Import"
+msgstr "Importation partielle du guide des programmes"
+
+msgid "The EPG import loaded {loaded} of {total} sources. The programme guide may be incomplete."
+msgstr "{loaded} sources sur {total} ont Ã©tÃ© importÃ©es. Le guide des programmes peut Ãªtre incomplet."

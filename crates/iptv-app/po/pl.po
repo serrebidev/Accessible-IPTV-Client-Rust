@@ -5603,3 +5603,12 @@ msgstr "Osiągnięto limit zapisanych kolejek."
 
 msgid "When a recording starts or finishes successfully:"
 msgstr "Po pomyślnym rozpoczęciu lub zakończeniu nagrywania:"
+
+msgid "The recording schedule could not be saved. Check available disk space and write permissions."
+msgstr "Nie udaÅo siÄ zapisaÄ harmonogramu nagraÅ. SprawdÅº iloÅÄ wolnego miejsca na dysku i uprawnienia do zapisu."
+
+msgid "Partial EPG Import"
+msgstr "CzÄÅciowy import przewodnika po programach"
+
+msgid "The EPG import loaded {loaded} of {total} sources. The programme guide may be incomplete."
+msgstr "Zaimportowano {loaded} z {total} ÅºrÃ³deÅ. Przewodnik po programach moÅ¼e byÄ niekompletny."

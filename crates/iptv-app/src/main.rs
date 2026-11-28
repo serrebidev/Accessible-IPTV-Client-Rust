@@ -672,6 +672,11 @@ struct Wiring {
     /// message when it lands (N21; Python's `_epg_import_notify`).
     /// Automatic loads never set it, so they stay quiet.
     epg_import_notify: Rc<std::cell::Cell<bool>>,
+    /// PR #48: the last incomplete import attempt — the
+    /// sources hash and the epoch second an automatic retry
+    /// becomes due — so a partial guide is not re-fetched
+    /// continuously.
+    epg_incomplete: Rc<RefCell<Option<(String, i64)>>>,
     /// The independent 60-second guide-freshness timer (audit
     /// E11): row suffixes track programme boundaries even when
     /// every worker is idle.
@@ -1504,6 +1509,7 @@ fn bind_browser(
         epg_inflight_sources: Rc::new(RefCell::new(Vec::new())),
         epg_recheck: Rc::new(std::cell::Cell::new(false)),
         epg_import_notify: Rc::new(std::cell::Cell::new(false)),
+        epg_incomplete: Rc::new(RefCell::new(None)),
         epg_timer: Rc::new(Timer::new(&frame)),
         search_results: Rc::new(RefCell::new(Vec::new())),
         search_status: Rc::new(RefCell::new(String::new())),
@@ -3074,23 +3080,49 @@ fn poll_providers(wiring: &Wiring, controls: Controls, frame: Frame) {
 /// Python's `_report_epg_import_finished`). Both boxes go
 /// through the N18 notification queue, so a modal already
 /// open defers them instead of stacking.
-fn report_epg_import_finished(frame: Frame, success: bool) {
-    if success {
-        show_or_queue_notification(
-            frame,
-            "The EPG import has finished. The programme guide is up to date.",
-            "Import Complete",
-            MessageDialogStyle::OK | MessageDialogStyle::IconInformation,
-            None,
-        );
-    } else {
-        show_or_queue_notification(
-            frame,
-            "The EPG import did not finish. The programme guide may be incomplete or unchanged.\n\nCheck that the EPG sources in File > EPG Manager are reachable, then try again.",
-            "Import Failed",
-            MessageDialogStyle::OK | MessageDialogStyle::IconWarning,
-            None,
-        );
+/// How a hand-started import turned out (PR #48): complete,
+/// partial (some sources loaded), or failed (none did).
+#[derive(Clone, Copy)]
+enum EpgImportReport {
+    Complete,
+    Partial(usize, usize),
+    Failed,
+}
+
+fn report_epg_import_finished(frame: Frame, report: EpgImportReport) {
+    match report {
+        EpgImportReport::Complete => {
+            show_or_queue_notification(
+                frame,
+                "The EPG import has finished. The programme guide is up to date.",
+                "Import Complete",
+                MessageDialogStyle::OK | MessageDialogStyle::IconInformation,
+                None,
+            );
+        }
+        EpgImportReport::Partial(loaded, total) => {
+            let message = trf(
+                "The EPG import loaded {loaded} of {total} sources. The programme guide may be incomplete.",
+                &[("loaded", &loaded.to_string()), ("total", &total.to_string())],
+            ) + "\n\n"
+                + &tr("Check that the EPG sources in File > EPG Manager are reachable, then try again.");
+            show_or_queue_notification(
+                frame,
+                &message,
+                "Partial EPG Import",
+                MessageDialogStyle::OK | MessageDialogStyle::IconWarning,
+                None,
+            );
+        }
+        EpgImportReport::Failed => {
+            show_or_queue_notification(
+                frame,
+                "The EPG import did not finish. The programme guide may be incomplete or unchanged.\n\nCheck that the EPG sources in File > EPG Manager are reachable, then try again.",
+                "Import Failed",
+                MessageDialogStyle::OK | MessageDialogStyle::IconWarning,
+                None,
+            );
+        }
     }
 }
 
@@ -3107,7 +3139,7 @@ fn poll_epg(wiring: &Wiring, frame: Frame, status: Status) {
         let notify = wiring.epg_import_notify.get();
         wiring.epg_import_notify.set(false);
         match result {
-            Ok((snapshot, store_note)) => {
+            Ok((snapshot, store_note, loaded, total)) => {
                 let counts = (
                     snapshot.guide.channels.len(),
                     snapshot.guide.programme_count(),
@@ -3121,14 +3153,26 @@ fn poll_epg(wiring: &Wiring, frame: Frame, status: Status) {
                 // Python records the import stamp and the hash of
                 // the sources actually imported, so the next
                 // automatic decision can respect the interval.
+                // PR #48: only a COMPLETE import (every source
+                // loaded) extends guide freshness; a partial one
+                // still feeds the guide and the scans below, and
+                // an automatic retry of the same sources waits
+                // five minutes instead of re-fetching at once.
                 let imported = wiring.epg_inflight_sources.borrow().clone();
-                wiring
-                    .persist
-                    .set_and_save("epg_last_import_epoch", serde_json::json!(now_epoch()));
-                wiring.persist.set_and_save(
-                    "epg_last_sources_hash",
-                    serde_json::json!(hash_epg_sources(&imported)),
-                );
+                let complete = total > 0 && loaded == total;
+                if complete {
+                    *wiring.epg_incomplete.borrow_mut() = None;
+                    wiring
+                        .persist
+                        .set_and_save("epg_last_import_epoch", serde_json::json!(now_epoch()));
+                    wiring.persist.set_and_save(
+                        "epg_last_sources_hash",
+                        serde_json::json!(hash_epg_sources(&imported)),
+                    );
+                } else {
+                    *wiring.epg_incomplete.borrow_mut() =
+                        Some((hash_epg_sources(&imported), now_epoch() + 300));
+                }
                 // PR #46: a fresh guide requests a series
                 // scan, as Python does after an import.
                 wiring.series_last_scan.set(0.0);
@@ -3166,7 +3210,11 @@ fn poll_epg(wiring: &Wiring, frame: Frame, status: Status) {
                     "guide",
                 );
                 if notify {
-                    report_epg_import_finished(frame, true);
+                    if complete {
+                        report_epg_import_finished(frame, EpgImportReport::Complete);
+                    } else {
+                        report_epg_import_finished(frame, EpgImportReport::Partial(loaded, total));
+                    }
                 }
                 // Saved searches run after every guide import
                 // (C11, Python `_scan_saved_searches`).
@@ -3186,8 +3234,13 @@ fn poll_epg(wiring: &Wiring, frame: Frame, status: Status) {
             Err(error) => {
                 iptv_core::applog::error("epg", &format!("Guide failed to load: {error}"));
                 status.set_label(&trf("Guide failed to load: {error}", &[("error", &error)]));
+                // PR #48: a failed attempt also defers the next
+                // automatic retry of the same sources.
+                let imported = wiring.epg_inflight_sources.borrow().clone();
+                *wiring.epg_incomplete.borrow_mut() =
+                    Some((hash_epg_sources(&imported), now_epoch() + 300));
                 if notify {
-                    report_epg_import_finished(frame, false);
+                    report_epg_import_finished(frame, EpgImportReport::Failed);
                 }
             }
         }
@@ -4454,6 +4507,17 @@ fn probe_channel_media_now(wiring: &Wiring, channel: &Channel) {
     if wiring.player.borrow().session.current().is_some() {
         return;
     }
+    // PR #48: no new probe while a playback request is being
+    // resolved — the probe could take the connection the
+    // playback is waiting for.
+    if wiring
+        .pending_resolves
+        .borrow()
+        .values()
+        .any(|pending| matches!(pending, PendingResolve::Play(..)))
+    {
+        return;
+    }
     let cast_url = cast_source_url(&wiring.cast_ui);
     if single_stream_busy(
         &wiring.recordings,
@@ -4663,24 +4727,34 @@ fn terminate_media_probes(probe: &MediaProbe) {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .drain()
         .collect();
+    if procs.is_empty() {
+        return;
+    }
     let urls = probe
         .urls
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone();
-    for (identity, handle) in procs {
-        if let Some(mut child) = handle
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take()
-        {
-            let _ = child.kill();
-            let _ = child.wait();
+    // PR #48: killing and reaping a stuck probe child can
+    // block; Python retires probes on their own thread for
+    // the same reason. The state above is already drained,
+    // so the session proceeds at once and the release is
+    // noted when the child is actually gone.
+    std::thread::spawn(move || {
+        for (identity, handle) in procs {
+            if let Some(mut child) = handle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+            {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            if let Some(url) = urls.get(&identity) {
+                iptv_core::catchup_direct::note_media_released(url);
+            }
         }
-        if let Some(url) = urls.get(&identity) {
-            iptv_core::catchup_direct::note_media_released(url);
-        }
-    }
+    });
 }
 
 /// The media kind the channel's own metadata states (port of
@@ -6056,6 +6130,17 @@ fn poll_recordings(wiring: &Wiring, frame: Frame, status: Status) {
     if !wiring.closing_application.get() && now - wiring.last_dvr_tick.get() >= 10.0 {
         wiring.last_dvr_tick.set(now);
         run_dvr_tick(wiring, status, now);
+        // PR #48: a schedule write that failed is reported
+        // once per outage (the core retries it on its own).
+        if wiring.dvr.borrow_mut().take_save_warning() {
+            show_or_queue_notification(
+                frame,
+                "The recording schedule could not be saved. Check available disk space and write permissions.",
+                "Scheduled Recordings",
+                MessageDialogStyle::OK | MessageDialogStyle::IconWarning,
+                None,
+            );
+        }
         if now - wiring.series_last_scan.get() >= 3600.0 {
             run_series_scan(wiring);
         }
@@ -7240,6 +7325,7 @@ fn clone_wiring(wiring: &Wiring) -> Wiring {
         epg_inflight_sources: Rc::clone(&wiring.epg_inflight_sources),
         epg_recheck: Rc::clone(&wiring.epg_recheck),
         epg_import_notify: Rc::clone(&wiring.epg_import_notify),
+        epg_incomplete: Rc::clone(&wiring.epg_incomplete),
         epg_timer: Rc::clone(&wiring.epg_timer),
         search_results: Rc::clone(&wiring.search_results),
         search_status: Rc::clone(&wiring.search_status),
@@ -9901,8 +9987,9 @@ fn menu_import_epg(wiring: &Wiring, frame: Frame, status: Status) {
 /// N25, `main.py:2962`): an entry that is not a positive
 /// number warns, and a number no channel carries and no
 /// position reaches reports not found.
+#[allow(clippy::too_many_lines)] // one gesture: entry, match, chooser, select
 fn menu_go_to_channel_number(wiring: &Wiring, frame: Frame, list: ListCtrl, status: Status) {
-    let (row, index, number) = {
+    let found = {
         let model = wiring.model.borrow();
         if model.is_empty() {
             // Python returns silently when nothing is in scope.
@@ -9948,17 +10035,90 @@ fn menu_go_to_channel_number(wiring: &Wiring, frame: Frame, list: ListCtrl, stat
         // (`number`, then `tvg-chno`), then falls back to
         // the 1-based position — only when the channel at
         // that position carries no number of its own.
-        let mut row = None;
+        let mut matches: Vec<(usize, Channel)> = Vec::new();
         for candidate in 0..row_count {
             let Some(channel) = model.channel(candidate) else {
                 continue;
             };
             if own_number(channel) == digits {
-                row = Some(candidate);
-                break;
+                matches.push((candidate, channel.clone()));
             }
         }
-        let row = row.or_else(|| {
+        (matches, digits)
+    };
+    let (matches, digits) = found;
+    // PR #48: the same number on several channels (one per
+    // playlist, usually) asks which one instead of silently
+    // taking the first.
+    let picked = if matches.len() > 1 {
+        let mut labels: Vec<String> = matches
+            .iter()
+            .map(|(_, channel)| {
+                let name = channel.name.trim();
+                let name = if name.is_empty() {
+                    tr("Untitled channel")
+                } else {
+                    name.to_string()
+                };
+                let duplicated = matches
+                    .iter()
+                    .filter(|(_, other)| other.name.trim().eq_ignore_ascii_case(name.as_str()))
+                    .count()
+                    > 1;
+                if duplicated && !channel.group.trim().is_empty() {
+                    format!("{} ({})", name, channel.group.trim())
+                } else {
+                    name
+                }
+            })
+            .collect();
+        let folded: Vec<String> = labels.iter().map(|label| label.to_lowercase()).collect();
+        if folded
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+            != folded.len()
+        {
+            labels = labels
+                .iter()
+                .enumerate()
+                .map(|(index, label)| format!("{}. {}", index + 1, label))
+                .collect();
+        }
+        let dialog = SingleChoiceDialog::builder(
+            &frame,
+            &tr("Choose a channel to play:"),
+            &tr("Go to Channel Number"),
+            &labels.iter().map(String::as_str).collect::<Vec<_>>(),
+        )
+        .build();
+        dialog.set_selection(0);
+        if dialog.show_modal_tracked() != ID_OK {
+            return;
+        }
+        let selection = dialog.get_selection();
+        if selection < 0 {
+            return;
+        }
+        matches
+            .get(usize::try_from(selection).unwrap_or(usize::MAX))
+            .map(|(row, _)| *row)
+    } else {
+        matches.first().map(|(row, _)| *row)
+    };
+    let (row, index, number) = {
+        let model = wiring.model.borrow();
+        let row_count = model.len();
+        let own_number = |channel: &Channel| -> String {
+            let raw = channel
+                .unknown_attributes
+                .get("number")
+                .filter(|own| !own.is_empty())
+                .or_else(|| channel.unknown_attributes.get("tvg-chno"))
+                .map_or("", |own| own.as_str());
+            iptv_core::navindex::channel_number(raw)
+        };
+        let row = picked.or_else(|| {
             if digits.len() > row_count.to_string().len() {
                 return None;
             }
@@ -10202,7 +10362,38 @@ fn import_blocker(wiring: &Wiring) -> Option<&'static str> {
     if wiring.downloads.borrow().iter().any(|row| !row.done) {
         return Some("downloads are in progress");
     }
+    // PR #48: a catch-up download still being prepared (its
+    // address resolving or its probe staged) is pending work
+    // too — a settings restore must wait for it.
+    let preparing = !wiring.staged_downloads.borrow().is_empty()
+        || wiring
+            .pending_resolves
+            .borrow()
+            .values()
+            .any(|pending| matches!(pending, PendingResolve::Download { .. }));
+    if preparing {
+        return Some("downloads are in progress");
+    }
     None
+}
+
+/// Whether this catch-up programme's download is already
+/// being prepared: a resolve in flight for it, or a staged
+/// probe waiting on its media check (PR #48).
+fn catchup_preparation_in_flight(wiring: &Wiring, key: &str) -> bool {
+    if wiring.staged_downloads.borrow().contains_key(key) {
+        return true;
+    }
+    wiring
+        .pending_resolves
+        .borrow()
+        .values()
+        .any(|pending| match pending {
+            PendingResolve::Download {
+                channel, programme, ..
+            } => catchup_download_key(channel, programme) == key,
+            _ => false,
+        })
 }
 
 /// The recovery step of an import: prompt for the recovery
@@ -18972,6 +19163,13 @@ fn finish_epg_auto_import(wiring: &Wiring, sources: Vec<String>, usable: bool) {
         wiring.epg_recheck.set(true);
         return;
     }
+    // PR #48: an incomplete attempt at these same sources
+    // defers the automatic retry until its time comes.
+    if let Some((hash, retry_at)) = &*wiring.epg_incomplete.borrow() {
+        if *hash == hash_epg_sources(&sources) && now_epoch() < *retry_at {
+            return;
+        }
+    }
     let should_import = {
         let config = wiring.persist.config.borrow();
         #[allow(clippy::cast_possible_truncation)]
@@ -21298,10 +21496,13 @@ fn render_cw_rows(rows: &[CwRow], list: ListBox) {
 
 /// Scan results handed from the library worker's completion
 /// callback to the dialog timer (PR #36).
+/// Scan deliveries carry the folder they belong to (PR #48):
+/// each folder publishes its rows as its own scan lands.
 type LibraryScanDeliveries = std::sync::Arc<
     std::sync::Mutex<
         Vec<(
             u64,
+            String,
             Result<(Vec<iptv_core::recording_library::LibraryRow>, Vec<String>), String>,
         )>,
     >,
@@ -21489,13 +21690,19 @@ fn queue_maybe_advance(wiring: &Wiring, status: Status) {
 /// Python's `RecordingLibraryDialog`).
 #[allow(clippy::struct_excessive_bools)] // independent dialog state flags, as in Python
 struct LibraryUi {
-    /// One scan worker per folder key (PR #44): `None` is
-    /// the all-folders scan, `Some(dir)` a single folder.
-    scan_tasks: std::collections::HashMap<Option<String>, iptv_core::background::LatestTask>,
+    /// One scan worker per folder (PR #44, keyed per folder
+    /// since PR #48: every folder scans and publishes on its
+    /// own, so a slow share never delays the healthy folders).
+    scan_tasks: std::collections::HashMap<String, iptv_core::background::LatestTask>,
     scan_version: u64,
     scanning: bool,
     deliveries: LibraryScanDeliveries,
     directories: Vec<String>,
+    /// The latest published rows per folder; `rows` is their
+    /// merged, deduplicated union.
+    folder_rows: std::collections::HashMap<String, Vec<iptv_core::recording_library::LibraryRow>>,
+    folder_warnings: std::collections::HashMap<String, Vec<String>>,
+    scan_outstanding: std::collections::HashSet<String>,
     rows: Vec<iptv_core::recording_library::LibraryRow>,
     view: Vec<iptv_core::recording_library::LibraryRow>,
     warnings: Vec<String>,
@@ -21533,65 +21740,66 @@ const LIBRARY_STATUS_VALUES: [&str; 6] =
     ["", "completed", "partial", "stopped", "failed", "unknown"];
 const LIBRARY_SORT_KEYS: [&str; 4] = ["date", "title", "duration", "size"];
 
-/// One library scan over the chosen scope (Python's refresh
-/// work): per-folder warnings collect instead of aborting,
-/// and an all-folders scan dedupes by resolved path.
+/// One folder's library scan (Python's refresh work, per
+/// folder since PR #48): its warnings collect instead of
+/// aborting the other folders.
 fn library_scan(
-    directories: &[String],
-    selection: usize,
+    dir: &str,
     trash_view: bool,
     active_paths: &[PathBuf],
     token: &iptv_core::background::CancelToken,
 ) -> (Vec<iptv_core::recording_library::LibraryRow>, Vec<String>) {
+    // PR #48: one folder per scan, so each folder publishes
+    // on its own and a blocked share delays nothing else.
+    let mut warnings = Vec::new();
+    let found = if trash_view {
+        iptv_core::recording_library::scan_trash(
+            Path::new(dir),
+            &|| token.is_canceled(),
+            &mut warnings,
+        )
+    } else {
+        iptv_core::recording_library::scan(
+            Path::new(dir),
+            active_paths,
+            &|| token.is_canceled(),
+            &mut warnings,
+        )
+    };
+    match found {
+        Ok(rows) => (rows, warnings),
+        Err(error) => {
+            warnings.push(error);
+            (Vec::new(), warnings)
+        }
+    }
+}
+
+/// Rebuild the merged row list and warning list from the
+/// per-folder publications, in folder order, deduplicated
+/// by canonical path (the same file reached through two
+/// folders lists once).
+fn library_merge(guard: &mut LibraryUi) {
     let mut rows = Vec::new();
     let mut warnings = Vec::new();
-    let scope: Vec<String> = if selection < directories.len() {
-        vec![directories[selection].clone()]
-    } else {
-        directories.to_vec()
-    };
-    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for dir in &scope {
-        let resolved = std::fs::canonicalize(dir)
-            .map_or_else(|_| dir.clone(), |path| path.to_string_lossy().into_owned());
-        if !visited.insert(resolved.to_lowercase()) {
-            continue;
+    for dir in &guard.directories {
+        if let Some(found) = guard.folder_rows.get(dir) {
+            rows.extend(found.iter().cloned());
         }
-        let mut folder_warnings = Vec::new();
-        let found = if trash_view {
-            iptv_core::recording_library::scan_trash(
-                Path::new(dir),
-                &|| token.is_canceled(),
-                &mut folder_warnings,
-            )
-        } else {
-            iptv_core::recording_library::scan(
-                Path::new(dir),
-                active_paths,
-                &|| token.is_canceled(),
-                &mut folder_warnings,
-            )
+        if let Some(found) = guard.folder_warnings.get(dir) {
+            warnings.extend(found.iter().cloned());
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    rows.retain(|row| {
+        let resolved = match std::fs::canonicalize(&row.path) {
+            Ok(path) => path.to_string_lossy().into_owned(),
+            Err(_) => row.path.clone(),
         };
-        warnings.append(&mut folder_warnings);
-        match found {
-            Ok(mut found) => rows.append(&mut found),
-            Err(error) => warnings.push(error),
-        }
-        if token.is_canceled() {
-            return (Vec::new(), Vec::new());
-        }
-    }
-    if selection >= directories.len() {
-        let mut seen = std::collections::HashSet::new();
-        rows.retain(|row| {
-            let resolved = match std::fs::canonicalize(&row.path) {
-                Ok(path) => path.to_string_lossy().into_owned(),
-                Err(_) => row.path.clone(),
-            };
-            seen.insert(resolved.to_lowercase())
-        });
-    }
-    (rows, warnings)
+        seen.insert(resolved.to_lowercase())
+    });
+    guard.rows = rows;
+    guard.warnings = warnings;
 }
 
 /// The paths a library operation must not touch (Python's
@@ -21655,14 +21863,26 @@ fn library_selected(controls: &LibraryControls, count: usize) -> Vec<usize> {
 #[allow(clippy::cast_possible_wrap)] // row counts fit an i64
 #[allow(clippy::cast_precision_loss)] // MiB display only
 fn library_render(ui: &Rc<RefCell<LibraryUi>>, controls: &LibraryControls) {
-    let (rows, warnings, busy, op_busy) = {
+    let (rows, warnings, scanning, op_busy) = {
         let guard = ui.borrow();
         (
             guard.rows.clone(),
             guard.warnings.clone(),
-            guard.busy,
+            guard.scanning,
             guard.op_busy,
         )
+    };
+    // PR #48: a filter re-render keeps the focused row (by
+    // path), not just the selection.
+    let focused_path: Option<String> = {
+        let guard = ui.borrow();
+        let focused =
+            controls
+                .list
+                .get_next_item(-1, ListNextItemFlag::All, ListItemState::Focused);
+        usize::try_from(focused)
+            .ok()
+            .and_then(|index| guard.view.get(index).map(|row| row.path.clone()))
     };
     let selected_paths: Vec<String> = {
         let guard = ui.borrow();
@@ -21719,12 +21939,23 @@ fn library_render(ui: &Rc<RefCell<LibraryUi>>, controls: &LibraryControls) {
             ListItemState::Selected | ListItemState::Focused,
         );
     }
+    if let Some(path) = &focused_path {
+        if let Some(index) = guard.view.iter().position(|row| &row.path == path) {
+            controls.list.set_item_state(
+                index as i64,
+                ListItemState::Focused,
+                ListItemState::Focused,
+            );
+        }
+    }
     let selected = library_selected(controls, guard.view.len());
     let selected_rows: Vec<&iptv_core::recording_library::LibraryRow> = selected
         .iter()
         .filter_map(|index| guard.view.get(*index))
         .collect();
-    let ready = !busy && !op_busy;
+    // PR #48: controls stay live while folders scan; only a
+    // file operation disables them.
+    let ready = !op_busy;
     let trash_view = guard.trash_view;
     controls
         .play
@@ -21749,12 +21980,6 @@ fn library_render(ui: &Rc<RefCell<LibraryUi>>, controls: &LibraryControls) {
     controls.add_folder.enable(ready);
     controls.refresh.enable(ready);
     controls.export_list.enable(ready && !guard.view.is_empty());
-    if busy {
-        controls
-            .status_label
-            .set_label(&tr("Loading recordings..."));
-        return;
-    }
     if op_busy {
         controls
             .status_label
@@ -21773,6 +21998,9 @@ fn library_render(ui: &Rc<RefCell<LibraryUi>>, controls: &LibraryControls) {
             ("size", &format!("{:.2}", total_size as f64 / 1_048_576.0)),
         ],
     );
+    if scanning {
+        text += &tr(" Loading recordings...");
+    }
     let mut unique_warnings: Vec<&String> = Vec::new();
     for warning in &warnings {
         if !unique_warnings.contains(&warning) {
@@ -21790,59 +22018,60 @@ fn library_render(ui: &Rc<RefCell<LibraryUi>>, controls: &LibraryControls) {
     controls.status_label.set_label(&text);
 }
 
-/// Submit a fresh scan (Python's `refresh`): the action
-/// controls disable while it runs.
+/// Submit fresh per-folder scans (Python's `refresh`).
 fn library_refresh(wiring: &Wiring, ui: &Rc<RefCell<LibraryUi>>, controls: &LibraryControls) {
-    // PR #44: a refresh is allowed while a scan runs (the
-    // folder choice stays live); only a file operation
-    // blocks it. Each folder keeps its own scan worker and
-    // a version counter drops stale deliveries.
-    let (key, directories, selection, trash_view, deliveries, version) = {
+    // PR #48: one scan worker per folder in scope, each
+    // publishing as it lands; a refresh is allowed while a
+    // scan runs (the folder choice stays live); only a file
+    // operation blocks it.
+    let (scope, trash_view, deliveries, version) = {
         let mut guard = ui.borrow_mut();
-        if guard.busy && !guard.scanning {
+        if guard.op_busy {
             return;
         }
         guard.busy = true;
         guard.scanning = true;
         guard.scan_version += 1;
         let selection = controls.folder.get_selection().unwrap_or(0) as usize;
-        let key = if selection < guard.directories.len() {
-            Some(guard.directories[selection].clone())
+        let scope: Vec<String> = if selection < guard.directories.len() {
+            vec![guard.directories[selection].clone()]
         } else {
-            None
+            guard.directories.clone()
         };
         for task in guard.scan_tasks.values() {
             task.cancel();
         }
         let known = guard.directories.clone();
-        guard.scan_tasks.retain(|task_key, _| match task_key {
-            None => true,
-            Some(dir) => known.contains(dir),
-        });
-        guard.scan_tasks.entry(key.clone()).or_default();
+        guard.scan_tasks.retain(|dir, _| known.contains(dir));
+        guard.folder_rows.retain(|dir, _| known.contains(dir));
+        guard.folder_warnings.retain(|dir, _| known.contains(dir));
+        guard.scan_outstanding = scope.iter().cloned().collect();
         (
-            key,
-            known,
-            selection,
+            scope,
             guard.trash_view,
             std::sync::Arc::clone(&guard.deliveries),
             guard.scan_version,
         )
     };
     let active = library_active_paths(wiring);
-    if let Some(task) = ui.borrow().scan_tasks.get(&key) {
-        task.submit(
-            move |token| {
-                let (rows, warnings) =
-                    library_scan(&directories, selection, trash_view, &active, token);
-                Ok((rows, warnings))
-            },
-            move |result| {
-                if let Ok(mut queue) = deliveries.lock() {
-                    queue.push((version, result));
-                }
-            },
-        );
+    for dir in scope {
+        ui.borrow_mut().scan_tasks.entry(dir.clone()).or_default();
+        let active = active.clone();
+        let delivery_dir = dir.clone();
+        let delivery_queue = std::sync::Arc::clone(&deliveries);
+        if let Some(task) = ui.borrow().scan_tasks.get(&dir) {
+            task.submit(
+                move |token| {
+                    let (rows, warnings) = library_scan(&dir, trash_view, &active, token);
+                    Ok((rows, warnings))
+                },
+                move |result| {
+                    if let Ok(mut queue) = delivery_queue.lock() {
+                        queue.push((version, delivery_dir, result));
+                    }
+                },
+            );
+        }
     }
     library_render(ui, controls);
 }
@@ -21859,9 +22088,19 @@ fn library_run_op(
 ) {
     {
         let mut guard = ui.borrow_mut();
-        if guard.busy || guard.op_busy {
+        if guard.op_busy {
             return;
         }
+        // PR #48: starting an operation cancels every scan
+        // worker and bumps the scan version, so no stale
+        // delivery can publish over the operation's refresh.
+        for task in guard.scan_tasks.values() {
+            task.cancel();
+        }
+        guard.scan_version += 1;
+        guard.scan_outstanding.clear();
+        guard.scanning = false;
+        guard.busy = false;
         guard.op_busy = true;
     }
     let (tx, rx) = std::sync::mpsc::channel();
@@ -22660,6 +22899,9 @@ fn open_recording_library(wiring: &Wiring, main_status: Status) {
         scanning: false,
         deliveries: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
         directories,
+        folder_rows: std::collections::HashMap::new(),
+        folder_warnings: std::collections::HashMap::new(),
+        scan_outstanding: std::collections::HashSet::new(),
         rows: Vec::new(),
         view: Vec::new(),
         warnings: Vec::new(),
@@ -23011,16 +23253,22 @@ fn open_recording_library(wiring: &Wiring, main_status: Status) {
             let mut queue = guard.deliveries.lock().unwrap();
             std::mem::take(&mut *queue)
         };
-        for (version, delivery) in deliveries {
+        for (version, dir, delivery) in deliveries {
             let mut guard = ui_poll.borrow_mut();
             if version != guard.scan_version {
                 continue;
             }
-            guard.busy = false;
-            guard.scanning = false;
+            // PR #48: each folder publishes as its scan lands;
+            // the scan round ends when the last folder reports.
+            guard.scan_outstanding.remove(&dir);
             if let Ok((rows, warnings)) = delivery {
-                guard.rows = rows;
-                guard.warnings = warnings;
+                guard.folder_rows.insert(dir.clone(), rows);
+                guard.folder_warnings.insert(dir, warnings);
+                library_merge(&mut guard);
+            }
+            if guard.scan_outstanding.is_empty() {
+                guard.busy = false;
+                guard.scanning = false;
             }
             changed = true;
         }
@@ -28280,6 +28528,12 @@ fn start_catchup_download(
     programme: &Programme,
     status: Status,
 ) {
+    // PR #48: a second request for a programme whose download
+    // is already being prepared is refused, not resolved again.
+    if catchup_preparation_in_flight(wiring, &catchup_download_key(channel, programme)) {
+        status.set_label("This catch-up programme is already downloading.");
+        return;
+    }
     let now = now_epoch();
     match iptv_core::catchup::resolve_show_url(channel, programme.start, programme.stop, now) {
         Ok(
@@ -28342,6 +28596,10 @@ fn start_recovered_download(
     status: Status,
 ) {
     let pad = (pre_minutes, post_minutes);
+    if catchup_preparation_in_flight(wiring, &catchup_download_key(channel, programme)) {
+        status.set_label("This catch-up programme is already downloading.");
+        return;
+    }
     let now = now_epoch();
     match iptv_core::catchup::resolve_show_url(channel, programme.start, programme.stop, now) {
         Ok(
@@ -28521,9 +28779,11 @@ fn begin_catchup_download_with_padding(
     // like a playback or recording session.
     terminate_media_probes(&wiring.media_probe);
     // Audit R03: refuse a duplicate active capture of the same
-    // programme instead of overwriting its output.
+    // programme instead of overwriting its output. PR #48: a
+    // download still being prepared counts too.
     let key = catchup_download_key(channel, programme);
     let duplicate = wiring.recordings.borrow().is_recording(&key)
+        || catchup_preparation_in_flight(wiring, &key)
         || wiring
             .downloads
             .borrow()
@@ -30060,7 +30320,7 @@ fn open_whats_new(wiring: &Wiring, status: Status) {
 }
 
 /// The What's New text for the running version (updated per release).
-const WHATS_NEW_TEXT: &str = "Version 0.4.42 The Hungarian translation of the newest recording features is polished, matching the Python client’s wording.\n\nVersion 0.4.41 Scheduled Recordings gains a filter: Ctrl+F searches by title or channel, and the view selector shows the next seven days, failed and partial recordings, or paused rules. Recording Notifications chooses a dialog, an announcement, or history only for successful starts and finishes, and a recording that misses part of its scheduled time now says so. The playback queue keeps an item until playback really starts, and the queue editor can save, load and delete named queues. The player gains Save Subtitle Transcript, Save Selected Subtitles in the subtitle search, and Save Recording Excerpt, which writes a bookmarked range of a local recording to a new MKV in the background.\n\nVersion 0.4.40 The Hungarian translation is polished throughout, and the user guide now covers the newest recording features in every language: pausing a recording rule, reviewing guide time changes for reminders, recording playback speed and subtitle text search.\n\nVersion 0.4.39 Recording rules can pause from Scheduled Recordings, reminders can follow programme moves in the guide, and exiting now lets recordings in progress finish after naming them and asking first. Stalker channels connect in the background with a Playback Error box when the portal fails, the Recording Library scans each folder on its own worker and always plays finished recordings inside the app at the saved position, and the player gains Recording Playback Speed and Find Text in Recording Subtitles for local recordings.\n\nVersion 0.4.33 When a stream cannot be recovered, the Stream Lost message now appears once. Before, closing it could open another one, over and over.\n\nVersion 0.4.32The built-in player can now boost volume up to 200 percent for quiet streams: the slider, volume keys and mouse wheel all run to 200, matching the Python client.\n\nVersion 0.4.31 Help > About now has a separate link for each of GitHub, Forgejo, the projects site, Telegram and the full credits: Tab reaches each one and Enter or Space opens it.\n\nVersion 0.4.30 Help > About now lists the author, the GitHub and Forgejo pages, the projects site and the Telegram channel, and points to CREDITS.md for full credits. The README follows the shared layout and credits the libraries and upstream code the app uses.\n\nVersion 0.4.29 No more console windows: every tool the app runs in the background, ffmpeg included, now starts hidden. Before, a terminal window could open at startup and every time you paused on a channel, taking the focus away, which made arrowing and Alt+Tab back into the app feel frozen. Search now waits for you: typing in Search channels no longer refilters the list on every key; press Enter to search and move to the channel list, or leave the field with Tab, Shift+Tab or a click. Clear the field and leave it to see every channel again. And moving through the channel list does less work, so your screen reader has fewer updates to process.\n\nVersion 0.4.28 The recording tools from the Python client’s latest update are here. Recordings > Recording Library lists your finished recordings from up to 20 folders: search, filter by status, sort, play or resume, rename titles, move recordings to the recording trash and restore them, with active recordings always left out. The built-in player gains Previous Episode and Next Episode (Ctrl+PageUp and Ctrl+PageDown) and Playback > Subtitle Timing (Ctrl+Shift+T), which shifts subtitle display and speech by up to ten minutes either way for the current media. Scheduled Recordings gains Edit Times and Recording Conflicts: overlaps are checked against your per-account recording connection limits, shown with their real windows including padding, and a new recording that would exceed a known limit asks first. Continue Watching gains a Type choice: recordings keep their own saved positions, separate from Video on Demand, and removing or clearing affects only the type you are looking at. An Xtream account whose server rejects the saved credentials now says so plainly instead of looking like an empty catalogue. And copied text now survives closing the app: copies are flushed to the clipboard before the app exits, so a stream URL you copied is still there to paste afterwards.\n\nVersion 0.4.26 The About box links and the user guide's bug-report address now point to the project's Forgejo home, as the Python client's do; the old GitHub addresses no longer open. All three packages (Windows, Linux and macOS) are now built and published by the Forgejo release workflow.\n\nVersion 0.4.25 Updates now come from the project's Forgejo home instead of GitHub: Check for Updates, and the optional launch check in Options, ask the Forgejo release page for the newest version, and releases are published there from now on. The previous version still checked GitHub, so this one must be installed by hand; afterwards updates resume automatically from Forgejo. This release carries the Windows package.\n\nVersion 0.4.24 Category names are spoken again in the Categories tree. NVDA announced only “Categories, tree view” for every item and never the category itself, because naming the tree the way the newer interface library prefers had replaced the tree’s own accessibility with a stub that knows no items. The tree now takes its name the way the Python client does, so All Channels, Favorites and every playlist category are read aloud with their position and level as you move through them. The tree also gains the expand buttons and root lines the Python tree shows.\n\nVersion 0.4.23 Translations now run on patois, the gettext library that translates Paperback: the catalogues for all 13 languages are compiled into the program itself instead of travelling as a folder of files beside it, and the standard dialogs’ own strings now follow the app’s language too. Same translations, same language menu, same best-fit choice for your system language — nothing else changes.\n\nVersion 0.4.22 Release notes are now written for people, in the changelog in the project repository, and the GitHub release page shows them. Every past release’s notes have been filled in the same way, back to the first one. The release process now refuses to publish a version whose changelog section is missing, so an empty release page cannot ship again.\n\nVersion 0.4.21 Escape now closes windows, as it always did in the Python app: every list window (What’s on Now, Continue Watching, Recently Watched, Reminders, Account Info, Downloads, the programme guide and more), the Playlist and EPG managers, the account form, Scheduled Recordings, Recording Conflicts, the Reminder, VOD, Cast, Audio Preferences, Shutdown Countdown and User Guide windows all hide on Escape, and the hand-built dialogs (sliders, Recording Problem Times, About, Custom Player, Resume) cancel on Escape. Before, Escape did nothing in any of them.\n\nVersion 0.4.20 stops the Windows console window from opening alongside the app: the program is now a proper Windows GUI application, like the Python client. Nothing else changes from 0.4.19.\n\nVersion 0.4.19 removes the Windows debugging-check dialogs for good. They were never app errors: the interface library was being built with its developer consistency checks switched on, so an internal check that a shipped build is supposed to skip could stop the app with a dialog (the menu check and the tree check in earlier versions were the same thing). The library is now built the way release builds are meant to be, with those checks compiled out, matching the Python client. Also fixed: switching the player into or out of fullscreen now settles its layout and focus just after the switch, as the Python client defers them.\n\nVersion 0.4.18 completes the second parity pass against the Python client. Chromecast casting works now: devices are found on your network, the channel plays through the cast proxy, the app asks before disconnecting, saved positions and local buffering are refused while casting, and a casting session counts against one-connection providers. Translations ship with the app: the Python client's catalogues and help guides in 14 languages are bundled, so a non-English system language now actually translates the interface and the guides. A new Account Info window finds your provider accounts, including accounts detected from playlist and channel addresses, and shows each account's status and limits, with Copy Details. Guide imports match Python: gzipped guides resume after an interruption, imports lock across app copies, an old guide database offers Python's repair prompt, and the import's start and finish are announced. Dialogs carry Python's explanations as readable text, the About box gains the community links, What Is Playing and Go to Channel answer the way Python's do, the category tree branches per playlist with an Other playlists branch and channel counts, Favorites messages match Python's, the player status line shows buffer, bitrate and volume in Python's format, audio track changes are spoken, and the mouse wheel over the player changes the volume. Recording formats now follow the selected channel's stream type, failed catch-up downloads retry and explain themselves, and message boxes that arrive while another is open now queue instead of stacking. The guide import lock also clears promptly on Windows and macOS when the copy of the app that held it has closed.\n\nVersion 0.4.14 keeps the window responsive while the saved guide loads, and brings more of the Python client's behaviour across. Channel details, series scans, guide search and What's on Now now read the saved guide on a background thread instead of freezing the window, and results that arrive after you have moved on are dropped instead of replacing what you are looking at. Guide matching now uses the Python client's scored matcher, so channels find their correct guide listings more reliably. Recordings gain the Python client's per-recording logs, outcome reports and Recording Problem Times view, and a failed download now explains the provider error in plain words instead of leaving a raw code.\n\nVersion 0.4.13 makes the built-in player's timers actually run, and stops decoding video when the player window is hidden. Reconnect, resume, subtitle speech and the sleep timer now work in the real app; they were silently dead in every earlier build. Hidden playback uses far less processing power (about 1.5 percent of one core instead of about 12), and pressing Enter while the player engine is still starting no longer freezes the window; playback begins when the engine is ready. Also fixed: two libVLC data layouts that could corrupt memory, and the release packages now bundle the newest VLC 3 release.\\n\\nVersion 0.4.12 adds VOD search and item details, and stops the window freezing during playback. In the VOD window, the new Search VOD field searches movies and series across every group: type a title and press Enter; each result row names its group and where it comes from, the status line says how many items matched, and clearing the search brings back the group you were browsing. The new Item details view shows the selected item's title, type, group, source, its guide description when one is available, and its stream address. Opening a series from the results and going back returns you to the same results with that series still selected. Also fixed: the guide information on channel rows now refreshes on a background thread instead of on the window itself, so alt-tabbing back into the app during playback answers right away instead of taking five to ten seconds, and a refreshed guide merges in much faster.\\n\\nVersion 0.4.11 makes startup and channel changes feel instant with a large guide. The channel rows used to freeze for several seconds after each playlist load, because refreshing the guide information on each row scanned the whole saved guide; it now looks at just the hours around the current time, the same way the Python client does. On a guide with about 800,000 programmes that step drops from about five seconds to a fraction of a second, so new channels are ready to use as soon as they appear.\n\nVersion 0.4.10 speeds up the programme guide and fixes a recording check. The guide now loads and refreshes as fast as the Python client or faster: on a large test guide, a first load dropped from about thirteen minutes to about two and a half, a refresh from about three minutes to about one, and opening the app with a guide already saved is instant instead of taking most of a minute. Recordings work again on non-English Windows systems: the free-space check before recording no longer depends on localized command output (thanks to Farhan Khan for that fix). And the player no longer logs a warning about a plugin-path option that current libVLC removed; it uses the mechanism libVLC supports now.\n\nVersion 0.4.9 refreshes everything under the hood: the cryptography, the guide parser, the database and the platform libraries are all at their newest released versions. Nothing changes on screen, and settings backups stay fully compatible; backups written by earlier versions still restore.\n\nVersion 0.4.8\n\nCasting works with header-protected streams again. The built-in cast proxy now answers the HEAD requests casting devices send before playing, follows redirects so playlists resolve against the address they actually live at, and passes range and duration headers through, so casting devices can probe a stream properly. Streams that need a specific player identity now get the default one automatically. Thanks to Farhan Khan for the fix. The PR validation gate also checks whitespace properly again.\n\nVersion 0.4.7\n\nFaster with big playlists and guides, and the last parity gaps closed. Large playlists now keep a background index, so switching playlists or categories and searching stay quick even with hundreds of thousands of channels, and the guide shown on each row refreshes almost instantly instead of re-checking every channel against the guide every minute. Scheduled Recordings has the right-click menu (Refresh, Cancel, Delete) like the Python client. The preferred audio track check now waits as long as the Python client does, so a slow stream is less likely to lose your saved track. Closing the app no longer waits on the player engine. The log file lives where the Python client puts it. And pressing F1 while a menu is open now opens the help for the menu item you are on.\n\nVersion 0.4.6\n\nFix: single-instance handover now works on Windows (the lock file is opened with the access Windows requires). Plus the Python parity catch-up. Guide sources saved by the Python client now load, the saved guide is there again after a restart, and search finds programmes as well as channels. Provider playlists keep their own channels separate, replace cleanly on refresh, and a failed refresh keeps the channels you had. Resume positions now read the Python client's bookmarks, so Continue Watching carries across. Recordings get unique file names, retries, destination space checks, and honest empty-recording reports; reminders and series recording match the Python dialogs. The app is single-instance (a second launch hands over to the running one), keeps a real log file under Help, checks for updates hourly, and F1 opens the help topic for the window you are in.\n\nVersion 0.4.4\n\nLess talk, working keys. Controls no longer read out instructional sentences when you land on them — Categories, Search, and Channels announce their names, like the Python app, and the channel list no longer repeats the playlist status message every time you tab to it. Ctrl+Up and Ctrl+Down now only change the volume; they no longer move the channel or category selection at the same time. And the search field selects your whole query when you enter it, so typing replaces it, with Ctrl+A selecting all.\n\nVersion 0.4.3\n\nRecording conflicts and safer imports. When a scheduled recording would take a provider connection your watching is using, the recording waits with its reason shown in Scheduled Recordings instead of cutting in; you choose there: keep watching and let it wait, stop playback and record, or cancel the recording. Waiting recordings start fairly, earliest first, when a connection frees. And importing settings now first saves a verified encrypted recovery copy of your current settings where you choose, under its own password, and refuses to run while recordings or downloads are active. The basic player (when libVLC is unavailable) also reports its state honestly now, and its menus no longer offer full-player-only controls.\n\nVersion 0.4.2\n\nReliability and subtitle speech. Playback now confirms before it counts as playing, and a failing stream retries inside one 30-second budget with a clear Stream lost message instead of spinning forever. Recordings that start late say so honestly, and cancelling a scheduled recording now stops its capture. Settings backups interchange with the Python client, verified both ways. Subtitles can now speak through an application voice on Windows (SAPI), not only through your screen reader: pick the backend, output device, volume, and speed under Options, Subtitle Speech, and if the chosen output device disappears, speech pauses until it returns or falls back to the system default, per the device policy.\n\nVersion 0.4.1\n\nLess talk. Channel rows now carry the guide the way the Python app does — channel name first, then the current and next programmes after it — and moving through the list no longer speaks the guide out loud on every step; the description panel still fills in silently.\n\nVersion 0.4.0\n\nSigned updates. Check for Updates now uses the ship-shape updater, the same signed updater as BlindRadio: update packages are cryptographically signed and verified before anything installs, then install and relaunch on their own (Windows and Linux; macOS opens the verified disk image for a manual install). Releases before this one can still update forward onto it.\n\nVersion 0.3.4\n\nFix: large playlists load promptly at startup. The playlist now loads first and the programme guide follows once it settles, instead of the two downloads racing; the guide database write no longer freezes the window; and the channel list says Loading playlist while a load is in flight instead of claiming no playlist is loaded.\n\nVersion 0.3.3\n\nFix: streams play again. The packages now bundle libVLC (the built-in player engine) beside the app on Windows, Linux, and macOS, so playback works with no separate VLC install. If libVLC still cannot load, pressing play now says so instead of failing silently.\n\nVersion 0.3.2\n\nFix: large playlists and guides now load. The HTTP library silently capped downloads at 10 MB, so a big provider playlist (for example a 28 MB, 115,000-channel list) failed to add and its EPG could never load. Playlist, EPG, Xtream, and Stalker fetches now take the full body.\n\nVersion 0.3.1\n\nFix: the Windows build no longer shows a wxWidgets debug dialog (\"Can't expand/collapse hidden root node!\") at startup or when the category list rebuilds. Nothing else changes from 0.3.0.\n\nVersion 0.3.0\n\nMain window: the layout now matches the Python client exactly (Playlist view and Categories on the left; Search, Channels, description and Stream URL on the right), and the menu-less shortcuts from the Python client work here: Ctrl+Up/Down volume, Ctrl+Shift+R record, Ctrl+D favorite and the rest of the documented set.\n\nPlayer: a Playback menu in Python's order, a Sleep Timer with an optional volume fade-out, and an Audio Output Device dialog that lists the real libVLC devices (System default first) and applies the saved choice at playback start. Announcement levels now gate player speech exactly as Python's do (None, Errors only, Important events, Detailed status).\n\nLocal Live Buffer: live TV in the built-in player can be buffered locally (off by default; set it up from the player's Playback menu), which enables pausing live TV, Rewind Live TV and Return to Live. A recording of a buffered channel reads the buffer instead of opening a second provider connection.\n\nDialogs: What's on Now has its filter box with a program count; Continue Watching gains Check Availability, which re-resolves each saved position against the current playlists and reports Available or Unavailable per row. Settings backup and restore now use Python's password-protected encrypted format, so backups interchange with the Python client both ways.\n\nMenus and shell: the Media Player menu lists all 32 players the Python client offers, with its exact per-platform program lookup. The tray icon builds Python's popup fresh on every right-click (Restore, Player Controls, Stop Recording(s) while recording, Exit) and left-click restores the window. The Recordings menu's minimum-free-space reserve and schedule padding use Python's values.";
+const WHATS_NEW_TEXT: &str = "Version 0.4.43 Recording, playback and schedule fixes from the Python client: a recording schedule that cannot be saved now warns you once and keeps retrying, guide imports only count as fresh when every source loaded and say so when one is partial, Go to Channel Number asks which channel when a number appears more than once, and the Recording Library shows each folder as soon as it is scanned instead of waiting for the slowest one.\n\nVersion 0.4.42 The Hungarian translation of the newest recording features is polished, matching the Python client’s wording.\n\nVersion 0.4.41 Scheduled Recordings gains a filter: Ctrl+F searches by title or channel, and the view selector shows the next seven days, failed and partial recordings, or paused rules. Recording Notifications chooses a dialog, an announcement, or history only for successful starts and finishes, and a recording that misses part of its scheduled time now says so. The playback queue keeps an item until playback really starts, and the queue editor can save, load and delete named queues. The player gains Save Subtitle Transcript, Save Selected Subtitles in the subtitle search, and Save Recording Excerpt, which writes a bookmarked range of a local recording to a new MKV in the background.\n\nVersion 0.4.40 The Hungarian translation is polished throughout, and the user guide now covers the newest recording features in every language: pausing a recording rule, reviewing guide time changes for reminders, recording playback speed and subtitle text search.\n\nVersion 0.4.39 Recording rules can pause from Scheduled Recordings, reminders can follow programme moves in the guide, and exiting now lets recordings in progress finish after naming them and asking first. Stalker channels connect in the background with a Playback Error box when the portal fails, the Recording Library scans each folder on its own worker and always plays finished recordings inside the app at the saved position, and the player gains Recording Playback Speed and Find Text in Recording Subtitles for local recordings.\n\nVersion 0.4.33 When a stream cannot be recovered, the Stream Lost message now appears once. Before, closing it could open another one, over and over.\n\nVersion 0.4.32The built-in player can now boost volume up to 200 percent for quiet streams: the slider, volume keys and mouse wheel all run to 200, matching the Python client.\n\nVersion 0.4.31 Help > About now has a separate link for each of GitHub, Forgejo, the projects site, Telegram and the full credits: Tab reaches each one and Enter or Space opens it.\n\nVersion 0.4.30 Help > About now lists the author, the GitHub and Forgejo pages, the projects site and the Telegram channel, and points to CREDITS.md for full credits. The README follows the shared layout and credits the libraries and upstream code the app uses.\n\nVersion 0.4.29 No more console windows: every tool the app runs in the background, ffmpeg included, now starts hidden. Before, a terminal window could open at startup and every time you paused on a channel, taking the focus away, which made arrowing and Alt+Tab back into the app feel frozen. Search now waits for you: typing in Search channels no longer refilters the list on every key; press Enter to search and move to the channel list, or leave the field with Tab, Shift+Tab or a click. Clear the field and leave it to see every channel again. And moving through the channel list does less work, so your screen reader has fewer updates to process.\n\nVersion 0.4.28 The recording tools from the Python client’s latest update are here. Recordings > Recording Library lists your finished recordings from up to 20 folders: search, filter by status, sort, play or resume, rename titles, move recordings to the recording trash and restore them, with active recordings always left out. The built-in player gains Previous Episode and Next Episode (Ctrl+PageUp and Ctrl+PageDown) and Playback > Subtitle Timing (Ctrl+Shift+T), which shifts subtitle display and speech by up to ten minutes either way for the current media. Scheduled Recordings gains Edit Times and Recording Conflicts: overlaps are checked against your per-account recording connection limits, shown with their real windows including padding, and a new recording that would exceed a known limit asks first. Continue Watching gains a Type choice: recordings keep their own saved positions, separate from Video on Demand, and removing or clearing affects only the type you are looking at. An Xtream account whose server rejects the saved credentials now says so plainly instead of looking like an empty catalogue. And copied text now survives closing the app: copies are flushed to the clipboard before the app exits, so a stream URL you copied is still there to paste afterwards.\n\nVersion 0.4.26 The About box links and the user guide's bug-report address now point to the project's Forgejo home, as the Python client's do; the old GitHub addresses no longer open. All three packages (Windows, Linux and macOS) are now built and published by the Forgejo release workflow.\n\nVersion 0.4.25 Updates now come from the project's Forgejo home instead of GitHub: Check for Updates, and the optional launch check in Options, ask the Forgejo release page for the newest version, and releases are published there from now on. The previous version still checked GitHub, so this one must be installed by hand; afterwards updates resume automatically from Forgejo. This release carries the Windows package.\n\nVersion 0.4.24 Category names are spoken again in the Categories tree. NVDA announced only “Categories, tree view” for every item and never the category itself, because naming the tree the way the newer interface library prefers had replaced the tree’s own accessibility with a stub that knows no items. The tree now takes its name the way the Python client does, so All Channels, Favorites and every playlist category are read aloud with their position and level as you move through them. The tree also gains the expand buttons and root lines the Python tree shows.\n\nVersion 0.4.23 Translations now run on patois, the gettext library that translates Paperback: the catalogues for all 13 languages are compiled into the program itself instead of travelling as a folder of files beside it, and the standard dialogs’ own strings now follow the app’s language too. Same translations, same language menu, same best-fit choice for your system language — nothing else changes.\n\nVersion 0.4.22 Release notes are now written for people, in the changelog in the project repository, and the GitHub release page shows them. Every past release’s notes have been filled in the same way, back to the first one. The release process now refuses to publish a version whose changelog section is missing, so an empty release page cannot ship again.\n\nVersion 0.4.21 Escape now closes windows, as it always did in the Python app: every list window (What’s on Now, Continue Watching, Recently Watched, Reminders, Account Info, Downloads, the programme guide and more), the Playlist and EPG managers, the account form, Scheduled Recordings, Recording Conflicts, the Reminder, VOD, Cast, Audio Preferences, Shutdown Countdown and User Guide windows all hide on Escape, and the hand-built dialogs (sliders, Recording Problem Times, About, Custom Player, Resume) cancel on Escape. Before, Escape did nothing in any of them.\n\nVersion 0.4.20 stops the Windows console window from opening alongside the app: the program is now a proper Windows GUI application, like the Python client. Nothing else changes from 0.4.19.\n\nVersion 0.4.19 removes the Windows debugging-check dialogs for good. They were never app errors: the interface library was being built with its developer consistency checks switched on, so an internal check that a shipped build is supposed to skip could stop the app with a dialog (the menu check and the tree check in earlier versions were the same thing). The library is now built the way release builds are meant to be, with those checks compiled out, matching the Python client. Also fixed: switching the player into or out of fullscreen now settles its layout and focus just after the switch, as the Python client defers them.\n\nVersion 0.4.18 completes the second parity pass against the Python client. Chromecast casting works now: devices are found on your network, the channel plays through the cast proxy, the app asks before disconnecting, saved positions and local buffering are refused while casting, and a casting session counts against one-connection providers. Translations ship with the app: the Python client's catalogues and help guides in 14 languages are bundled, so a non-English system language now actually translates the interface and the guides. A new Account Info window finds your provider accounts, including accounts detected from playlist and channel addresses, and shows each account's status and limits, with Copy Details. Guide imports match Python: gzipped guides resume after an interruption, imports lock across app copies, an old guide database offers Python's repair prompt, and the import's start and finish are announced. Dialogs carry Python's explanations as readable text, the About box gains the community links, What Is Playing and Go to Channel answer the way Python's do, the category tree branches per playlist with an Other playlists branch and channel counts, Favorites messages match Python's, the player status line shows buffer, bitrate and volume in Python's format, audio track changes are spoken, and the mouse wheel over the player changes the volume. Recording formats now follow the selected channel's stream type, failed catch-up downloads retry and explain themselves, and message boxes that arrive while another is open now queue instead of stacking. The guide import lock also clears promptly on Windows and macOS when the copy of the app that held it has closed.\n\nVersion 0.4.14 keeps the window responsive while the saved guide loads, and brings more of the Python client's behaviour across. Channel details, series scans, guide search and What's on Now now read the saved guide on a background thread instead of freezing the window, and results that arrive after you have moved on are dropped instead of replacing what you are looking at. Guide matching now uses the Python client's scored matcher, so channels find their correct guide listings more reliably. Recordings gain the Python client's per-recording logs, outcome reports and Recording Problem Times view, and a failed download now explains the provider error in plain words instead of leaving a raw code.\n\nVersion 0.4.13 makes the built-in player's timers actually run, and stops decoding video when the player window is hidden. Reconnect, resume, subtitle speech and the sleep timer now work in the real app; they were silently dead in every earlier build. Hidden playback uses far less processing power (about 1.5 percent of one core instead of about 12), and pressing Enter while the player engine is still starting no longer freezes the window; playback begins when the engine is ready. Also fixed: two libVLC data layouts that could corrupt memory, and the release packages now bundle the newest VLC 3 release.\\n\\nVersion 0.4.12 adds VOD search and item details, and stops the window freezing during playback. In the VOD window, the new Search VOD field searches movies and series across every group: type a title and press Enter; each result row names its group and where it comes from, the status line says how many items matched, and clearing the search brings back the group you were browsing. The new Item details view shows the selected item's title, type, group, source, its guide description when one is available, and its stream address. Opening a series from the results and going back returns you to the same results with that series still selected. Also fixed: the guide information on channel rows now refreshes on a background thread instead of on the window itself, so alt-tabbing back into the app during playback answers right away instead of taking five to ten seconds, and a refreshed guide merges in much faster.\\n\\nVersion 0.4.11 makes startup and channel changes feel instant with a large guide. The channel rows used to freeze for several seconds after each playlist load, because refreshing the guide information on each row scanned the whole saved guide; it now looks at just the hours around the current time, the same way the Python client does. On a guide with about 800,000 programmes that step drops from about five seconds to a fraction of a second, so new channels are ready to use as soon as they appear.\n\nVersion 0.4.10 speeds up the programme guide and fixes a recording check. The guide now loads and refreshes as fast as the Python client or faster: on a large test guide, a first load dropped from about thirteen minutes to about two and a half, a refresh from about three minutes to about one, and opening the app with a guide already saved is instant instead of taking most of a minute. Recordings work again on non-English Windows systems: the free-space check before recording no longer depends on localized command output (thanks to Farhan Khan for that fix). And the player no longer logs a warning about a plugin-path option that current libVLC removed; it uses the mechanism libVLC supports now.\n\nVersion 0.4.9 refreshes everything under the hood: the cryptography, the guide parser, the database and the platform libraries are all at their newest released versions. Nothing changes on screen, and settings backups stay fully compatible; backups written by earlier versions still restore.\n\nVersion 0.4.8\n\nCasting works with header-protected streams again. The built-in cast proxy now answers the HEAD requests casting devices send before playing, follows redirects so playlists resolve against the address they actually live at, and passes range and duration headers through, so casting devices can probe a stream properly. Streams that need a specific player identity now get the default one automatically. Thanks to Farhan Khan for the fix. The PR validation gate also checks whitespace properly again.\n\nVersion 0.4.7\n\nFaster with big playlists and guides, and the last parity gaps closed. Large playlists now keep a background index, so switching playlists or categories and searching stay quick even with hundreds of thousands of channels, and the guide shown on each row refreshes almost instantly instead of re-checking every channel against the guide every minute. Scheduled Recordings has the right-click menu (Refresh, Cancel, Delete) like the Python client. The preferred audio track check now waits as long as the Python client does, so a slow stream is less likely to lose your saved track. Closing the app no longer waits on the player engine. The log file lives where the Python client puts it. And pressing F1 while a menu is open now opens the help for the menu item you are on.\n\nVersion 0.4.6\n\nFix: single-instance handover now works on Windows (the lock file is opened with the access Windows requires). Plus the Python parity catch-up. Guide sources saved by the Python client now load, the saved guide is there again after a restart, and search finds programmes as well as channels. Provider playlists keep their own channels separate, replace cleanly on refresh, and a failed refresh keeps the channels you had. Resume positions now read the Python client's bookmarks, so Continue Watching carries across. Recordings get unique file names, retries, destination space checks, and honest empty-recording reports; reminders and series recording match the Python dialogs. The app is single-instance (a second launch hands over to the running one), keeps a real log file under Help, checks for updates hourly, and F1 opens the help topic for the window you are in.\n\nVersion 0.4.4\n\nLess talk, working keys. Controls no longer read out instructional sentences when you land on them — Categories, Search, and Channels announce their names, like the Python app, and the channel list no longer repeats the playlist status message every time you tab to it. Ctrl+Up and Ctrl+Down now only change the volume; they no longer move the channel or category selection at the same time. And the search field selects your whole query when you enter it, so typing replaces it, with Ctrl+A selecting all.\n\nVersion 0.4.3\n\nRecording conflicts and safer imports. When a scheduled recording would take a provider connection your watching is using, the recording waits with its reason shown in Scheduled Recordings instead of cutting in; you choose there: keep watching and let it wait, stop playback and record, or cancel the recording. Waiting recordings start fairly, earliest first, when a connection frees. And importing settings now first saves a verified encrypted recovery copy of your current settings where you choose, under its own password, and refuses to run while recordings or downloads are active. The basic player (when libVLC is unavailable) also reports its state honestly now, and its menus no longer offer full-player-only controls.\n\nVersion 0.4.2\n\nReliability and subtitle speech. Playback now confirms before it counts as playing, and a failing stream retries inside one 30-second budget with a clear Stream lost message instead of spinning forever. Recordings that start late say so honestly, and cancelling a scheduled recording now stops its capture. Settings backups interchange with the Python client, verified both ways. Subtitles can now speak through an application voice on Windows (SAPI), not only through your screen reader: pick the backend, output device, volume, and speed under Options, Subtitle Speech, and if the chosen output device disappears, speech pauses until it returns or falls back to the system default, per the device policy.\n\nVersion 0.4.1\n\nLess talk. Channel rows now carry the guide the way the Python app does — channel name first, then the current and next programmes after it — and moving through the list no longer speaks the guide out loud on every step; the description panel still fills in silently.\n\nVersion 0.4.0\n\nSigned updates. Check for Updates now uses the ship-shape updater, the same signed updater as BlindRadio: update packages are cryptographically signed and verified before anything installs, then install and relaunch on their own (Windows and Linux; macOS opens the verified disk image for a manual install). Releases before this one can still update forward onto it.\n\nVersion 0.3.4\n\nFix: large playlists load promptly at startup. The playlist now loads first and the programme guide follows once it settles, instead of the two downloads racing; the guide database write no longer freezes the window; and the channel list says Loading playlist while a load is in flight instead of claiming no playlist is loaded.\n\nVersion 0.3.3\n\nFix: streams play again. The packages now bundle libVLC (the built-in player engine) beside the app on Windows, Linux, and macOS, so playback works with no separate VLC install. If libVLC still cannot load, pressing play now says so instead of failing silently.\n\nVersion 0.3.2\n\nFix: large playlists and guides now load. The HTTP library silently capped downloads at 10 MB, so a big provider playlist (for example a 28 MB, 115,000-channel list) failed to add and its EPG could never load. Playlist, EPG, Xtream, and Stalker fetches now take the full body.\n\nVersion 0.3.1\n\nFix: the Windows build no longer shows a wxWidgets debug dialog (\"Can't expand/collapse hidden root node!\") at startup or when the category list rebuilds. Nothing else changes from 0.3.0.\n\nVersion 0.3.0\n\nMain window: the layout now matches the Python client exactly (Playlist view and Categories on the left; Search, Channels, description and Stream URL on the right), and the menu-less shortcuts from the Python client work here: Ctrl+Up/Down volume, Ctrl+Shift+R record, Ctrl+D favorite and the rest of the documented set.\n\nPlayer: a Playback menu in Python's order, a Sleep Timer with an optional volume fade-out, and an Audio Output Device dialog that lists the real libVLC devices (System default first) and applies the saved choice at playback start. Announcement levels now gate player speech exactly as Python's do (None, Errors only, Important events, Detailed status).\n\nLocal Live Buffer: live TV in the built-in player can be buffered locally (off by default; set it up from the player's Playback menu), which enables pausing live TV, Rewind Live TV and Return to Live. A recording of a buffered channel reads the buffer instead of opening a second provider connection.\n\nDialogs: What's on Now has its filter box with a program count; Continue Watching gains Check Availability, which re-resolves each saved position against the current playlists and reports Available or Unavailable per row. Settings backup and restore now use Python's password-protected encrypted format, so backups interchange with the Python client both ways.\n\nMenus and shell: the Media Player menu lists all 32 players the Python client offers, with its exact per-platform program lookup. The tray icon builds Python's popup fresh on every right-click (Restore, Player Controls, Stop Recording(s) while recording, Exit) and left-click restores the window. The Recordings menu's minimum-free-space reserve and schedule padding use Python's values.";
 
 /// Run the platform shutdown (factored out of the recordings poll
 /// for the countdown dialog).

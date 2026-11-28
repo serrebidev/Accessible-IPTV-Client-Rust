@@ -5577,3 +5577,12 @@ msgstr "保存済みキューの上限に達しました。"
 
 msgid "When a recording starts or finishes successfully:"
 msgstr "録画が正常に開始または終了したとき："
+
+msgid "The recording schedule could not be saved. Check available disk space and write permissions."
+msgstr "é²ç»ã¹ã±ã¸ã¥ã¼ã«ãä¿å­ã§ãã¾ããã§ããããã£ã¹ã¯ã®ç©ºãå®¹éã¨æ¸ãè¾¼ã¿æ¨©éãç¢ºèªãã¦ãã ããã"
+
+msgid "Partial EPG Import"
+msgstr "çªçµè¡¨ã®ä¸é¨ãåãè¾¼ã¿ã¾ãã"
+
+msgid "The EPG import loaded {loaded} of {total} sources. The programme guide may be incomplete."
+msgstr "{total} ä»¶ã®çªçµè¡¨ã½ã¼ã¹ã®ãã¡ {loaded} ä»¶ãåãè¾¼ã¿ã¾ãããçªçµè¡¨ãä¸å®å¨ãªå¯è½æ§ãããã¾ãã"

@@ -5678,3 +5678,12 @@ msgstr "Die Höchstzahl gespeicherter Warteschlangen ist erreicht."
 
 msgid "When a recording starts or finishes successfully:"
 msgstr "Wenn eine Aufnahme erfolgreich startet oder endet:"
+
+msgid "The recording schedule could not be saved. Check available disk space and write permissions."
+msgstr "Der Aufnahmeplan konnte nicht gespeichert werden. PrÃ¼fen Sie den freien Speicherplatz und die Schreibberechtigungen."
+
+msgid "Partial EPG Import"
+msgstr "ProgrammfÃ¼hrer teilweise importiert"
+
+msgid "The EPG import loaded {loaded} of {total} sources. The programme guide may be incomplete."
+msgstr "{loaded} von {total} Quellen wurden importiert. Der ProgrammfÃ¼hrer ist mÃ¶glicherweise unvollstÃ¤ndig."

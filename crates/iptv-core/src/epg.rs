@@ -1833,16 +1833,23 @@ enum EpgJob {
 }
 
 enum EpgLoadResult {
-    Loaded(Box<EpgGuide>, String),
+    /// PR #48: the load also reports how many of the sources
+    /// actually came in, so the app can tell a complete import
+    /// from a partial one.
+    Loaded(Box<EpgGuide>, String, usize, usize),
     Failed(String),
 }
 
 enum EpgEvent {
-    Ready(std::sync::Arc<EpgSnapshot>, String),
+    Ready(std::sync::Arc<EpgSnapshot>, String, usize, usize),
     Failed(String),
 }
 
 /// Off-UI-thread guide loader mirroring the browse/search worker shape.
+/// What a finished guide load delivers: the snapshot, the
+/// store note, and the loaded/total source counts (PR #48).
+pub type EpgDelivery = Result<(std::sync::Arc<EpgSnapshot>, String, usize, usize), String>;
+
 pub struct EpgWorker {
     jobs: std::sync::mpsc::Sender<EpgJob>,
     events: std::sync::Mutex<std::sync::mpsc::Receiver<EpgEvent>>,
@@ -1863,7 +1870,7 @@ impl EpgWorker {
             let mut snapshot: Option<std::sync::Arc<EpgSnapshot>> = None;
             while let Ok(EpgJob::Fetch { sources, store }) = job_receiver.recv() {
                 let event = match run_epg_load(&sources, store.as_deref()) {
-                    EpgLoadResult::Loaded(guide, note) => {
+                    EpgLoadResult::Loaded(guide, note, loaded, total) => {
                         let mut guide = *guide;
                         if let Some(previous) = &snapshot {
                             let mut merged = previous.guide.clone();
@@ -1879,7 +1886,7 @@ impl EpgWorker {
                             generation,
                         });
                         snapshot = Some(std::sync::Arc::clone(&next));
-                        EpgEvent::Ready(next, note)
+                        EpgEvent::Ready(next, note, loaded, total)
                     }
                     EpgLoadResult::Failed(error) => EpgEvent::Failed(error),
                 };
@@ -1902,12 +1909,16 @@ impl EpgWorker {
         let _ = self.jobs.send(EpgJob::Fetch { sources, store });
     }
 
-    /// The next finished load, when one is waiting.
+    /// The next finished load, when one is waiting: the
+    /// snapshot, the store note, and how many of the requested
+    /// sources loaded out of the total (PR #48).
     #[must_use]
-    pub fn try_recv(&self) -> Option<Result<(std::sync::Arc<EpgSnapshot>, String), String>> {
+    pub fn try_recv(&self) -> Option<EpgDelivery> {
         let events = self.events.lock().ok()?;
         match events.try_recv().ok()? {
-            EpgEvent::Ready(snapshot, note) => Some(Ok((snapshot, note))),
+            EpgEvent::Ready(snapshot, note, loaded, total) => {
+                Some(Ok((snapshot, note, loaded, total)))
+            }
             EpgEvent::Failed(error) => Some(Err(error)),
         }
     }
@@ -2020,7 +2031,7 @@ fn run_epg_load(sources: &[String], store_path: Option<&std::path::Path>) -> Epg
             failures[0]
         );
     }
-    EpgLoadResult::Loaded(Box::new(merged), note)
+    EpgLoadResult::Loaded(Box::new(merged), note, loaded, sources.len())
 }
 
 // ---------------------------------------------------------------------------
@@ -3044,7 +3055,8 @@ mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(25));
         };
-        let (guide, note) = outcome.unwrap();
+        let (guide, note, loaded, total) = outcome.unwrap();
+        assert_eq!((loaded, total), (1, 1));
         assert_eq!(guide.guide.programme_count(), 1);
         assert_eq!(guide.generation, 1);
         assert!(guide.indexes.known_ids.contains("c1"));
@@ -3828,7 +3840,7 @@ mod tests {
             Some(store_path.clone()),
         );
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        let (guide, note) = loop {
+        let (guide, note, loaded, total) = loop {
             if let Some(result) = worker.try_recv() {
                 break result.expect("one good source loads");
             }
@@ -3838,6 +3850,8 @@ mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(25));
         };
+        // PR #48: a partial load reports its counts (1 of 2).
+        assert_eq!((loaded, total), (1, 2));
         assert_eq!(guide.guide.programme_count(), 2);
         assert_eq!(guide.generation, 1);
         assert!(note.contains("1 of 2 guide sources failed"), "{note}");
@@ -3848,7 +3862,7 @@ mod tests {
             Some(store_path.clone()),
         );
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        let (second, _) = loop {
+        let (second, _, _, _) = loop {
             if let Some(result) = worker.try_recv() {
                 break result.expect("second successful source load");
             }
@@ -3865,7 +3879,7 @@ mod tests {
             Some(store_path.clone()),
         );
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        let (third, _) = loop {
+        let (third, _, _, _) = loop {
             if let Some(result) = worker.try_recv() {
                 break result.expect("third successful source load");
             }

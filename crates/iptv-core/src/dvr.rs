@@ -631,6 +631,12 @@ pub struct DvrSchedule {
     /// The unreadable file could not be backed up: every write is
     /// refused so the original bytes survive (Python `_load_error`).
     load_error: bool,
+    /// PR #48: a failed schedule write leaves the in-memory
+    /// state intact; the failure is reported once per outage
+    /// and retried until it lands.
+    save_warning_pending: bool,
+    save_retry_at: Option<std::time::Instant>,
+    save_failures: u32,
 }
 
 /// Python `checked_weekdays`: Monday 0 to Sunday 6, sorted and
@@ -931,10 +937,48 @@ impl DvrSchedule {
     }
 
     /// A clock-driven save: a failure is logged, never turned into a
-    /// job state (Python `_save_schedule`).
-    pub fn save_logged(&self) {
-        if let Err(error) = self.save() {
-            crate::applog::error("dvr", &format!("Could not save the DVR schedule: {error}"));
+    /// job state (Python `_save_schedule`). PR #48: the failure is
+    /// also remembered — reported once per outage through
+    /// [`Self::take_save_warning`] and retried by the tick until
+    /// the write lands, so a full disk cannot silently lose the
+    /// schedule for the rest of the session.
+    pub fn save_logged(&mut self) {
+        match self.save() {
+            Ok(()) => {
+                self.save_warning_pending = false;
+                self.save_retry_at = None;
+                self.save_failures = 0;
+            }
+            Err(error) => {
+                crate::applog::error("dvr", &format!("Could not save the DVR schedule: {error}"));
+                if self.save_failures == 0 {
+                    self.save_warning_pending = true;
+                }
+                self.save_failures = self.save_failures.saturating_add(1);
+                // A quick first retry, then Python's 60-second
+                // recovery cadence.
+                let delay = if self.save_failures == 1 { 2 } else { 60 };
+                self.save_retry_at =
+                    Some(std::time::Instant::now() + std::time::Duration::from_secs(delay));
+            }
+        }
+    }
+
+    /// Take the pending save-failure warning, if any: true once
+    /// per outage (PR #48, Python's `on_save_error`).
+    pub fn take_save_warning(&mut self) -> bool {
+        std::mem::take(&mut self.save_warning_pending)
+    }
+
+    /// Retry a failed schedule write when its retry time has
+    /// come (PR #48); called at the head of every tick.
+    fn retry_save(&mut self) {
+        if self
+            .save_retry_at
+            .is_some_and(|at| std::time::Instant::now() >= at)
+        {
+            self.save_retry_at = None;
+            self.save_logged();
         }
     }
 
@@ -1451,6 +1495,7 @@ impl DvrSchedule {
         now: f64,
         gate: &mut dyn FnMut(&DvrJob) -> Option<String>,
     ) -> Vec<DvrAction> {
+        self.retry_save();
         let mut actions = Vec::new();
         let mut changed = false;
         let ids = self.fair_order_ids();
@@ -2649,6 +2694,30 @@ mod tests {
             schedule.add_manual_job(again, now),
             Err("This recording is already scheduled.".to_string())
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn save_failure_warns_once_and_keeps_retrying() {
+        // PR #48: a schedule under a path that cannot be written
+        // (its parent is a file) fails every save; the in-memory
+        // schedule is untouched, the warning fires once for the
+        // outage, and a retry is scheduled.
+        let dir = temp_dir("savefail");
+        let blocker = dir.join("blocker");
+        std::fs::write(&blocker, b"x").unwrap();
+        let mut schedule = DvrSchedule::load(blocker.join("schedule.json"), 0.0);
+        schedule.save_logged();
+        assert!(schedule.take_save_warning());
+        assert!(!schedule.take_save_warning());
+        assert!(schedule.save_retry_at.is_some());
+        schedule.save_logged();
+        assert!(!schedule.take_save_warning(), "still the same outage");
+        // A writable schedule saves cleanly and never warns.
+        let mut ok = DvrSchedule::load(dir.join("schedule.json"), 0.0);
+        ok.save_logged();
+        assert!(!ok.take_save_warning());
+        assert!(ok.save_retry_at.is_none());
         let _ = std::fs::remove_dir_all(dir);
     }
 
