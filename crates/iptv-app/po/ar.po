@@ -5395,3 +5395,129 @@ msgstr "اختر تسجيلات قادمة تقع خارج فترة الإيقا
 
 msgid "Stopped because the app exited."
 msgstr "توقّف التسجيل عند إغلاق التطبيق."
+
+msgid "A saved queue with this name already exists."
+msgstr "توجد بالفعل قائمة انتظار محفوظة بهذا الاسم."
+
+msgid "Add a named bookmark to mark a point inside the recording first."
+msgstr "أضف أولًا إشارة مرجعية باسم داخل التسجيل."
+
+msgid "All"
+msgstr "الكل"
+
+msgid "Announce and save in history"
+msgstr "إعلان وحفظ في السجل"
+
+msgid "Choose a new filename for the excerpt."
+msgstr "اختر اسم ملف جديدًا للمقطع."
+
+msgid "Choose a saved queue:"
+msgstr "اختر قائمة انتظار محفوظة:"
+
+msgid "Choose a valid recording range and an MKV filename."
+msgstr "اختر نطاقًا صالحًا واسم ملف MKV."
+
+msgid "Choose the end of the excerpt:"
+msgstr "اختر نهاية المقطع:"
+
+msgid "Choose the start of the excerpt:"
+msgstr "اختر بداية المقطع:"
+
+msgid "Could not save the recording excerpt."
+msgstr "تعذر حفظ مقطع التسجيل."
+
+msgid "Delete Saved Queue..."
+msgstr "حذف قائمة انتظار محفوظة…"
+
+msgid "Delete this saved queue?"
+msgstr "هل تريد حذف قائمة الانتظار المحفوظة؟"
+
+msgid "End of recording"
+msgstr "نهاية التسجيل"
+
+msgid "Enter a queue name of 1 to 80 characters and include a recording."
+msgstr "أدخل اسمًا من حرف واحد إلى 80 حرفًا وأضف تسجيلًا."
+
+msgid "Failed and Partial"
+msgstr "الفاشلة والجزئية"
+
+msgid "Filter by title or channel"
+msgstr "تصفية حسب العنوان أو القناة"
+
+msgid "Load Saved Queue..."
+msgstr "تحميل قائمة انتظار محفوظة…"
+
+msgid "Name for this queue:"
+msgstr "اسم قائمة الانتظار:"
+
+msgid "Next 7 Days"
+msgstr "الأيام السبعة القادمة"
+
+msgid "Open a local recording with text subtitles first."
+msgstr "افتح أولًا تسجيلًا محليًا بترجمة نصية."
+
+msgid "Paused Recording Rules"
+msgstr "قواعد التسجيل الموقوفة مؤقتًا"
+
+msgid "Recording Notifications..."
+msgstr "إشعارات التسجيل…"
+
+msgid "Recording saved: {title}"
+msgstr "حُفظ التسجيل: {title}"
+
+msgid "Replace the current playback queue?"
+msgstr "هل تريد استبدال قائمة التشغيل الحالية؟"
+
+msgid "Replace the saved queue with this name?"
+msgstr "هل تريد استبدال القائمة المحفوظة بهذا الاسم؟"
+
+msgid "Save Queue..."
+msgstr "حفظ قائمة الانتظار…"
+
+msgid "Save Recording Excerpt..."
+msgstr "حفظ مقطع من التسجيل…"
+
+msgid "Save Selected Subtitles..."
+msgstr "حفظ الترجمات المحددة…"
+
+msgid "Save Subtitle Transcript..."
+msgstr "حفظ تفريغ الترجمة النصية…"
+
+msgid "Save in history only"
+msgstr "حفظ في السجل فقط"
+
+msgid "Saved Playback Queues"
+msgstr "قوائم التشغيل المحفوظة"
+
+msgid "Saving recording excerpt..."
+msgstr "جارٍ حفظ مقطع التسجيل…"
+
+msgid "Saving the recording excerpt timed out."
+msgstr "انتهت مهلة حفظ مقطع التسجيل."
+
+msgid "Schedule view"
+msgstr "عرض الجدول"
+
+msgid "Select one subtitle to jump to its position."
+msgstr "حدد سطر ترجمة واحدًا للانتقال إلى موضعه."
+
+msgid "Show a dialog"
+msgstr "عرض مربع حوار"
+
+msgid "Start of recording"
+msgstr "بداية التسجيل"
+
+msgid "Text file (*.txt)"
+msgstr "ملف نصي (*.txt)"
+
+msgid "The queue could not be saved."
+msgstr "تعذر حفظ قائمة الانتظار."
+
+msgid "The recording did not cover the full scheduled time."
+msgstr "لم يغطِّ التسجيل كامل الفترة المجدولة."
+
+msgid "The saved queue limit has been reached."
+msgstr "بلغت الحد الأقصى للقوائم المحفوظة."
+
+msgid "When a recording starts or finishes successfully:"
+msgstr "عند بدء تسجيل أو انتهائه بنجاح:"

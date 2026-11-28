@@ -249,6 +249,8 @@ Reprodução > Sincronização das legendas (Ctrl+Shift+T) ajusta até dez minut
 
 Durante a reprodução de uma gravação local, use o menu de reprodução para buscar palavras no arquivo de legendas carregado ou em uma faixa de texto incorporada. Selecione um resultado e pressione Enter para ir até ele. A velocidade pode variar de 0,75× a 2×. Escolha a velocidade normal para voltar a 1×.
 
+Em Reprodução, **Guardar transcrição das legendas** exporta a faixa de texto com indicações de tempo. Nos resultados de pesquisa, selecione linhas e escolha **Guardar legendas selecionadas**. Para saltar para o ponto pretendido, selecione uma única linha e prima Enter.
+
 ### Dispositivo de saída de áudio {#audio-output-device}
 
 Reprodução > Dispositivo de saída de áudio… (D) escolhe os alto-falantes ou fones que o reprodutor usa, por exemplo para manter o som da TV longe do seu leitor de tela. Predefinido do sistema segue o dispositivo predefinido do Windows. A escolha é lembrada.
@@ -293,7 +295,7 @@ O programa pode gravar qualquer canal para um arquivo enquanto você assiste out
 
 Gravar o que você está assistindo no reprodutor integrado usa a mesma conexão com o provedor, então funciona mesmo com contas que permitem só um fluxo por vez.
 
-Parar uma gravação pode levar um momento enquanto o arquivo é finalizado. Ao sair do aplicativo, as gravações ainda em andamento também são paradas; antes, o programa lhes dá um curto intervalo para finalizar os arquivos.
+Ao parar uma gravação ou sair da aplicação, é dado tempo para terminar de escrever o ficheiro. O prazo depende do ficheiro e do formato.
 
 Gravações > Biblioteca de gravações lista arquivos concluídos de até 20 pastas, incluindo a pasta de gravação atual. Adicionar pasta inclui uma pasta existente sem mudar o destino das novas gravações. Remover pasta da biblioteca mantém os arquivos intactos. A pasta de gravação atual não pode ser removida.
 
@@ -302,6 +304,8 @@ Pesquise por título, canal ou data. Reproduzir / Retomar abre o arquivo e ofere
 Mover para a lixeira de gravações transfere o arquivo para a lixeira do aplicativo dentro da sua pasta de gravação, sem liberar espaço. Mostrar gravações excluídas exibe esses arquivos. Restaurar gravação devolve o arquivo à pasta original sem substituir arquivos existentes. Nessa visualização, Excluir arquivo de gravação o apaga permanentemente após confirmação. Remover uma entrada de Gravações agendadas não exclui o arquivo de mídia.
 
 Todas as pastas de gravações reúne as pastas configuradas. Filtre por estado e ordene por data, título, duração ou tamanho; Decrescente inverte a ordem. Ctrl+A seleciona todas as linhas visíveis; a quantidade e o tamanho total são exibidos. Lixeira, exclusão permanente e restauração aceitam várias seleções; reprodução e renomeação exigem uma só. Leitura e filtragem ocorrem em segundo plano; fechar não cancela ações confirmadas.
+
+No editor, **Guardar fila** conserva as gravações restantes pela sua ordem. Na mesma janela pode carregar ou eliminar uma fila guardada. Cada ficheiro é verificado quando chega a sua vez. Em **Notificações de gravação**, escolha um diálogo, um aviso falado ou apenas o histórico para inícios e conclusões bem-sucedidos. Para guardar um excerto, adicione um marcador com nome a uma gravação local, escolha **Guardar excerto da gravação** em Reprodução e defina os limites. O vídeo e o áudio são guardados num novo MKV em segundo plano.
 
 ### Formato de gravação {#recording-formats}
 
@@ -333,6 +337,8 @@ O programa pergunta antes de fechar se ainda houver gravações agendadas espera
 Conflitos de gravação, em Gravações agendadas, lista as sobreposições da entrada selecionada, incluindo as margens. Os detalhes mostram canal, apelido da conta e intervalo real. Editar horários abre o editor existente. A confirmação oferece esses detalhes e Agendar mesmo assim. Um limite conhecido compara apenas a mesma conta; sem ele, as sobreposições não representam necessariamente um limite do provedor.
 
 No menu de contexto das gravações agendadas, você pode pausar uma regra recorrente ou de série entre duas datas, incluindo ambas. A gravação será retomada na próxima transmissão prevista. É possível remover a pausa antes disso. Selecione várias gravações futuras para exportá-las, com as margens de gravação, para um único arquivo .ics. Ao sair, o aplicativo pede confirmação antes de interromper uma gravação em andamento e conclui a gravação dos arquivos. Antes de confirmar, pode consultar os horários da primeira gravação que será ignorada e da primeira após a pausa, caso já sejam conhecidos.
+
+Em Gravações agendadas, prima Ctrl+F para filtrar por título ou canal. Pode mostrar os próximos sete dias, as gravações falhadas e parciais ou as regras suspensas. Limpe a pesquisa e escolha Tudo para voltar à lista completa.
 
 ### Margem de agendamento {#schedule-padding}
 

@@ -5588,3 +5588,129 @@ msgstr "Az alkalmazás bezárása folyamatban van."
 
 msgid "The postponed alert falls outside the new time window."
 msgstr "A halasztás csak akkor tartható meg, ha az értesítés új időpontja még nem érkezett el, és megelőzi a műsor befejezését."
+
+msgid "A saved queue with this name already exists."
+msgstr "Már van ilyen nevű mentett lejátszási sor."
+
+msgid "Add a named bookmark to mark a point inside the recording first."
+msgstr "Először jelöljön meg egy pontot a felvételben a „Könyvjelző hozzáadása…” paranccsal."
+
+msgid "All"
+msgstr "Összes"
+
+msgid "Announce and save in history"
+msgstr "Bemondás és előzménybejegyzés"
+
+msgid "Choose a new filename for the excerpt."
+msgstr "A megadott néven már létezik fájl. Adjon másik nevet a részletnek."
+
+msgid "Choose a saved queue:"
+msgstr "Válasszon mentett lejátszási sort:"
+
+msgid "Choose a valid recording range and an MKV filename."
+msgstr "Adja meg a részlet érvényes kezdő- és végpontját, valamint egy .mkv kiterjesztésű fájlnevet."
+
+msgid "Choose the end of the excerpt:"
+msgstr "Válassza ki a részlet végpontját:"
+
+msgid "Choose the start of the excerpt:"
+msgstr "Válassza ki a részlet kezdőpontját:"
+
+msgid "Could not save the recording excerpt."
+msgstr "A felvételrészlet mentése nem sikerült."
+
+msgid "Delete Saved Queue..."
+msgstr "Mentett sor törlése…"
+
+msgid "Delete this saved queue?"
+msgstr "Törli ezt a mentett sort?"
+
+msgid "End of recording"
+msgstr "A felvétel vége"
+
+msgid "Enter a queue name of 1 to 80 characters and include a recording."
+msgstr "Adjon a lejátszási sornak 1–80 karakter hosszú nevet. A sorban legalább egy felvételnek szerepelnie kell."
+
+msgid "Failed and Partial"
+msgstr "Sikertelen, kimaradt és részleges"
+
+msgid "Filter by title or channel"
+msgstr "Szűrés cím vagy csatorna szerint"
+
+msgid "Load Saved Queue..."
+msgstr "Mentett sor betöltése…"
+
+msgid "Name for this queue:"
+msgstr "A lejátszási sor neve:"
+
+msgid "Next 7 Days"
+msgstr "Következő 7 nap"
+
+msgid "Open a local recording with text subtitles first."
+msgstr "Nyisson meg egy helyi felvételt, majd töltsön be szöveges feliratot."
+
+msgid "Paused Recording Rules"
+msgstr "Felvételek szüneteltetési időszakkal"
+
+msgid "Recording Notifications..."
+msgstr "Felvételi értesítések…"
+
+msgid "Recording saved: {title}"
+msgstr "Felvétel mentve: {title}"
+
+msgid "Replace the current playback queue?"
+msgstr "Lecseréli a jelenlegi lejátszási sort?"
+
+msgid "Replace the saved queue with this name?"
+msgstr "Felülírja az azonos nevű mentett lejátszási sort?"
+
+msgid "Save Queue..."
+msgstr "Lejátszási sor mentése…"
+
+msgid "Save Recording Excerpt..."
+msgstr "Felvételrészlet mentése…"
+
+msgid "Save Selected Subtitles..."
+msgstr "Kijelölt találatok mentése…"
+
+msgid "Save Subtitle Transcript..."
+msgstr "Feliratátirat mentése…"
+
+msgid "Save in history only"
+msgstr "Csak előzménybejegyzés"
+
+msgid "Saved Playback Queues"
+msgstr "Mentett lejátszási sorok"
+
+msgid "Saving recording excerpt..."
+msgstr "Felvételrészlet mentése…"
+
+msgid "Saving the recording excerpt timed out."
+msgstr "Lejárt a felvételrészlet mentésére rendelkezésre álló idő."
+
+msgid "Schedule view"
+msgstr "Az ütemezés nézete"
+
+msgid "Select one subtitle to jump to its position."
+msgstr "Az ugráshoz egyetlen találatot jelöljön ki."
+
+msgid "Show a dialog"
+msgstr "Párbeszédablak megjelenítése"
+
+msgid "Start of recording"
+msgstr "A felvétel kezdete"
+
+msgid "Text file (*.txt)"
+msgstr "Szövegfájl (*.txt)"
+
+msgid "The queue could not be saved."
+msgstr "A lejátszási sort nem sikerült menteni."
+
+msgid "The recording did not cover the full scheduled time."
+msgstr "A felvétel az ütemezett időszaknak csak egy részét tartalmazza."
+
+msgid "The saved queue limit has been reached."
+msgstr "Elérte a mentett lejátszási sorok megengedett számát."
+
+msgid "When a recording starts or finishes successfully:"
+msgstr "Értesítés a felvétel sikeres indításáról és befejezéséről:"

@@ -249,6 +249,8 @@ Lecture > Synchronisation des sous-titres (Ctrl+Maj+T) règle un décalage maxim
 
 Pendant la lecture d’un enregistrement local, le menu Lecture permet de rechercher du texte dans un fichier de sous-titres chargé ou dans une piste de texte intégrée. Sélectionnez un résultat et appuyez sur Entrée pour y accéder. La vitesse de lecture est réglable de 0,75× à 2×. Choisissez « Vitesse normale » pour revenir à 1×.
 
+Dans Lecture, **Enregistrer la transcription des sous-titres** exporte la piste textuelle avec ses repères temporels. Dans les résultats de recherche, sélectionnez des lignes et choisissez **Enregistrer les sous-titres sélectionnés**. Pour atteindre un repère, sélectionnez une seule ligne et appuyez sur Entrée.
+
 ### Périphérique de sortie audio {#audio-output-device}
 
 Lecture > Périphérique de sortie audio… (D) choisit les haut-parleurs ou le casque que le lecteur utilise, par exemple pour éloigner le son du téléviseur de votre lecteur d'écran. Par défaut du système suit le périphérique par défaut de Windows. Le choix est mémorisé.
@@ -293,7 +295,7 @@ Le programme peut enregistrer n'importe quelle chaîne dans un fichier pendant q
 
 Enregistrer ce que vous regardez dans le lecteur intégré utilise la même connexion au fournisseur ; cela fonctionne donc même avec les comptes qui n'autorisent qu'un flux à la fois.
 
-L'arrêt d'un enregistrement peut prendre un moment, le temps de finaliser son fichier. Quand l'application se ferme, les enregistrements encore en cours sont eux aussi arrêtés ; le programme leur laisse d'abord un court délai pour finaliser leurs fichiers.
+Quand vous arrêtez un enregistrement ou quittez l’application, celle-ci laisse le temps de terminer l’écriture du fichier. Le délai dépend du fichier et du format d’enregistrement.
 
 Enregistrements > Bibliothèque des enregistrements affiche les fichiers terminés de 20 dossiers au maximum, dont le dossier d’enregistrement actuel. Ajouter un dossier ajoute un dossier existant sans changer la destination des nouveaux enregistrements. Retirer le dossier de la bibliothèque conserve ses fichiers. Le dossier d’enregistrement actuel ne peut pas être retiré.
 
@@ -302,6 +304,8 @@ Recherchez par titre, chaîne ou date. Lire / Reprendre ouvre le fichier et prop
 Déplacer dans la corbeille des enregistrements place le fichier dans la corbeille de l’application à l’intérieur de son dossier d’enregistrement, sans libérer d’espace. Afficher les enregistrements supprimés les rend visibles. Restaurer l’enregistrement remet le fichier dans son dossier d’origine sans écraser un fichier existant. Dans cette vue, Supprimer le fichier d’enregistrement le supprime définitivement après confirmation. Retirer une entrée des Enregistrements programmés ne supprime pas le fichier multimédia.
 
 Tous les dossiers d’enregistrements réunit les dossiers configurés. Filtrez par état et triez par date, titre, durée ou taille ; Ordre décroissant inverse le tri. Ctrl+A sélectionne toutes les lignes visibles ; le nombre et la taille totale sont affichés. Corbeille, suppression définitive et restauration acceptent plusieurs fichiers ; lecture et renommage exigent une seule sélection. L’analyse et le filtrage s’effectuent en arrière-plan ; fermer ne suspend pas une action confirmée.
+
+Dans l’éditeur de la file, **Enregistrer la file** conserve les enregistrements restants dans leur ordre. La même fenêtre permet de charger ou de supprimer une file enregistrée. Chaque fichier est vérifié à son tour. Dans **Notifications d’enregistrement**, choisissez une boîte de dialogue, une annonce ou seulement l’historique pour les débuts et fins d’enregistrement réussis. Pour enregistrer un extrait, créez un signet nommé dans un fichier local, choisissez **Enregistrer un extrait** dans Lecture, puis définissez les bornes. La vidéo et l’audio sont enregistrés dans un nouveau MKV en arrière-plan.
 
 ### Format d'enregistrement {#recording-formats}
 
@@ -333,6 +337,8 @@ Le programme demande confirmation avant de se fermer si des enregistrements prog
 Conflits d’enregistrement, dans Enregistrements programmés, présente les chevauchements de l’entrée sélectionnée, marges comprises. Les détails indiquent la chaîne, l’alias du compte et la période réelle. Modifier les horaires ouvre l’éditeur existant. La confirmation propose ces détails et Programmer quand même. Un budget connu limite la comparaison au même compte ; sinon, les chevauchements ne prétendent pas représenter une limite du fournisseur.
 
 Dans le menu contextuel des enregistrements programmés, vous pouvez suspendre une règle récurrente ou une série entre deux dates incluses. L’enregistrement reprend à la prochaine diffusion prévue. Vous pouvez lever la suspension plus tôt. Sélectionnez plusieurs enregistrements à venir pour les exporter dans un seul fichier .ics avec leurs marges. À la fermeture, l’application demande confirmation avant d’arrêter un enregistrement en cours et termine l’écriture des fichiers. Avant de confirmer, vous pouvez consulter les horaires du premier enregistrement suspendu et du premier enregistrement après la pause, s’ils sont connus.
+
+Dans Enregistrements programmés, utilisez Ctrl+F pour filtrer par titre ou chaîne. Affichez les sept prochains jours, les échecs et enregistrements partiels ou les règles suspendues. Effacez la recherche et choisissez Tout pour retrouver la liste complète.
 
 ### Marge de programmation {#schedule-padding}
 

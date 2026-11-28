@@ -5573,3 +5573,129 @@ msgstr "Sélectionnez des enregistrements à venir en dehors de la période de s
 
 msgid "Stopped because the app exited."
 msgstr "L’enregistrement s’est arrêté à la fermeture de l’application."
+
+msgid "A saved queue with this name already exists."
+msgstr "Une file enregistrée porte déjà ce nom."
+
+msgid "Add a named bookmark to mark a point inside the recording first."
+msgstr "Ajoutez d’abord un signet nommé dans l’enregistrement."
+
+msgid "All"
+msgstr "Tout"
+
+msgid "Announce and save in history"
+msgstr "Annoncer et consigner dans l’historique"
+
+msgid "Choose a new filename for the excerpt."
+msgstr "Choisissez un nouveau nom de fichier pour l’extrait."
+
+msgid "Choose a saved queue:"
+msgstr "Choisissez une file enregistrée :"
+
+msgid "Choose a valid recording range and an MKV filename."
+msgstr "Choisissez un intervalle valide et un nom de fichier MKV."
+
+msgid "Choose the end of the excerpt:"
+msgstr "Choisissez la fin de l’extrait :"
+
+msgid "Choose the start of the excerpt:"
+msgstr "Choisissez le début de l’extrait :"
+
+msgid "Could not save the recording excerpt."
+msgstr "Impossible d’enregistrer l’extrait."
+
+msgid "Delete Saved Queue..."
+msgstr "Supprimer une file enregistrée…"
+
+msgid "Delete this saved queue?"
+msgstr "Supprimer cette file enregistrée ?"
+
+msgid "End of recording"
+msgstr "Fin de l’enregistrement"
+
+msgid "Enter a queue name of 1 to 80 characters and include a recording."
+msgstr "Saisissez un nom de 1 à 80 caractères et ajoutez un enregistrement."
+
+msgid "Failed and Partial"
+msgstr "Échecs et enregistrements partiels"
+
+msgid "Filter by title or channel"
+msgstr "Filtrer par titre ou chaîne"
+
+msgid "Load Saved Queue..."
+msgstr "Charger une file enregistrée…"
+
+msgid "Name for this queue:"
+msgstr "Nom de la file :"
+
+msgid "Next 7 Days"
+msgstr "7 prochains jours"
+
+msgid "Open a local recording with text subtitles first."
+msgstr "Ouvrez d’abord un enregistrement local avec des sous-titres textuels."
+
+msgid "Paused Recording Rules"
+msgstr "Règles d’enregistrement suspendues"
+
+msgid "Recording Notifications..."
+msgstr "Notifications d’enregistrement…"
+
+msgid "Recording saved: {title}"
+msgstr "Enregistrement sauvegardé : {title}"
+
+msgid "Replace the current playback queue?"
+msgstr "Remplacer la file de lecture actuelle ?"
+
+msgid "Replace the saved queue with this name?"
+msgstr "Remplacer la file enregistrée sous ce nom ?"
+
+msgid "Save Queue..."
+msgstr "Enregistrer la file…"
+
+msgid "Save Recording Excerpt..."
+msgstr "Enregistrer un extrait…"
+
+msgid "Save Selected Subtitles..."
+msgstr "Enregistrer les sous-titres sélectionnés…"
+
+msgid "Save Subtitle Transcript..."
+msgstr "Enregistrer la transcription des sous-titres…"
+
+msgid "Save in history only"
+msgstr "Consigner uniquement dans l’historique"
+
+msgid "Saved Playback Queues"
+msgstr "Files de lecture enregistrées"
+
+msgid "Saving recording excerpt..."
+msgstr "Enregistrement de l’extrait en cours…"
+
+msgid "Saving the recording excerpt timed out."
+msgstr "Le délai d’enregistrement de l’extrait a expiré."
+
+msgid "Schedule view"
+msgstr "Vue de la programmation"
+
+msgid "Select one subtitle to jump to its position."
+msgstr "Sélectionnez un sous-titre pour accéder à sa position."
+
+msgid "Show a dialog"
+msgstr "Afficher une boîte de dialogue"
+
+msgid "Start of recording"
+msgstr "Début de l’enregistrement"
+
+msgid "Text file (*.txt)"
+msgstr "Fichier texte (*.txt)"
+
+msgid "The queue could not be saved."
+msgstr "Impossible d’enregistrer la file."
+
+msgid "The recording did not cover the full scheduled time."
+msgstr "L’enregistrement ne couvre pas toute la durée prévue."
+
+msgid "The saved queue limit has been reached."
+msgstr "La limite de files enregistrées est atteinte."
+
+msgid "When a recording starts or finishes successfully:"
+msgstr "Lorsqu’un enregistrement démarre ou se termine normalement :"

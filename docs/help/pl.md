@@ -249,6 +249,8 @@ Odtwarzanie > Synchronizacja napisów (Ctrl+Shift+T) ustawia przesunięcie do dz
 
 Podczas odtwarzania lokalnego nagrania menu odtwarzania umożliwia wyszukanie tekstu we wczytanym pliku napisów lub na osadzonej ścieżce tekstowej. Wybierz wynik i naciśnij Enter, aby przejść do tego miejsca. Możesz zmieniać prędkość od 0,75× do 2×. Wybierz normalną prędkość, aby wrócić do 1×.
 
+W menu Odtwarzanie polecenie **Zapisz transkrypcję napisów** eksportuje ścieżkę tekstową ze znacznikami czasu. W wynikach wyszukiwania zaznacz wiersze i wybierz **Zapisz wybrane napisy**. Aby przejść do wybranego miejsca, zaznacz jeden wiersz i naciśnij Enter.
+
 ### Urządzenie wyjścia audio {#audio-output-device}
 
 Odtwarzanie > Urządzenie wyjścia audio... (D) wybiera głośniki albo słuchawki, których używa odtwarzacz, na przykład aby odsunąć dźwięk telewizji od czytnika ekranu. Domyślne systemu podąża za domyślnym urządzeniem Windows. Wybór jest zapamiętywany.
@@ -293,7 +295,7 @@ Program może nagrywać dowolny kanał do pliku, podczas gdy oglądasz coś inne
 
 Nagrywanie oglądanego programu we wbudowanym odtwarzaczu używa tego samego połączenia z dostawcą, więc działa także przy kontach pozwalających na jeden strumień naraz.
 
-Zatrzymanie nagrania może chwilę potrwać, zanim jego plik zostanie domknięty. Przy zamykaniu aplikacji trwające jeszcze nagrania również są zatrzymywane; program najpierw daje im krótką chwilę na domknięcie plików.
+Po zatrzymaniu nagrywania lub zamknięciu aplikacji program daje czas na ukończenie zapisu pliku. Czas zależy od pliku i formatu nagrania.
 
 Nagrania > Biblioteka nagrań pokazuje ukończone pliki z maksymalnie 20 folderów, w tym bieżącego folderu nagrań. Dodaj folder dołącza istniejący folder bez zmiany miejsca zapisu nowych nagrań. Usuń folder z biblioteki pozostawia pliki bez zmian. Bieżącego folderu nagrań nie można usunąć z listy.
 
@@ -302,6 +304,8 @@ Wyszukuj według tytułu, kanału lub daty. Odtwórz / Wznów otwiera plik i pro
 Przenieś do kosza nagrań umieszcza plik w koszu aplikacji wewnątrz jego folderu nagrań i nie zwalnia miejsca. Pokaż usunięte nagrania wyświetla te pliki. Przywróć nagranie przenosi plik do pierwotnego folderu bez nadpisywania istniejących plików. W tym widoku Usuń plik nagrania usuwa go trwale po potwierdzeniu. Usunięcie wpisu z Zaplanowanych nagrań nie usuwa pliku multimedialnego.
 
 Wszystkie foldery nagrań łączy skonfigurowane foldery. Filtruj według stanu i sortuj według daty, tytułu, czasu trwania lub rozmiaru; Malejąco odwraca kolejność. Ctrl+A zaznacza wszystkie widoczne wiersze; wyświetlana jest liczba i łączny rozmiar. Kosz, trwałe usuwanie i przywracanie obsługują wiele plików; odtwarzanie i zmiana tytułu wymagają jednego. Skanowanie i filtrowanie działa w tle; zamknięcie nie przerywa zatwierdzonych operacji.
+
+W edytorze **Zapisz kolejkę** zachowuje pozostałe nagrania w ustalonej kolejności. W tym samym oknie można wczytać lub usunąć zapisaną kolejkę. Pliki są sprawdzane w chwili rozpoczęcia odtwarzania. W **Powiadomieniach o nagraniach** można wybrać okno dialogowe, komunikat głosowy lub sam wpis w historii. Aby zapisać fragment, dodaj nazwaną zakładkę do lokalnego nagrania, wybierz **Zapisz fragment nagrania** w menu Odtwarzanie i wskaż granice. Obraz i dźwięk zostaną zapisane w nowym pliku MKV w tle.
 
 ### Format nagrywania {#recording-formats}
 
@@ -333,6 +337,8 @@ Program pyta przed zamknięciem, jeśli zaplanowane nagrania wciąż czekają na
 Konflikty nagrań w Zaplanowanych nagraniach pokazują nakładanie się wybranego wpisu, uwzględniając zapas czasu. Szczegóły obejmują kanał, nazwę konta i rzeczywisty przedział. Edytuj godziny otwiera istniejący edytor. Potwierdzenie oferuje te szczegóły i Zaplanuj mimo to. Znany limit zawęża porównanie do tego samego konta; inaczej są to tylko nakładające się terminy, bez założenia limitu dostawcy.
 
 W menu kontekstowym zaplanowanych nagrań możesz wstrzymać regułę cykliczną lub nagrywanie serialu na okres obejmujący obie wskazane daty. Nagrywanie zostanie wznowione od następnej pasującej emisji. Przerwę można zakończyć wcześniej. Zaznacz kilka nadchodzących nagrań, aby wyeksportować je do jednego pliku .ics z uwzględnieniem dodatkowego czasu przed audycją i po niej. Przy zamykaniu aplikacja pyta o potwierdzenie zatrzymania trwającego nagrania i kończy zapis plików. Przed zatwierdzeniem można sprawdzić termin pierwszego pominiętego nagrania i pierwszego nagrania po przerwie, o ile są już znane.
+
+W zaplanowanych nagraniach naciśnij Ctrl+F, aby filtrować według tytułu lub kanału. Możesz wyświetlić nadchodzące siedem dni, nagrania nieudane i częściowe lub wstrzymane reguły. Wyczyść wyszukiwanie i wybierz Wszystkie, aby wrócić do pełnej listy.
 
 ### Margines nagrywania {#schedule-padding}
 

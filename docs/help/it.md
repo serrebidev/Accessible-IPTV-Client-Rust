@@ -249,6 +249,8 @@ Riproduzione > Sincronizzazione sottotitoli (Ctrl+Maiusc+T) regola fino a dieci 
 
 Durante la riproduzione di una registrazione locale, il menu di riproduzione permette di cercare parole nel file di sottotitoli caricato o nella traccia di testo incorporata. Selezionare un risultato e premere Invio per raggiungerlo. La velocità può variare da 0,75× a 2×. Selezionare la velocità normale per tornare a 1×.
 
+In Riproduzione, **Salva trascrizione dei sottotitoli** esporta la traccia di testo con gli orari. Nei risultati di ricerca, selezionare le righe e scegliere **Salva sottotitoli selezionati**. Selezionare una sola riga e premere Invio per raggiungere quella posizione.
+
 ### Dispositivo di uscita audio {#audio-output-device}
 
 Riproduzione > Dispositivo di uscita audio… (D) sceglie gli altoparlanti o le cuffie che il lettore usa, per esempio per tenere lontano il suono della TV dal proprio lettore di schermo. Predefinito di sistema segue il dispositivo predefinito di Windows. La scelta è ricordata.
@@ -293,7 +295,7 @@ Il programma può registrare qualsiasi canale in un file mentre si guarda altro,
 
 Registrare ciò che si guarda nel lettore integrato usa la stessa connessione al provider, quindi funziona anche con account che permettono un solo flusso alla volta.
 
-Fermare una registrazione può richiedere un momento mentre il file viene finalizzato. Quando l'applicazione si chiude, anche le registrazioni ancora in corso vengono fermate; il programma concede prima un breve margine per finalizzare i file.
+Quando si arresta una registrazione o si chiude il programma, l’app attende che il file venga finalizzato. Il tempo concesso dipende dal file e dal formato.
 
 Registrazioni > Raccolta registrazioni elenca i file completati in un massimo di 20 cartelle, compresa quella di registrazione attuale. Aggiungi cartella include una cartella esistente senza cambiare la destinazione delle nuove registrazioni. Rimuovi cartella dalla raccolta lascia intatti i file. La cartella di registrazione attuale non può essere rimossa.
 
@@ -302,6 +304,8 @@ Cercare per titolo, canale o data. Riproduci / Riprendi apre il file e propone l
 Sposta nel cestino delle registrazioni trasferisce il file nel cestino dell’applicazione dentro la sua cartella di registrazione, senza liberare spazio. Mostra registrazioni eliminate rende visibili questi file. Ripristina registrazione li riporta nella cartella originale senza sovrascrivere file esistenti. In questa vista, Elimina file di registrazione li elimina definitivamente dopo conferma. Rimuovere una voce da Registrazioni programmate non elimina il file multimediale.
 
 Tutte le cartelle delle registrazioni riunisce le cartelle configurate. Filtra per stato e ordina per data, titolo, durata o dimensione; Decrescente inverte l’ordine. Ctrl+A seleziona tutte le righe visibili; vengono mostrati conteggio e dimensione totale. Cestino, eliminazione definitiva e ripristino supportano più selezioni; riproduzione e rinomina richiedono un solo elemento. Analisi e filtri operano in background; la chiusura non annulla operazioni confermate.
+
+Nell’editor, **Salva coda** conserva nell’ordine le registrazioni rimanenti. Dalla stessa finestra si può caricare o eliminare una coda salvata. Ogni file viene verificato al proprio turno. In **Notifiche di registrazione**, scegliere una finestra, un annuncio o solo la cronologia per avvii e conclusioni riusciti. Per salvare un estratto, aggiungere un segnalibro con nome a una registrazione locale, scegliere **Salva estratto della registrazione** in Riproduzione e indicare gli estremi. Video e audio vengono salvati in un nuovo MKV in background.
 
 ### Formato di registrazione {#recording-formats}
 
@@ -333,6 +337,8 @@ Il programma chiede conferma prima di chiudersi se ci sono registrazioni program
 Conflitti di registrazione, in Registrazioni programmate, elenca le sovrapposizioni dell’elemento selezionato, inclusi i margini. I dettagli indicano canale, alias dell’account e intervallo effettivo. Modifica orari apre l’editor esistente. La conferma offre questi dettagli e Programma comunque. Un limite noto confronta solo lo stesso account; altrimenti mostra sovrapposizioni temporali senza presumere un limite del fornitore.
 
 Nel menu contestuale delle registrazioni programmate è possibile sospendere una regola ricorrente o una serie tra due date, entrambe incluse. La registrazione riprende dalla trasmissione successiva prevista. La sospensione si può rimuovere in anticipo. Selezionare più registrazioni future per esportarle in un unico file .ics con i rispettivi margini. All’uscita l’applicazione chiede conferma prima di interrompere una registrazione in corso e completa la scrittura dei file. Prima della conferma vengono mostrati, se disponibili, gli orari della prima registrazione che verrà saltata e della prima dopo la pausa.
+
+Nelle registrazioni programmate, Ctrl+F filtra per titolo o canale. Scegliere tra i prossimi sette giorni, le registrazioni non riuscite o parziali e le regole sospese. Cancellare la ricerca e scegliere Tutto per mostrare l’elenco completo.
 
 ### Margine di programmazione {#schedule-padding}
 

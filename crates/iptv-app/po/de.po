@@ -5552,3 +5552,129 @@ msgstr "Wählen Sie anstehende Aufnahmen außerhalb des Pausenzeitraums."
 
 msgid "Stopped because the app exited."
 msgstr "Die Aufnahme wurde beim Beenden der Anwendung gestoppt."
+
+msgid "A saved queue with this name already exists."
+msgstr "Eine gespeicherte Warteschlange mit diesem Namen ist bereits vorhanden."
+
+msgid "Add a named bookmark to mark a point inside the recording first."
+msgstr "Setzen Sie zuerst ein benanntes Lesezeichen innerhalb der Aufnahme."
+
+msgid "All"
+msgstr "Alle"
+
+msgid "Announce and save in history"
+msgstr "Ansagen und im Verlauf speichern"
+
+msgid "Choose a new filename for the excerpt."
+msgstr "Wählen Sie einen neuen Dateinamen für den Ausschnitt."
+
+msgid "Choose a saved queue:"
+msgstr "Gespeicherte Warteschlange wählen:"
+
+msgid "Choose a valid recording range and an MKV filename."
+msgstr "Wählen Sie einen gültigen Zeitbereich und einen MKV-Dateinamen."
+
+msgid "Choose the end of the excerpt:"
+msgstr "Ende des Ausschnitts wählen:"
+
+msgid "Choose the start of the excerpt:"
+msgstr "Anfang des Ausschnitts wählen:"
+
+msgid "Could not save the recording excerpt."
+msgstr "Der Aufnahmeausschnitt konnte nicht gespeichert werden."
+
+msgid "Delete Saved Queue..."
+msgstr "Gespeicherte Warteschlange löschen…"
+
+msgid "Delete this saved queue?"
+msgstr "Diese gespeicherte Warteschlange löschen?"
+
+msgid "End of recording"
+msgstr "Ende der Aufnahme"
+
+msgid "Enter a queue name of 1 to 80 characters and include a recording."
+msgstr "Geben Sie einen Namen mit 1 bis 80 Zeichen ein und fügen Sie eine Aufnahme hinzu."
+
+msgid "Failed and Partial"
+msgstr "Fehlgeschlagen und unvollständig"
+
+msgid "Filter by title or channel"
+msgstr "Nach Titel oder Sender filtern"
+
+msgid "Load Saved Queue..."
+msgstr "Gespeicherte Warteschlange laden…"
+
+msgid "Name for this queue:"
+msgstr "Name der Warteschlange:"
+
+msgid "Next 7 Days"
+msgstr "Nächste 7 Tage"
+
+msgid "Open a local recording with text subtitles first."
+msgstr "Öffnen Sie zuerst eine lokale Aufnahme mit Textuntertiteln."
+
+msgid "Paused Recording Rules"
+msgstr "Pausierte Aufnahmeregeln"
+
+msgid "Recording Notifications..."
+msgstr "Aufnahmebenachrichtigungen…"
+
+msgid "Recording saved: {title}"
+msgstr "Aufnahme gespeichert: {title}"
+
+msgid "Replace the current playback queue?"
+msgstr "Aktuelle Wiedergabewarteschlange ersetzen?"
+
+msgid "Replace the saved queue with this name?"
+msgstr "Gespeicherte Warteschlange mit diesem Namen ersetzen?"
+
+msgid "Save Queue..."
+msgstr "Warteschlange speichern…"
+
+msgid "Save Recording Excerpt..."
+msgstr "Aufnahmeausschnitt speichern…"
+
+msgid "Save Selected Subtitles..."
+msgstr "Ausgewählte Untertitel speichern…"
+
+msgid "Save Subtitle Transcript..."
+msgstr "Untertiteltranskript speichern…"
+
+msgid "Save in history only"
+msgstr "Nur im Verlauf speichern"
+
+msgid "Saved Playback Queues"
+msgstr "Gespeicherte Wiedergabewarteschlangen"
+
+msgid "Saving recording excerpt..."
+msgstr "Aufnahmeausschnitt wird gespeichert…"
+
+msgid "Saving the recording excerpt timed out."
+msgstr "Zeitlimit beim Speichern des Aufnahmeausschnitts überschritten."
+
+msgid "Schedule view"
+msgstr "Planungsansicht"
+
+msgid "Select one subtitle to jump to its position."
+msgstr "Wählen Sie einen Untertitel aus, um zu seiner Position zu springen."
+
+msgid "Show a dialog"
+msgstr "Dialog anzeigen"
+
+msgid "Start of recording"
+msgstr "Anfang der Aufnahme"
+
+msgid "Text file (*.txt)"
+msgstr "Textdatei (*.txt)"
+
+msgid "The queue could not be saved."
+msgstr "Die Warteschlange konnte nicht gespeichert werden."
+
+msgid "The recording did not cover the full scheduled time."
+msgstr "Die Aufnahme deckt den geplanten Zeitraum nicht vollständig ab."
+
+msgid "The saved queue limit has been reached."
+msgstr "Die Höchstzahl gespeicherter Warteschlangen ist erreicht."
+
+msgid "When a recording starts or finishes successfully:"
+msgstr "Wenn eine Aufnahme erfolgreich startet oder endet:"

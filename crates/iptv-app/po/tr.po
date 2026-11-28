@@ -5457,3 +5457,129 @@ msgstr "Ara dışında kalan yaklaşan kayıtları seçin."
 
 msgid "Stopped because the app exited."
 msgstr "Uygulamadan çıkıldığı için kayıt durduruldu."
+
+msgid "A saved queue with this name already exists."
+msgstr "Bu adda kayıtlı bir sıra zaten var."
+
+msgid "Add a named bookmark to mark a point inside the recording first."
+msgstr "Önce kaydın içinde adlandırılmış bir yer imi ekleyin."
+
+msgid "All"
+msgstr "Tümü"
+
+msgid "Announce and save in history"
+msgstr "Sesli bildir ve geçmişe kaydet"
+
+msgid "Choose a new filename for the excerpt."
+msgstr "Kesit için yeni bir dosya adı seçin."
+
+msgid "Choose a saved queue:"
+msgstr "Kayıtlı bir sıra seçin:"
+
+msgid "Choose a valid recording range and an MKV filename."
+msgstr "Geçerli bir kayıt aralığı ve MKV dosya adı seçin."
+
+msgid "Choose the end of the excerpt:"
+msgstr "Kesitin bitişini seçin:"
+
+msgid "Choose the start of the excerpt:"
+msgstr "Kesitin başlangıcını seçin:"
+
+msgid "Could not save the recording excerpt."
+msgstr "Kayıt kesiti kaydedilemedi."
+
+msgid "Delete Saved Queue..."
+msgstr "Kayıtlı sırayı sil…"
+
+msgid "Delete this saved queue?"
+msgstr "Bu kayıtlı sıra silinsin mi?"
+
+msgid "End of recording"
+msgstr "Kaydın sonu"
+
+msgid "Enter a queue name of 1 to 80 characters and include a recording."
+msgstr "1–80 karakterlik bir ad girin ve bir kayıt ekleyin."
+
+msgid "Failed and Partial"
+msgstr "Başarısız ve kısmi"
+
+msgid "Filter by title or channel"
+msgstr "Başlığa veya kanala göre filtrele"
+
+msgid "Load Saved Queue..."
+msgstr "Kayıtlı sırayı yükle…"
+
+msgid "Name for this queue:"
+msgstr "Sıranın adı:"
+
+msgid "Next 7 Days"
+msgstr "Gelecek 7 gün"
+
+msgid "Open a local recording with text subtitles first."
+msgstr "Önce metin altyazısı olan yerel bir kayıt açın."
+
+msgid "Paused Recording Rules"
+msgstr "Duraklatılan kayıt kuralları"
+
+msgid "Recording Notifications..."
+msgstr "Kayıt bildirimleri…"
+
+msgid "Recording saved: {title}"
+msgstr "Kayıt kaydedildi: {title}"
+
+msgid "Replace the current playback queue?"
+msgstr "Geçerli oynatma sırası değiştirilsin mi?"
+
+msgid "Replace the saved queue with this name?"
+msgstr "Bu addaki kayıtlı sıra değiştirilsin mi?"
+
+msgid "Save Queue..."
+msgstr "Sırayı kaydet…"
+
+msgid "Save Recording Excerpt..."
+msgstr "Kayıt kesitini kaydet…"
+
+msgid "Save Selected Subtitles..."
+msgstr "Seçili altyazıları kaydet…"
+
+msgid "Save Subtitle Transcript..."
+msgstr "Altyazı dökümünü kaydet…"
+
+msgid "Save in history only"
+msgstr "Yalnızca geçmişe kaydet"
+
+msgid "Saved Playback Queues"
+msgstr "Kayıtlı oynatma sıraları"
+
+msgid "Saving recording excerpt..."
+msgstr "Kayıt kesiti kaydediliyor…"
+
+msgid "Saving the recording excerpt timed out."
+msgstr "Kayıt kesiti kaydedilirken zaman aşımı oluştu."
+
+msgid "Schedule view"
+msgstr "Zamanlama görünümü"
+
+msgid "Select one subtitle to jump to its position."
+msgstr "Konumuna atlamak için bir altyazı seçin."
+
+msgid "Show a dialog"
+msgstr "İletişim kutusu göster"
+
+msgid "Start of recording"
+msgstr "Kaydın başlangıcı"
+
+msgid "Text file (*.txt)"
+msgstr "Metin dosyası (*.txt)"
+
+msgid "The queue could not be saved."
+msgstr "Sıra kaydedilemedi."
+
+msgid "The recording did not cover the full scheduled time."
+msgstr "Kayıt, planlanan sürenin tamamını kapsamadı."
+
+msgid "The saved queue limit has been reached."
+msgstr "Kayıtlı sıra sınırına ulaşıldı."
+
+msgid "When a recording starts or finishes successfully:"
+msgstr "Kayıt başarıyla başladığında veya bittiğinde:"

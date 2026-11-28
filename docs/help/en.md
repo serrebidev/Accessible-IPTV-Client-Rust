@@ -288,6 +288,8 @@ Playback > Subtitle Timing (Ctrl+Shift+T) adjusts subtitle delay by up to ten mi
 
 During local recording playback, choose **Find Text in Recording Subtitles** in the Playback menu. Load a text subtitle file or select an embedded text track, enter a word or phrase, choose a result and press Enter to jump there. **Recording Playback Speed** changes the recording’s speed from 0.75× to 2×. Choose **Normal speed** to return to 1×.
 
+In Playback, **Save Subtitle Transcript** exports the loaded text track with time stamps. In subtitle search results, select one or more rows and choose **Save Selected Subtitles**. To jump to a time, select just one row and press Enter.
+
 ### Audio output device {#audio-output-device}
 
 In the player window, open Playback > Audio Output Device to choose where the built-in player sends its sound, for example to keep TV sound away from your screen reader. The list starts with System default, followed by the output devices libVLC reports. Your choice is remembered and applied every time playback starts; System default leaves the choice to the operating system. The list comes from libVLC, so it is available when the libVLC engine is in use.
@@ -334,7 +336,7 @@ The program can record any channel to a file while you watch something else, or 
 
 Recording what you are watching in the built-in player uses the same connection to the provider, so it works even with accounts that allow only one stream at a time.
 
-Stopping a recording can take a moment while its file is finalized. When the application exits, any recordings still in progress are also stopped; the program first gives them a short grace period to finalize their files.
+When you stop a recording or close the app, it gives the recording file time to finish writing. The time allowed depends on the file and recording format.
 
 Recordings > Recording Space Monitor checks free space every five seconds while recording. Warning is enabled by default below 1024 MiB. Automatic stopping is off by default; enable it and choose a stop threshold, initially 256 MiB, to request graceful file closure before the drive fills up. The warning threshold must not be lower than the stop threshold. Recordings on the same drive share one warning; if stopping is enabled, all affected recordings are stopped. The check cannot reserve space or guarantee file closure on a full or disconnected drive.
 
@@ -345,6 +347,8 @@ Search by title, channel or date. Play / Resume opens the selected file and offe
 Move to Recording Trash moves a file into the application's trash within its recording folder; this does not free disk space. Show Deleted Recordings lists these files. Restore Recording returns a file to its original folder without overwriting an existing file. Delete Recording File in this view permanently deletes it after confirmation. Removing an entry from Scheduled Recordings does not delete the media file.
 
 Recording Library > Export List to CSV exports the currently filtered and sorted list with title, channel, date, duration, status and size. It excludes file paths and stream URLs; spreadsheet formula prefixes in text are protected. The library remembers its folder, search, status filter, sort and direction when closed. Deleted Recordings is always off on reopening. Exports run only when requested, without rescanning media.
+
+In the queue editor, **Save Queue** stores the remaining recordings in order under a name. **Load Saved Queue** restores the list and checks each file when its turn comes. Use **Delete Saved Queue** to remove a saved list. **Recording Notifications** in the Recordings menu lets you show a dialog, hear a short announcement, or use Notification History for successful starts and finishes. To save an excerpt, add a named bookmark inside a local recording and choose **Playback > Save Recording Excerpt**. Pick the start and end from bookmarks or file boundaries. The app writes video and audio to a new MKV in the background.
 
 All Recording Folders combines the configured folders. Filter by status and sort by date, title, duration or file size; Descending reverses the order. Ctrl+A selects all visible rows. Selected count and total size are shown. Trash, permanent deletion and restore support multiple selections; playback and title renaming require one. Disk scans and filtering run in the background; closing the window does not cancel a confirmed file action.
 
@@ -388,6 +392,8 @@ Recording Conflicts in Scheduled Recordings lists overlaps for one selected entr
 Recordings > Recording Connection Limits sets the connections available to recordings for each provider account: 1–64, or 0 for no additional limit. Allow for playback and other devices; this setting does not discover the provider's actual limit. Scheduling checks the peak number of simultaneous recording connections for the same known account. Exceeding its budget requires confirmation; without a known budget, overlapping schedules receive the usual warning. A new recording is refused when its budget is full; existing recordings continue. A recording using the player's local buffer does not count as another provider connection. Existing single-stream protections still apply.
 
 In Scheduled Recordings, open an item’s context menu and choose **Pause Recording Rule**. The first and last dates are both included. Recording resumes with the next eligible broadcast. Reopen the rule to remove the pause. To export several upcoming bookings, select them and choose **Export Selected Recordings to Calendar**. The single .ics file includes the recording margins. On normal exit, the app asks before stopping an active recording and finishes writing the files before closing. Before confirming, you can review the first skipped recording and the first one after the pause, when their times are known.
+
+In Scheduled Recordings, press Ctrl+F to filter by title or channel. Use the view selector to show the next seven days, failures and partial recordings, or paused rules. To see everything again, clear the search and choose All.
 
 ### Schedule padding {#schedule-padding}
 
