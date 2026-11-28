@@ -92,4 +92,13 @@ incomplete-attempt marker are session-only, exactly like Python's.
 
 ## Gate
 
-To be filled in with the recorded results before shipping.
+Recorded 2026-11-28 before shipping v0.4.43: `cargo fmt --all --
+--check` clean; `cargo clippy --locked --workspace --all-targets --
+-D warnings` clean; `cargo test --locked --workspace` 566 passed /
+0 failed (iptv-core 521, iptv-app 25, iptv-vlc 9, remaining suites
+11); playlist parity PASS against the pinned Python checkout
+(a29ad9a3); `git diff --check` clean; `msgfmt --check` clean on all
+13 catalogues. New regression coverage: the DVR save-failure test
+(warns once per outage, retry armed, in-memory state intact), the
+backup pause-period cases, and the EPG worker test now asserting
+the (loaded, total) counts on a partial load.

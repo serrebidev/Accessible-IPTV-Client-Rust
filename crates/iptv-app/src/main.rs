@@ -672,9 +672,10 @@ struct Wiring {
     /// message when it lands (N21; Python's `_epg_import_notify`).
     /// Automatic loads never set it, so they stay quiet.
     epg_import_notify: Rc<std::cell::Cell<bool>>,
-    /// PR #48: the last incomplete import attempt (sources hash
-    /// + the epoch second an automatic retry becomes due), so a
-    /// partial guide is not re-fetched continuously.
+    /// PR #48: the last incomplete import attempt — the
+    /// sources hash and the epoch second an automatic retry
+    /// becomes due — so a partial guide is not re-fetched
+    /// continuously.
     epg_incomplete: Rc<RefCell<Option<(String, i64)>>>,
     /// The independent 60-second guide-freshness timer (audit
     /// E11): row suffixes track programme boundaries even when
@@ -3081,6 +3082,7 @@ fn poll_providers(wiring: &Wiring, controls: Controls, frame: Frame) {
 /// open defers them instead of stacking.
 /// How a hand-started import turned out (PR #48): complete,
 /// partial (some sources loaded), or failed (none did).
+#[derive(Clone, Copy)]
 enum EpgImportReport {
     Complete,
     Partial(usize, usize),
@@ -9985,6 +9987,7 @@ fn menu_import_epg(wiring: &Wiring, frame: Frame, status: Status) {
 /// N25, `main.py:2962`): an entry that is not a positive
 /// number warns, and a number no channel carries and no
 /// position reaches reports not found.
+#[allow(clippy::too_many_lines)] // one gesture: entry, match, chooser, select
 fn menu_go_to_channel_number(wiring: &Wiring, frame: Frame, list: ListCtrl, status: Status) {
     let found = {
         let model = wiring.model.borrow();

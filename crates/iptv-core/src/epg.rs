@@ -1846,6 +1846,10 @@ enum EpgEvent {
 }
 
 /// Off-UI-thread guide loader mirroring the browse/search worker shape.
+/// What a finished guide load delivers: the snapshot, the
+/// store note, and the loaded/total source counts (PR #48).
+pub type EpgDelivery = Result<(std::sync::Arc<EpgSnapshot>, String, usize, usize), String>;
+
 pub struct EpgWorker {
     jobs: std::sync::mpsc::Sender<EpgJob>,
     events: std::sync::Mutex<std::sync::mpsc::Receiver<EpgEvent>>,
@@ -1909,9 +1913,7 @@ impl EpgWorker {
     /// snapshot, the store note, and how many of the requested
     /// sources loaded out of the total (PR #48).
     #[must_use]
-    pub fn try_recv(
-        &self,
-    ) -> Option<Result<(std::sync::Arc<EpgSnapshot>, String, usize, usize), String>> {
+    pub fn try_recv(&self) -> Option<EpgDelivery> {
         let events = self.events.lock().ok()?;
         match events.try_recv().ok()? {
             EpgEvent::Ready(snapshot, note, loaded, total) => {
