@@ -973,7 +973,10 @@ impl DvrSchedule {
     /// Retry a failed schedule write when its retry time has
     /// come (PR #48); called at the head of every tick.
     fn retry_save(&mut self) {
-        if self.save_retry_at.is_some_and(|at| std::time::Instant::now() >= at) {
+        if self
+            .save_retry_at
+            .is_some_and(|at| std::time::Instant::now() >= at)
+        {
             self.save_retry_at = None;
             self.save_logged();
         }

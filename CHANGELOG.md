@@ -5,6 +5,14 @@ adjacent releases were part of the same fix stream, they are combined with a
 version range such as `0.2.2-0.2.3`. Each release's section below is its
 Forgejo release note, taken from this file by the release workflow.
 
+## 0.4.43
+
+- Recording, playback and schedule regressions fixed, matching the Python client's v1.152.6 (PR #48): a failed recording-schedule save now warns once and keeps retrying in the background instead of silently losing the schedule; settings backup validation rejects a job with an invalid pause period, like loading does.
+- Guide imports are honest about partial results: the freshness stamp only advances when every EPG source loaded, a hand-run import reports "Partial EPG Import" with the counts, and automatic retries of the same sources wait five minutes after an incomplete attempt.
+- Go to Channel Number asks which channel when the same number appears on several channels, with names disambiguated by group and numbered when they still collide.
+- The Recording Library scans each folder on its own and shows each folder's recordings as soon as that folder lands — a slow network share no longer delays the rest; the controls stay usable while scanning, the status line says recordings are still loading, and re-filtering keeps the focused recording.
+- Catch-up downloads refuse a duplicate while the same programme is still being prepared, settings import also waits for downloads being prepared, stuck media probes retire off the interface thread, and no new probe starts while a playback is being resolved.
+
 ## 0.4.42
 
 - Hungarian polish (Python PR #47, by Tibor): the recording-workflow strings added in 0.4.41 and the Hungarian user guide are revised to match the Python client's v1.152.5 wording exactly.

@@ -387,15 +387,14 @@ impl DvrJobCheck {
         if let Some(pause) = &self.pause_dates {
             let period = pause.as_array().and_then(|row| {
                 if row.len() == 2 {
-                    Some([
-                        row[0].as_str()?.to_string(),
-                        row[1].as_str()?.to_string(),
-                    ])
+                    Some([row[0].as_str()?.to_string(), row[1].as_str()?.to_string()])
                 } else {
                     None
                 }
             });
-            if period.as_ref().is_none_or(|p| !crate::dvr::valid_pause_period(p))
+            if period
+                .as_ref()
+                .is_none_or(|p| !crate::dvr::valid_pause_period(p))
                 || !(0.0..=253_402_300_799.0).contains(&self.start_ts)
             {
                 return false;
